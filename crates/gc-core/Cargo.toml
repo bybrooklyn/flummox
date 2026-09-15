@@ -1,0 +1,25 @@
+[package]
+name = "gc-core"
+description = "Model, filesystem probing, estimation and compression backends for gamecompressor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror.workspace = true
+libc.workspace = true
+nix.workspace = true
+xattr.workspace = true
+zstd.workspace = true
+walkdir.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+gc-testutil.workspace = true
+
+[lints]
+workspace = true

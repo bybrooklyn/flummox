@@ -1,0 +1,20 @@
+[package]
+name = "gc-launchers"
+description = "Game library detection for Steam, Heroic, Lutris, Bottles and manual folders"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gc-core.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+gc-testutil.workspace = true
+
+[lints]
+workspace = true

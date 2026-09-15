@@ -1,0 +1,7 @@
+# No relaxations, on purpose.
+#
+# Clippy can allow unwrap/expect/panic/indexing inside #[test] code, and the
+# defaults for those knobs are off. They stay off here: test code is held to
+# the same bar as the rest of the workspace, so tests return
+# `gc_testutil::TestResult` and report failures with `check`/`check_eq`
+# instead of panicking.

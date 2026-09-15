@@ -1,0 +1,70 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "bins/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/bybrooklyn/gamecompressor"
+authors = ["gamecompressor contributors"]
+
+[workspace.dependencies]
+gc-core = { path = "crates/gc-core" }
+gc-launchers = { path = "crates/gc-launchers" }
+gc-testutil = { path = "crates/gc-testutil" }
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+zstd = "0.13"
+walkdir = "2"
+rayon = "1"
+nix = { version = "0.31", features = ["fs", "ioctl", "user"] }
+libc = "0.2"
+xattr = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+directories = "6"
+humansize = "2"
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+# Strict from day one (the bav-gui table): clippy.toml relaxes the panicking
+# lints inside #[test] code only.
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+todo = "deny"
+unimplemented = "deny"
+exit = "deny"
+mem_forget = "deny"
+panic_in_result_fn = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+let_underscore_must_use = "deny"
+unwrap_in_result = "deny"
+missing_panics_doc = "deny"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug = "line-tables-only"
+
+[profile.dev]
+panic = "abort"
+debug = "line-tables-only"
+
+# zstd at high levels is painfully slow unoptimized; tests compress real data.
+[profile.dev.package.zstd-sys]
+opt-level = 3
