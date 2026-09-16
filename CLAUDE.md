@@ -59,7 +59,24 @@ when the rule was written.
   depends on that, and `compressing_leaves_the_fingerprint_fields_alone` locks
   it in.
 - A btrfs compression property on a directory is inherited by new files. That
-  is how downloads can land compressed with no extra I/O.
+  is how downloads can land compressed with no extra I/O. It carries no level:
+  directories set to `zstd:1` and `zstd:15` produced byte-identical output,
+  both at the mount's level. The write path also applies the kernel's
+  heuristic and skips files a forced defrag does compress, measured as
+  halflife.wad landing at 1.000 through the property and 0.692 after a pass.
+  So the property is the cheap half and a pass still collects the rest.
+- btrfs compresses each 128 KiB block on its own, with no matches carried
+  between blocks. Against high-level large-window zstd on the same files:
+  resources.assets 0.620 to 0.455, UnityPlayer.so 0.368 to 0.313, icudtl.dat
+  0.399 to 0.352. No zstd level reaches past that, so the 5 to 16 percent it
+  represents needs the pack tier.
+- FIEMAP reports which extents hold compressed data, not how much they shrank.
+  Measuring bytes saved needs `compsize`, which needs privileges this tool does
+  not ask for, so savings are reported as estimates and labelled as such.
+- lzo and zlib lose to zstd on real game files at every level measured, so
+  per-file choice is worth making over the zstd level and not over the
+  algorithm. Level 3 to 15 is worth 3 to 13 points depending on the file, at 5
+  to 10 times the CPU, and level 15 is sometimes worse than 9.
 - iced 0.14: `Space::new` takes no arguments, and the `theme` and `view`
   arguments of `iced::application` must be function items. A closure is
   inferred for one specific lifetime and will not satisfy `ViewFn`.
