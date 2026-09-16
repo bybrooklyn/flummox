@@ -144,12 +144,14 @@ pub fn run() -> Result<()> {
     let out = Output { json: cli.json };
     match cli.command {
         Command::Scan { tools } => cmd_scan(&env, out, tools),
-        Command::Estimate { selector, level } => cmd_estimate(&env, out, &selector, &level),
+        Command::Estimate { selector, level } => {
+            cmd_estimate(&env, out, &selector, &level, &cancel)
+        }
         Command::Compress { selector, level, threads, force, dry_run } => {
             cmd_compress(&env, &selector, &level, threads, force, dry_run, &cancel)
         }
         Command::Decompress { selector, force } => cmd_decompress(&env, &selector, force, &cancel),
-        Command::Status { selector } => cmd_status(&env, out, &selector),
+        Command::Status { selector } => cmd_status(&env, out, &selector, &cancel),
         Command::Log { limit } => cmd_log(out, limit),
         Command::Drives => cmd_drives(&env),
         Command::Doctor => cmd_doctor(&env),
@@ -388,8 +390,8 @@ fn check_idle(game: &Game, force: bool) -> Result<()> {
     Ok(())
 }
 
-fn walk(game: &Game, backend: &dyn Backend) -> Result<Inventory> {
-    let inv = inventory::walk(&game.install_dir, &backend.walk_opts())
+fn walk(game: &Game, backend: &dyn Backend, cancel: Option<&AtomicBool>) -> Result<Inventory> {
+    let inv = inventory::walk_cancellable(&game.install_dir, &backend.walk_opts(), cancel)
         .with_context(|| format!("reading {}", game.install_dir.display()))?;
     for w in &inv.warnings {
         eprintln!("warning: {w}");
@@ -454,11 +456,17 @@ fn cmd_scan(env: &Env, out: Output, tools: bool) -> Result<()> {
     })
 }
 
-fn cmd_estimate(env: &Env, out: Output, selector: &str, level: &LevelArgs) -> Result<()> {
+fn cmd_estimate(
+    env: &Env,
+    out: Output,
+    selector: &str,
+    level: &LevelArgs,
+    cancel: &Arc<AtomicBool>,
+) -> Result<()> {
     let game = find_game(env, selector)?;
     let opts = level.opts(1);
     let (fs, backend) = backend_for(&game.install_dir)?;
-    let inv = walk(&game, backend.as_ref())?;
+    let inv = walk(&game, backend.as_ref(), Some(cancel.as_ref()))?;
     if !out.json {
         println!(
             "{}: {} in {} files on {}",
@@ -483,8 +491,17 @@ fn cmd_estimate(env: &Env, out: Output, selector: &str, level: &LevelArgs) -> Re
         measured: measured.as_ref(),
         levels: recorded_levels(open_db().as_ref(), &game),
     };
-    let est =
-        estimate::estimate_game_with(&game.install_dir, &inv, model.as_ref(), &est_opts, &probe);
+    let est = estimate::estimate_game_cancellable(
+        &game.install_dir,
+        &inv,
+        model.as_ref(),
+        &est_opts,
+        &probe,
+        Some(cancel.as_ref()),
+    );
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("Stopped early, so this estimate covers only part of the game.");
+    }
 
     #[derive(serde::Serialize)]
     struct EstimateOut<'a> {
@@ -635,7 +652,7 @@ fn cmd_compress(
              snapshots expire."
         );
     }
-    let full_inv = walk(&game, backend.as_ref())?;
+    let full_inv = walk(&game, backend.as_ref(), Some(cancel.as_ref()))?;
 
     // After a game update most of an install is byte-identical to what was
     // compressed last time. Where an earlier pass already ran at this level or
@@ -678,12 +695,13 @@ fn cmd_compress(
             measured: measured.as_ref(),
             levels: recorded_levels(db.as_ref(), &game),
         };
-        let est = estimate::estimate_game_with(
+        let est = estimate::estimate_game_cancellable(
             &game.install_dir,
             &full_inv,
             model.as_ref(),
             &est_opts,
             &probe,
+            Some(cancel.as_ref()),
         );
         println!("{} (dry run, nothing written)", game.title);
         print_estimate(&est, &est_opts);
@@ -810,7 +828,7 @@ fn cmd_decompress(
     let (_fs, backend) = backend_for(&game.install_dir)?;
     check_idle(&game, force)?;
     let mut db = open_db();
-    let inv = walk(&game, backend.as_ref())?;
+    let inv = walk(&game, backend.as_ref(), Some(cancel.as_ref()))?;
     println!("Decompressing {}", game.title);
     // Same restriction as a compress job: by this point every path the work
     // needs is known, so the process has no business reaching anything else.
@@ -853,10 +871,15 @@ fn cmd_decompress(
     Ok(())
 }
 
-fn cmd_status(env: &Env, out: Output, selector: &str) -> Result<()> {
+fn cmd_status(
+    env: &Env,
+    out: Output,
+    selector: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<()> {
     let game = find_game(env, selector)?;
     let (fs, backend) = backend_for(&game.install_dir)?;
-    let inv = walk(&game, backend.as_ref())?;
+    let inv = walk(&game, backend.as_ref(), Some(cancel.as_ref()))?;
     let status = backend.status(&game.install_dir, &inv)?;
 
     #[derive(serde::Serialize)]

@@ -132,6 +132,20 @@ impl Inventory {
 /// user's home cannot drag the walk outside its own directory. Special files
 /// and the pack store are skipped.
 pub fn walk(install_dir: &Path, opts: &WalkOpts) -> io::Result<Inventory> {
+    walk_cancellable(install_dir, opts, None)
+}
+
+/// [`walk`], stoppable part way through.
+///
+/// A full install can hold half a million files, and stat-ing all of them on a
+/// cold cache takes minutes. Cancelling returns [`io::ErrorKind::Interrupted`]
+/// so a caller cannot mistake a partial walk for a complete one and compress
+/// only the part that was seen.
+pub fn walk_cancellable(
+    install_dir: &Path,
+    opts: &WalkOpts,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> io::Result<Inventory> {
     use std::os::unix::fs::MetadataExt;
 
     if !install_dir.is_dir() {
@@ -146,6 +160,9 @@ pub fn walk(install_dir: &Path, opts: &WalkOpts) -> io::Result<Inventory> {
         .into_iter()
         .filter_entry(|e| e.file_name() != std::ffi::OsStr::new(STORE_DIR));
     for entry in walker {
+        if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled while walking"));
+        }
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {

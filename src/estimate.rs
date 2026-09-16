@@ -325,11 +325,36 @@ pub fn estimate_game_with(
     opts: &EstimateOpts,
     probe: &dyn DiskProbe,
 ) -> Estimate {
+    estimate_game_cancellable(install_dir, inv, model, opts, probe, None)
+}
+
+/// [`estimate_game_with`], stoppable part way through.
+///
+/// Sampling reads up to [`MAX_SAMPLE_BYTES`] and compresses every block it
+/// reads at the target level, twice where the mount already compresses. At
+/// level 15 on a large install that runs for a while, and `estimate` is the
+/// first command anyone tries, so it has to answer Ctrl-C. A cancelled
+/// estimate returns what it measured so far, which is why the result carries
+/// `sampled`.
+pub fn estimate_game_cancellable(
+    install_dir: &Path,
+    inv: &Inventory,
+    model: &dyn UnitModel,
+    opts: &EstimateOpts,
+    probe: &dyn DiskProbe,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Estimate {
+    let cancelled = || {
+        cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+    };
     let candidates: Vec<_> = inv.to_compress().collect();
     let budget = std::sync::atomic::AtomicU64::new(MAX_SAMPLE_BYTES);
     let results: Vec<(FileEstimate, bool)> = candidates
         .par_iter()
         .map(|entry| {
+            if cancelled() {
+                return (FileEstimate { size: entry.size, ..FileEstimate::default() }, false);
+            }
             // Read once and clamp. Two threads can both pass a bare `== 0`
             // check and both subtract, wrapping the counter to about 1.8e19,
             // after which the budget stops limiting anything.
