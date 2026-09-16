@@ -13,6 +13,7 @@
 //! - `FS_IOC_FIEMAP`, whose `ENCODED` flag marks compressed extents, to report
 //!   status without the privileges `compsize` needs.
 
+use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::Path;
@@ -24,6 +25,7 @@ use crate::backend::{
 use crate::estimate::{BtrfsModel, UnitModel};
 use crate::fsprobe::BackendKind;
 use crate::inventory::Inventory;
+use crate::safeio::Anchor;
 
 /// zstd, as numbered by `BTRFS_COMPRESS_ZSTD`.
 const BTRFS_COMPRESS_ZSTD: u8 = 3;
@@ -97,7 +99,15 @@ nix::ioctl_readwrite!(fs_ioc_fiemap, b'f', 11, Fiemap);
 /// *permission* rather than the open mode, so this also works on a game
 /// executable that is currently running.
 pub fn compress_file(path: &Path, level: i32) -> io::Result<()> {
-    let file = std::fs::File::open(path)?;
+    compress_fd(&File::open(path)?, level)
+}
+
+/// Rewrites an already-open file as compressed extents at `level`.
+///
+/// Jobs use this rather than [`compress_file`], having opened the file
+/// through a [`Anchor`] so the path could not have been swapped for a symlink
+/// between the walk and the open.
+pub fn compress_fd(file: &File, level: i32) -> io::Result<()> {
     let args = DefragRangeArgs {
         start: 0,
         len: u64::MAX,
@@ -131,7 +141,11 @@ pub fn compress_file(path: &Path, level: i32) -> io::Result<()> {
 
 /// Rewrites a file as uncompressed extents.
 pub fn decompress_file(path: &Path) -> io::Result<()> {
-    let file = std::fs::File::open(path)?;
+    decompress_fd(&File::open(path)?)
+}
+
+/// Rewrites an already-open file as uncompressed extents.
+pub fn decompress_fd(file: &File) -> io::Result<()> {
     let args = DefragRangeArgs {
         start: 0,
         len: u64::MAX,
@@ -169,7 +183,11 @@ pub fn set_dir_property(dir: &Path, enabled: bool) -> io::Result<()> {
 /// FIEMAP is unprivileged and still says which extents are compressed, which
 /// is enough to show how much of a game is done.
 pub fn compressed_bytes(path: &Path) -> io::Result<(u64, u64)> {
-    let file = std::fs::File::open(path)?;
+    compressed_bytes_fd(&File::open(path)?)
+}
+
+/// [`compressed_bytes`], for a file that is already open.
+pub fn compressed_bytes_fd(file: &File) -> io::Result<(u64, u64)> {
     let fd = file.as_raw_fd();
     let mut compressed = 0u64;
     let mut total = 0u64;
@@ -254,10 +272,21 @@ impl BtrfsBackend {
         inv: &Inventory,
         threads: usize,
         ctx: &JobCtx<'_>,
-        op: &(dyn Fn(&Path) -> io::Result<()> + Sync),
+        op: &(dyn Fn(&File) -> io::Result<()> + Sync),
     ) -> io::Result<Outcome> {
         use rayon::prelude::*;
 
+        // Hold the install directory open for the whole job and reach every
+        // file through it, so nothing can substitute a symlink for a path
+        // between the walk that chose these files and the rewrite of each one.
+        let anchor = Anchor::open(install_dir)?;
+        if !anchor.fully_resolved() {
+            ctx.events.event(Event::Warning(
+                "this kernel has no openat2, so only the last part of each path is \
+                 checked against symlinks"
+                    .to_owned(),
+            ));
+        }
         let targets: Vec<_> = inv.to_compress().collect();
         let files = targets.len() as u64;
         let bytes = targets.iter().map(|f| f.size).sum();
@@ -277,14 +306,19 @@ impl BtrfsBackend {
                 if ctx.cancelled() {
                     return;
                 }
-                let path = entry.path(install_dir);
-                if let Err(e) = op(&path) {
+                let fail = |e: std::io::Error| {
                     let msg = format!("{}: {e}", entry.rel.display());
                     ctx.events.event(Event::Warning(msg.clone()));
                     if let Ok(mut errs) = errors.lock() {
                         errs.push(msg);
                     }
-                    return;
+                };
+                let file = match anchor.open_file(&entry.rel) {
+                    Ok(file) => file,
+                    Err(e) => return fail(e),
+                };
+                if let Err(e) = op(&file) {
+                    return fail(e);
                 }
                 let done = files_done.fetch_add(1, Ordering::Relaxed) + 1;
                 let bdone = bytes_done.fetch_add(entry.size, Ordering::Relaxed) + entry.size;
@@ -336,7 +370,7 @@ impl Backend for BtrfsBackend {
         ctx: &JobCtx<'_>,
     ) -> io::Result<Outcome> {
         let level = opts.btrfs_level();
-        let outcome = self.run(install_dir, inv, opts.threads, ctx, &|p| compress_file(p, level))?;
+        let outcome = self.run(install_dir, inv, opts.threads, ctx, &|f| compress_fd(f, level))?;
         // Do this last: if the job failed or was cancelled, the directory
         // should not claim to be compressed.
         if !outcome.cancelled
@@ -374,7 +408,7 @@ impl Backend for BtrfsBackend {
         if let Err(e) = set_dir_property(install_dir, false) {
             ctx.events.event(Event::Warning(format!("clearing btrfs.compression: {e}")));
         }
-        let outcome = self.run(install_dir, &all, 2, ctx, &decompress_file)?;
+        let outcome = self.run(install_dir, &all, 2, ctx, &decompress_fd)?;
         ctx.events.event(Event::Finished(Box::new(outcome.clone())));
         Ok(outcome)
     }
@@ -382,12 +416,17 @@ impl Backend for BtrfsBackend {
     fn status(&self, install_dir: &Path, inv: &Inventory) -> io::Result<CompressionStatus> {
         use rayon::prelude::*;
 
+        let anchor = Anchor::open(install_dir)?;
         let (compressed, total, files) = inv
             .files
             .par_iter()
-            .map(|entry| match compressed_bytes(&entry.path(install_dir)) {
-                Ok((c, t)) => (c, t, 1),
-                Err(_) => (0, 0, 0),
+            .map(|entry| {
+                match anchor.open_file(&entry.rel).and_then(|f| compressed_bytes_fd(&f)) {
+                    Ok((c, t)) => (c, t, 1),
+                    // A file that vanished or cannot be read simply does not
+                    // contribute; status is a report, not a job.
+                    Err(_) => (0, 0, 0),
+                }
             })
             .reduce(
                 || (0u64, 0u64, 0u64),

@@ -178,6 +178,20 @@ impl EstimateOpts {
 pub trait DiskProbe: Sync {
     /// Returns (bytes held compressed, bytes mapped), or `None` if unknown.
     fn measure(&self, path: &Path) -> Option<(u64, u64)>;
+
+    /// The zstd level already applied to this file by an earlier pass, if the
+    /// caller has a record of one.
+    ///
+    /// This closes the last gap in the estimate. btrfs stores a block
+    /// uncompressed whenever compressing it would not free a whole sector,
+    /// and the result is indistinguishable on disk from a block nothing ever
+    /// tried — so without a record, an estimate keeps advertising a saving
+    /// that an earlier pass already proved is not there. Measured on real
+    /// installs: Celeste still claimed about 45 MB immediately after a max
+    /// pass, and Balatro predicted 717 kB where a rerun actually freed 369 kB.
+    fn attempted_level(&self, _path: &Path) -> Option<i32> {
+        None
+    }
 }
 
 /// A probe that measures nothing, so estimates fall back to the mount options.
@@ -323,6 +337,21 @@ pub fn estimate_game_with(
                 return (FileEstimate { size: entry.size, ..FileEstimate::default() }, false);
             }
             let path = entry.path(install_dir);
+            // A pass at this level or higher has already had its chance at
+            // this file; whatever it left uncompressed, it left uncompressed
+            // for a reason. Claiming a further saving here is how the
+            // estimator used to promise space that a rerun could not deliver.
+            if probe.attempted_level(&path).is_some_and(|applied| applied >= opts.level) {
+                return (
+                    FileEstimate {
+                        size: entry.size,
+                        disk_now: entry.size,
+                        disk_after: entry.size,
+                        sampled: 0,
+                    },
+                    false,
+                );
+            }
             let measured = probe.measure(&path).and_then(|(compressed, mapped)| {
                 (mapped > 0).then(|| compressed as f64 / mapped as f64)
             });

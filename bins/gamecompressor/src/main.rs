@@ -4,6 +4,7 @@
 //! they live on, then hand the work to a `gc_core` backend. The GUI and the
 //! daemon will call the same functions.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,6 +16,9 @@ use humansize::{DECIMAL, format_size};
 
 use gc_core::backend::{self, Backend, CompressOpts, Event, EventSink, JobCtx, Preset};
 use gc_core::busy::{self, ProcFs};
+use gc_core::db::{Activity, ActivityLevel, Db, GameRecord};
+use gc_core::estimate::DiskProbe;
+use gc_core::sandbox::{self, SandboxPlan};
 use gc_core::estimate::{self, EstimateOpts};
 use gc_core::fsprobe::{self, FsInfo, Tier};
 use gc_core::inventory::{self, Inventory};
@@ -81,6 +85,12 @@ enum Command {
         /// Game to inspect.
         selector: String,
     },
+    /// Show what this tool has done recently.
+    Log {
+        /// How many entries to show.
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
     /// List the drives holding games, and how each one can be compressed.
     Drives,
     /// Check this machine for anything that would stop the tool working.
@@ -136,6 +146,7 @@ fn main() -> Result<()> {
         }
         Command::Decompress { selector, force } => cmd_decompress(&env, &selector, force, &cancel),
         Command::Status { selector } => cmd_status(&env, &selector),
+        Command::Log { limit } => cmd_log(limit),
         Command::Drives => cmd_drives(&env),
         Command::Doctor => cmd_doctor(&env),
     }
@@ -184,8 +195,87 @@ fn size(bytes: u64) -> String {
     format_size(bytes, DECIMAL)
 }
 
+/// Roughly how long ago something happened, for the activity log.
+///
+/// The log answers "what has this been doing lately", and a Unix timestamp
+/// answers that badly.
+fn ago(ts: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    let seconds = now.saturating_sub(ts).max(0);
+    match seconds {
+        s if s < 60 => "just now".to_owned(),
+        s if s < 3_600 => format!("{} min ago", s / 60),
+        s if s < 86_400 => format!("{} h ago", s / 3_600),
+        s => format!("{} days ago", s / 86_400),
+    }
+}
+
+/// Opens the state database, explaining rather than failing if it cannot.
+///
+/// Nothing here needs the database to do its job: without it a pass simply is
+/// not recorded, which costs the user an accurate estimate next time but not
+/// the compression itself.
+fn open_db() -> Option<Db> {
+    let path = Db::default_path()?;
+    match Db::open(&path) {
+        Ok(db) => Some(db),
+        Err(e) => {
+            eprintln!(
+                "warning: cannot use the state database at {} ({e}).\n         \
+                 This pass will not be recorded, so the next estimate will not know \
+                 what was already done.",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// An estimator probe that also knows what earlier passes did.
+///
+/// The backend measures what is compressed on disk today; the database
+/// remembers the level each file was last processed at. The second half is
+/// what stops an estimate from promising space that a previous pass already
+/// proved is not there.
+struct RecordedProbe<'a> {
+    measured: &'a dyn DiskProbe,
+    levels: HashMap<PathBuf, i32>,
+}
+
+impl DiskProbe for RecordedProbe<'_> {
+    fn measure(&self, path: &Path) -> Option<(u64, u64)> {
+        self.measured.measure(path)
+    }
+
+    fn attempted_level(&self, path: &Path) -> Option<i32> {
+        self.levels.get(path).copied()
+    }
+}
+
+/// The level each of a game's files was last compressed at, by absolute path.
+///
+/// The database stores paths relative to the install directory, while the
+/// estimator asks about absolute ones, so they are joined here.
+fn recorded_levels(db: Option<&Db>, game: &Game) -> HashMap<PathBuf, i32> {
+    let Some(db) = db else { return HashMap::new() };
+    match db.fingerprints(&game.id) {
+        Ok(prints) => prints
+            .into_iter()
+            .map(|(rel, fp)| (game.install_dir.join(rel), fp.level_applied))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read what earlier passes did");
+            HashMap::new()
+        }
+    }
+}
+
 fn scan(env: &Env) -> Scan {
     let scan = gc_launchers::scan_all(env);
+    tracing::info!(games = scan.games.len(), warnings = scan.warnings.len(), "scanned launchers");
     for warning in &scan.warnings {
         eprintln!("warning: {warning}");
     }
@@ -303,16 +393,22 @@ fn cmd_estimate(env: &Env, selector: &str, level: &LevelArgs) -> Result<()> {
         fs.fstype
     );
     eprintln!("sampling...");
+    tracing::info!(
+        game = %game.title,
+        files = inv.files.len(),
+        candidates = inv.to_compress().count(),
+        level = opts.btrfs_level(),
+        "estimating"
+    );
     let model = backend.model(&opts);
     let est_opts = EstimateOpts::new(opts.btrfs_level(), &fs);
-    let probe = backend.disk_probe();
-    let est = estimate::estimate_game_with(
-        &game.install_dir,
-        &inv,
-        model.as_ref(),
-        &est_opts,
-        probe.as_ref(),
-    );
+    let measured = backend.disk_probe();
+    let probe = RecordedProbe {
+        measured: measured.as_ref(),
+        levels: recorded_levels(open_db().as_ref(), &game),
+    };
+    let est =
+        estimate::estimate_game_with(&game.install_dir, &inv, model.as_ref(), &est_opts, &probe);
     print_estimate(&est, &est_opts);
     Ok(())
 }
@@ -437,6 +533,9 @@ fn cmd_compress(
     let opts = level.opts(threads);
     let (fs, backend) = backend_for(&game.install_dir)?;
     check_idle(&game, force)?;
+    // Open the database before the sandbox goes up: creating its directory is
+    // simpler to do now than to grant a sandboxed process.
+    let mut db = open_db();
     if let Some(why) = fsprobe::snapshot_risk(&fs) {
         eprintln!(
             "warning: {why}.\n         Compressing rewrites every extent, which unshares it \
@@ -444,18 +543,55 @@ fn cmd_compress(
              snapshots expire."
         );
     }
-    let inv = walk(&game, backend.as_ref())?;
+    let full_inv = walk(&game, backend.as_ref())?;
+
+    // After a game update most of an install is byte-identical to what was
+    // compressed last time. Where an earlier pass already ran at this level or
+    // higher, only the files that actually changed are worth rewriting —
+    // otherwise a small patch costs a rewrite of the whole install.
+    let previous = db.as_ref().and_then(|db| db.game(&game.id).ok().flatten());
+    let reuse = previous.as_ref().is_some_and(|prev| prev.level >= opts.btrfs_level());
+    let mut unchanged = 0usize;
+    let inv = match (reuse, db.as_ref()) {
+        (true, Some(open)) => match open.changed_since(&game.id, &full_inv) {
+            Ok(changed) => {
+                unchanged = full_inv.files.len().saturating_sub(changed.len());
+                Inventory { files: changed, warnings: Vec::new() }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not tell which files changed; doing all of them");
+                full_inv.clone()
+            }
+        },
+        _ => full_inv.clone(),
+    };
+    if unchanged > 0 {
+        println!(
+            "{unchanged} files are unchanged since the last pass at level {}; skipping them.",
+            previous.as_ref().map_or(0, |p| p.level)
+        );
+    }
+    // Running a job over nothing would still print a free-space delta, and on
+    // a busy filesystem that delta is somebody else's writes.
+    if !dry_run && inv.to_compress().next().is_none() {
+        println!("Nothing to do: {} is already compressed and nothing has changed.", game.title);
+        return Ok(());
+    }
 
     if dry_run {
         let model = backend.model(&opts);
         let est_opts = EstimateOpts::new(opts.btrfs_level(), &fs);
-        let probe = backend.disk_probe();
+        let measured = backend.disk_probe();
+        let probe = RecordedProbe {
+            measured: measured.as_ref(),
+            levels: recorded_levels(db.as_ref(), &game),
+        };
         let est = estimate::estimate_game_with(
             &game.install_dir,
-            &inv,
+            &full_inv,
             model.as_ref(),
             &est_opts,
-            probe.as_ref(),
+            &probe,
         );
         println!("{} (dry run, nothing written)", game.title);
         print_estimate(&est, &est_opts);
@@ -468,6 +604,16 @@ fn cmd_compress(
         backend.kind().label(),
         opts.btrfs_level()
     );
+    // Drop this process's access to everything except the game itself, before
+    // any worker thread exists. Discovery is already finished, so nothing
+    // further needs to read Steam's configuration.
+    let plan = SandboxPlan::for_job(&game.install_dir, Db::default_path().as_deref().and_then(Path::parent));
+    let sandboxed = sandbox::restrict(&plan);
+    tracing::info!(status = %sandboxed.describe(), "sandbox");
+    if !sandboxed.is_active() {
+        tracing::warn!("{}", sandboxed.describe());
+    }
+
     let progress = Progress::new();
     let ctx = JobCtx { events: &progress, cancel: cancel.as_ref() };
     tracing::info!(game = %game.title, level = opts.btrfs_level(), files = inv.files.len(), "compressing");
@@ -487,9 +633,14 @@ fn cmd_compress(
         size(outcome.bytes),
         outcome.skipped
     );
+    // This figure is the filesystem's free space before and after, so anything
+    // else writing to the same drive lands in it too. It is worth showing, but
+    // not worth dressing up as a measurement of this job alone.
     let freed = outcome.freed();
-    if freed > 0 {
-        println!("Freed about {} (measured from free space, so approximate).", size(freed as u64));
+    if outcome.files == 0 {
+        println!("No files were rewritten.");
+    } else if freed > 0 {
+        println!("Freed about {} (from free space, so approximate).", size(freed.unsigned_abs()));
     } else {
         println!(
             "Free space did not go up. On a drive already mounted with compression, \
@@ -500,6 +651,45 @@ fn cmd_compress(
         println!("{} files failed; the first few:", outcome.errors.len());
         for e in outcome.errors.iter().take(5) {
             println!("  {e}");
+        }
+    }
+
+    if let Some(open) = db.as_mut() {
+        let mut record = GameRecord::new(
+            game.id.clone(),
+            game.title.clone(),
+            game.install_dir.clone(),
+            backend.kind(),
+            &opts,
+        );
+        record.build = game.build.clone();
+        record.install_bytes = full_inv.total_bytes();
+        record.disk_before = outcome.free_before;
+        record.disk_after = outcome.free_after;
+        // When files were skipped as unchanged, they are still compressed at
+        // whatever the earlier, higher level was; recording the lower level of
+        // this pass would make a later run redo them for nothing.
+        record.level = previous.as_ref().map_or(record.level, |p| p.level.max(record.level));
+        // Fingerprints are stored for the whole install, not just the files
+        // this pass touched, or the skipped ones would look new next time.
+        if let Err(e) = open.record_compression(&record, &full_inv) {
+            eprintln!("warning: could not record this pass: {e}");
+        }
+        let entry = Activity::new(
+            ActivityLevel::Info,
+            "compress",
+            format!(
+                "{} at zstd {} ({} files, {})",
+                game.title,
+                record.level,
+                outcome.files,
+                size(outcome.bytes)
+            ),
+        )
+        .for_game(&game.id)
+        .with_bytes(-freed);
+        if let Err(e) = open.log_activity(&entry) {
+            tracing::warn!(error = %e, "could not write to the activity log");
         }
     }
     Ok(())
@@ -514,6 +704,7 @@ fn cmd_decompress(
     let game = find_game(env, selector)?;
     let (_fs, backend) = backend_for(&game.install_dir)?;
     check_idle(&game, force)?;
+    let mut db = open_db();
     let inv = walk(&game, backend.as_ref())?;
     println!("Decompressing {}", game.title);
     let progress = Progress::new();
@@ -525,6 +716,25 @@ fn cmd_decompress(
     let freed = outcome.freed();
     if freed < 0 {
         println!("Uses about {} more space now.", size(freed.unsigned_abs()));
+    }
+
+    if let Some(open) = db.as_mut() {
+        // Forget first: the stored fingerprints describe a compressed install
+        // that no longer exists, and `forget` also clears this game's log
+        // entries, so the entry below has to come after it.
+        if let Err(e) = open.forget(&game.id) {
+            eprintln!("warning: could not clear the record for {}: {e}", game.title);
+        }
+        let entry = Activity::new(
+            ActivityLevel::Info,
+            "decompress",
+            format!("{} back to uncompressed ({} files)", game.title, outcome.files),
+        )
+        .for_game(&game.id)
+        .with_bytes(-freed);
+        if let Err(e) = open.log_activity(&entry) {
+            tracing::warn!(error = %e, "could not write to the activity log");
+        }
     }
     Ok(())
 }
@@ -552,6 +762,38 @@ fn cmd_status(env: &Env, selector: &str) -> Result<()> {
         "\n  Exact compressed sizes need root, so this shows how much data is stored\n  \
          compressed rather than how many bytes it takes up."
     );
+    Ok(())
+}
+
+fn cmd_log(limit: u32) -> Result<()> {
+    let Some(path) = Db::default_path() else {
+        bail!("cannot work out where the state database lives; is HOME set?");
+    };
+    let db = Db::open(&path).with_context(|| format!("opening {}", path.display()))?;
+    let entries = db.recent_activity(limit).context("reading the activity log")?;
+    if entries.is_empty() {
+        println!("Nothing recorded yet. Compress a game and it will show up here.");
+        return Ok(());
+    }
+    for entry in entries {
+        // The byte figure comes from the drive's free space, which moves for
+        // reasons that have nothing to do with us, so it is labelled as the
+        // rough thing it is.
+        let delta = if entry.bytes_delta == 0 {
+            String::new()
+        } else if entry.bytes_delta < 0 {
+            format!("  (free space +{})", size(entry.bytes_delta.unsigned_abs()))
+        } else {
+            format!("  (free space -{})", size(entry.bytes_delta.unsigned_abs()))
+        };
+        println!(
+            "{:>12}  {:<5}  {:<12}  {}{delta}",
+            ago(entry.ts),
+            entry.level.as_str(),
+            entry.kind,
+            entry.message
+        );
+    }
     Ok(())
 }
 
