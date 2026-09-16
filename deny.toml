@@ -41,9 +41,28 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
 
 # Advisories consciously accepted, each of which must carry a comment saying
-# why the code is not reachable or what mitigates it. Empty on purpose: there
-# is nothing to excuse yet, and the list should stay hard to add to.
-ignore = []
+# why the code is not reachable or what mitigates it. The list should stay
+# hard to add to: an entry here is a decision to ship something the ecosystem
+# has flagged.
+#
+# Both entries below are "unmaintained" notices rather than vulnerabilities —
+# no exploit, no fix to apply — and both arrived with the GUI, reached only
+# through `iced`. RUSTSEC says outright that no safe upgrade exists for
+# either, so the alternatives are to ship them, to drop the GUI, or to pin an
+# older iced that has the same crates. They should be revisited whenever iced
+# is updated, and removed the moment its font or macro stack moves on.
+ignore = [
+    # `paste`, via the wgpu/naga rendering stack. A proc-macro: it runs at
+    # compile time and contributes no code to the shipped binary, so an
+    # unmaintained version is a maintenance risk rather than an attack
+    # surface.
+    "RUSTSEC-2024-0436",
+    # `ttf-parser`, via cosmic-text in iced's text rendering. This one does
+    # parse input, so it is the more serious of the two — but the only fonts
+    # it sees are the system fonts iced loads to draw the window, not
+    # anything a game or a downloaded file supplies.
+    "RUSTSEC-2026-0192",
+]
 
 # ---------------------------------------------------------------------------
 # Licences
@@ -79,6 +98,24 @@ allow = [
     # foldhash, reached through hashbrown. Zlib is permissive and
     # GPL-compatible, and again there is no alternative in the expression.
     "Zlib",
+
+    # --- Arrived with the GUI. Every one of these is reached only through
+    # `iced` and its window, rendering and clipboard stack, and every one is
+    # permissive and GPL-3.0-compatible. They are listed separately so that if
+    # the GUI is ever dropped, `unused-allowed-license` flags the whole group
+    # at once.
+    #
+    # arrayref, via tiny-skia. Simplified BSD, no dual option.
+    "BSD-2-Clause",
+    # clipboard-win and error-code, via window_clipboard. The Boost licence is
+    # permissive and, unusually, does not even require attribution in binaries.
+    "BSL-1.0",
+    # hexf-parse, via naga. A public-domain dedication rather than a licence,
+    # so there is nothing to be incompatible with.
+    "CC0-1.0",
+    # libloading, via ash and the Wayland/X11 backends. ISC is the two-clause
+    # BSD licence with simpler wording; the FSF treats them identically.
+    "ISC",
 ]
 
 # A crate whose licence cannot be determined from its metadata gets refused

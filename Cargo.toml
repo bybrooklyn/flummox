@@ -11,9 +11,12 @@ repository = "https://github.com/bybrooklyn/gamecompressor"
 authors = ["gamecompressor contributors"]
 
 [workspace.dependencies]
-gc-core = { path = "crates/gc-core" }
-gc-launchers = { path = "crates/gc-launchers" }
-gc-testutil = { path = "crates/gc-testutil" }
+# Version as well as path: a path-only dependency is a wildcard requirement,
+# which cargo-deny rejects and which would publish as `*` if these crates ever
+# went to a registry.
+gc-core = { path = "crates/gc-core", version = "0.1.0" }
+gc-launchers = { path = "crates/gc-launchers", version = "0.1.0" }
+gc-testutil = { path = "crates/gc-testutil", version = "0.1.0" }
 anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive", "env"] }
@@ -41,6 +44,9 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 directories = "6"
 humansize = "2"
 tempfile = "3"
+# Pinned exactly: iced's API still moves between patch releases, and the GUI
+# is the one place a surprise break costs a rewrite rather than a fix.
+iced = "=0.14.0"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
