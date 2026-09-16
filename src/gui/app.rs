@@ -185,7 +185,7 @@ pub fn update(state: &mut State, message: Message) {
                 Status::info(format!("Found {} games.", state.games.len()))
             } else {
                 Status::error(format!(
-                    "Found {} games, but {} launcher(s) could not be read — see Overview.",
+                    "Found {} games, but {} launcher(s) could not be read. See Overview.",
                     state.games.len(),
                     state.warnings.len()
                 ))

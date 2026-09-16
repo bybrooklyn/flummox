@@ -3,7 +3,7 @@
 //! [`BtrfsModel::disk_cost`] is the arithmetic every number the user sees is
 //! built from: the estimate on the Games page, the "you will save 14 GB"
 //! before a job, and the comparison against what the job actually freed. It is
-//! also the one part of the estimator with no feedback loop — if it is wrong,
+//! also the one part of the estimator with no feedback loop. If it is wrong,
 //! nothing downstream notices, the tool just quietly promises the wrong
 //! number and loses the user's trust the first time they check with `df`.
 //!
@@ -61,8 +61,8 @@ proptest! {
     // `failure_persistence: None` because an integration test has no `src`
     // directory beside it for proptest to keep a `.proptest-regressions` file
     // in; left on, it warns on every failure and drops a stray file into
-    // `tests/`. The strategies below pin the interesting edges — the sector
-    // boundaries and `u32::MAX` — as explicit `Just` cases, so no shrunk
+    // `tests/`. The strategies below pin the interesting edges (the sector
+    // boundaries and `u32::MAX`) as explicit `Just` cases, so no shrunk
     // counter-example depends on a persisted seed to be found again.
     #![proptest_config(ProptestConfig {
         cases: 1024,
@@ -119,7 +119,7 @@ proptest! {
     /// `compressed / uncompressed` ratio, and it is why the estimator's
     /// numbers survive contact with `compsize`. Shaving 300 bytes off a 128
     /// KiB block frees nothing at all, because btrfs cannot hand back part of
-    /// a sector — so it keeps the block raw. The other direction is asserted
+    /// a sector, so it keeps the block raw. The other direction is asserted
     /// too: once the block does clear the bar, it must free at least the whole
     /// sector that made it worth taking.
     ///
@@ -127,7 +127,7 @@ proptest! {
     /// arithmetic rather than by repeating the implementation's
     /// `compressed.saturating_add(SECTOR) > uncompressed`. That is the point
     /// of a property: restating the expression would make any mistake in it
-    /// invisible. It is also not hypothetical — the two disagree at
+    /// invisible. The two really do disagree at
     /// `uncompressed == compressed == u32::MAX`, where the saturating add
     /// pins at `u32::MAX` and the comparison decides a block that saves
     /// nothing is worth compressing. The *cost* is the same on both branches

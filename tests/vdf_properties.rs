@@ -13,7 +13,7 @@
 //! to write down. The properties here therefore quantify over arbitrary input
 //! and assert the things that must hold for *all* of it:
 //!
-//! * a call to `parse` always comes back — no panic, no hang, no stack
+//! * a call to `parse` always comes back: no panic, no hang, no stack
 //!   overflow from nesting the input controls;
 //! * an error never points at a line the file does not have;
 //! * the parser never invents more structure than it read, so a small hostile
@@ -48,8 +48,8 @@ fn count_entries(root: &Object) -> usize {
 ///
 /// Purely random bytes almost never produce a `"` followed by a `{`, so they
 /// exercise little more than the first two tokens. Assembling documents out of
-/// the parser's own vocabulary — braces, quotes, backslashes, `[$COND]`
-/// brackets, `//`, newlines, a BOM — drives it deep into the states that only
+/// the parser's own vocabulary (braces, quotes, backslashes, `[$COND]`
+/// brackets, `//`, newlines, a BOM) drives it deep into the states that only
 /// occur part-way through a real manifest.
 fn token_soup() -> impl Strategy<Value = String> {
     let piece = prop_oneof![
@@ -196,7 +196,7 @@ proptest! {
     ///
     /// Steam stores Windows paths (`C:\\games\\x`), display names with quotes
     /// and multi-line descriptions. If the escape rules do not survive a
-    /// round-trip, an install path silently changes meaning — and an install
+    /// round-trip, an install path changes meaning without saying so, and an install
     /// path is the directory this tool is about to rewrite every file in.
     /// Positional comparison is deliberate: `get` is case-insensitive and
     /// returns the first match, which would hide a mismatch whenever the
@@ -290,7 +290,7 @@ fn nested_document(depth: usize) -> String {
 ///
 /// `parse_object` descends once per `{`, so without a cap a manifest is free
 /// to ask for as many stack frames as it likes. Ten thousand levels is nothing
-/// to write — sixty kilobytes of text — and a stack overflow is not a
+/// to write, sixty kilobytes of text, and a stack overflow is not a
 /// catchable error in Rust: it is an abort that takes the whole process with
 /// it, which for a tool that scans every library on the machine means a crash
 /// with no message. Dropping the parsed tree recurses the same way, so

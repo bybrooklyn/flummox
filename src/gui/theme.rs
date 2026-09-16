@@ -71,7 +71,7 @@ pub fn panel(_theme: &Theme) -> container::Style {
 /// A banner across the top of the content area.
 ///
 /// `is_error` picks the colour, rather than the wording being sniffed for
-/// words like "failed" — a message is not a reliable signal of its own kind.
+/// words like "failed". The wording of a message does not reliably say what kind it is.
 pub fn banner(is_error: bool) -> impl Fn(&Theme) -> container::Style {
     move |_theme| container::Style {
         background: Some(Background::Color(if is_error { DANGER } else { ACCENT_DIM })),

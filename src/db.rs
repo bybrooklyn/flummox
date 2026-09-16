@@ -18,8 +18,8 @@
 //! applied to each file gives the estimator the missing fact. Teaching it to
 //! use that fact is a separate change; this module only stores it.
 //!
-//! Everything here is synchronous. The database is small — a few thousand rows
-//! per game — and every caller is already doing filesystem work, so the cost
+//! Everything here is synchronous. The database is small, a few thousand rows
+//! per game, and every caller is already doing filesystem work, so the cost
 //! of a connection per process is not worth avoiding.
 
 use std::collections::HashMap;
@@ -97,7 +97,7 @@ pub const NOT_ATTEMPTED: i32 = 0;
 /// `relpath` and `path` are BLOBs because a Linux path is a sequence of bytes,
 /// not a string. Most game files are ASCII, but some installer or mod will
 /// eventually write a name that is not valid UTF-8, and storing it as TEXT
-/// would either fail or silently mangle it — and a mangled path means the file
+/// would either fail or mangle it, and a mangled path means the file
 /// is fingerprinted under a name that never matches again, so it is
 /// recompressed on every single pass.
 const SCHEMA_V1: &str = "
@@ -534,7 +534,7 @@ impl Db {
     /// is byte-identical, and only what comes back here needs recompressing.
     ///
     /// A game that was never recorded has no fingerprints, so every file comes
-    /// back — which is the right answer for a first pass.
+    /// back, which is the right answer for a first pass.
     pub fn changed_since(&self, id: &GameId, inv: &Inventory) -> Result<Vec<FileEntry>> {
         let stored = self.fingerprints(id)?;
         Ok(inv

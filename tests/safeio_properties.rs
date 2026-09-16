@@ -2,8 +2,8 @@
 //!
 //! [`is_contained`] is a security boundary, not a convenience. It is the
 //! filter in front of `openat2`, and it decides whether a relative path that
-//! came out of a walk — or out of a pack manifest, which is a file on disk
-//! that a game's installer could have written — is allowed to be opened
+//! came out of a walk, or out of a pack manifest, which is a file on disk
+//! that a game's installer could have written, is allowed to be opened
 //! against the install directory's handle. Everything downstream of it is a
 //! job that *rewrites* the files it opens.
 //!
@@ -76,7 +76,7 @@ proptest! {
     ///
     /// Not just a leading `..`: the component can be buried at any depth,
     /// behind any number of names that individually look fine. A check that
-    /// only inspected the first component — the obvious way to write this —
+    /// only inspected the first component, the obvious way to write this,
     /// would pass every example anyone tends to write and still let
     /// `data/../../../.ssh/id_ed25519` through.
     #[test]

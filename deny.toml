@@ -20,7 +20,7 @@
 
 [graph]
 # Evaluate every feature combination rather than the default set. Features
-# pull in extra crates — `rusqlite`'s `bundled`, `clap`'s `derive` — and a
+# pull in extra crates, such as `rusqlite`'s `bundled` and `clap`'s `derive`, and a
 # licence or advisory that only appears behind a feature flag still ships.
 all-features = true
 
@@ -45,8 +45,8 @@ yanked = "deny"
 # hard to add to: an entry here is a decision to ship something the ecosystem
 # has flagged.
 #
-# Both entries below are "unmaintained" notices rather than vulnerabilities —
-# no exploit, no fix to apply — and both arrived with the GUI, reached only
+# Both entries below are "unmaintained" notices, not vulnerabilities:
+# no exploit, no fix to apply. Both arrived with the GUI, reached only
 # through `iced`. RUSTSEC says outright that no safe upgrade exists for
 # either, so the alternatives are to ship them, to drop the GUI, or to pin an
 # older iced that has the same crates. They should be revisited whenever iced
@@ -58,7 +58,7 @@ ignore = [
     # surface.
     "RUSTSEC-2024-0436",
     # `ttf-parser`, via cosmic-text in iced's text rendering. This one does
-    # parse input, so it is the more serious of the two — but the only fonts
+    # parse input, so it is the more serious of the two. The only fonts
     # it sees are the system fonts iced loads to draw the window, not
     # anything a game or a downloaded file supplies.
     "RUSTSEC-2026-0192",
@@ -82,9 +82,9 @@ allow = [
     "AGPL-3.0-or-later",
     # The overwhelming majority of the tree: the Rust ecosystem's usual
     # `MIT OR Apache-2.0` dual licence. Between them these two also satisfy
-    # every `OR` expression here — `Unlicense OR MIT`,
+    # every `OR` expression here: `Unlicense OR MIT`,
     # `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`, and
-    # `MIT OR Apache-2.0 OR LGPL-2.1-or-later` — so neither the LLVM exception
+    # `MIT OR Apache-2.0 OR LGPL-2.1-or-later`, so neither the LLVM exception
     # nor LGPL-2.1 needs to be allowed for those crates to be accepted.
     "MIT",
     "Apache-2.0",
@@ -92,7 +92,7 @@ allow = [
     # tool exists to drive. No dual option; BSD-3-Clause is GPL-compatible.
     "BSD-3-Clause",
     # unicode-ident, whose expression is
-    # `(MIT OR Apache-2.0) AND Unicode-3.0` — the `AND` means the Unicode
+    # `(MIT OR Apache-2.0) AND Unicode-3.0`. The `AND` means the Unicode
     # data licence must be allowed outright, it cannot be satisfied by MIT.
     "Unicode-3.0",
     # foldhash, reached through hashbrown. Zlib is permissive and

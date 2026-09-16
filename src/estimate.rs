@@ -185,7 +185,7 @@ pub trait DiskProbe: Sync {
     /// This closes the last gap in the estimate. btrfs stores a block
     /// uncompressed whenever compressing it would not free a whole sector,
     /// and the result is indistinguishable on disk from a block nothing ever
-    /// tried — so without a record, an estimate keeps advertising a saving
+    /// tried. Without a record, an estimate keeps advertising a saving
     /// that an earlier pass already proved is not there. Measured on real
     /// installs: Celeste still claimed about 45 MB immediately after a max
     /// pass, and Balatro predicted 717 kB where a rerun actually freed 369 kB.

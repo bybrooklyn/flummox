@@ -543,7 +543,7 @@ fn print_estimate(est: &estimate::Estimate, opts: &EstimateOpts) {
 /// otherwise.
 ///
 /// The redraw uses `\r`, which a pipe or log file records as one enormous
-/// line — a 1190-file job wrote 94 KB of it — so anything that is not a
+/// line. A 1190-file job wrote 94 KB of it, so anything that is not a
 /// terminal gets one line per tenth of the work instead.
 struct Progress {
     total_files: std::sync::atomic::AtomicU64,
@@ -639,7 +639,7 @@ fn cmd_compress(
 
     // After a game update most of an install is byte-identical to what was
     // compressed last time. Where an earlier pass already ran at this level or
-    // higher, only the files that actually changed are worth rewriting —
+    // higher, only the files that actually changed need rewriting,
     // otherwise a small patch costs a rewrite of the whole install.
     let previous = db.as_ref().and_then(|db| db.game(&game.id).ok().flatten());
     let reuse = previous.as_ref().is_some_and(|prev| prev.level >= opts.btrfs_level());

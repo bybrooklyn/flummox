@@ -1,7 +1,7 @@
 //! Properties of the per-file compress/skip decision.
 //!
-//! [`decide`] runs once per file on a walk of an install directory — hundreds
-//! of thousands of times on a full Steam library — and every `Compress` it
+//! [`decide`] runs once per file on a walk of an install directory, hundreds
+//! of thousands of times on a full Steam library, and every `Compress` it
 //! returns becomes a file the tool rewrites. Two of its rules exist purely to
 //! stop work that cannot pay off, and both are easy to break in a way no
 //! example test would notice:
@@ -45,7 +45,7 @@ fn stem() -> impl Strategy<Value = String> {
 }
 
 /// A relative path whose extension says the contents are already compressed,
-/// in either letter case — Steam depots ship both `.DDS` and `.dds`.
+/// in either letter case. Steam depots ship both `.DDS` and `.dds`.
 fn precompressed_path() -> impl Strategy<Value = PathBuf> {
     (stem(), 0usize..PRECOMPRESSED.len(), any::<bool>()).prop_filter_map(
         "a known precompressed extension",

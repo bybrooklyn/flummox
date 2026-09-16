@@ -2,7 +2,7 @@
 //!
 //! A compression job needs exactly two things: the install directory it is
 //! rewriting, and the handful of system paths any Rust program reads. It has
-//! no business touching the rest of the user's home directory — so before the
+//! no business touching the rest of the user's home directory. Before the
 //! job starts we ask the kernel to make that impossible, for this process,
 //! for the rest of its life.
 //!
@@ -19,7 +19,7 @@
 //!   (ABI v5) governs *device* files only, so sandboxing does not interfere.
 //! - **Restriction is inherited, not retroactive.** It applies to the calling
 //!   thread and anything it starts afterwards, so it must be applied before
-//!   the worker pool is built — never in the middle of a job.
+//!   the worker pool is built, never in the middle of a job.
 //!
 //! Enforcement is best-effort by design: on a kernel with an older Landlock
 //! ABI the kernel grants what it can and reports [`SandboxStatus::Partial`],
@@ -115,7 +115,7 @@ impl SandboxPlan {
 /// Never fails: a kernel without Landlock returns
 /// [`SandboxStatus::Unavailable`] and the caller carries on. Call this before
 /// starting worker threads, and only once the tool has finished discovering
-/// games — scanning reads Steam's configuration, which lives outside every
+/// games. Scanning reads Steam's configuration, which lives outside every
 /// game folder.
 pub fn restrict(plan: &SandboxPlan) -> SandboxStatus {
     if plan.writable.is_empty() {

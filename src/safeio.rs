@@ -1,7 +1,7 @@
 //! Opening game files without trusting the path.
 //!
 //! A job walks a directory and then, moments later, opens what it found. In
-//! between, anything could replace a component of that path with a symlink —
+//! between, anything could replace a component of that path with a symlink,
 //! and an ordinary `File::open` would follow it, letting a job rewrite a file
 //! outside the game. The window is small and a game directory is usually only
 //! writable by its owner, but the fix costs nothing: hold the install

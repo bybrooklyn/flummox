@@ -160,7 +160,7 @@ impl Object {
 /// The parser descends once per `{`, so without a limit the *input file*
 /// decides how much stack to consume. Measured on a default test thread,
 /// 3,200 levels parsed fine and 4,800 aborted the whole process with a stack
-/// overflow — not a panic, so nothing could catch it. Roughly 20 KB of
+/// overflow. That is an abort, not a panic, so nothing could catch it. Roughly 20 KB of
 /// `.acf` reaches that depth, and Steam's manifests live in a directory the
 /// user (or anything running as them) can write, so a corrupt or hostile file
 /// could take down a library scan with no message.

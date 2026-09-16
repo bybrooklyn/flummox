@@ -9,7 +9,7 @@ compressed game is still an ordinary directory of ordinary files. Steam does not
 know anything happened, and there is no archive to unpack before playing.
 
 **Status: early.** The btrfs backend works and is in daily use on the author's
-library. Support for ext4, XFS and F2FS — which is what the Steam Deck needs —
+library. Support for ext4, XFS and F2FS, which is what the Steam Deck needs,
 is designed but not built yet.
 
 ## What it does
@@ -18,7 +18,7 @@ is designed but not built yet.
   the awkward cases: several app IDs sharing one folder, and Steam's "running"
   flag going stale after a crash.
 - **Estimates before it acts.** Files are sampled rather than read whole, and
-  the estimate models what the *filesystem* will do — btrfs compresses each
+  the estimate models what the *filesystem* will do. btrfs compresses each
   128 KiB block separately and stores a block uncompressed when compressing it
   would not free a whole 4 KiB sector.
 - **Compresses in place.** Games stay playable, and files Steam writes later
@@ -62,7 +62,7 @@ Presets are `fast`, `balanced` and `max` (zstd 3, 9 and 15); `--level` overrides
 them. Every read-only command takes `--json`.
 
 Compression is worth least on a drive already mounted with `compress=zstd:1`,
-because most of the gain is already banked — the tool says so rather than
+because most of the gain is already banked. The tool says so instead of
 quietly reporting a large number.
 
 ## How it protects you
@@ -89,8 +89,8 @@ duplicate versions and sources).
 
 ## Does it actually save anything?
 
-That depends entirely on the game. Already-compressed data — video, audio,
-textures, packed archives — gives back nothing, and the tool skips it rather
+That depends entirely on the game. Already-compressed data (video, audio,
+textures, packed archives) gives back nothing, and the tool skips it instead of
 than burning CPU to prove it. Measured here on btrfs already mounted with
 `compress=zstd:1`, so these are gains *on top of* what the mount had:
 
