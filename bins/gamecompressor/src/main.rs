@@ -6,6 +6,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result, bail};
@@ -27,6 +28,11 @@ use gc_launchers::{Env, Scan};
     about = "Compress installed games with zstd, keeping them playable"
 )]
 struct Cli {
+    /// Log what is happening to stderr; repeat for more detail.
+    ///
+    /// `RUST_LOG` overrides this when set, for the usual per-module filters.
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
     #[command(subcommand)]
     command: Command,
 }
@@ -119,18 +125,59 @@ impl From<PresetArg> for Preset {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    init_logging(cli.verbose);
+    let cancel = install_signal_handler()?;
     let env = Env::current().context("HOME is not set")?;
     match cli.command {
         Command::Scan { tools } => cmd_scan(&env, tools),
         Command::Estimate { selector, level } => cmd_estimate(&env, &selector, &level),
         Command::Compress { selector, level, threads, force, dry_run } => {
-            cmd_compress(&env, &selector, &level, threads, force, dry_run)
+            cmd_compress(&env, &selector, &level, threads, force, dry_run, &cancel)
         }
-        Command::Decompress { selector, force } => cmd_decompress(&env, &selector, force),
+        Command::Decompress { selector, force } => cmd_decompress(&env, &selector, force, &cancel),
         Command::Status { selector } => cmd_status(&env, &selector),
         Command::Drives => cmd_drives(&env),
         Command::Doctor => cmd_doctor(&env),
     }
+}
+
+/// Sends `tracing` output to stderr, quiet unless asked.
+///
+/// Results go to stdout and stay parseable; this stream is for the story of
+/// what the tool did, which matters most when a job on someone's game library
+/// did something unexpected.
+fn init_logging(verbose: u8) {
+    let default = match verbose {
+        0 => "warn",
+        1 => "info",
+        2 => "debug",
+        _ => "trace",
+    };
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
+    // Failure here means a subscriber is already installed, which is not
+    // worth refusing to run over.
+    let _started = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
+/// Makes Ctrl-C stop a job cleanly instead of killing it mid-file.
+///
+/// The flag is polled between files, so the current file always finishes:
+/// btrfs rewrites a file's extents atomically, and stopping between files
+/// leaves the game in a state that is simply "partly compressed", which is
+/// valid and can be resumed by running the command again. Killing the process
+/// outright would be safe too, but the user would lose the summary of what
+/// had already been done.
+fn install_signal_handler() -> Result<Arc<AtomicBool>> {
+    let flag = Arc::new(AtomicBool::new(false));
+    for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+        let _id = signal_hook::flag::register(signal, Arc::clone(&flag))
+            .with_context(|| format!("installing the handler for signal {signal}"))?;
+    }
+    Ok(flag)
 }
 
 fn size(bytes: u64) -> String {
@@ -376,6 +423,7 @@ impl Progress {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_compress(
     env: &Env,
     selector: &str,
@@ -383,6 +431,7 @@ fn cmd_compress(
     threads: usize,
     force: bool,
     dry_run: bool,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<()> {
     let game = find_game(env, selector)?;
     let opts = level.opts(threads);
@@ -419,13 +468,19 @@ fn cmd_compress(
         backend.kind().label(),
         opts.btrfs_level()
     );
-    let cancel = AtomicBool::new(false);
     let progress = Progress::new();
-    let ctx = JobCtx { events: &progress, cancel: &cancel };
+    let ctx = JobCtx { events: &progress, cancel: cancel.as_ref() };
+    tracing::info!(game = %game.title, level = opts.btrfs_level(), files = inv.files.len(), "compressing");
     let outcome = backend
         .compress(&game.install_dir, &inv, &opts, &ctx)
         .with_context(|| format!("compressing {}", game.title))?;
 
+    if outcome.cancelled {
+        println!(
+            "Stopped early. What was already compressed stays compressed; \
+             run the same command again to finish the rest."
+        );
+    }
     println!(
         "Done: {} files, {} processed, {} skipped",
         outcome.files,
@@ -450,15 +505,19 @@ fn cmd_compress(
     Ok(())
 }
 
-fn cmd_decompress(env: &Env, selector: &str, force: bool) -> Result<()> {
+fn cmd_decompress(
+    env: &Env,
+    selector: &str,
+    force: bool,
+    cancel: &Arc<AtomicBool>,
+) -> Result<()> {
     let game = find_game(env, selector)?;
     let (_fs, backend) = backend_for(&game.install_dir)?;
     check_idle(&game, force)?;
     let inv = walk(&game, backend.as_ref())?;
     println!("Decompressing {}", game.title);
-    let cancel = AtomicBool::new(false);
     let progress = Progress::new();
-    let ctx = JobCtx { events: &progress, cancel: &cancel };
+    let ctx = JobCtx { events: &progress, cancel: cancel.as_ref() };
     let outcome = backend
         .decompress(&game.install_dir, &inv, &ctx)
         .with_context(|| format!("decompressing {}", game.title))?;

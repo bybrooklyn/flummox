@@ -12,6 +12,10 @@ serde = { workspace = true }
 thiserror.workspace = true
 libc.workspace = true
 nix.workspace = true
+rustix.workspace = true
+rusqlite.workspace = true
+landlock.workspace = true
+tracing.workspace = true
 xattr.workspace = true
 zstd.workspace = true
 walkdir.workspace = true
@@ -20,6 +24,7 @@ rayon.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 gc-testutil.workspace = true
+proptest.workspace = true
 
 [lints]
 workspace = true

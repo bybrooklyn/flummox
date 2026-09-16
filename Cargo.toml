@@ -25,6 +25,17 @@ walkdir = "2"
 rayon = "1"
 nix = { version = "0.31", features = ["fs", "ioctl", "user"] }
 libc = "0.2"
+# openat2(2) with RESOLVE_BENEATH/RESOLVE_NO_SYMLINKS: every game file is
+# opened relative to a directory handle, so a swapped symlink cannot redirect
+# a job outside the install directory.
+rustix = { version = "1", features = ["fs"] }
+# Landlock: an unprivileged process can drop its own filesystem rights, so a
+# compression job can only reach the game it was asked to work on.
+landlock = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+signal-hook = "0.3"
+proptest = "1"
 xattr = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
 directories = "6"

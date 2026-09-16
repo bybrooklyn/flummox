@@ -15,6 +15,9 @@ thiserror.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 gc-testutil.workspace = true
+# The VDF parser reads files Steam writes, not files we write: its robustness
+# against arbitrary input is a property, not a list of examples.
+proptest.workspace = true
 
 [lints]
 workspace = true

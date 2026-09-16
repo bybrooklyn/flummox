@@ -126,7 +126,7 @@ impl JobCtx<'_> {
 }
 
 /// What a finished job did.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Outcome {
     /// Files rewritten.
     pub files: u64,
@@ -155,7 +155,7 @@ impl Outcome {
 }
 
 /// How compressed a directory currently is.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct CompressionStatus {
     /// Bytes held in compressed extents.
     pub compressed_bytes: u64,

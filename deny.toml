@@ -1,0 +1,136 @@
+# cargo-deny policy for gamecompressor.
+#
+# Run with:  cargo deny check
+#
+# This tool runs on a user's own machine, with write access to entire game
+# libraries, and the compression backends reach the kernel through `unsafe`
+# ioctls and `openat2`. A dependency that is compromised, unvendorable, or
+# licensed incompatibly is therefore not a paperwork problem: it is either a
+# supply-chain foothold in something that rewrites files, or a licence
+# violation in a GPL-3.0-or-later program that we cannot legally ship.
+#
+# The four sections below correspond to the four questions worth asking of a
+# dependency tree: is anything known to be broken, may we legally link it, are
+# we carrying it more than once, and did it come from somewhere we trust.
+#
+# Note on schema: no `version = 2` key is set. Those keys existed only to opt
+# in to the modern schema while the v1 one was still supported, and setting
+# them now draws a deprecation warning from current cargo-deny. Only fields
+# valid in the current schema are used here.
+
+[graph]
+# Evaluate every feature combination rather than the default set. Features
+# pull in extra crates — `rusqlite`'s `bundled`, `clap`'s `derive` — and a
+# licence or advisory that only appears behind a feature flag still ships.
+all-features = true
+
+# ---------------------------------------------------------------------------
+# Security advisories (RUSTSEC)
+# ---------------------------------------------------------------------------
+[advisories]
+# Any crate with a known vulnerability is an error, not a warning. This is the
+# default in the current schema and is restated here because it is the single
+# most important line in the file: a build must fail rather than quietly ship
+# a known hole in something that holds an open directory handle on a user's
+# games.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+
+# A yanked crate has been withdrawn by its own author, most often because a
+# release was broken or compromised. Continuing to build against one is
+# depending on something nobody is willing to stand behind any more.
+yanked = "deny"
+
+# Advisories consciously accepted, each of which must carry a comment saying
+# why the code is not reachable or what mitigates it. Empty on purpose: there
+# is nothing to excuse yet, and the list should stay hard to add to.
+ignore = []
+
+# ---------------------------------------------------------------------------
+# Licences
+# ---------------------------------------------------------------------------
+[licenses]
+# gamecompressor is GPL-3.0-or-later, so the binary may only link libraries
+# under licences that are GPL-3-compatible. Permissive licences are; anything
+# reciprocal on a different footing (AGPL, SSPL, proprietary) is not, and
+# would have to be removed rather than debated.
+#
+# This list is exactly what the current dependency tree resolves to, verified
+# against `cargo metadata`, and nothing more. Keeping it minimal is the point:
+# a speculative entry is an approval granted in advance to a crate nobody has
+# looked at, and `unused-allowed-license` below makes a stale entry visible.
+allow = [
+    # Our own crates, and the terms the whole work ships under.
+    "GPL-3.0-or-later",
+    # The overwhelming majority of the tree: the Rust ecosystem's usual
+    # `MIT OR Apache-2.0` dual licence. Between them these two also satisfy
+    # every `OR` expression here — `Unlicense OR MIT`,
+    # `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`, and
+    # `MIT OR Apache-2.0 OR LGPL-2.1-or-later` — so neither the LLVM exception
+    # nor LGPL-2.1 needs to be allowed for those crates to be accepted.
+    "MIT",
+    "Apache-2.0",
+    # zstd-safe and zstd-sys, the bindings to the compression library this
+    # tool exists to drive. No dual option; BSD-3-Clause is GPL-compatible.
+    "BSD-3-Clause",
+    # unicode-ident, whose expression is
+    # `(MIT OR Apache-2.0) AND Unicode-3.0` — the `AND` means the Unicode
+    # data licence must be allowed outright, it cannot be satisfied by MIT.
+    "Unicode-3.0",
+    # foldhash, reached through hashbrown. Zlib is permissive and
+    # GPL-compatible, and again there is no alternative in the expression.
+    "Zlib",
+]
+
+# A crate whose licence cannot be determined from its metadata gets refused
+# rather than guessed at. 0.93 is cargo-deny's default threshold for matching
+# a licence file against a known text; lowering it would trade a clear failure
+# for a confident wrong answer.
+confidence-threshold = 0.93
+
+# Per-crate exceptions to the list above. Empty on purpose, for the same
+# reason `advisories.ignore` is.
+exceptions = []
+
+# Flag allowances that nothing in the tree uses any more. Without this an
+# allow-list only ever grows, and eventually describes a policy far broader
+# than what is actually being linked.
+unused-allowed-license = "warn"
+
+# ---------------------------------------------------------------------------
+# Bans and duplicates
+# ---------------------------------------------------------------------------
+[bans]
+# Two versions of the same crate is a warning rather than an error. It is
+# usually somebody else's transitive dependency and not something this
+# workspace can fix on its own, but it is worth seeing: duplicates inflate the
+# binary, double the audit surface, and in the case of something like
+# `rustix` or `libc` can mean two different sets of syscall bindings compiled
+# into one process.
+multiple-versions = "warn"
+
+# A wildcard version requirement means the next release of that crate is
+# accepted sight unseen. For a tool with these privileges, that is the exact
+# shape of a supply-chain compromise.
+wildcards = "deny"
+
+# Crates that must never appear at all. Empty today; this is where a
+# dependency that turned out to be unmaintained or hostile would be recorded
+# so it cannot come back through a transitive edge.
+deny = []
+
+# ---------------------------------------------------------------------------
+# Sources
+# ---------------------------------------------------------------------------
+[sources]
+# Everything must come from crates.io, which at least gives immutable
+# published versions, a checksum in Cargo.lock, and a public record.
+unknown-registry = "deny"
+
+# A git dependency points at a mutable branch with no checksum in the
+# published index: whoever controls that repository controls what gets
+# compiled into a program that rewrites the user's files. The workspace has
+# none today, and adding one should require editing this policy first.
+unknown-git = "deny"
+
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

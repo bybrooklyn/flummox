@@ -99,7 +99,7 @@ impl FileEstimate {
 }
 
 /// The result for a whole game.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub struct Estimate {
     /// Files a compress pass would rewrite.
     ///

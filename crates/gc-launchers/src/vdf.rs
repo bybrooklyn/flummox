@@ -35,6 +35,8 @@ pub enum ErrorKind {
     ExpectedValue,
     /// The document did not start with `"key" { ... }`.
     ExpectedRoot,
+    /// Objects were nested deeper than [`MAX_DEPTH`].
+    TooDeep,
 }
 
 impl fmt::Display for ErrorKind {
@@ -46,6 +48,7 @@ impl fmt::Display for ErrorKind {
             Self::UnexpectedBrace => "unexpected '}'",
             Self::ExpectedValue => "expected a value",
             Self::ExpectedRoot => "expected a top-level \"key\" { ... }",
+            Self::TooDeep => "objects nested too deeply",
         };
         f.write_str(s)
     }
@@ -152,6 +155,22 @@ impl Object {
     }
 }
 
+/// How deeply objects may nest before parsing gives up.
+///
+/// The parser descends once per `{`, so without a limit the *input file*
+/// decides how much stack to consume. Measured on a default test thread,
+/// 3,200 levels parsed fine and 4,800 aborted the whole process with a stack
+/// overflow — not a panic, so nothing could catch it. Roughly 20 KB of
+/// `.acf` reaches that depth, and Steam's manifests live in a directory the
+/// user (or anything running as them) can write, so a corrupt or hostile file
+/// could take down a library scan with no message.
+///
+/// Real manifests nest four or five deep; `libraryfolders.vdf` reaches three.
+/// A few hundred levels costs nothing and leaves the limit far out of the way
+/// of any genuine file. Dropping the parsed tree recurses the same way, so
+/// refusing to build a deep one protects that too.
+pub const MAX_DEPTH: u32 = 128;
+
 /// Parses a whole document and returns its single top-level object.
 ///
 /// The top-level key itself (`"AppState"`, `"libraryfolders"`, …) is dropped;
@@ -173,7 +192,7 @@ pub fn parse_root(text: &str) -> Result<(String, Object), Error> {
         Some(Token::Open) => {}
         _ => return Err(lexer.err(ErrorKind::ExpectedRoot)),
     }
-    let obj = lexer.parse_object()?;
+    let obj = lexer.parse_object(1)?;
     Ok((key, obj))
 }
 
@@ -316,7 +335,14 @@ impl<'a> Lexer<'a> {
     }
 
     /// Parses entries until the matching `}`; the `{` is already eaten.
-    fn parse_object(&mut self) -> Result<Object, Error> {
+    ///
+    /// `depth` is this object's nesting level, starting at 1 for the
+    /// top-level object, and is capped at [`MAX_DEPTH`] so the input cannot
+    /// choose how much stack to use.
+    fn parse_object(&mut self, depth: u32) -> Result<Object, Error> {
+        if depth > MAX_DEPTH {
+            return Err(self.err(ErrorKind::TooDeep));
+        }
         let mut entries = Vec::new();
         loop {
             let key = match self.next_token()? {
@@ -331,7 +357,7 @@ impl<'a> Lexer<'a> {
                     // An optional [$COND] may follow a value; drop it.
                     Value::Str(s)
                 }
-                Some(Token::Open) => Value::Obj(self.parse_object()?),
+                Some(Token::Open) => Value::Obj(self.parse_object(depth.saturating_add(1))?),
                 Some(Token::Close) => return Err(self.err(ErrorKind::UnexpectedBrace)),
                 Some(Token::Cond) => return Err(self.err(ErrorKind::ExpectedValue)),
                 None => return Err(self.err(ErrorKind::UnexpectedEof)),
