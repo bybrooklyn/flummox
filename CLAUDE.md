@@ -13,6 +13,42 @@ just test     # every test, all features
 
 Both must be clean. `cargo check` passing proves neither.
 
+## Before believing a measurement
+
+Seven harnesses in one session produced clean tables that could not have
+failed. Every one was a shell mistake rather than a wrong hypothesis, and each
+returned numbers that looked like an answer:
+
+- `du -b` implies `--apparent-size`, so an "on disk" column compared a file
+  against itself and every ratio was 1.000. On btrfs neither `du` nor
+  `stat %b` sees compression at all. `compsize` is what reads it, and it needs
+  privileges this tool does not take. The sysfs counter
+  `/sys/fs/btrfs/<uuid>/allocation/data/bytes_used` is readable and works.
+- `cp` and GNU `cat` both reflink on btrfs through `copy_file_range`, so seven
+  compression variants shared one set of extents and no variant ever wrote a
+  byte. `filefrag -v` showing identical physical offsets is the tell. `dd`
+  writes real bytes.
+- `btrfs filesystem defragment` takes the algorithm as `-czstd` and the level
+  as a separate `-L 15`. A `||` fallback turned the rejected `-czstd:15` into
+  four runs of the same default command.
+- `2>/dev/null` on a path that does not exist returns silence, which looks the
+  same as a clean result.
+- zsh does not word-split unquoted expansions, so `for f in $fields` ran once
+  with every field joined into one string. Use `while IFS= read -r`.
+- `timeout ... | tail` reports tail's exit status, so the pipeline claimed a
+  process had survived when nothing about it had been checked.
+
+So:
+
+1. Include a control that must fail. Zeros must compress, random must not, a
+   baseline must land on its known value. If the control is wrong, the numbers
+   are noise whatever they say.
+2. Never send stderr to `/dev/null` while establishing a result.
+3. Never use `||` as a fallback in a measurement. It hides the first command
+   failing and silently answers a different question.
+4. Capture the exit status of the thing being measured, not of a pipe.
+5. Check what the tool measures, not what the column is called.
+
 ## Code rules
 
 1. No `unwrap`, `expect`, `panic!`, `assert!`, `unreachable!`, `todo!`, or
