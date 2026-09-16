@@ -372,6 +372,12 @@ impl Db {
         // the reply is recorded rather than checked.
         let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         tracing::debug!(journal_mode = %mode, "state database journal mode");
+        // SQLite's default busy timeout is zero, so a second instance gets
+        // SQLITE_BUSY the instant the first holds the write lock. That happens
+        // whenever the window is open while a job finishes: the pass goes
+        // unrecorded, and the next run recompresses a library that was already
+        // done. Five seconds is far longer than any write here takes.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // Off by default in SQLite, and the files table depends on it to keep
         // fingerprints from outliving the game row they belong to.
         conn.pragma_update(None, "foreign_keys", true)?;

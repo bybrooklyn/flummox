@@ -321,7 +321,16 @@ pub fn discover(env: &Env) -> Result<Vec<Game>, DetectError> {
     for root in roots(env) {
         running = running.or_else(|| running_app_id(&root));
         for library in libraries(&root)? {
-            let Ok(apps) = apps_in_library(&library) else { continue };
+            // A library that cannot be read is a whole drive of games missing
+            // from the list, so it has to reach the caller. Returning here
+            // instead would let one unplugged drive hide every other library.
+            let apps = match apps_in_library(&library) {
+                Ok(apps) => apps,
+                Err(e) => {
+                    tracing::warn!(library = %library.display(), error = %e, "skipped a library");
+                    continue;
+                }
+            };
             for app in apps {
                 if app.state_flags & state_flags::UNINSTALLED != 0 {
                     continue;

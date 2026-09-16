@@ -123,8 +123,19 @@ impl ProcFs {
 
 impl ProcSource for ProcFs {
     fn processes(&self) -> Vec<ProcInfo> {
-        let Ok(entries) = std::fs::read_dir(&self.root) else {
-            return Vec::new();
+        // An empty list means "nothing is running", which is what lets a job
+        // start. If /proc cannot be read at all, that answer is a guess, so
+        // say so loudly instead of quietly clearing the way.
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::error!(
+                    proc = %self.root.display(),
+                    error = %e,
+                    "cannot read /proc, so a running game cannot be detected"
+                );
+                return Vec::new();
+            }
         };
         entries
             .flatten()

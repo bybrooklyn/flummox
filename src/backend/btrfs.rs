@@ -98,7 +98,7 @@ nix::ioctl_readwrite!(fs_ioc_fiemap, b'f', 11, Fiemap);
 /// The file is opened read-only on purpose: the kernel checks write
 /// *permission* rather than the open mode, so this also works on a game
 /// executable that is currently running.
-pub fn compress_file(path: &Path, level: i32) -> io::Result<()> {
+pub fn compress_file(path: &Path, level: i32) -> io::Result<i32> {
     compress_fd(&File::open(path)?, level)
 }
 
@@ -107,7 +107,7 @@ pub fn compress_file(path: &Path, level: i32) -> io::Result<()> {
 /// Jobs use this rather than [`compress_file`], having opened the file
 /// through a [`Anchor`] so the path could not have been swapped for a symlink
 /// between the walk and the open.
-pub fn compress_fd(file: &File, level: i32) -> io::Result<()> {
+pub fn compress_fd(file: &File, level: i32) -> io::Result<i32> {
     let args = DefragRangeArgs {
         start: 0,
         len: u64::MAX,
@@ -121,9 +121,13 @@ pub fn compress_fd(file: &File, level: i32) -> io::Result<()> {
     // `btrfs_ioctl_defrag_range_args` that outlives the call.
     let result = unsafe { btrfs_defrag_range(file.as_raw_fd(), &args) };
     match result {
-        Ok(_) => Ok(()),
-        // Kernels before 6.15 do not know the level flag. Retry at the
-        // filesystem's default zstd level rather than failing the job.
+        Ok(_) => Ok(level),
+        // Kernels before 6.15 do not know the level flag. Retrying at the
+        // filesystem's default level beats failing the job, but the caller
+        // has to learn which level actually landed: recording the level that
+        // was asked for tells the estimator this file is done at 15 when it
+        // is compressed at the mount default, and it then refuses to offer
+        // the saving that is still there.
         Err(nix::errno::Errno::EOPNOTSUPP | nix::errno::Errno::EINVAL) => {
             let fallback = DefragRangeArgs {
                 flags: DEFRAG_RANGE_COMPRESS | DEFRAG_RANGE_START_IO,
@@ -132,12 +136,18 @@ pub fn compress_fd(file: &File, level: i32) -> io::Result<()> {
             };
             // SAFETY: as above.
             unsafe { btrfs_defrag_range(file.as_raw_fd(), &fallback) }
-                .map(|_| ())
+                .map(|_| DEFAULT_LEVEL)
                 .map_err(errno_to_io)
         }
         Err(e) => Err(errno_to_io(e)),
     }
 }
+
+/// The level the kernel applies when we cannot ask for one.
+///
+/// btrfs uses zstd level 3 unless the mount says otherwise, so this is a
+/// floor rather than a promise.
+pub const DEFAULT_LEVEL: i32 = 3;
 
 /// Rewrites a file as uncompressed extents.
 pub fn decompress_file(path: &Path) -> io::Result<()> {
@@ -272,7 +282,7 @@ impl BtrfsBackend {
         inv: &Inventory,
         threads: usize,
         ctx: &JobCtx<'_>,
-        op: &(dyn Fn(&File) -> io::Result<()> + Sync),
+        op: &(dyn Fn(&File) -> io::Result<i32> + Sync),
     ) -> io::Result<Outcome> {
         use rayon::prelude::*;
 
@@ -292,9 +302,11 @@ impl BtrfsBackend {
         let bytes = targets.iter().map(|f| f.size).sum();
         ctx.events.event(Event::Started { files, bytes });
 
-        let free_before = free_bytes(install_dir).unwrap_or(0);
+        let free_before = free_bytes(install_dir).ok();
         let files_done = AtomicU64::new(0);
         let bytes_done = AtomicU64::new(0);
+        // Starts above any real zstd level so the first file lowers it.
+        let applied_level = std::sync::atomic::AtomicI64::new(i64::from(i32::MAX));
         let errors = std::sync::Mutex::new(Vec::new());
 
         let pool = rayon::ThreadPoolBuilder::new()
@@ -317,8 +329,13 @@ impl BtrfsBackend {
                     Ok(file) => file,
                     Err(e) => return fail(e),
                 };
-                if let Err(e) = op(&file) {
-                    return fail(e);
+                match op(&file) {
+                    // Every file in a pass gets the same treatment, so the
+                    // lowest level seen is the level the pass achieved.
+                    Ok(applied) => {
+                        applied_level.fetch_min(i64::from(applied), Ordering::Relaxed);
+                    }
+                    Err(e) => return fail(e),
                 }
                 let done = files_done.fetch_add(1, Ordering::Relaxed) + 1;
                 let bdone = bytes_done.fetch_add(entry.size, Ordering::Relaxed) + entry.size;
@@ -330,15 +347,23 @@ impl BtrfsBackend {
             });
         });
 
-        // The kernel writes compressed extents back asynchronously; without a
-        // sync the free-space reading would still show the old figure.
-        nix::unistd::sync();
+        // The kernel writes compressed extents back asynchronously, so the
+        // free-space reading below would otherwise show the old figure.
+        // syncfs covers this filesystem only; sync(2) blocks on every mounted
+        // filesystem, ignores Ctrl-C, and can stall for tens of seconds on an
+        // unrelated slow drive.
+        if let Err(e) = rustix::fs::syncfs(anchor.as_fd()) {
+            ctx.events.event(Event::Warning(format!("could not flush the filesystem: {e}")));
+        }
         Ok(Outcome {
             files: files_done.load(Ordering::Relaxed),
             bytes: bytes_done.load(Ordering::Relaxed),
             skipped: (inv.files.len() as u64).saturating_sub(files),
             free_before,
-            free_after: free_bytes(install_dir).unwrap_or(0),
+            free_after: free_bytes(install_dir).ok(),
+            effective_level: i32::try_from(applied_level.load(Ordering::Relaxed))
+                .ok()
+                .filter(|level| *level != i32::MAX),
             cancelled: ctx.cancelled(),
             errors: errors.into_inner().unwrap_or_default(),
         })
@@ -408,7 +433,7 @@ impl Backend for BtrfsBackend {
         if let Err(e) = set_dir_property(install_dir, false) {
             ctx.events.event(Event::Warning(format!("clearing btrfs.compression: {e}")));
         }
-        let outcome = self.run(install_dir, &all, 2, ctx, &decompress_fd)?;
+        let outcome = self.run(install_dir, &all, 2, ctx, &|f| decompress_fd(f).map(|()| 0))?;
         ctx.events.event(Event::Finished(Box::new(outcome.clone())));
         Ok(outcome)
     }
@@ -485,6 +510,41 @@ mod tests {
         // Contents must survive both passes.
         let back = std::fs::read(&path).ctx("read text.dat back")?;
         check_eq(back.len(), 12 * 500_000, "the file's length after both passes")
+    }
+
+    /// Compressing a file must not disturb the fields the incremental pass
+    /// compares.
+    ///
+    /// A pass stores a fingerprint per file and recompresses only what
+    /// changed. The fingerprint includes ctime, and a defrag rewrites the
+    /// inode, so if the kernel bumped ctime then every file we just
+    /// compressed would look changed on the next run and the whole library
+    /// would be rewritten every time, without any error to notice. Measured
+    /// on kernel 7.2: it does not. This test exists so that stays true.
+    #[test]
+    fn compressing_leaves_the_fingerprint_fields_alone() -> TestResult {
+        use std::os::unix::fs::MetadataExt;
+
+        let Some(tmp) = btrfs_tempdir() else {
+            eprintln!("skipped: not running on btrfs");
+            return Ok(());
+        };
+        let path = tmp.path().join("fingerprint.dat");
+        std::fs::write(&path, "compress me ".repeat(200_000).into_bytes())
+            .ctx("write the test file")?;
+        let before = std::fs::metadata(&path).ctx("stat before")?;
+
+        compress_file(&path, 15).ctx("compress the file")?;
+        let after = std::fs::metadata(&path).ctx("stat after")?;
+
+        check_eq(after.ino(), before.ino(), "the inode must survive")?;
+        check_eq(after.size(), before.size(), "the logical size must not move")?;
+        check_eq(after.mtime_nsec(), before.mtime_nsec(), "mtime must not move")?;
+        check_eq(
+            after.ctime_nsec(),
+            before.ctime_nsec(),
+            "ctime must not move, or every compressed file looks changed next run",
+        )
     }
 
     #[test]

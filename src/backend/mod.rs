@@ -134,10 +134,21 @@ pub struct Outcome {
     pub bytes: u64,
     /// Files skipped, including ones that were already compressed.
     pub skipped: u64,
-    /// Free space on the filesystem before the job.
-    pub free_before: u64,
-    /// Free space after.
-    pub free_after: u64,
+    /// Free space on the filesystem before the job, if it could be read.
+    ///
+    /// `None` when `statvfs` failed, which happens when a drive is removed
+    /// mid-job. Treating that as zero made the tool report freeing the entire
+    /// disk.
+    pub free_before: Option<u64>,
+    /// Free space after, on the same terms.
+    pub free_after: Option<u64>,
+    /// The compression level the kernel actually applied.
+    ///
+    /// Lower than the level asked for when the kernel is too old to accept
+    /// one. Recording the requested level instead tells the estimator a file
+    /// is finished at 15 when it is sitting at the mount default, and it then
+    /// refuses to offer the saving that is still available.
+    pub effective_level: Option<i32>,
     /// Whether the job stopped early because it was cancelled.
     pub cancelled: bool,
     /// Per-file failures, as messages.
@@ -149,8 +160,10 @@ impl Outcome {
     ///
     /// Anything else writing to the same filesystem during the job shows up
     /// here too, which is why the UI labels this figure approximate.
-    pub fn freed(&self) -> i64 {
-        self.free_after as i64 - self.free_before as i64
+    pub fn freed(&self) -> Option<i64> {
+        let before = i64::try_from(self.free_before?).ok()?;
+        let after = i64::try_from(self.free_after?).ok()?;
+        Some(after - before)
     }
 }
 

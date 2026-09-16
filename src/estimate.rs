@@ -330,7 +330,10 @@ pub fn estimate_game_with(
     let results: Vec<(FileEstimate, bool)> = candidates
         .par_iter()
         .map(|entry| {
-            let remaining = budget.load(std::sync::atomic::Ordering::Relaxed);
+            // Read once and clamp. Two threads can both pass a bare `== 0`
+            // check and both subtract, wrapping the counter to about 1.8e19,
+            // after which the budget stops limiting anything.
+            let remaining = budget.load(std::sync::atomic::Ordering::Acquire);
             if remaining == 0 {
                 // Out of sampling budget: assume the file behaves like the
                 // ones already measured by leaving it out of both totals.
@@ -357,9 +360,13 @@ pub fn estimate_game_with(
             });
             match estimate_file_with(&path, entry.size, model, opts, measured) {
                 Ok(est) => {
-                    budget.fetch_sub(
-                        est.sampled.min(remaining),
-                        std::sync::atomic::Ordering::Relaxed,
+                    // Saturating, not wrapping: `remaining` was read before
+                    // the file was sampled, so another thread may have spent
+                    // the budget in between.
+                    let _spent = budget.fetch_update(
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                        |left| Some(left.saturating_sub(est.sampled)),
                     );
                     let worth = est.worthwhile();
                     (est, worth)

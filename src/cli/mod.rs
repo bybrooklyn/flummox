@@ -729,15 +729,16 @@ fn cmd_compress(
     // else writing to the same drive lands in it too. It is worth showing, but
     // not worth dressing up as a measurement of this job alone.
     let freed = outcome.freed();
-    if outcome.files == 0 {
-        println!("No files were rewritten.");
-    } else if freed > 0 {
-        println!("Freed about {} (from free space, so approximate).", size(freed.unsigned_abs()));
-    } else {
-        println!(
+    match (outcome.files, freed) {
+        (0, _) => println!("No files were rewritten."),
+        (_, None) => println!("Could not read free space, so there is no figure to report."),
+        (_, Some(n)) if n > 0 => {
+            println!("Freed about {} (from free space, so approximate).", size(n.unsigned_abs()));
+        }
+        _ => println!(
             "Free space did not go up. On a drive already mounted with compression, \
              most of the gain was already there."
-        );
+        ),
     }
     if !outcome.errors.is_empty() {
         println!("{} files failed; the first few:", outcome.errors.len());
@@ -756,12 +757,22 @@ fn cmd_compress(
         );
         record.build = game.build.clone();
         record.install_bytes = full_inv.total_bytes();
-        record.disk_before = outcome.free_before;
-        record.disk_after = outcome.free_after;
+        record.disk_before = outcome.free_before.unwrap_or_default();
+        record.disk_after = outcome.free_after.unwrap_or_default();
         // When files were skipped as unchanged, they are still compressed at
         // whatever the earlier, higher level was; recording the lower level of
         // this pass would make a later run redo them for nothing.
+        // The level the kernel applied, which is lower than the one asked for
+        // on a kernel too old to accept a level at all.
+        record.level = outcome.effective_level.unwrap_or(record.level);
         record.level = previous.as_ref().map_or(record.level, |p| p.level.max(record.level));
+        if outcome.effective_level.is_some_and(|applied| applied < opts.btrfs_level()) {
+            println!(
+                "Note: this kernel does not accept a compression level, so the files were \
+                 compressed at the filesystem default rather than {}.",
+                opts.btrfs_level()
+            );
+        }
         // Fingerprints are stored for the whole install, not just the files
         // this pass touched, or the skipped ones would look new next time.
         if let Err(e) = open.record_compression(&record, &full_inv) {
@@ -779,7 +790,9 @@ fn cmd_compress(
             ),
         )
         .for_game(&game.id)
-        .with_bytes(-freed);
+        // Zero when free space could not be read, so the log records "no
+        // figure" instead of an invented one.
+        .with_bytes(-freed.unwrap_or_default());
         if let Err(e) = open.log_activity(&entry) {
             tracing::warn!(error = %e, "could not write to the activity log");
         }
@@ -811,8 +824,10 @@ fn cmd_decompress(
         .with_context(|| format!("decompressing {}", game.title))?;
     println!("Done: {} files rewritten", outcome.files);
     let freed = outcome.freed();
-    if freed < 0 {
-        println!("Uses about {} more space now.", size(freed.unsigned_abs()));
+    if let Some(n) = freed
+        && n < 0
+    {
+        println!("Uses about {} more space now.", size(n.unsigned_abs()));
     }
 
     if let Some(open) = db.as_mut() {
@@ -828,7 +843,9 @@ fn cmd_decompress(
             format!("{} back to uncompressed ({} files)", game.title, outcome.files),
         )
         .for_game(&game.id)
-        .with_bytes(-freed);
+        // Zero when free space could not be read, so the log records "no
+        // figure" instead of an invented one.
+        .with_bytes(-freed.unwrap_or_default());
         if let Err(e) = open.log_activity(&entry) {
             tracing::warn!(error = %e, "could not write to the activity log");
         }
