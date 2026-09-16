@@ -97,6 +97,18 @@ flummox log                         # what Flummox has done
 flummox doctor                      # check this machine
 ```
 
+Steam reports some folders that are not games, like shared redistributables
+and runtimes. Flummox filters the obvious ones, and you can correct the rest:
+
+```sh
+flummox exclude add "Steamworks Shared"   # stop seeing it
+flummox exclude list
+flummox exclude remove 105600
+```
+
+A hidden entry stays out of scans and will not be compressed even if you name
+it directly.
+
 Name a game by its Steam app ID, by `steam:105600`, or by part of its title.
 Presets are `fast`, `balanced` and `max`. Every read-only command takes
 `--json`.
