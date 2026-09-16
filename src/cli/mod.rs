@@ -105,10 +105,31 @@ enum Command {
         #[command(subcommand)]
         action: HookAction,
     },
+    /// Hide something that is not a game, or that you never want touched.
+    Exclude {
+        #[command(subcommand)]
+        action: ExcludeAction,
+    },
     /// List the drives holding games, and how each one can be compressed.
     Drives,
     /// Check this machine for anything that would stop the tool working.
     Doctor,
+}
+
+#[derive(Debug, Subcommand)]
+enum ExcludeAction {
+    /// Hide a game, by app ID or part of its title.
+    Add {
+        /// What to hide.
+        selector: String,
+    },
+    /// Show a hidden game again.
+    Remove {
+        /// What to stop hiding.
+        selector: String,
+    },
+    /// What is currently hidden.
+    List,
 }
 
 #[derive(Debug, Subcommand)]
@@ -175,6 +196,7 @@ pub fn run() -> Result<()> {
         Command::Status { selector } => cmd_status(&env, out, &selector, &cancel),
         Command::Log { limit } => cmd_log(out, limit),
         Command::Hook { action } => cmd_hook(&env, out, action),
+        Command::Exclude { action } => cmd_exclude(&env, out, action),
         Command::Drives => cmd_drives(&env),
         Command::Doctor => cmd_doctor(&env),
     }
@@ -443,7 +465,13 @@ fn walk(game: &Game, backend: &dyn Backend, cancel: Option<&AtomicBool>) -> Resu
 
 fn cmd_scan(env: &Env, out: Output, tools: bool) -> Result<()> {
     let scan = scan(env);
-    let games: Vec<&Game> = scan.games.iter().filter(|g| tools || !g.is_tool).collect();
+    let hidden = excluded_ids(open_db().as_ref());
+    let games: Vec<&Game> = scan
+        .games
+        .iter()
+        .filter(|g| tools || !g.is_tool)
+        .filter(|g| !g.ids().any(|id| hidden.contains(id)))
+        .collect();
     if games.is_empty() && !out.json {
         println!("No games found. Is Steam installed for this user?");
         return Ok(());
@@ -694,6 +722,16 @@ fn cmd_compress(
     // Open the database before the sandbox goes up: creating its directory is
     // simpler to do now than to grant a sandboxed process.
     let mut db = open_db();
+    // Naming a hidden game directly should not get around hiding it.
+    if let Some(open) = db.as_ref()
+        && game.ids().any(|id| open.is_excluded(id).unwrap_or(false))
+    {
+        bail!(
+            "{} is on the exclusion list. Run `flummox exclude remove {}` first.",
+            game.title,
+            game.id
+        );
+    }
     if let Some(why) = fsprobe::snapshot_risk(&fs) {
         eprintln!(
             "warning: {why}.\n         Compressing rewrites every extent, which unshares it \
@@ -1143,6 +1181,72 @@ fn cmd_hook(env: &Env, out: Output, action: HookAction) -> Result<()> {
             HookAction::Status => {}
         }
     })
+}
+
+/// The games hidden by the exclusion list.
+///
+/// Returns an empty set when the database is unavailable, so a missing
+/// database hides nothing rather than hiding everything.
+fn excluded_ids(db: Option<&Db>) -> Vec<crate::model::GameId> {
+    db.and_then(|db| db.excluded().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+}
+
+fn cmd_exclude(env: &Env, out: Output, action: ExcludeAction) -> Result<()> {
+    let Some(path) = Db::default_path() else {
+        bail!("cannot work out where the state database lives; is HOME set?");
+    };
+    let db = Db::open(&path).with_context(|| format!("opening {}", path.display()))?;
+
+    match action {
+        ExcludeAction::Add { selector } => {
+            let game = find_game(env, &selector)?;
+            db.exclude(&game.id, &game.title).context("recording the exclusion")?;
+            println!("Hidden: {} ({})", game.title, game.id);
+            println!("It will not appear in scans and will not be compressed.");
+            Ok(())
+        }
+        ExcludeAction::Remove { selector } => {
+            // Matched against the list rather than a scan, because an excluded
+            // game no longer turns up in one.
+            let hidden = db.excluded().context("reading the exclusion list")?;
+            let found = hidden.iter().find(|(id, title)| {
+                id.to_string().eq_ignore_ascii_case(selector.trim())
+                    || id.key == selector.trim()
+                    || title.to_lowercase().contains(&selector.trim().to_lowercase())
+            });
+            let Some((id, title)) = found else {
+                bail!("{selector:?} is not on the exclusion list; try `flummox exclude list`");
+            };
+            db.unexclude(id).context("removing the exclusion")?;
+            println!("Visible again: {title} ({id})");
+            Ok(())
+        }
+        ExcludeAction::List => {
+            #[derive(serde::Serialize)]
+            struct ExcludedRow {
+                id: String,
+                title: String,
+            }
+            let hidden = db.excluded().context("reading the exclusion list")?;
+            let rows: Vec<ExcludedRow> = hidden
+                .iter()
+                .map(|(id, title)| ExcludedRow { id: id.to_string(), title: title.clone() })
+                .collect();
+            out.emit(&rows, || {
+                if rows.is_empty() {
+                    println!("Nothing is hidden.");
+                    return;
+                }
+                for row in &rows {
+                    println!("{:<44}  {}", row.title, row.id);
+                }
+            })
+        }
+    }
 }
 
 fn cmd_drives(env: &Env) -> Result<()> {

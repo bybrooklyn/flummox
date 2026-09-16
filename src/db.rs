@@ -83,7 +83,24 @@ pub type Result<T> = std::result::Result<T, DbError>;
 /// Bumping this and adding another arm to [`migrate`] is the whole upgrade
 /// procedure. Migrations are additive: a new release adds tables or nullable
 /// columns, so an older build can still open the file and read what it knows.
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
+
+/// Added in v2: the exclusion list.
+///
+/// A separate statement because an existing database is already at v1 and
+/// will never re-run the v1 batch, so a table added to that batch alone would
+/// never appear on a machine that has used the tool before.
+///
+/// Named `hidden`, not `excluded`. SQLite calls the rejected row of an upsert
+/// `excluded`, so `SET title = excluded.title` against a table of that name
+/// reads the table instead and quietly updates nothing.
+const SCHEMA_V2: &str = "
+CREATE TABLE IF NOT EXISTS hidden(
+    id       TEXT PRIMARY KEY,
+    title    TEXT NOT NULL,
+    added_at INTEGER NOT NULL
+);
+";
 
 /// The `level_applied` value meaning no compression was ever attempted.
 ///
@@ -140,6 +157,12 @@ CREATE TABLE IF NOT EXISTS jobs(
     error    TEXT
 );
 CREATE INDEX IF NOT EXISTS jobs_by_state ON jobs(state, created);
+
+CREATE TABLE IF NOT EXISTS hidden(
+    id       TEXT PRIMARY KEY,
+    title    TEXT NOT NULL,
+    added_at INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS activity(
     id          INTEGER PRIMARY KEY,
@@ -614,6 +637,61 @@ impl Db {
         Ok(out)
     }
 
+    /// Stops a game appearing in scans and refuses to compress it.
+    ///
+    /// Steam reports folders that are not games: shared redistributables,
+    /// runtimes, and whatever else ends up under `steamapps/common`. The tool
+    /// guesses at some of those, and this is how a person corrects the guess.
+    pub fn exclude(&self, id: &GameId, title: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO hidden(id, title, added_at) VALUES(?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET title = excluded.title",
+            params![id.to_string(), title, now_secs()],
+        )?;
+        Ok(())
+    }
+
+    /// Lets a game be seen again.
+    ///
+    /// Returns whether it had been excluded, so a caller can say "that was not
+    /// on the list" rather than claiming to have removed something.
+    pub fn unexclude(&self, id: &GameId) -> Result<bool> {
+        let rows = self.conn.execute("DELETE FROM hidden WHERE id = ?1", params![id.to_string()])?;
+        Ok(rows > 0)
+    }
+
+    /// Every excluded game, as id and title, oldest first.
+    pub fn excluded(&self) -> Result<Vec<(GameId, String)>> {
+        let mut stmt =
+            self.conn.prepare("SELECT id, title FROM hidden ORDER BY added_at, id")?;
+        let rows = stmt.query_map([], |row| {
+            let id: String = row.get(0)?;
+            let title: String = row.get(1)?;
+            Ok((id, title))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, title) = row?;
+            // An id that no longer parses belongs to a launcher this build
+            // does not know, so it stays in the table and is skipped here.
+            if let Some(id) = parse_game_id(&id) {
+                out.push((id, title));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether this game is on the exclusion list.
+    pub fn is_excluded(&self, id: &GameId) -> Result<bool> {
+        let found: Option<i64> = self
+            .conn
+            .query_row("SELECT 1 FROM hidden WHERE id = ?1", params![id.to_string()], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     /// Drops everything stored about a game, for a decompress.
     ///
     /// The activity log goes too, so the UI should log the decompress *after*
@@ -695,6 +773,9 @@ fn migrate(conn: &Connection) -> Result<()> {
     tracing::info!(from = current, to = SCHEMA_VERSION, "migrating the state database");
     if current < 1 {
         conn.execute_batch(SCHEMA_V1)?;
+    }
+    if current < 2 {
+        conn.execute_batch(SCHEMA_V2)?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
@@ -991,6 +1072,41 @@ mod tests {
         check_eq(warning.level, ActivityLevel::Warn, "the warning kept its level")?;
         check_eq(warning.bytes_delta, -512, "freed bytes are negative")?;
         check_eq(warning.game_id.clone(), None, "an entry with no game has no id")
+    }
+
+    #[test]
+    fn excluding_hides_a_game_and_removing_shows_it_again() -> TestResult {
+        let db = Db::open_in_memory().ctx("open")?;
+        let id = celeste();
+        let other = GameId::new(Launcher::Steam, "228980");
+
+        check(!db.is_excluded(&id).ctx("check before")?, "nothing is hidden to begin with")?;
+        check(db.excluded().ctx("list before")?.is_empty(), "the list starts empty")?;
+
+        db.exclude(&id, "Celeste").ctx("exclude Celeste")?;
+        db.exclude(&other, "Steamworks Common Redistributables").ctx("exclude the redist")?;
+
+        check(db.is_excluded(&id).ctx("check after")?, "Celeste is hidden")?;
+        check_eq(db.excluded().ctx("list after")?.len(), 2, "both are on the list")?;
+
+        // Excluding twice updates the title instead of failing on the key.
+        db.exclude(&id, "Celeste (renamed)").ctx("exclude again")?;
+        let listed = db.excluded().ctx("list again")?;
+        check_eq(listed.len(), 2, "excluding twice does not add a second row")?;
+        let title = listed
+            .iter()
+            .find(|(listed_id, _)| *listed_id == id)
+            .map(|(_, title)| title.clone())
+            .ctx("Celeste missing from the list")?;
+        check_eq(title, "Celeste (renamed)".to_owned(), "the title is updated")?;
+
+        check(db.unexclude(&id).ctx("unexclude")?, "removing reports that it was there")?;
+        check(!db.is_excluded(&id).ctx("check removed")?, "Celeste is visible again")?;
+        check(
+            !db.unexclude(&id).ctx("unexclude twice")?,
+            "removing something absent reports that it was not there",
+        )?;
+        check_eq(db.excluded().ctx("final list")?.len(), 1, "the other game stays hidden")
     }
 
     #[test]
