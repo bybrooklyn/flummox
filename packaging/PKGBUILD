@@ -29,8 +29,8 @@ options=('!lto')  # LTO is already configured in the release profile.
 # Built straight from the checkout this file lives in, so there is no source
 # array and nothing to checksum. `$startdir` is the packaging directory, so
 # the repository root is one level up. A PKGBUILD for the AUR would instead
-# fetch a tagged tarball and verify it; this one is for building your own
-# copy, and is deliberately not pretending otherwise.
+# fetch a tagged tarball and verify it. This one builds your own copy, where
+# a checksum would change with every edit to the tree.
 _tree="$startdir/.."
 
 prepare() {

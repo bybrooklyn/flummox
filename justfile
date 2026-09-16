@@ -35,12 +35,17 @@ cli *ARGS:
     cargo run --bin flummox -- {{ARGS}}
 
 # The prose rules in CLAUDE.md, as far as grep can check them.
+#
+# The scanned set is everything a reader can see, not just Rust. A banned
+# phrase reached the shipped .desktop file while this reported clean, because
+# packaging/ was not in the list.
 prose:
     #!/usr/bin/env bash
     set -uo pipefail
     fail=0
+    targets=(src tests packaging justfile deny.toml README.md CLAUDE.md .github)
     for pattern in '—' 'on purpose' 'deliberately' 'by design' 'worth knowing' 'is the point'; do
-        hits=$(grep -rn "$pattern" src tests README.md deny.toml CLAUDE.md 2>/dev/null | grep -v 'CLAUDE.md' || true)
+        hits=$(grep -rn "$pattern" "${targets[@]}" 2>/dev/null | grep -v '^CLAUDE.md:' | grep -v '^justfile:' || true)
         if [ -n "$hits" ]; then
             echo "banned: $pattern"
             echo "$hits" | sed 's/^/  /'

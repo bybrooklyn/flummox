@@ -82,6 +82,14 @@ costs nothing: there is no second pass, no rewriting, and no time added to the
 download. Games already installed are untouched, so run `flummox compress` for
 those.
 
+The hook does not catch everything. The filesystem judges each file as it is
+written, using whatever compression level the drive was mounted with, and it
+skips files it guesses will not pay. It guesses wrong often enough to matter.
+Measured on this machine: a 37 MB Half-Life texture archive arrived
+uncompressed, and a later `flummox compress` brought it to 26 MB. A 27 MB
+Unity asset file arrived at 20 MB, and a pass took it to 17 MB. Running
+`flummox compress` after a large download is still worth doing.
+
 `flummox hook off` stops it applying to future downloads and leaves everything
 already compressed exactly as it is.
 
