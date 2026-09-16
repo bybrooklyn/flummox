@@ -3,7 +3,7 @@
 //! Kept separate from [`crate::view`] so that page code reads as layout rather
 //! than as a list of colour values.
 
-use iced::widget::{container, text};
+use iced::widget::{button, container, text};
 use iced::{Background, Border, Color, Element, Font, Theme, color};
 
 /// The one accent colour: used for the selected page and for savings.
@@ -78,6 +78,54 @@ pub fn banner(is_error: bool) -> impl Fn(&Theme) -> container::Style {
         border: Border { radius: 6.0.into(), width: 0.0, color: DANGER },
         text_color: Some(TEXT),
         ..container::Style::default()
+    }
+}
+
+/// Blends `from` into `to`, with `t` from 0.0 to 1.0.
+///
+/// Animations interpolate a single number, and this turns that number into
+/// the colours a widget style needs.
+fn mix(from: Color, to: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    Color::from_rgb(
+        from.r + (to.r - from.r) * t,
+        from.g + (to.g - from.g) * t,
+        from.b + (to.b - from.b) * t,
+    )
+}
+
+/// A sidebar entry, drawn as a button with a filled background.
+///
+/// `highlight` runs from 0.0 to 1.0 so the caller can animate the selection
+/// as it moves between entries instead of snapping.
+pub fn nav_button(highlight: f32) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let hover = match status {
+            button::Status::Hovered | button::Status::Pressed => 0.35,
+            button::Status::Active | button::Status::Disabled => 0.0,
+        };
+        let fill = (highlight + hover).clamp(0.0, 1.0);
+        button::Style {
+            background: Some(Background::Color(mix(PANEL, ACCENT_DIM, fill))),
+            text_color: mix(TEXT_MUTED, TEXT, highlight.clamp(0.0, 1.0).max(hover)),
+            border: Border { radius: 6.0.into(), width: 0.0, color: Color::TRANSPARENT },
+            ..button::Style::default()
+        }
+    }
+}
+
+/// The button for the main action on a page.
+pub fn action_button(_theme: &Theme, status: button::Status) -> button::Style {
+    let fill = match status {
+        button::Status::Hovered | button::Status::Pressed => ACCENT,
+        button::Status::Active => ACCENT_DIM,
+        button::Status::Disabled => PANEL,
+    };
+    button::Style {
+        background: Some(Background::Color(fill)),
+        text_color: TEXT,
+        border: Border { radius: 6.0.into(), width: 0.0, color: Color::TRANSPARENT },
+        ..button::Style::default()
     }
 }
 

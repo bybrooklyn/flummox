@@ -3,6 +3,8 @@
 //! This module only reads state and builds elements; anything that changes
 //! the world goes through a [`Message`] and [`crate::app::update`].
 
+use std::time::Instant;
+
 use humansize::{DECIMAL, format_size};
 use iced::widget::{button, column, container, row, scrollable, text};
 use iced::{Element, Length};
@@ -15,7 +17,7 @@ const SIDEBAR_WIDTH: f32 = 190.0;
 
 /// The whole window.
 pub fn view(state: &State) -> Element<'_, Message> {
-    let body = row![sidebar(state), content(state)];
+    let body = row![sidebar(state, Instant::now()), content(state)];
     container(body)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -24,10 +26,17 @@ pub fn view(state: &State) -> Element<'_, Message> {
 }
 
 /// The page list down the left.
-fn sidebar(state: &State) -> Element<'_, Message> {
-    let mut items = column![text("flummox").size(18)].spacing(4).padding(16);
+///
+/// `now` is read once per frame so every entry interpolates against the same
+/// instant, which keeps the highlight one moving shape.
+fn sidebar(state: &State, now: Instant) -> Element<'_, Message> {
+    let position = state.nav.interpolate_with(|slot| slot, now);
+    let mut items = column![text("Flummox").size(20)].spacing(6).padding(16);
     for page in PAGES {
-        items = items.push(nav_item(page, page == state.page));
+        // Full strength where the selection has arrived, fading out across the
+        // one entry either side of it.
+        let highlight = (1.0 - (position - page.slot()).abs()).clamp(0.0, 1.0);
+        items = items.push(nav_item(page, highlight, page == state.page));
     }
     container(items)
         .width(Length::Fixed(SIDEBAR_WIDTH))
@@ -37,15 +46,11 @@ fn sidebar(state: &State) -> Element<'_, Message> {
 }
 
 /// One entry in the sidebar.
-fn nav_item(page: Page, selected: bool) -> Element<'static, Message> {
-    let label = if selected {
-        text(page.label()).size(15)
-    } else {
-        theme::muted(page.label()).size(15)
-    };
-    button(label)
+fn nav_item(page: Page, highlight: f32, selected: bool) -> Element<'static, Message> {
+    button(text(page.label()).size(15))
         .width(Length::Fill)
-        .style(button::text)
+        .padding(10)
+        .style(theme::nav_button(highlight))
         // The page you are on is not somewhere to navigate to.
         .on_press_maybe((!selected).then_some(Message::GoTo(page)))
         .into()
@@ -85,13 +90,9 @@ fn page(state: &State) -> Element<'_, Message> {
         Page::Overview => overview(state),
         Page::Games => games(state),
         Page::Queue => placeholder("Queue", "Jobs will appear here once the GUI can start them."),
-        Page::Updates => {
-            placeholder("Updates", "Games updated since they were last compressed will be listed here.")
-        }
+        Page::Updates => updates(state),
         Page::Drives => drives(state),
-        Page::Activity => {
-            placeholder("Activity", "What the tool has done, read from the state database.")
-        }
+        Page::Activity => activity(state),
     }
 }
 
@@ -107,6 +108,8 @@ fn overview(state: &State) -> Element<'_, Message> {
         theme::stat(state.games.len().to_string(), "games found"),
         theme::stat(format_size(state.total_bytes(), DECIMAL), "installed"),
         theme::stat(supported.to_string(), "can be compressed"),
+        theme::stat(state.compressed_count().to_string(), "compressed so far"),
+        theme::stat(format_size(state.estimated_saved(), DECIMAL), "estimated saving"),
     ]
     .spacing(40);
 
@@ -125,7 +128,12 @@ fn overview(state: &State) -> Element<'_, Message> {
     }
 
     items
-        .push(button(text("Rescan")).on_press(Message::Refresh))
+        .push(
+            button(text("Rescan"))
+                .padding(10)
+                .style(theme::action_button)
+                .on_press(Message::Refresh),
+        )
         .into()
 }
 
@@ -191,6 +199,58 @@ fn drives(state: &State) -> Element<'_, Message> {
         ]
         .spacing(2);
         list = list.push(container(entry).padding(12).width(Length::Fill).style(theme::panel));
+    }
+    list.into()
+}
+
+/// Games the launcher has updated since the last pass.
+///
+/// A build string that no longer matches the one recorded means Steam has
+/// written new files, and those files are not compressed yet.
+fn updates(state: &State) -> Element<'_, Message> {
+    let mut list = column![theme::page_title("Updates")].spacing(10);
+    let mut found = 0usize;
+    for row_data in &state.games {
+        let Some(record) = state.records.iter().find(|r| r.id == row_data.game.id) else {
+            continue;
+        };
+        if record.build == row_data.game.build {
+            continue;
+        }
+        found += 1;
+        let entry = column![
+            text(row_data.game.title.clone()).size(15),
+            theme::muted(format!(
+                "compressed at zstd {}, and the game has changed since",
+                record.level
+            )),
+        ]
+        .spacing(2);
+        list = list.push(container(entry).padding(12).width(Length::Fill).style(theme::panel));
+    }
+    if found == 0 {
+        return list.push(theme::muted("Every compressed game is up to date.")).into();
+    }
+    list.into()
+}
+
+/// What the tool has done, newest first.
+fn activity(state: &State) -> Element<'_, Message> {
+    let mut list = column![theme::page_title("Activity")].spacing(10);
+    if state.activity.is_empty() {
+        return list
+            .push(theme::muted("Nothing recorded yet. Compress a game and it appears here."))
+            .into();
+    }
+    for entry in &state.activity {
+        let mut line = column![text(entry.message.clone()).size(15)].spacing(2);
+        if entry.bytes_delta != 0 {
+            let size = format_size(entry.bytes_delta.unsigned_abs(), DECIMAL);
+            let note =
+                if entry.bytes_delta < 0 { format!("{size} freed") } else { format!("{size} used") };
+            line = line.push(theme::muted(note));
+        }
+        list = list.push(container(line).padding(12).width(Length::Fill).style(theme::panel));
     }
     list.into()
 }

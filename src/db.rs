@@ -519,6 +519,43 @@ impl Db {
         raw.into_record(id).map(Some)
     }
 
+    /// Every game with a recorded pass, most recently compressed first.
+    ///
+    /// A row whose id no longer parses is left out, so a record written by a
+    /// build that knew another launcher cannot stop the rest being read.
+    pub fn games(&self) -> Result<Vec<GameRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, launcher, title, path, backend, level, preset,
+                    build_at_compress, compressed_at, install_bytes,
+                    disk_before, disk_after, est_saving
+             FROM games ORDER BY compressed_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let id: String = row.get(0)?;
+            Ok((id, RawGame {
+                launcher: row.get(1)?,
+                title: row.get(2)?,
+                path: row.get(3)?,
+                backend: row.get(4)?,
+                level: row.get(5)?,
+                preset: row.get(6)?,
+                build: row.get(7)?,
+                compressed_at: row.get(8)?,
+                install_bytes: row.get(9)?,
+                disk_before: row.get(10)?,
+                disk_after: row.get(11)?,
+                est_saving: row.get(12)?,
+            }))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, raw) = row?;
+            let Some(id) = parse_game_id(&id) else { continue };
+            out.push(raw.into_record(&id)?);
+        }
+        Ok(out)
+    }
+
     /// Every stored fingerprint for a game, keyed by path relative to the
     /// install directory.
     pub fn fingerprints(&self, id: &GameId) -> Result<HashMap<PathBuf, FileFingerprint>> {

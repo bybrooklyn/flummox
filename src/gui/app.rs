@@ -1,11 +1,17 @@
 //! The window's state and the messages that change it.
 //!
-//! Free of `iced` types, so everything here can be driven from a test with no
-//! display attached. [`crate::gui::view`] is the only module that knows what a
-//! widget is.
+//! Holds no widgets, so everything here can be driven from a test with no
+//! display attached. [`crate::gui::view`] is the only module that builds
+//! widgets. The one `iced` type here is [`Animation`], which is arithmetic
+//! over time and needs no window.
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
+use iced::Animation;
+use iced::animation::Easing;
+
+use crate::db::{Activity, Db, GameRecord};
 use crate::fsprobe::{self, Tier};
 use crate::model::Game;
 use crate::launchers::Env;
@@ -41,6 +47,21 @@ impl Page {
             Self::Updates => "Updates",
             Self::Drives => "Drives",
             Self::Activity => "Activity",
+        }
+    }
+
+    /// Position in the sidebar, as the value the selection animates towards.
+    ///
+    /// Spelled out instead of derived from [`PAGES`] so it needs no cast from
+    /// an index. `pages_and_slots_agree` keeps the two in step.
+    pub fn slot(self) -> f32 {
+        match self {
+            Self::Overview => 0.0,
+            Self::Games => 1.0,
+            Self::Queue => 2.0,
+            Self::Updates => 3.0,
+            Self::Drives => 4.0,
+            Self::Activity => 5.0,
         }
     }
 }
@@ -128,23 +149,64 @@ pub struct State {
     pub warnings: Vec<String>,
     /// The banner above the page, if any.
     pub status: Option<Status>,
+    /// The state database, when one could be opened.
+    pub db: Option<Db>,
+    /// What earlier passes recorded, most recent first.
+    pub records: Vec<GameRecord>,
+    /// Recent log lines, for the Activity page.
+    pub activity: Vec<Activity>,
+    /// The sidebar selection, so it slides between entries.
+    pub nav: Animation<f32>,
 }
 
 impl State {
     /// Builds the initial state by scanning for games.
-    pub fn new(env: Env) -> Self {
-        let mut state =
-            Self { env, page: Page::Overview, games: Vec::new(), warnings: Vec::new(), status: None };
+    ///
+    /// The database is passed in so a test can run against none, and never
+    /// against the real one.
+    pub fn new(env: Env, db: Option<Db>) -> Self {
+        let mut state = Self {
+            env,
+            page: Page::Overview,
+            games: Vec::new(),
+            warnings: Vec::new(),
+            status: None,
+            db,
+            records: Vec::new(),
+            activity: Vec::new(),
+            nav: Animation::new(Page::Overview.slot())
+                .duration(Duration::from_millis(220))
+                .easing(Easing::EaseOutCubic),
+        };
         state.refresh();
         state
     }
 
-    /// Rescans the launchers.
+    /// Rescans the launchers and reloads what earlier passes recorded.
     pub fn refresh(&mut self) {
         let scan = crate::launchers::scan_all(&self.env);
         self.warnings = scan.warnings.iter().map(ToString::to_string).collect();
         self.games = scan.games.into_iter().filter(|g| !g.is_tool).map(GameRow::probe).collect();
-        tracing::info!(games = self.games.len(), "scanned");
+        if let Some(db) = &self.db {
+            // An unreadable database leaves these empty, so the window shows
+            // what is on disk without claiming anything was compressed.
+            self.records = db.games().unwrap_or_default();
+            self.activity = db.recent_activity(50).unwrap_or_default();
+        }
+        tracing::info!(games = self.games.len(), records = self.records.len(), "scanned");
+    }
+
+    /// Games with a recorded compression pass.
+    pub fn compressed_count(&self) -> usize {
+        self.records.len()
+    }
+
+    /// What earlier passes estimated they saved, summed.
+    ///
+    /// The estimate is shown instead of the free-space delta, which covers the
+    /// whole filesystem and includes writes by other processes.
+    pub fn estimated_saved(&self) -> u64 {
+        self.records.iter().filter_map(|r| u64::try_from(r.est_saving).ok()).sum()
     }
 
     /// Games this tool can actually work on.
@@ -178,6 +240,10 @@ pub enum Message {
     Refresh,
     /// Dismiss the banner.
     Dismiss,
+    /// A frame passed while something was animating.
+    ///
+    /// Carries nothing: the view reads the clock itself as it draws.
+    Tick,
 }
 
 /// Applies a message.
@@ -187,7 +253,10 @@ pub enum Message {
 /// the first one lands rather than before.
 pub fn update(state: &mut State, message: Message) {
     match message {
-        Message::GoTo(page) => state.page = page,
+        Message::GoTo(page) => {
+            state.page = page;
+            state.nav.go_mut(page.slot(), Instant::now());
+        }
         Message::Refresh => {
             state.refresh();
             // A launcher that could not be read is worth saying out loud: the
@@ -203,6 +272,9 @@ pub fn update(state: &mut State, message: Message) {
             });
         }
         Message::Dismiss => state.status = None,
+        // The frame itself is the work: receiving it redraws the window, and
+        // the sidebar reads the animation afresh each time.
+        Message::Tick => {}
     }
 }
 
@@ -216,7 +288,7 @@ mod tests {
     /// happens to be installed.
     fn empty_state() -> Result<(tempfile::TempDir, State), String> {
         let tmp = tempfile::TempDir::new().map_err(|e| e.to_string())?;
-        let state = State::new(Env::from_home(tmp.path()));
+        let state = State::new(Env::from_home(tmp.path()), None);
         Ok((tmp, state))
     }
 
@@ -241,6 +313,36 @@ mod tests {
         check(state.status.is_some(), "a refresh reports what it found")?;
         update(&mut state, Message::Dismiss);
         check(state.status.is_none(), "dismissing clears the banner")
+    }
+
+    #[test]
+    fn pages_and_slots_agree() -> TestResult {
+        let mut previous: Option<f32> = None;
+        for page in PAGES {
+            let slot = page.slot();
+            let matches = PAGES.iter().filter(|other| other.slot() == slot).count();
+            check_eq(matches, 1, format!("{page:?} has a slot of its own"))?;
+            match previous {
+                Some(last) => {
+                    check(slot > last, format!("{page:?} sits after the entry before it"))?;
+                }
+                None => check(slot.abs() < f32::EPSILON, "the first entry sits at zero")?,
+            }
+            previous = Some(slot);
+        }
+        check(previous.is_some(), "the sidebar lists at least one page")
+    }
+
+    #[test]
+    fn navigating_moves_the_selection_animation() -> TestResult {
+        let (_tmp, mut state) = empty_state()?;
+        update(&mut state, Message::GoTo(Page::Drives));
+        let settled = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let landed = state.nav.interpolate_with(|value| value, settled);
+        check(
+            (landed - Page::Drives.slot()).abs() < 0.01,
+            format!("the selection settles on Drives, reached {landed}"),
+        )
     }
 
     #[test]
