@@ -31,7 +31,6 @@ thiserror = "2"
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "1"
 zstd = "0.13"
 walkdir = "2"
 rayon = "1"
@@ -44,7 +43,6 @@ rustix = { version = "1", features = ["fs"] }
 landlock = "0.4"
 xattr = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
-directories = "6"
 humansize = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

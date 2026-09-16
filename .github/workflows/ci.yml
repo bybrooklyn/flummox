@@ -11,18 +11,18 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  test:
-    name: Build, test and lint
+  check:
+    name: Build, test, lint and dependency policy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install the toolchain
         run: rustup toolchain install stable --profile minimal --component clippy
 
       # The GUI links against the system's windowing, rendering and font
-      # libraries; without these the workspace builds everywhere except the
-      # one crate a user actually looks at.
+      # libraries. Without these everything builds except the one binary a
+      # user actually looks at.
       - name: Install the GUI's system dependencies
         run: |
           sudo apt-get update
@@ -30,41 +30,31 @@ jobs:
             libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev \
             libxi-dev libgl1-mesa-dev libfontconfig1-dev
 
+      # CI runs the same recipes the pre-push hook runs. While CI called cargo
+      # directly the two drifted, and a licence failure reached main because
+      # the local checks and the remote ones were not the same checks.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-deny
+
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build
-        run: cargo build --all-features --all-targets
-
-      # The btrfs-specific tests check the filesystem they are running on and
-      # skip themselves elsewhere, so this is honest but not complete: the
-      # ioctl paths are only really exercised on a btrfs machine. See the
-      # `fs-matrix` job below.
-      - name: Test
-        run: cargo test --all-features
-
-      - name: Clippy
-        run: cargo clippy --all-features --all-targets -- -D warnings
-
-  deny:
-    name: Dependency policy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check
+      # lint, then test, then the dependency policy.
+      - name: just ci
+        run: just ci
 
   fs-matrix:
     name: Filesystem matrix (btrfs)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
       - name: Install the toolchain
         run: rustup toolchain install stable --profile minimal
 
-      # A loop-mounted image is the only way to exercise the real defrag
-      # ioctl and the FIEMAP reader on a runner. Mounting needs root, which is
-      # why this is a separate job rather than part of the test run.
+      # A loop-mounted image is the only way to exercise the real defrag ioctl
+      # and the FIEMAP reader on a runner. Mounting needs root, which is why
+      # this is a separate job.
       - name: Make a btrfs filesystem to test against
         run: |
           sudo apt-get update
@@ -77,10 +67,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # The tests that need btrfs create their temporary directories inside
-      # the current directory, so running from the mount is what selects them.
+      # These tests create their temporary directories inside the current
+      # directory, so running from the mount is what selects them. Anywhere
+      # else they skip themselves, which would make a green run misleading.
       - name: Run the backend tests on btrfs
         run: |
-          cargo build --tests -p flummox
+          cargo build --tests
           cd /tmp/btrfs
-          cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" -p flummox backend::btrfs
+          cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" backend::btrfs
