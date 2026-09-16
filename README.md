@@ -1,105 +1,143 @@
 # Flummox
 
-Compress your game library and keep playing it. Named for the reaction to how
-much space comes back.
+Your games take up less space and still work. Named for the reaction to how
+much comes back.
 
-This is a Linux counterpart to the Windows tool of the same idea: instead of NTFS
-LZX compression, it uses the filesystem's own transparent zstd support, so a
-compressed game is still an ordinary directory of ordinary files. Steam does not
-know anything happened, and there is no archive to unpack before playing.
+Flummox tells the filesystem to store your installed games compressed. The
+files stay where they are, the game still launches, and nothing is packed into
+an archive you have to unpack first. One command puts it all back.
 
-**Status: early.** The btrfs backend works and is in daily use on the author's
-library. Support for ext4, XFS and F2FS, which is what the Steam Deck needs,
-is designed but not built yet.
+How much you get back depends entirely on the game. Video, audio, textures and
+packed archives give back nothing, and Flummox skips them instead of burning
+CPU to prove it. A few real examples from one library, estimated at the
+strongest setting:
 
-## What it does
+| Game                  | Installed | Estimated saving |
+|-----------------------|-----------|------------------|
+| Detroit: Become Human | 65.8 GB   | 4.34 GB          |
+| Warframe              | 55.3 GB   | 958 MB           |
+| Celeste               | 1.20 GB   | 45 MB            |
+| Just Cause 3          | 88.3 GB   | 56 MB            |
 
-- **Finds your games.** Steam libraries (native, Flatpak and snap), including
-  the awkward cases: several app IDs sharing one folder, and Steam's "running"
-  flag going stale after a crash.
-- **Estimates before it acts.** Files are sampled rather than read whole, and
-  the estimate models what the *filesystem* will do. btrfs compresses each
-  128 KiB block separately and stores a block uncompressed when compressing it
-  would not free a whole 4 KiB sector.
-- **Compresses in place.** Games stay playable, and files Steam writes later
-  inherit compression.
-- **Only redoes what changed.** Each pass records a fingerprint per file, so
-  after a game update it recompresses the handful of files that actually
-  changed rather than the whole install.
-- **Reverses cleanly.** `decompress` puts a game back.
+Just Cause 3 is the honest counterexample: 88 GB that is already packed tight,
+so there is almost nothing to win. Flummox tells you that before it does any
+work, which is the whole reason it estimates first.
 
-It refuses to touch a game that is running, updating or being validated, and it
-warns before compressing on a snapshotted subvolume, where rewriting extents can
-*increase* usage until the snapshots expire.
+Those figures come from a drive **already** compressing everything at the
+weakest setting, so they are gains on top of that. On an uncompressed drive,
+expect more.
 
-## Install
+## Get it
 
-Requires a recent Rust toolchain and a btrfs filesystem.
+**[Download the latest release](https://github.com/bybrooklyn/flummox/releases/latest)**
+
+Arch and CachyOS:
+
+```sh
+git clone https://github.com/bybrooklyn/flummox
+cd flummox/packaging && makepkg -si
+```
+
+Anything else, with a Rust toolchain installed:
 
 ```sh
 git clone https://github.com/bybrooklyn/flummox
 cd flummox
-cargo build --release
+cargo build --release --features gui
 ```
 
-The binaries are `target/release/flummox` (command line) and
-`target/release/flummox-gui` (desktop window).
+That gives you `flummox` for the terminal and `flummox-gui` for the window.
+Leave off `--features gui` if you only want the command line tool, and you skip
+compiling the entire window stack with it.
 
-## Use
+## What works today
+
+| | |
+|---|---|
+| **Games** | Steam, including native, Flatpak and snap installs |
+| **Drives** | btrfs |
+| **Desktop** | Any Linux desktop. The window runs on Wayland and X11 |
+
+## What does not work yet
+
+| | |
+|---|---|
+| **ext4, XFS, F2FS** | Designed, not built. This is what the Steam Deck's internal drive uses, so the Deck is not supported yet |
+| **Windows and macOS** | Planned. Windows will use its own compression, not zstd |
+| **Heroic, Lutris, Bottles** | Planned. Steam only for now |
+| **Flatpak build** | Not possible. The sandbox hides other processes, so Flummox could not tell whether a game was running, which is the check that keeps it from touching a game you are playing |
+
+## Use it
 
 ```sh
-flummox scan                     # what is installed, and where
-flummox estimate 105600          # what compressing it would save
+flummox scan                        # every game, and what drive it is on
+flummox estimate 105600             # what compressing it would save
 flummox compress 105600 --preset max
-flummox status 105600            # how much is stored compressed
-flummox decompress 105600        # put it back
-flummox log                      # what this tool has done
-flummox doctor                   # check this machine
+flummox decompress 105600           # put it back
+flummox status 105600               # how much is stored compressed
+flummox log                         # what Flummox has done
+flummox doctor                      # check this machine
 ```
 
-A game can be named by app ID, by `steam:105600`, or by part of its title.
-Presets are `fast`, `balanced` and `max` (zstd 3, 9 and 15); `--level` overrides
-them. Every read-only command takes `--json`.
+Name a game by its Steam app ID, by `steam:105600`, or by part of its title.
+Presets are `fast`, `balanced` and `max`. Every read-only command takes
+`--json`.
 
-Compression is worth least on a drive already mounted with `compress=zstd:1`,
-because most of the gain is already banked. The tool says so instead of
-quietly reporting a large number.
+Flummox refuses to touch a game that is running, updating or being verified.
+Ctrl-C stops between files, so a cancelled job leaves a game that is partly
+compressed, still playable, and safe to resume.
 
-## How it protects you
+## Is this safe?
 
-This runs on your own machine with write access to entire game libraries, and it
-reaches the kernel through `unsafe` ioctls. That earns some care:
+Compression changes how the filesystem stores a file, not the file. Every byte
+reads back identically, which the tests check by comparing checksums before and
+after. Nothing is deleted and nothing is moved.
 
-- **Every file is opened through a held directory handle**, using `openat2` with
-  `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, so a symlink swapped in between
-  choosing a file and rewriting it cannot redirect the job elsewhere.
-- **Jobs are sandboxed with Landlock** before any worker thread starts: the
-  process can reach the game folder and little else, whatever the code does.
-- **The manifest parser is bounded.** It reads files Steam writes, in a
-  directory anything running as you can write to. Nesting is capped, after a
-  property test found that about 20 KB of nested braces would overflow the stack
-  and abort the process outright.
-- **Nothing is deleted.** Compression rewrites a file's storage; the contents are
-  unchanged, which the test suite checks by comparing checksums before and after.
-- **Ctrl-C stops between files**, so a cancelled job leaves a valid, partly
-  compressed game that can be resumed.
+The one case to know about: if your drive has snapshots, rewriting a file
+unshares it from its snapshots, so usage can go **up** until those snapshots
+expire. Flummox checks and warns before it starts.
 
-Dependencies are checked with `cargo deny check` (advisories, licences,
-duplicate versions and sources).
+---
 
-## Does it actually save anything?
+## How it works
 
-That depends entirely on the game. Already-compressed data (video, audio,
-textures, packed archives) gives back nothing, and the tool skips it instead of
-than burning CPU to prove it. Measured here on btrfs already mounted with
-`compress=zstd:1`, so these are gains *on top of* what the mount had:
+The rest of this is for people who want the mechanism.
 
-| Game    | Install | Freed at zstd 15 |
-|---------|---------|------------------|
-| Celeste | 1.20 GB | 80.35 MB         |
-| Balatro | 66.7 MB | 3.04 MB          |
+**Compressing.** btrfs can store any file compressed, and decompresses blocks
+as they are read, which is why the game neither knows nor cares. Flummox drives
+`BTRFS_IOC_DEFRAG_RANGE` once per file to rewrite it compressed at a chosen
+zstd level, and sets a property on the folder so files Steam writes later
+inherit it.
 
-Estimates are sampled, so treat them as a guide.
+**Estimating.** Reading a 60 GB install to predict the result would cost as
+much as doing it. Flummox samples evenly spaced blocks and models what the
+filesystem will actually do: btrfs compresses each 128 KiB block separately and
+keeps a block uncompressed when compressing it would not free a whole 4 KiB
+sector. It then reads which extents are already compressed, via `FIEMAP`, so it
+never promises a saving that a previous pass already took.
+
+**Only redoing what changed.** Each pass records size, inode, mtime and ctime
+per file in a small SQLite database. After a game update, only the files that
+actually changed are recompressed. Compressing does not disturb any of those
+four fields, which a regression test pins down.
+
+**Finding games.** Flummox parses Steam's own `libraryfolders.vdf` and
+`appmanifest_*.acf`. That means handling the awkward parts: several app IDs
+sharing one install folder, and Steam's "running" flag still being set after a
+crash. It cross-checks against live processes rather than trusting the flag.
+
+**Safety machinery.** Files are opened relative to a held directory handle with
+`openat2` and `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, so a symlink swapped in
+after the scan cannot redirect a write. Each job restricts itself with Landlock
+before any worker thread starts, so the process can reach the game folder and
+little else. The manifest parser caps nesting, after a property test found that
+about 20 KB of nested braces would overflow the stack and abort the process.
+
+**Checks.** `just ci` runs clippy at deny-warnings, the full test suite, and
+`cargo deny check` for advisories, licences, duplicate versions and sources.
+A pre-push hook runs the same thing, so CI is a second opinion rather than the
+first one. `unwrap`, `expect`, `panic` and indexing are banned throughout,
+including in tests.
 
 ## Licence
 

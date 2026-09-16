@@ -13,6 +13,10 @@
 //! - `FS_IOC_FIEMAP`, whose `ENCODED` flag marks compressed extents, to report
 //!   status without the privileges `compsize` needs.
 
+// Every ioctl in the crate is here: the defrag call that compresses a file and
+// the FIEMAP call that reports what is compressed.
+#![allow(unsafe_code)]
+
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -93,19 +97,15 @@ struct FiemapExtent {
 
 nix::ioctl_readwrite!(fs_ioc_fiemap, b'f', 11, Fiemap);
 
-/// Rewrites a file as compressed extents at `level`.
-///
-/// The file is opened read-only. The kernel checks write *permission*, not
-/// the open mode, so this still works on a game executable that is running.
-pub fn compress_file(path: &Path, level: i32) -> io::Result<i32> {
-    compress_fd(&File::open(path)?, level)
-}
-
 /// Rewrites an already-open file as compressed extents at `level`.
 ///
-/// Jobs use this rather than [`compress_file`], having opened the file
-/// through a [`Anchor`] so the path could not have been swapped for a symlink
-/// between the walk and the open.
+/// Taking a handle rather than a path is the point: the caller obtained it
+/// from an [`Anchor`], so the path could not have been swapped for a symlink
+/// between the walk and the rewrite. There is deliberately no path-taking
+/// version, because that would be a route around the check.
+///
+/// The handle may be read-only. The kernel checks write *permission*, not the
+/// open mode, so this still works on a game executable that is running.
 pub fn compress_fd(file: &File, level: i32) -> io::Result<i32> {
     let args = DefragRangeArgs {
         start: 0,
@@ -148,12 +148,9 @@ pub fn compress_fd(file: &File, level: i32) -> io::Result<i32> {
 /// floor rather than a promise.
 pub const DEFAULT_LEVEL: i32 = 3;
 
-/// Rewrites a file as uncompressed extents.
-pub fn decompress_file(path: &Path) -> io::Result<()> {
-    decompress_fd(&File::open(path)?)
-}
-
 /// Rewrites an already-open file as uncompressed extents.
+///
+/// Anchored for the same reason as [`compress_fd`].
 pub fn decompress_fd(file: &File) -> io::Result<()> {
     let args = DefragRangeArgs {
         start: 0,
@@ -492,13 +489,16 @@ mod tests {
         };
         let path = tmp.path().join("text.dat");
         std::fs::write(&path, "compress me ".repeat(500_000).into_bytes()).ctx("write text.dat")?;
+        // Reached the way a job reaches it, through an anchored open.
+        let anchor = Anchor::open(tmp.path()).ctx("open the anchor")?;
+        let file = anchor.open_file(Path::new("text.dat")).ctx("open text.dat")?;
 
-        compress_file(&path, 15).ctx("compress text.dat")?;
+        compress_fd(&file, 15).ctx("compress text.dat")?;
         let (compressed, total) = compressed_bytes(&path).ctx("map extents after compressing")?;
         check(total > 0, "the file maps at least one extent")?;
         check(compressed > 0, format!("expected compressed extents, got {compressed}/{total}"))?;
 
-        decompress_file(&path).ctx("decompress text.dat")?;
+        decompress_fd(&file).ctx("decompress text.dat")?;
         let (compressed, total) = compressed_bytes(&path).ctx("map extents after decompressing")?;
         check_eq(
             compressed,
@@ -533,7 +533,9 @@ mod tests {
             .ctx("write the test file")?;
         let before = std::fs::metadata(&path).ctx("stat before")?;
 
-        compress_file(&path, 15).ctx("compress the file")?;
+        let anchor = Anchor::open(tmp.path()).ctx("open the anchor")?;
+        let file = anchor.open_file(Path::new("fingerprint.dat")).ctx("open the file")?;
+        compress_fd(&file, 15).ctx("compress the file")?;
         let after = std::fs::metadata(&path).ctx("stat after")?;
 
         check_eq(after.ino(), before.ino(), "the inode must survive")?;

@@ -14,6 +14,10 @@
 //! final component but cannot police the directories above it; callers can
 //! check [`Anchor::fully_resolved`] to know which guarantee they have.
 
+// Opening files is this module's whole job, and `openat2` comes through
+// `rustix`, so the unsafe here is in the test helper rather than the API.
+#![allow(unsafe_code)]
+
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};

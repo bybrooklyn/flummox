@@ -4,6 +4,9 @@
 //! Steam apps flagged "running" with nothing running. So before touching a
 //! directory we also look for a live process with a file open inside it.
 
+// `getuid` is the only unsafe call here, used to skip other users' processes.
+#![allow(unsafe_code)]
+
 use std::path::{Path, PathBuf};
 
 /// A process, reduced to the paths that tell us whether it is using a game.

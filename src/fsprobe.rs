@@ -6,6 +6,10 @@
 //! btrfs gives every subvolume its own device number, so a subvolume would
 //! never match its mount entry.
 
+// `statfs` has no safe wrapper that reports the filesystem magic, so the call
+// is made directly.
+#![allow(unsafe_code)]
+
 use std::ffi::CString;
 use std::io;
 use std::mem::MaybeUninit;

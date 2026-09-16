@@ -27,6 +27,9 @@
 //! but honest about it. Compression is not a security boundary the user chose
 //! to rely on, so failing to sandbox must never fail the job.
 
+// The enforcement test forks, because Landlock is irreversible per process.
+#![allow(unsafe_code)]
+
 use std::path::{Path, PathBuf};
 
 use landlock::{
