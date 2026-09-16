@@ -686,7 +686,7 @@ impl RawGame {
 ///
 /// Safe to call on an already-current database: it reads `user_version` first
 /// and does nothing when there is nothing to do. A file written by a newer
-/// build is left alone rather than downgraded.
+/// build is left alone, never downgraded.
 fn migrate(conn: &Connection) -> Result<()> {
     let current: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if current >= SCHEMA_VERSION {

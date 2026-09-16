@@ -124,10 +124,10 @@ proptest! {
     /// sector that made it worth taking.
     ///
     /// The "does this free a sector?" test is computed here in exact `u64`
-    /// arithmetic rather than by repeating the implementation's
-    /// `compressed.saturating_add(SECTOR) > uncompressed`. That is the point
-    /// of a property: restating the expression would make any mistake in it
-    /// invisible. The two really do disagree at
+    /// arithmetic, not by repeating the implementation's
+    /// `compressed.saturating_add(SECTOR) > uncompressed`. Restating the
+    /// expression would make any mistake in it invisible, which is what a
+    /// property is for. The two really do disagree at
     /// `uncompressed == compressed == u32::MAX`, where the saturating add
     /// pins at `u32::MAX` and the comparison decides a block that saves
     /// nothing is worth compressing. The *cost* is the same on both branches

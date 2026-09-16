@@ -2,9 +2,9 @@
 //! it can be compressed.
 //!
 //! The filesystem type comes from `/proc/self/mountinfo` by longest-prefix
-//! match, cross-checked against the `statfs` magic. `st_dev` is deliberately
-//! not used: btrfs gives every subvolume its own device number, so a subvolume
-//! would never match its mount entry.
+//! match, cross-checked against the `statfs` magic. `st_dev` would not work:
+//! btrfs gives every subvolume its own device number, so a subvolume would
+//! never match its mount entry.
 
 use std::ffi::CString;
 use std::io;

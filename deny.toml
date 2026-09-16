@@ -4,14 +4,13 @@
 #
 # This tool runs on a user's own machine, with write access to entire game
 # libraries, and the compression backends reach the kernel through `unsafe`
-# ioctls and `openat2`. A dependency that is compromised, unvendorable, or
-# licensed incompatibly is therefore not a paperwork problem: it is either a
-# supply-chain foothold in something that rewrites files, or a licence
-# violation in an AGPL-3.0-or-later program that we cannot legally ship.
+# ioctls and `openat2`. A compromised dependency here can rewrite someone's
+# files, and an incompatibly licensed one cannot legally ship in an
+# AGPL-3.0-or-later program.
 #
-# The four sections below correspond to the four questions worth asking of a
-# dependency tree: is anything known to be broken, may we legally link it, are
-# we carrying it more than once, and did it come from somewhere we trust.
+# The four sections below answer four questions about the dependency tree: is
+# anything known to be broken, may we legally link it, are we carrying it more
+# than once, and did it come from somewhere we trust.
 #
 # Note on schema: no `version = 2` key is set. Those keys existed only to opt
 # in to the modern schema while the v1 one was still supported, and setting
@@ -19,8 +18,8 @@
 # valid in the current schema are used here.
 
 [graph]
-# Evaluate every feature combination rather than the default set. Features
-# pull in extra crates, such as `rusqlite`'s `bundled` and `clap`'s `derive`, and a
+# Evaluate every feature combination, not just the default set. Features pull
+# in extra crates, such as `rusqlite`'s `bundled` and `clap`'s `derive`, and a
 # licence or advisory that only appears behind a feature flag still ships.
 all-features = true
 
@@ -74,9 +73,9 @@ ignore = [
 # would have to be removed rather than debated.
 #
 # This list is exactly what the current dependency tree resolves to, verified
-# against `cargo metadata`, and nothing more. Keeping it minimal is the point:
-# a speculative entry is an approval granted in advance to a crate nobody has
-# looked at, and `unused-allowed-license` below makes a stale entry visible.
+# against `cargo metadata`, and nothing more. A speculative entry approves in
+# advance a crate no one has looked at, and `unused-allowed-license` below
+# makes a stale entry visible.
 allow = [
     # Our own crates, and the terms the whole work ships under.
     "AGPL-3.0-or-later",
@@ -118,14 +117,15 @@ allow = [
     "ISC",
 ]
 
-# A crate whose licence cannot be determined from its metadata gets refused
-# rather than guessed at. 0.93 is cargo-deny's default threshold for matching
-# a licence file against a known text; lowering it would trade a clear failure
-# for a confident wrong answer.
+# A crate whose licence cannot be determined from its metadata is refused, not
+# guessed at. 0.93 is cargo-deny's default threshold for matching a licence
+# file against a known text; lowering it would trade a clear failure for a
+# confident wrong answer.
 confidence-threshold = 0.93
 
-# Per-crate exceptions to the list above. Empty on purpose, for the same
-# reason `advisories.ignore` is.
+# Per-crate exceptions to the list above. Empty, for the same reason
+# `advisories.ignore` is: an entry here grants one crate a licence the project
+# has not accepted generally.
 exceptions = []
 
 # Flag allowances that nothing in the tree uses any more. Without this an
@@ -137,12 +137,11 @@ unused-allowed-license = "warn"
 # Bans and duplicates
 # ---------------------------------------------------------------------------
 [bans]
-# Two versions of the same crate is a warning rather than an error. It is
-# usually somebody else's transitive dependency and not something this
-# workspace can fix on its own, but it is worth seeing: duplicates inflate the
-# binary, double the audit surface, and in the case of something like
-# `rustix` or `libc` can mean two different sets of syscall bindings compiled
-# into one process.
+# Two versions of the same crate warns instead of failing, because it is
+# usually somebody else's transitive dependency and not something this project
+# can fix. It still shows up here: duplicates inflate the binary, double the
+# audit surface, and for something like `rustix` or `libc` mean two different
+# sets of syscall bindings compiled into one process.
 multiple-versions = "warn"
 
 # A wildcard version requirement means the next release of that crate is

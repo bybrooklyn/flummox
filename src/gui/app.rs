@@ -1,8 +1,8 @@
 //! The window's state and the messages that change it.
 //!
-//! Deliberately free of `iced` types, exactly as bav-gui does it: everything
-//! here can be driven from a test with no display attached, and
-//! [`crate::view`] is the only module that knows what a widget is.
+//! Free of `iced` types, so everything here can be driven from a test with no
+//! display attached. [`crate::gui::view`] is the only module that knows what a
+//! widget is.
 
 use std::path::PathBuf;
 

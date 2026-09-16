@@ -13,7 +13,7 @@
 //! rather than trusting our own path checks (which [`crate::safeio`] still
 //! applies as the first line of defence).
 //!
-//! Two properties worth knowing:
+//! Two properties that shape how this is called:
 //! - **Regular-file ioctls stay allowed.** The btrfs backend drives
 //!   `BTRFS_IOC_DEFRAG_RANGE` on ordinary files, and Landlock's ioctl control
 //!   (ABI v5) governs *device* files only, so sandboxing does not interfere.
@@ -21,7 +21,7 @@
 //!   thread and anything it starts afterwards, so it must be applied before
 //!   the worker pool is built, never in the middle of a job.
 //!
-//! Enforcement is best-effort by design: on a kernel with an older Landlock
+//! Enforcement is best-effort: on a kernel with an older Landlock
 //! ABI the kernel grants what it can and reports [`SandboxStatus::Partial`],
 //! and where the feature is missing entirely the job still runs, unsandboxed
 //! but honest about it. Compression is not a security boundary the user chose
@@ -84,7 +84,7 @@ impl SandboxPlan {
     /// Builds a plan from explicit path lists, dropping any that do not exist.
     ///
     /// Landlock rejects a rule naming a missing path, and a Steam library on
-    /// an unplugged drive is an ordinary situation rather than an error.
+    /// an unplugged drive is ordinary, not an error.
     pub fn for_paths(writable: Vec<PathBuf>, readable: Vec<PathBuf>) -> Self {
         let keep = |paths: Vec<PathBuf>| -> Vec<PathBuf> {
             paths.into_iter().filter(|p| p.exists()).collect()

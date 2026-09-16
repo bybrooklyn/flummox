@@ -25,7 +25,7 @@ use proptest::prelude::*;
 
 /// One ordinary path component: non-empty, no separator, and not `..`.
 ///
-/// The character class is deliberately almost unrestricted. Game directories
+/// The character class is almost unrestricted. Game directories
 /// hold names with spaces, dots, colons, emoji and whatever else a publisher
 /// felt like shipping, and none of that should make a path look like an
 /// escape attempt.

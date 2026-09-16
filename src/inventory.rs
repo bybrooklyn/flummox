@@ -197,7 +197,7 @@ pub fn decide(rel: &Path, size: u64, opts: &WalkOpts) -> Action {
 
 /// Extensions whose contents are already compressed or encrypted.
 ///
-/// Game archives such as `.pak` are deliberately absent: some are compressed
+/// Game archives such as `.pak` are absent: some are compressed
 /// and some are not, so sampling decides those.
 const PRECOMPRESSED_EXTENSIONS: &[&str] = &[
     // Archives and containers

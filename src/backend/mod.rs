@@ -103,7 +103,7 @@ pub trait EventSink: Sync {
     fn event(&self, event: Event);
 }
 
-/// An event sink that drops everything, for tests and one-shot calls.
+/// An event sink that discards everything, for tests and one-shot calls.
 pub struct NullSink;
 
 impl EventSink for NullSink {

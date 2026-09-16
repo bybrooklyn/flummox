@@ -41,7 +41,7 @@ impl Anchor {
             Mode::empty(),
         )?;
         // Probe once so callers can report which guarantee is in force,
-        // rather than discovering it per file.
+        // instead of discovering it per file.
         let fully_resolved = match rustix::fs::openat2(
             &dir,
             ".",

@@ -1,8 +1,8 @@
-//! `flummox`: the command-line front end.
+//! The command line front end.
 //!
-//! Every command follows the same shape: find the games, probe the filesystem
-//! they live on, then hand the work to a `flummox` backend. The GUI and the
-//! daemon will call the same functions.
+//! Every command has the same shape: find the games, probe the filesystem they
+//! live on, then hand the work to a backend. The GUI runs these same commands
+//! as child processes, so anything it can do is available here too.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -202,7 +202,7 @@ fn size(bytes: u64) -> String {
 /// Where a command's results go.
 ///
 /// Text is for a person reading a terminal; JSON is for a script, and for the
-/// GUI, which drives exactly the same commands rather than a second copy of
+/// GUI, which drives these same commands instead of keeping a second copy of
 /// this logic. Progress and warnings always go to stderr, so JSON on stdout
 /// stays parseable even mid-job.
 #[derive(Debug, Clone, Copy)]
@@ -567,8 +567,8 @@ impl EventSink for Progress {
                 let total_files = self.total_files.load(Relaxed).max(1);
                 let total_bytes = self.total_bytes.load(Relaxed).max(1);
                 if self.tty {
-                    // Keep the tail of a long path: the file name is the part
-                    // worth seeing.
+                    // Keep the tail of a long path, which is where the file
+                    // name is.
                     let tail: Vec<char> = current.chars().rev().take(48).collect();
                     let name: String = tail.into_iter().rev().collect();
                     eprint!(

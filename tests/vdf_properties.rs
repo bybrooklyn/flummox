@@ -27,9 +27,9 @@ use proptest::test_runner::TestCaseError;
 
 /// Counts every key/value pair in a document, at every depth.
 ///
-/// Deliberately iterative. A recursive walk here would overflow the stack on
-/// exactly the inputs these properties exist to probe, and the test would then
-/// be reporting its own bug rather than the parser's.
+/// Iterative, because a recursive walk would overflow the stack on exactly
+/// the inputs these properties exist to probe, and the test would then report
+/// its own bug instead of the parser's.
 fn count_entries(root: &Object) -> usize {
     let mut total = 0usize;
     let mut stack: Vec<&Object> = vec![root];
@@ -305,9 +305,9 @@ fn nested_document(depth: usize) -> String {
 /// that depth, and Steam's manifests live in a directory the user (or
 /// anything running as them) can write to.
 ///
-/// The claim has two halves on purpose. A parser that rejected everything
-/// would satisfy the first, so the second pins the limit far enough away from
-/// real files: manifests nest four or five deep, `libraryfolders.vdf` three.
+/// The claim has two halves. A parser that rejected everything would satisfy
+/// the first, so the second pins the limit far enough from real files:
+/// manifests nest four or five deep, `libraryfolders.vdf` three.
 #[test]
 fn deeply_nested_objects_are_refused_rather_than_overflowing_the_stack() -> TestResult {
     let deep = nested_document(10_000);

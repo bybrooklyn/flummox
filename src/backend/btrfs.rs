@@ -95,9 +95,8 @@ nix::ioctl_readwrite!(fs_ioc_fiemap, b'f', 11, Fiemap);
 
 /// Rewrites a file as compressed extents at `level`.
 ///
-/// The file is opened read-only on purpose: the kernel checks write
-/// *permission* rather than the open mode, so this also works on a game
-/// executable that is currently running.
+/// The file is opened read-only. The kernel checks write *permission*, not
+/// the open mode, so this still works on a game executable that is running.
 pub fn compress_file(path: &Path, level: i32) -> io::Result<i32> {
     compress_fd(&File::open(path)?, level)
 }
