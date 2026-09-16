@@ -38,7 +38,10 @@ nix = { version = "0.31", features = ["fs", "ioctl", "user"] }
 libc = "0.2"
 # openat2 with RESOLVE_BENEATH and RESOLVE_NO_SYMLINKS, so a swapped symlink
 # cannot redirect a job outside the install directory.
-rustix = { version = "1", features = ["fs"] }
+# `event` adds no dependencies. The download watcher needs poll: signal-hook
+# registers with SA_RESTART, so a blocking read is resumed after a signal and
+# would never see the flag asking it to stop.
+rustix = { version = "1", features = ["fs", "event"] }
 # Landlock lets an unprivileged process drop its own filesystem rights.
 landlock = "0.4"
 xattr = "1"

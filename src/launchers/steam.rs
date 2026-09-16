@@ -75,6 +75,14 @@ const WORKING_FLAGS: &[(u32, &str)] = &[
     (state_flags::LOCKED, "locked"),
 ];
 
+/// Whether Steam is still working on an app's files.
+///
+/// Reads the same table the scan reports from, so a bit added there is
+/// honoured here without a second list to keep in step.
+pub fn is_working(flags: u32) -> bool {
+    WORKING_FLAGS.iter().any(|(bit, _)| flags & bit != 0)
+}
+
 /// Appids that are runtimes or redistributables rather than games.
 ///
 /// Compressing these would slow every game's startup for almost no gain, so

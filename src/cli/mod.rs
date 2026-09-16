@@ -105,6 +105,21 @@ enum Command {
         #[command(subcommand)]
         action: HookAction,
     },
+    /// Compress Steam downloads as they finish.
+    ///
+    /// Stays running and watches Steam's own manifests. A game is compressed
+    /// once its download settles, which recovers what the filesystem's write
+    /// heuristic skipped while the files were being written.
+    Watch {
+        #[command(flatten)]
+        level: LevelArgs,
+        /// Files to work on at once.
+        #[arg(long, default_value_t = 2)]
+        threads: usize,
+        /// Report what would be compressed, without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Hide something that is not a game, or that you never want touched.
     Exclude {
         #[command(subcommand)]
@@ -196,6 +211,9 @@ pub fn run() -> Result<()> {
         Command::Status { selector } => cmd_status(&env, out, &selector, &cancel),
         Command::Log { limit } => cmd_log(out, limit),
         Command::Hook { action } => cmd_hook(&env, out, action),
+        Command::Watch { level, threads, dry_run } => {
+            cmd_watch(&env, &level, threads, dry_run, &cancel)
+        }
         Command::Exclude { action } => cmd_exclude(&env, out, action),
         Command::Drives => cmd_drives(&env),
         Command::Doctor => cmd_doctor(&env),
@@ -1139,6 +1157,43 @@ fn steam_libraries(env: &Env) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// Watches Steam and compresses each download once it finishes.
+///
+/// The property `flummox hook` sets compresses during the download and costs
+/// nothing, but the filesystem judges each file as it is written and skips
+/// ones it guesses will not pay. A pass afterwards recovers those.
+fn cmd_watch(
+    env: &Env,
+    level: &LevelArgs,
+    threads: usize,
+    dry_run: bool,
+    cancel: &Arc<AtomicBool>,
+) -> Result<()> {
+    let libraries = steam_libraries(env);
+    if libraries.is_empty() {
+        bail!("no Steam libraries found; try `flummox doctor`");
+    }
+    for library in &libraries {
+        println!("Watching {}", library.display());
+    }
+    println!("Waiting for downloads to finish. Press Ctrl-C to stop.");
+    crate::watch::run(&libraries, cancel.as_ref(), |app| {
+        if app.is_tool() {
+            return;
+        }
+        println!("\n{} finished downloading.", app.name);
+        if dry_run {
+            println!("  (dry run, nothing written)");
+            return;
+        }
+        let selector = app.appid.to_string();
+        if let Err(e) = cmd_compress(env, &selector, level, threads, false, false, false, cancel) {
+            eprintln!("warning: could not compress {}: {e:#}", app.name);
+        }
+    })
+    .context("watching Steam libraries")
 }
 
 fn cmd_hook(env: &Env, out: Output, action: HookAction) -> Result<()> {

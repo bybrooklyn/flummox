@@ -27,3 +27,4 @@ pub mod model;
 pub mod safeio;
 pub mod sandbox;
 pub mod testutil;
+pub mod watch;
