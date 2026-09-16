@@ -797,6 +797,29 @@ fn cmd_compress(
         return Ok(());
     }
 
+    // Sampled before the pass runs. Compressing changes what the probe sees,
+    // so an estimate taken afterwards reports a saving that has already been
+    // taken, which is why this cannot be deferred to the end.
+    let pass_saving = {
+        let model = backend.model(&opts);
+        let est_opts = EstimateOpts::new(opts.btrfs_level(), &fs);
+        let measured = backend.disk_probe();
+        let probe = RecordedProbe {
+            measured: measured.as_ref(),
+            levels: recorded_levels(db.as_ref(), &game),
+        };
+        estimate::estimate_game_cancellable(
+            &game.install_dir,
+            &inv,
+            model.as_ref(),
+            &est_opts,
+            &probe,
+            Some(cancel.as_ref()),
+        )
+        .saving()
+    };
+    println!("Estimated saving: {}", size(pass_saving));
+
     println!(
         "Compressing {} with {} at zstd level {}",
         game.title,
@@ -873,6 +896,13 @@ fn cmd_compress(
         record.install_bytes = full_inv.total_bytes();
         record.disk_before = outcome.free_before.unwrap_or_default();
         record.disk_after = outcome.free_after.unwrap_or_default();
+        // Added to what earlier passes predicted. A later pass over the same
+        // game only has whatever is left to take, so replacing the figure
+        // would make a game's saving fall every time it is recompressed.
+        record.est_saving = previous
+            .as_ref()
+            .map_or(0, |p| p.est_saving)
+            .saturating_add(i64::try_from(pass_saving).unwrap_or(i64::MAX));
         // When files were skipped as unchanged, they are still compressed at
         // whatever the earlier, higher level was; recording the lower level of
         // this pass would make a later run redo them for nothing.

@@ -234,10 +234,11 @@ pub struct GameRecord {
     pub disk_before: u64,
     /// Disk usage after it.
     pub disk_after: u64,
-    /// What the estimator predicted it would save.
+    /// What estimates predicted this game would save, summed over its passes.
     ///
-    /// Kept so a later run can compare the prediction against
-    /// `disk_before - disk_after` and show how far off it was.
+    /// A prediction, not a measurement: FIEMAP reports which extents hold
+    /// compressed data, not how much they shrank, so the freed byte count is
+    /// not readable without privileges this tool does not ask for.
     pub est_saving: i64,
 }
 
