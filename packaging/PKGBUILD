@@ -1,0 +1,64 @@
+# Maintainer: Brooklyn <brooklyn.halmstad@proton.me>
+#
+# Arch/CachyOS package. Build from a checkout with:
+#   cd packaging && makepkg -si
+#
+# There is no AUR submission yet; when there is, `source` should point at a
+# release tarball with a checksum rather than at the working tree, and
+# `pkgver()` should read the tag.
+
+pkgname=gamecompressor
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Compress installed games with zstd on Linux, and keep playing them"
+arch=('x86_64')
+url="https://github.com/bybrooklyn/gamecompressor"
+license=('GPL-3.0-or-later')
+# The command-line tool needs nothing beyond libc: it talks to btrfs through
+# ioctls rather than through btrfs-progs. The rest are what the GUI links
+# against for its window, input and text.
+depends=('gcc-libs' 'libxkbcommon' 'wayland' 'libx11' 'fontconfig')
+makedepends=('cargo' 'git')
+# FUSE is listed here rather than in depends because the tier that needs it
+# (ext4, XFS, F2FS) is not built yet; installing fuse3 now would be asking for
+# something the package does not use.
+optdepends=('btrfs-progs: for inspecting compression with compsize'
+            'fuse3: for the pack tier, once it exists')
+options=('!lto')  # LTO is already configured in the release profile.
+
+# Built straight from the checkout this file lives in, so there is no source
+# array and nothing to checksum. `$startdir` is the packaging directory, so
+# the repository root is one level up. A PKGBUILD for the AUR would instead
+# fetch a tagged tarball and verify it; this one is for building your own
+# copy, and is deliberately not pretending otherwise.
+_tree="$startdir/.."
+
+prepare() {
+    cd "$_tree"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$_tree"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo build --frozen --release
+}
+
+check() {
+    cd "$_tree"
+    export RUSTUP_TOOLCHAIN=stable
+    # The btrfs tests check the filesystem they are running on and skip
+    # themselves elsewhere, so this passes on any build host.
+    cargo test --frozen --workspace
+}
+
+package() {
+    cd "$_tree"
+    install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+    install -Dm755 "target/release/$pkgname-gui" "$pkgdir/usr/bin/$pkgname-gui"
+    install -Dm644 "packaging/$pkgname.desktop" \
+        "$pkgdir/usr/share/applications/$pkgname.desktop"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
