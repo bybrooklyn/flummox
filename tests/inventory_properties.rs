@@ -59,8 +59,9 @@ fn precompressed_path() -> impl Strategy<Value = PathBuf> {
 
 /// A relative path that nothing about its name marks as already compressed.
 ///
-/// `.pak` is included on purpose: the crate deliberately leaves game archives
-/// to content sampling, because some are compressed and some are not.
+/// `.pak` is included, because the crate leaves game archives to content
+/// sampling: some are compressed and some are not, and the extension does not
+/// say which.
 fn plain_path() -> impl Strategy<Value = PathBuf> {
     (
         stem(),

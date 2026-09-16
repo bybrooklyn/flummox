@@ -548,8 +548,8 @@ impl Db {
     /// The zstd level last applied to one file, or `None` if the file has no
     /// fingerprint.
     ///
-    /// [`NOT_ATTEMPTED`] means the file was walked but deliberately skipped,
-    /// which is a different thing from never having been seen. The estimator
+    /// [`NOT_ATTEMPTED`] means the file was walked and then skipped, which is
+    /// a different thing from never having been seen. The estimator
     /// needs the distinction: a file already attempted at or above the target
     /// level has nothing further to give, even where the kernel left its
     /// blocks stored uncompressed because compressing them did not free a
