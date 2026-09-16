@@ -436,8 +436,71 @@ pub fn estimate_game_cancellable(
     out
 }
 
+/// How many blocks are sampled when choosing a file's level.
+const LEVEL_SAMPLE_BLOCKS: u64 = 8;
+
+/// How much of a file the slower level must save before it is used.
+///
+/// Measured across real game files, level 15 beats level 3 by 3 to 13 points
+/// of the original size and costs 5 to 10 times the processor time. Below this
+/// the file is one of the ones where it buys close to nothing, and on some it
+/// is worse than level 9.
+const LEVEL_GAIN: f64 = 0.02;
+
+/// Whether the slower level earns its cost on what was sampled.
+fn worth_the_level(cost_low: u64, cost_high: u64, sampled: u64) -> bool {
+    if sampled == 0 {
+        return false;
+    }
+    cost_low.saturating_sub(cost_high) as f64 / sampled as f64 >= LEVEL_GAIN
+}
+
+/// The level to compress one file at, given a cheap and an expensive choice.
+///
+/// Takes an open handle, not a path, so a job keeps reaching files only
+/// through the directory it holds open.
+pub fn choose_level(
+    file: &std::fs::File,
+    size: u64,
+    model: &dyn UnitModel,
+    low: i32,
+    high: i32,
+) -> io::Result<i32> {
+    if low >= high {
+        return Ok(low);
+    }
+    let block = u64::from(model.block_size());
+    let blocks = size.div_ceil(block).max(1);
+    let samples = blocks.min(LEVEL_SAMPLE_BLOCKS);
+    let stride = blocks / samples;
+    let mut handle = file;
+    let mut buf = vec![0u8; model.block_size() as usize];
+    let (mut cost_low, mut cost_high, mut sampled) = (0u64, 0u64, 0u64);
+
+    for i in 0..samples {
+        let offset = i.saturating_mul(stride).saturating_mul(block);
+        if offset >= size {
+            break;
+        }
+        handle.seek(SeekFrom::Start(offset))?;
+        let want = block.min(size - offset) as usize;
+        let read = read_full(&mut handle, buf.get_mut(..want).unwrap_or(&mut []))?;
+        let Some(chunk) = buf.get(..read) else { break };
+        if chunk.is_empty() {
+            break;
+        }
+        let raw = chunk.len() as u32;
+        let at_low = zstd::bulk::compress(chunk, low)?.len() as u32;
+        let at_high = zstd::bulk::compress(chunk, high)?.len() as u32;
+        cost_low = cost_low.saturating_add(model.disk_cost(raw, at_low));
+        cost_high = cost_high.saturating_add(model.disk_cost(raw, at_high));
+        sampled = sampled.saturating_add(read as u64);
+    }
+    Ok(if worth_the_level(cost_low, cost_high, sampled) { high } else { low })
+}
+
 /// Reads until the buffer is full or the file ends.
-fn read_full(file: &mut std::fs::File, buf: &mut [u8]) -> io::Result<usize> {
+fn read_full<R: Read>(file: &mut R, buf: &mut [u8]) -> io::Result<usize> {
     let mut total = 0;
     while total < buf.len() {
         let Some(rest) = buf.get_mut(total..) else { break };
@@ -511,6 +574,31 @@ mod tests {
         let size = write_file(&random, noise(4 * 1024 * 1024))?;
         let est = estimate_file(&random, size, &model, &opts).ctx("estimate noise.dat")?;
         check(!est.worthwhile(), format!("{est:?}"))
+    }
+
+    #[test]
+    fn the_slower_level_is_used_only_where_it_pays() -> TestResult {
+        let block = u64::from(BtrfsModel::BLOCK);
+        check(!worth_the_level(block, block, block), "no gain does not earn it")?;
+        check(!worth_the_level(0, 0, 0), "nothing sampled does not earn it")?;
+        // One percent of what was sampled, against a two percent bar.
+        check(!worth_the_level(1000, 990, 1000), "a gain under the bar does not earn it")?;
+        check(worth_the_level(1000, 950, 1000), "a gain over the bar earns it")
+    }
+
+    #[test]
+    fn a_file_with_nothing_to_gain_keeps_the_cheaper_level() -> TestResult {
+        let tmp = tempfile::tempdir().ctx("tempdir")?;
+        let path = tmp.path().join("noise.dat");
+        let size = write_file(&path, noise(2 * 1024 * 1024))?;
+        let file = std::fs::File::open(&path).ctx("open noise.dat")?;
+        let chosen = choose_level(&file, size, &BtrfsModel { level: 9 }, 9, 15)
+            .ctx("choose a level for noise.dat")?;
+        check_eq(chosen, 9, "incompressible data does not earn the slower level")?;
+        // A single candidate is answered without reading anything.
+        let same = choose_level(&file, size, &BtrfsModel { level: 9 }, 15, 15)
+            .ctx("choose between one level")?;
+        check_eq(same, 15, "one candidate is the answer")
     }
 
     #[test]

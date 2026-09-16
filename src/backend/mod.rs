@@ -46,6 +46,46 @@ impl Preset {
             Self::Max => "max",
         }
     }
+
+    /// How this preset picks a level for each file.
+    ///
+    /// Only `max` varies it. Level 15 costs 5 to 10 times level 3 and earns
+    /// between 3 and 13 points depending on the file, and on some files it is
+    /// worse than level 9, so it is spent where a sample says it pays.
+    pub fn level_plan(self) -> LevelPlan {
+        match self {
+            Self::Fast => LevelPlan::Fixed(3),
+            Self::Balanced => LevelPlan::Fixed(9),
+            Self::Max => LevelPlan::PerFile { low: 9, high: 15 },
+        }
+    }
+}
+
+/// How a job decides what level to compress a file at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LevelPlan {
+    /// The same level for every file.
+    Fixed(i32),
+    /// The cheaper level, unless a sample says the dearer one pays.
+    PerFile {
+        /// Used unless the sample earns better.
+        low: i32,
+        /// Used where it does.
+        high: i32,
+    },
+}
+
+impl LevelPlan {
+    /// The highest level this plan can apply.
+    ///
+    /// What an estimate targets, and what a later pass compares against to
+    /// decide whether a file has already had its chance.
+    pub fn ceiling(self) -> i32 {
+        match self {
+            Self::Fixed(level) => level,
+            Self::PerFile { high, .. } => high,
+        }
+    }
 }
 
 /// Settings for one compression job.
