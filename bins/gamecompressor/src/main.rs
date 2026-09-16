@@ -37,6 +37,9 @@ struct Cli {
     /// `RUST_LOG` overrides this when set, for the usual per-module filters.
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     verbose: u8,
+    /// Print results as JSON, for scripts and the GUI.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -138,15 +141,16 @@ fn main() -> Result<()> {
     init_logging(cli.verbose);
     let cancel = install_signal_handler()?;
     let env = Env::current().context("HOME is not set")?;
+    let out = Output { json: cli.json };
     match cli.command {
-        Command::Scan { tools } => cmd_scan(&env, tools),
-        Command::Estimate { selector, level } => cmd_estimate(&env, &selector, &level),
+        Command::Scan { tools } => cmd_scan(&env, out, tools),
+        Command::Estimate { selector, level } => cmd_estimate(&env, out, &selector, &level),
         Command::Compress { selector, level, threads, force, dry_run } => {
             cmd_compress(&env, &selector, &level, threads, force, dry_run, &cancel)
         }
         Command::Decompress { selector, force } => cmd_decompress(&env, &selector, force, &cancel),
-        Command::Status { selector } => cmd_status(&env, &selector),
-        Command::Log { limit } => cmd_log(limit),
+        Command::Status { selector } => cmd_status(&env, out, &selector),
+        Command::Log { limit } => cmd_log(out, limit),
         Command::Drives => cmd_drives(&env),
         Command::Doctor => cmd_doctor(&env),
     }
@@ -193,6 +197,48 @@ fn install_signal_handler() -> Result<Arc<AtomicBool>> {
 
 fn size(bytes: u64) -> String {
     format_size(bytes, DECIMAL)
+}
+
+/// Where a command's results go.
+///
+/// Text is for a person reading a terminal; JSON is for a script, and for the
+/// GUI, which drives exactly the same commands rather than a second copy of
+/// this logic. Progress and warnings always go to stderr, so JSON on stdout
+/// stays parseable even mid-job.
+#[derive(Debug, Clone, Copy)]
+struct Output {
+    json: bool,
+}
+
+impl Output {
+    /// Prints `value` as JSON, or runs `text` to print it for a human.
+    fn emit<T: serde::Serialize>(self, value: &T, text: impl FnOnce()) -> Result<()> {
+        if !self.json {
+            text();
+            return Ok(());
+        }
+        let mut stdout = std::io::stdout().lock();
+        serde_json::to_writer_pretty(&mut stdout, value).context("writing JSON")?;
+        writeln!(stdout).context("writing JSON")?;
+        Ok(())
+    }
+}
+
+/// One game in `scan --json`.
+#[derive(serde::Serialize)]
+struct ScanRow {
+    title: String,
+    id: String,
+    launcher: &'static str,
+    path: PathBuf,
+    size: Option<u64>,
+    state: String,
+    idle: bool,
+    is_tool: bool,
+    filesystem: String,
+    backend: Option<&'static str>,
+    supported: bool,
+    note: Option<String>,
 }
 
 /// Roughly how long ago something happened, for the activity log.
@@ -351,47 +397,77 @@ fn walk(game: &Game, backend: &dyn Backend) -> Result<Inventory> {
     Ok(inv)
 }
 
-fn cmd_scan(env: &Env, tools: bool) -> Result<()> {
+fn cmd_scan(env: &Env, out: Output, tools: bool) -> Result<()> {
     let scan = scan(env);
     let games: Vec<&Game> = scan.games.iter().filter(|g| tools || !g.is_tool).collect();
-    if games.is_empty() {
+    if games.is_empty() && !out.json {
         println!("No games found. Is Steam installed for this user?");
         return Ok(());
     }
-    let width = games.iter().map(|g| g.title.chars().count()).max().unwrap_or(10).min(48);
-    for game in &games {
-        let fs = fsprobe::probe(&game.install_dir).ok();
-        let tier = fs.as_ref().map_or("?".to_owned(), |f| match fsprobe::tier_for(f) {
-            Tier::Native(kind) => kind.label().to_owned(),
-            Tier::Pack => format!("{} (pack, not built yet)", f.fstype),
-            Tier::Unsupported(why) => format!("unsupported: {why}"),
-        });
-        println!(
-            "{:<width$}  {:>10}  {:<22}  {:<12}  {}",
-            game.title.chars().take(width).collect::<String>(),
-            game.size_hint.map(size).unwrap_or_default(),
-            game.state.to_string(),
-            game.id.to_string(),
-            tier,
-            width = width
-        );
-    }
-    println!("\n{} games", games.len());
-    Ok(())
+    let rows: Vec<ScanRow> = games
+        .iter()
+        .map(|game| {
+            let fs = fsprobe::probe(&game.install_dir).ok();
+            let tier = fs.as_ref().map(fsprobe::tier_for);
+            let (backend, supported, note) = match &tier {
+                Some(Tier::Native(kind)) => (Some(kind.label()), true, None),
+                Some(Tier::Pack) => (None, false, Some("needs the pack tier, not built yet".to_owned())),
+                Some(Tier::Unsupported(why)) => (None, false, Some((*why).to_owned())),
+                None => (None, false, Some("could not probe the filesystem".to_owned())),
+            };
+            ScanRow {
+                title: game.title.clone(),
+                id: game.id.to_string(),
+                launcher: game.id.launcher.slug(),
+                path: game.install_dir.clone(),
+                size: game.size_hint,
+                state: game.state.to_string(),
+                idle: game.state.is_idle(),
+                is_tool: game.is_tool,
+                filesystem: fs.map_or_else(|| "?".to_owned(), |f| f.fstype),
+                backend,
+                supported,
+                note,
+            }
+        })
+        .collect();
+
+    out.emit(&rows, || {
+        let width = rows.iter().map(|r| r.title.chars().count()).max().unwrap_or(10).min(48);
+        for row in &rows {
+            let support = match (&row.backend, &row.note) {
+                (Some(kind), _) => (*kind).to_owned(),
+                (None, Some(why)) => why.clone(),
+                (None, None) => "?".to_owned(),
+            };
+            println!(
+                "{:<width$}  {:>10}  {:<22}  {:<12}  {}",
+                row.title.chars().take(width).collect::<String>(),
+                row.size.map(size).unwrap_or_default(),
+                row.state,
+                row.id,
+                support,
+                width = width
+            );
+        }
+        println!("\n{} games", rows.len());
+    })
 }
 
-fn cmd_estimate(env: &Env, selector: &str, level: &LevelArgs) -> Result<()> {
+fn cmd_estimate(env: &Env, out: Output, selector: &str, level: &LevelArgs) -> Result<()> {
     let game = find_game(env, selector)?;
     let opts = level.opts(1);
     let (fs, backend) = backend_for(&game.install_dir)?;
     let inv = walk(&game, backend.as_ref())?;
-    println!(
-        "{}: {} in {} files on {}",
-        game.title,
-        size(inv.total_bytes()),
-        inv.files.len(),
-        fs.fstype
-    );
+    if !out.json {
+        println!(
+            "{}: {} in {} files on {}",
+            game.title,
+            size(inv.total_bytes()),
+            inv.files.len(),
+            fs.fstype
+        );
+    }
     eprintln!("sampling...");
     tracing::info!(
         game = %game.title,
@@ -409,8 +485,24 @@ fn cmd_estimate(env: &Env, selector: &str, level: &LevelArgs) -> Result<()> {
     };
     let est =
         estimate::estimate_game_with(&game.install_dir, &inv, model.as_ref(), &est_opts, &probe);
-    print_estimate(&est, &est_opts);
-    Ok(())
+
+    #[derive(serde::Serialize)]
+    struct EstimateOut<'a> {
+        game: &'a str,
+        id: String,
+        level: i32,
+        mount_level: Option<i32>,
+        #[serde(flatten)]
+        estimate: estimate::Estimate,
+    }
+    let payload = EstimateOut {
+        game: &game.title,
+        id: game.id.to_string(),
+        level: est_opts.level,
+        mount_level: est_opts.mount_level,
+        estimate: est,
+    };
+    out.emit(&payload, || print_estimate(&est, &est_opts))
 }
 
 fn print_estimate(est: &estimate::Estimate, opts: &EstimateOpts) {
@@ -707,6 +799,11 @@ fn cmd_decompress(
     let mut db = open_db();
     let inv = walk(&game, backend.as_ref())?;
     println!("Decompressing {}", game.title);
+    // Same restriction as a compress job: by this point every path the work
+    // needs is known, so the process has no business reaching anything else.
+    let plan =
+        SandboxPlan::for_job(&game.install_dir, Db::default_path().as_deref().and_then(Path::parent));
+    tracing::info!(status = %sandbox::restrict(&plan).describe(), "sandbox");
     let progress = Progress::new();
     let ctx = JobCtx { events: &progress, cancel: cancel.as_ref() };
     let outcome = backend
@@ -739,11 +836,37 @@ fn cmd_decompress(
     Ok(())
 }
 
-fn cmd_status(env: &Env, selector: &str) -> Result<()> {
+fn cmd_status(env: &Env, out: Output, selector: &str) -> Result<()> {
     let game = find_game(env, selector)?;
     let (fs, backend) = backend_for(&game.install_dir)?;
     let inv = walk(&game, backend.as_ref())?;
     let status = backend.status(&game.install_dir, &inv)?;
+
+    #[derive(serde::Serialize)]
+    struct StatusOut<'a> {
+        game: &'a str,
+        id: String,
+        filesystem: &'a str,
+        backend: &'static str,
+        mount_compression: Option<String>,
+        #[serde(flatten)]
+        status: backend::CompressionStatus,
+        compressed_fraction: f64,
+    }
+    if out.json {
+        let payload = StatusOut {
+            game: &game.title,
+            id: game.id.to_string(),
+            filesystem: &fs.fstype,
+            backend: backend.kind().label(),
+            mount_compression: fs
+                .mount_compression()
+                .map(|(a, l)| l.map_or_else(|| a.clone(), |l| format!("{a}:{l}"))),
+            status,
+            compressed_fraction: status.ratio(),
+        };
+        return out.emit(&payload, || {});
+    }
     println!("{} on {} ({})", game.title, fs.fstype, backend.kind().label());
     println!("  files      : {}", status.files);
     println!("  mapped     : {}", size(status.total_bytes));
@@ -765,12 +888,36 @@ fn cmd_status(env: &Env, selector: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_log(limit: u32) -> Result<()> {
+fn cmd_log(out: Output, limit: u32) -> Result<()> {
     let Some(path) = Db::default_path() else {
         bail!("cannot work out where the state database lives; is HOME set?");
     };
     let db = Db::open(&path).with_context(|| format!("opening {}", path.display()))?;
     let entries = db.recent_activity(limit).context("reading the activity log")?;
+
+    if out.json {
+        #[derive(serde::Serialize)]
+        struct LogRow {
+            ts: i64,
+            level: &'static str,
+            kind: String,
+            game: Option<String>,
+            message: String,
+            free_space_delta: i64,
+        }
+        let rows: Vec<LogRow> = entries
+            .iter()
+            .map(|e| LogRow {
+                ts: e.ts,
+                level: e.level.as_str(),
+                kind: e.kind.clone(),
+                game: e.game_id.as_ref().map(ToString::to_string),
+                message: e.message.clone(),
+                free_space_delta: -e.bytes_delta,
+            })
+            .collect();
+        return out.emit(&rows, || {});
+    }
     if entries.is_empty() {
         println!("Nothing recorded yet. Compress a game and it will show up here.");
         return Ok(());
