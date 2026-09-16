@@ -71,6 +71,9 @@ enum Command {
         /// Compress even when the game looks busy.
         #[arg(long)]
         force: bool,
+        /// Stop if the game is launched, instead of waiting for it to close.
+        #[arg(long)]
+        no_pause: bool,
         /// Estimate and show what would happen, without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -165,8 +168,8 @@ pub fn run() -> Result<()> {
         Command::Estimate { selector, level } => {
             cmd_estimate(&env, out, &selector, &level, &cancel)
         }
-        Command::Compress { selector, level, threads, force, dry_run } => {
-            cmd_compress(&env, &selector, &level, threads, force, dry_run, &cancel)
+        Command::Compress { selector, level, threads, force, no_pause, dry_run } => {
+            cmd_compress(&env, &selector, &level, threads, force, no_pause, dry_run, &cancel)
         }
         Command::Decompress { selector, force } => cmd_decompress(&env, &selector, force, &cancel),
         Command::Status { selector } => cmd_status(&env, out, &selector, &cancel),
@@ -260,6 +263,21 @@ struct ScanRow {
     backend: Option<&'static str>,
     supported: bool,
     note: Option<String>,
+}
+
+/// Pauses a job while the game is being played.
+///
+/// Scans this user's processes for anything with a file open inside the
+/// install directory, which is the same check that decides whether a job may
+/// start at all.
+struct GameInUse {
+    install_dir: PathBuf,
+}
+
+impl backend::BusyCheck for GameInUse {
+    fn in_use_by(&self) -> Option<String> {
+        busy::process_using(&self.install_dir, &ProcFs::new())
+    }
 }
 
 /// Roughly how long ago something happened, for the activity log.
@@ -630,6 +648,12 @@ impl EventSink for Progress {
                     );
                 }
             }
+            Event::Paused { by } => {
+                eprintln!("{}paused: {by} is using the game, waiting", if self.tty { "\r" } else { "" });
+            }
+            Event::Resumed => {
+                eprintln!("{}resumed", if self.tty { "\r" } else { "" });
+            }
             Event::Warning(msg) => eprintln!("{}warning: {msg}", if self.tty { "\r" } else { "" }),
             Event::Finished(_) => {
                 if self.tty {
@@ -659,6 +683,7 @@ fn cmd_compress(
     level: &LevelArgs,
     threads: usize,
     force: bool,
+    no_pause: bool,
     dry_run: bool,
     cancel: &Arc<AtomicBool>,
 ) -> Result<()> {
@@ -751,7 +776,14 @@ fn cmd_compress(
     }
 
     let progress = Progress::new();
-    let ctx = JobCtx { events: &progress, cancel: cancel.as_ref() };
+    // Pausing needs somewhere to look, so it is built here and borrowed
+    // for the length of the job.
+    let in_use = GameInUse { install_dir: game.install_dir.clone() };
+    let ctx = JobCtx {
+        events: &progress,
+        cancel: cancel.as_ref(),
+        busy: (!no_pause).then_some(&in_use as &dyn backend::BusyCheck),
+    };
     tracing::info!(game = %game.title, level = opts.btrfs_level(), files = inv.files.len(), "compressing");
     let outcome = backend
         .compress(&game.install_dir, &inv, &opts, &ctx)
@@ -862,7 +894,9 @@ fn cmd_decompress(
         SandboxPlan::for_job(&game.install_dir, Db::default_path().as_deref().and_then(Path::parent));
     tracing::info!(status = %sandbox::restrict(&plan).describe(), "sandbox");
     let progress = Progress::new();
-    let ctx = JobCtx { events: &progress, cancel: cancel.as_ref() };
+    // No pause on the way back out. Decompress is what someone runs to
+    // undo, and it should not sit waiting on a game.
+    let ctx = JobCtx { events: &progress, cancel: cancel.as_ref(), busy: None };
     let outcome = backend
         .decompress(&game.install_dir, &inv, &ctx)
         .with_context(|| format!("decompressing {}", game.title))?;

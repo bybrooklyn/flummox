@@ -328,8 +328,15 @@ impl BtrfsBackend {
             .build()
             .map_err(|e| io::Error::other(e.to_string()))?;
         pool.install(|| {
+            let last_busy_check =
+                std::sync::Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(60));
             targets.par_iter().for_each(|entry| {
                 if ctx.cancelled() {
+                    return;
+                }
+                // Between files, never inside one. A file's rewrite is a
+                // single ioctl and cannot be interrupted part way.
+                if !ctx.wait_while_busy(&last_busy_check) {
                     return;
                 }
                 let fail = |e: std::io::Error| {

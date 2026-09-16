@@ -91,6 +91,13 @@ pub enum Event {
         /// The file just finished, relative to the install directory.
         current: String,
     },
+    /// Waiting because the game was launched.
+    Paused {
+        /// The process holding the game open.
+        by: String,
+    },
+    /// The game closed, so work continues.
+    Resumed,
     /// Something went wrong that did not stop the job.
     Warning(String),
     /// The job ended.
@@ -116,12 +123,62 @@ pub struct JobCtx<'a> {
     pub events: &'a dyn EventSink,
     /// Set to stop the job at the next file boundary.
     pub cancel: &'a AtomicBool,
+    /// Asked between files: is something using the game right now?
+    ///
+    /// `None` means never pause. The backend knows nothing about Steam or
+    /// `/proc`; it only knows to wait while this says someone is playing.
+    pub busy: Option<&'a dyn BusyCheck>,
+}
+
+/// Answers whether the game is in use, so a job can wait instead of competing
+/// with it.
+///
+/// Compression is heavy on a disk. Running it while someone is loading a level
+/// is the wrong time, and refusing to start at all is the wrong answer for a
+/// job that may run for minutes.
+pub trait BusyCheck: Sync {
+    /// Who is using the game, or `None` when nothing is.
+    fn in_use_by(&self) -> Option<String>;
 }
 
 impl JobCtx<'_> {
     /// Whether the job has been asked to stop.
     pub fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// Blocks while the game is in use, returning when it is free.
+    ///
+    /// Returns `false` if the job was cancelled while waiting, so the caller
+    /// stops rather than resuming. Checking costs a `/proc` scan, so it is
+    /// rate limited: a scan per file would cost more than the compression on
+    /// a library with hundreds of thousands of files.
+    pub fn wait_while_busy(&self, last_check: &std::sync::Mutex<std::time::Instant>) -> bool {
+        const CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+        const POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+        let Some(busy) = self.busy else { return !self.cancelled() };
+        match last_check.lock() {
+            Ok(mut at) if at.elapsed() >= CHECK_EVERY => *at = std::time::Instant::now(),
+            Ok(_) => return !self.cancelled(),
+            Err(_) => return !self.cancelled(),
+        }
+
+        let mut announced = false;
+        while let Some(who) = busy.in_use_by() {
+            if self.cancelled() {
+                return false;
+            }
+            if !announced {
+                self.events.event(Event::Paused { by: who });
+                announced = true;
+            }
+            std::thread::sleep(POLL);
+        }
+        if announced {
+            self.events.event(Event::Resumed);
+        }
+        !self.cancelled()
     }
 }
 
@@ -256,6 +313,139 @@ pub fn model_for(kind: BackendKind, opts: &CompressOpts) -> Box<dyn UnitModel> {
             Box::new(BtrfsModel { level: opts.btrfs_level() })
         }
         BackendKind::Pack => Box::new(BtrfsModel { level: opts.btrfs_level() }),
+    }
+}
+
+#[cfg(test)]
+mod pause_tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::time::{Duration, Instant};
+
+    use crate::testutil::{TestResult, check, check_eq};
+
+    use super::*;
+
+    /// Reports busy for the first `busy_for` calls, then free.
+    struct FakeGame {
+        calls: AtomicUsize,
+        busy_for: usize,
+    }
+
+    impl BusyCheck for FakeGame {
+        fn in_use_by(&self) -> Option<String> {
+            let n = self.calls.fetch_add(1, Ordering::Relaxed);
+            (n < self.busy_for).then(|| "Portal 2 (pid 1234)".to_owned())
+        }
+    }
+
+    /// Records the events a job emitted, so a test can assert on them.
+    #[derive(Default)]
+    struct Recorder {
+        events: Mutex<Vec<String>>,
+    }
+
+    impl EventSink for Recorder {
+        fn event(&self, event: Event) {
+            let name = match event {
+                Event::Paused { by } => format!("paused by {by}"),
+                Event::Resumed => "resumed".to_owned(),
+                Event::Started { .. } => "started".to_owned(),
+                Event::Progress { .. } => "progress".to_owned(),
+                Event::Warning(m) => format!("warning {m}"),
+                Event::Finished(_) => "finished".to_owned(),
+            };
+            if let Ok(mut events) = self.events.lock() {
+                events.push(name);
+            }
+        }
+    }
+
+    /// Far enough in the past that the rate limit never suppresses a check.
+    fn due() -> Mutex<Instant> {
+        Mutex::new(Instant::now() - Duration::from_secs(60))
+    }
+
+    #[test]
+    fn waits_until_the_game_closes_then_says_so() -> TestResult {
+        let cancel = AtomicBool::new(false);
+        let events = Recorder::default();
+        // Busy for two polls, which at 500ms each means it blocks about a
+        // second before the game "closes".
+        let game = FakeGame { calls: AtomicUsize::new(0), busy_for: 2 };
+        let ctx = JobCtx { events: &events, cancel: &cancel, busy: Some(&game) };
+
+        let started = Instant::now();
+        let carry_on = ctx.wait_while_busy(&due());
+        let waited = started.elapsed();
+
+        check(carry_on, "the job should continue once the game closes")?;
+        check(
+            waited >= Duration::from_millis(400),
+            format!("expected it to block while busy, waited {waited:?}"),
+        )?;
+        let seen = events.events.lock().map_err(|e| e.to_string())?.clone();
+        check_eq(
+            seen,
+            vec!["paused by Portal 2 (pid 1234)".to_owned(), "resumed".to_owned()],
+            "it announces the pause once and the resume once",
+        )
+    }
+
+    #[test]
+    fn a_free_game_does_not_pause_or_announce() -> TestResult {
+        let cancel = AtomicBool::new(false);
+        let events = Recorder::default();
+        let game = FakeGame { calls: AtomicUsize::new(0), busy_for: 0 };
+        let ctx = JobCtx { events: &events, cancel: &cancel, busy: Some(&game) };
+
+        check(ctx.wait_while_busy(&due()), "a free game continues immediately")?;
+        let seen = events.events.lock().map_err(|e| e.to_string())?.len();
+        check_eq(seen, 0, "nothing to announce when nothing was waiting")
+    }
+
+    #[test]
+    fn cancelling_during_a_pause_stops_the_job() -> TestResult {
+        let cancel = AtomicBool::new(true);
+        let events = Recorder::default();
+        // Busy forever: only the cancel can end this wait.
+        let game = FakeGame { calls: AtomicUsize::new(0), busy_for: usize::MAX };
+        let ctx = JobCtx { events: &events, cancel: &cancel, busy: Some(&game) };
+
+        check(
+            !ctx.wait_while_busy(&due()),
+            "Ctrl-C during a pause must stop the job, not resume it",
+        )
+    }
+
+    #[test]
+    fn without_a_check_it_never_waits() -> TestResult {
+        let cancel = AtomicBool::new(false);
+        let events = Recorder::default();
+        let ctx = JobCtx { events: &events, cancel: &cancel, busy: None };
+
+        check(ctx.wait_while_busy(&due()), "no check means no pausing")?;
+        let seen = events.events.lock().map_err(|e| e.to_string())?.len();
+        check_eq(seen, 0, "and nothing announced")
+    }
+
+    #[test]
+    fn checks_are_rate_limited() -> TestResult {
+        let cancel = AtomicBool::new(false);
+        let events = Recorder::default();
+        let game = FakeGame { calls: AtomicUsize::new(0), busy_for: usize::MAX };
+        let ctx = JobCtx { events: &events, cancel: &cancel, busy: Some(&game) };
+
+        // Checked a moment ago, so this call must skip the scan entirely. A
+        // scan per file would cost more than the compression on a library
+        // with hundreds of thousands of files.
+        let recent = Mutex::new(Instant::now());
+        check(ctx.wait_while_busy(&recent), "a recent check means carry on")?;
+        check_eq(
+            game.calls.load(Ordering::Relaxed),
+            0,
+            "the busy check must not have been consulted at all",
+        )
     }
 }
 
