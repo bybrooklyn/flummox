@@ -101,7 +101,10 @@ Name a game by its Steam app ID, by `steam:105600`, or by part of its title.
 Presets are `fast`, `balanced` and `max`. Every read-only command takes
 `--json`.
 
-Flummox refuses to touch a game that is running, updating or being verified.
+Flummox will not start on a game that is running, updating or being verified.
+If you launch the game while it is working, it pauses and waits for you, then
+picks up where it left off. Pass `--no-pause` if you would rather it stop.
+
 Ctrl-C stops between files, so a cancelled job leaves a game that is partly
 compressed, still playable, and safe to resume.
 
