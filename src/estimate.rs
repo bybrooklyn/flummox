@@ -18,6 +18,20 @@ use crate::inventory::{self, Inventory};
 /// How many blocks are sampled from one file at most.
 const MAX_BLOCKS_PER_FILE: u64 = 32;
 
+/// How many blocks are sampled from a file whose header names a compressed
+/// container.
+///
+/// Fewer than [`MAX_BLOCKS_PER_FILE`], because such a file usually has nothing
+/// to give and sampling it fully is time spent proving that. More than one,
+/// because the header describes the container and not the bytes inside it: an
+/// archive that stores some of its entries uncompressed still has saving in it.
+const CONTAINER_BLOCKS: u64 = 8;
+
+/// How much of a file's head is read to look for a container's magic number.
+///
+/// The longest magic checked is five bytes.
+const MAGIC_PEEK: usize = 16;
+
 /// Sampling stops once this many bytes have been read for one game.
 const MAX_SAMPLE_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -225,13 +239,20 @@ pub fn estimate_file_with(
 ) -> io::Result<FileEstimate> {
     let block = u64::from(model.block_size());
     let blocks = size.div_ceil(block).max(1);
-    let sample_count = blocks.min(MAX_BLOCKS_PER_FILE);
-    // Spread the samples evenly, so a file with a compressible header and
-    // incompressible body is not judged by its header alone.
-    let stride = blocks / sample_count;
 
     let mut file = std::fs::File::open(path)?;
     let mut buf = vec![0u8; model.block_size() as usize];
+    // A container's magic number lowers how much of the file is sampled. It
+    // used to end the estimate at the first block, which reported no saving
+    // for every file starting with one, including archives holding entries
+    // that were never compressed.
+    let head = read_full(&mut file, buf.get_mut(..MAGIC_PEEK).unwrap_or(&mut []))?;
+    let container = inventory::is_precompressed_magic(buf.get(..head).unwrap_or(&[]));
+    let sample_count =
+        blocks.min(if container { CONTAINER_BLOCKS } else { MAX_BLOCKS_PER_FILE });
+    // Spread the samples evenly, so a file with a compressible header and
+    // incompressible body is not judged by its header alone.
+    let stride = blocks / sample_count;
     let mut est = FileEstimate { size, ..FileEstimate::default() };
     let mut sampled_now = 0u64;
     let mut sampled_after = 0u64;
@@ -248,14 +269,6 @@ pub fn estimate_file_with(
         let Some(chunk) = buf.get(..read) else { break };
         if chunk.is_empty() {
             break;
-        }
-        // A compressed container anywhere in the file means the rest is very
-        // likely compressed too.
-        if i == 0 && inventory::is_precompressed_magic(chunk) {
-            est.disk_now = size;
-            est.disk_after = size;
-            est.sampled = read as u64;
-            return Ok(est);
         }
         let uncompressed = chunk.len() as u32;
         let after = zstd::bulk::compress(chunk, opts.level)?.len() as u32;
@@ -464,6 +477,24 @@ mod tests {
         Ok(bytes.len() as u64)
     }
 
+    /// Pseudo-random bytes, standing in for already-compressed game data.
+    ///
+    /// splitmix64, whole words at a time: taking one byte per step would leave
+    /// a short repeating cycle that zstd compresses away.
+    fn noise(len: usize) -> Vec<u8> {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            out.extend_from_slice(&(z ^ (z >> 31)).to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
     #[test]
     fn estimates_compressible_and_random_files() -> TestResult {
         let tmp = tempfile::tempdir().ctx("tempdir")?;
@@ -476,39 +507,38 @@ mod tests {
         check(est.disk_after < est.disk_now / 10, format!("{est:?}"))?;
         check(est.worthwhile(), "a file of zeros is worth compressing")?;
 
-        // Pseudo-random bytes stand in for already-compressed game data.
-        // splitmix64, whole words at a time: taking one byte per step would
-        // leave a short repeating cycle that zstd compresses away.
-        let mut state = 0x9E37_79B9_7F4A_7C15u64;
-        let mut noise = Vec::with_capacity(4 * 1024 * 1024);
-        while noise.len() < 4 * 1024 * 1024 {
-            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = state;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            noise.extend_from_slice(&(z ^ (z >> 31)).to_le_bytes());
-        }
         let random = tmp.path().join("noise.dat");
-        let size = write_file(&random, noise)?;
+        let size = write_file(&random, noise(4 * 1024 * 1024))?;
         let est = estimate_file(&random, size, &model, &opts).ctx("estimate noise.dat")?;
         check(!est.worthwhile(), format!("{est:?}"))
     }
 
     #[test]
-    fn a_compressed_header_short_circuits_the_file() -> TestResult {
+    fn a_container_header_is_measured_rather_than_assumed() -> TestResult {
         let tmp = tempfile::tempdir().ctx("tempdir")?;
-        let path = tmp.path().join("archive.pak");
+        let model = BtrfsModel { level: 9 };
+        let opts = EstimateOpts { level: 9, mount_level: None };
+
+        // A zstd header over bytes that really are incompressible. This is the
+        // case the magic number is a useful hint for, and it still reports
+        // nothing to gain.
+        let packed = tmp.path().join("packed.pak");
+        let mut bytes = vec![0x28, 0xB5, 0x2F, 0xFD];
+        bytes.extend_from_slice(&noise(1024 * 1024));
+        let size = write_file(&packed, bytes)?;
+        let est = estimate_file(&packed, size, &model, &opts).ctx("estimate packed.pak")?;
+        check(!est.worthwhile(), format!("a packed archive has nothing to give: {est:?}"))?;
+
+        // The same header over bytes that compress. An archive can hold
+        // entries it never compressed, and reading one block and stopping
+        // reported no saving for every one of them.
+        let loose = tmp.path().join("loose.pak");
         let mut bytes = vec![0x28, 0xB5, 0x2F, 0xFD];
         bytes.resize(1024 * 1024, 0);
-        let size = write_file(&path, bytes)?;
-        let est =
-            estimate_file(&path, size, &BtrfsModel { level: 9 }, &EstimateOpts {
-                level: 9,
-                mount_level: None,
-            })
-            .ctx("estimate archive.pak")?;
-        check_eq(est.disk_now, est.disk_after, "a compressed header means nothing to gain")?;
-        check(!est.worthwhile(), "an already-compressed file is not worthwhile")
+        let size = write_file(&loose, bytes)?;
+        let est = estimate_file(&loose, size, &model, &opts).ctx("estimate loose.pak")?;
+        check(est.worthwhile(), format!("a loose archive is worth rewriting: {est:?}"))?;
+        check(est.disk_after < est.disk_now / 2, format!("{est:?}"))
     }
 
     #[test]
