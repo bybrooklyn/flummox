@@ -370,6 +370,11 @@ fn backend_for(install_dir: &Path) -> Result<(FsInfo, Box<dyn Backend>)> {
 }
 
 /// Refuses to touch a game that is running, updating or in use.
+/// Refuses to start when something is using the game.
+///
+/// Call this again after the walk. Walking a 64 GB install takes seconds, and
+/// a game launched in that window would otherwise have its files rewritten
+/// underneath it.
 fn check_idle(game: &Game, force: bool) -> Result<()> {
     let process = busy::process_using(&game.install_dir, &ProcFs::new());
     if let Some(p) = &process
@@ -653,6 +658,8 @@ fn cmd_compress(
         );
     }
     let full_inv = walk(&game, backend.as_ref(), Some(cancel.as_ref()))?;
+    // The walk took time. Anything could have started in it.
+    check_idle(&game, force)?;
 
     // After a game update most of an install is byte-identical to what was
     // compressed last time. Where an earlier pass already ran at this level or

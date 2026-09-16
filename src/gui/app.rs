@@ -53,6 +53,12 @@ pub struct GameRow {
     pub game: Game,
     /// The filesystem holding it.
     pub filesystem: String,
+    /// Where that filesystem is mounted.
+    ///
+    /// Cached because probing re-reads and re-parses `/proc/self/mountinfo`.
+    /// Without this the Drives page parsed it once per game to build the
+    /// list, then again per game on every frame.
+    pub mountpoint: Option<PathBuf>,
     /// Whether this tool can compress it at all.
     pub supported: bool,
     /// Why not, when it cannot.
@@ -69,11 +75,18 @@ impl GameRow {
                     Tier::Pack => (false, Some("needs the pack tier, which is not built yet".to_owned())),
                     Tier::Unsupported(why) => (false, Some(why.to_owned())),
                 };
-                Self { game, filesystem: fs.fstype, supported, note }
+                Self {
+                    game,
+                    filesystem: fs.fstype,
+                    mountpoint: Some(fs.mountpoint),
+                    supported,
+                    note,
+                }
             }
             Err(e) => Self {
                 game,
                 filesystem: "unknown".to_owned(),
+                mountpoint: None,
                 supported: false,
                 note: Some(format!("could not read the drive: {e}")),
             },
@@ -147,11 +160,9 @@ impl State {
     /// The drives games were found on.
     pub fn drives(&self) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = Vec::new();
-        for row in &self.games {
-            if let Ok(fs) = fsprobe::probe(&row.game.install_dir)
-                && !out.contains(&fs.mountpoint)
-            {
-                out.push(fs.mountpoint);
+        for mountpoint in self.games.iter().filter_map(|row| row.mountpoint.clone()) {
+            if !out.contains(&mountpoint) {
+                out.push(mountpoint);
             }
         }
         out
