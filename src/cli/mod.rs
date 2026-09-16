@@ -111,6 +111,8 @@ enum Command {
     /// once its download settles, which recovers what the filesystem's write
     /// heuristic skipped while the files were being written.
     Watch {
+        #[command(subcommand)]
+        action: Option<WatchAction>,
         #[command(flatten)]
         level: LevelArgs,
         /// Files to work on at once.
@@ -211,8 +213,8 @@ pub fn run() -> Result<()> {
         Command::Status { selector } => cmd_status(&env, out, &selector, &cancel),
         Command::Log { limit } => cmd_log(out, limit),
         Command::Hook { action } => cmd_hook(&env, out, action),
-        Command::Watch { level, threads, dry_run } => {
-            cmd_watch(&env, &level, threads, dry_run, &cancel)
+        Command::Watch { action, level, threads, dry_run } => {
+            cmd_watch(&env, action, &level, threads, dry_run, &cancel)
         }
         Command::Exclude { action } => cmd_exclude(&env, out, action),
         Command::Drives => cmd_drives(&env),
@@ -1159,6 +1161,116 @@ fn steam_libraries(env: &Env) -> Vec<PathBuf> {
     out
 }
 
+/// What to do with the background service.
+#[derive(Debug, Subcommand)]
+enum WatchAction {
+    /// Start watching at login, and now.
+    Enable,
+    /// Stop watching, now and at login.
+    Disable,
+    /// Report whether the background service is on.
+    Status,
+}
+
+/// The unit file name, under the user's own systemd directory.
+const UNIT_NAME: &str = "flummox-watch.service";
+
+/// First line of a unit this tool wrote.
+///
+/// `disable` removes a file only when it starts with this, so a unit someone
+/// wrote by hand at the same path is left where it is.
+const UNIT_MARKER: &str = "# Written by `flummox watch enable`.";
+
+/// Where a systemd user unit belongs.
+///
+/// `$XDG_CONFIG_HOME/systemd/user`, falling back to `~/.config/...`. A
+/// relative `XDG_CONFIG_HOME` is ignored, as the XDG specification requires.
+fn unit_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    Some(base.join("systemd").join("user"))
+}
+
+/// Runs `systemctl --user`, reporting whether it succeeded.
+fn systemctl(args: &[&str]) -> Result<bool> {
+    let status = std::process::Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .status()
+        .context("running systemctl, which this machine may not have")?;
+    Ok(status.success())
+}
+
+/// Installs the user unit and starts it.
+fn service_enable() -> Result<()> {
+    let dir = unit_dir().context("neither XDG_CONFIG_HOME nor HOME is set")?;
+    let exe = std::env::current_exe().context("finding this executable")?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join(UNIT_NAME);
+    // The running binary's own path is written in, so a build started from a
+    // working tree runs that build rather than one installed elsewhere.
+    let unit = format!(
+        "{UNIT_MARKER}\n\
+         [Unit]\n\
+         Description=Compress Steam downloads as they finish\n\
+         After=default.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={} watch\n\
+         Restart=on-failure\n\
+         RestartSec=30\n\
+         NoNewPrivileges=true\n\
+         Nice=10\n\
+         IOSchedulingClass=idle\n\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n",
+        exe.display()
+    );
+    std::fs::write(&path, unit).with_context(|| format!("writing {}", path.display()))?;
+    systemctl(&["daemon-reload"])?;
+    if !systemctl(&["enable", "--now", UNIT_NAME])? {
+        bail!("systemctl could not enable {UNIT_NAME}");
+    }
+    println!("New downloads will be compressed on their own, starting now.");
+    println!("Turn it off with `flummox watch disable`.");
+    Ok(())
+}
+
+/// Stops the user unit and removes it.
+fn service_disable() -> Result<()> {
+    let dir = unit_dir().context("neither XDG_CONFIG_HOME nor HOME is set")?;
+    let path = dir.join(UNIT_NAME);
+    let _stopped = systemctl(&["disable", "--now", UNIT_NAME])?;
+    match std::fs::read_to_string(&path) {
+        Ok(text) if text.starts_with(UNIT_MARKER) => {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("removing {}", path.display()))?;
+            systemctl(&["daemon-reload"])?;
+        }
+        Ok(_) => println!("Left {} where it is: this tool did not write it.", path.display()),
+        Err(_) => {}
+    }
+    println!("Downloads are no longer compressed on their own.");
+    println!("Anything already compressed stays as it is.");
+    Ok(())
+}
+
+/// Reports whether the background service is installed and running.
+fn service_status() -> Result<()> {
+    let enabled = systemctl(&["is-enabled", "--quiet", UNIT_NAME])?;
+    let active = systemctl(&["is-active", "--quiet", UNIT_NAME])?;
+    println!("Starts at login : {}", if enabled { "yes" } else { "no" });
+    println!("Running now     : {}", if active { "yes" } else { "no" });
+    if !enabled {
+        println!("\nTurn it on with `flummox watch enable`.");
+    }
+    Ok(())
+}
+
 /// Watches Steam and compresses each download once it finishes.
 ///
 /// The property `flummox hook` sets compresses during the download and costs
@@ -1166,11 +1278,18 @@ fn steam_libraries(env: &Env) -> Vec<PathBuf> {
 /// ones it guesses will not pay. A pass afterwards recovers those.
 fn cmd_watch(
     env: &Env,
+    action: Option<WatchAction>,
     level: &LevelArgs,
     threads: usize,
     dry_run: bool,
     cancel: &Arc<AtomicBool>,
 ) -> Result<()> {
+    match action {
+        Some(WatchAction::Enable) => return service_enable(),
+        Some(WatchAction::Disable) => return service_disable(),
+        Some(WatchAction::Status) => return service_status(),
+        None => {}
+    }
     let libraries = steam_libraries(env);
     if libraries.is_empty() {
         bail!("no Steam libraries found; try `flummox doctor`");

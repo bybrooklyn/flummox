@@ -90,6 +90,23 @@ uncompressed, and a later `flummox compress` brought it to 26 MB. A 27 MB
 Unity asset file arrived at 20 MB, and a pass took it to 17 MB. Running
 `flummox compress` after a large download is still worth doing.
 
+So turn on both halves:
+
+```sh
+flummox hook on          # compress during the download, at no cost
+flummox watch enable     # collect the rest once it finishes
+```
+
+`flummox watch enable` starts a small background service that runs at login.
+It reads Steam's own manifests and compresses a game once its download has
+settled, which picks up the files the filesystem skipped on the way past. It
+waits behind anything else using the disk, and it will not touch a game you
+are playing.
+
+`flummox watch status` says whether it is on, and `flummox watch disable`
+turns it off. Running `flummox watch` with no argument does the same work in
+the foreground, if you would rather watch it happen.
+
 `flummox hook off` stops it applying to future downloads and leaves everything
 already compressed exactly as it is.
 

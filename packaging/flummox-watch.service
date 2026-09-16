@@ -1,0 +1,30 @@
+[Unit]
+Description=Compress Steam downloads as they finish
+Documentation=https://github.com/bybrooklyn/flummox
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/flummox watch
+Restart=on-failure
+RestartSec=30
+
+# Games are compressed wherever they are installed, which includes drives
+# outside the home directory, so ProtectSystem=strict cannot be used here: it
+# would make those mounts read-only and every pass would fail. The real limit
+# is Landlock, which each job applies to itself before any worker thread
+# starts, restricting it to the one game it is working on.
+NoNewPrivileges=true
+PrivateTmp=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+MemoryDenyWriteExecute=true
+
+# A download has just finished, so the machine is likely still busy. Compression
+# waits behind anything else that wants the disk or the processor.
+Nice=10
+IOSchedulingClass=idle
+CPUSchedulingPolicy=idle
+
+[Install]
+WantedBy=default.target
