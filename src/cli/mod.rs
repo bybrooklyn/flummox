@@ -94,10 +94,28 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: u32,
     },
+    /// Compress new Steam downloads as they are written.
+    ///
+    /// Sets a property on each Steam library so future downloads and patches
+    /// land compressed, with no second pass over them afterwards.
+    Hook {
+        #[command(subcommand)]
+        action: HookAction,
+    },
     /// List the drives holding games, and how each one can be compressed.
     Drives,
     /// Check this machine for anything that would stop the tool working.
     Doctor,
+}
+
+#[derive(Debug, Subcommand)]
+enum HookAction {
+    /// Turn it on for every Steam library found.
+    On,
+    /// Turn it off. Games already compressed stay compressed.
+    Off,
+    /// Show which libraries have it.
+    Status,
 }
 
 #[derive(Debug, Args)]
@@ -153,6 +171,7 @@ pub fn run() -> Result<()> {
         Command::Decompress { selector, force } => cmd_decompress(&env, &selector, force, &cancel),
         Command::Status { selector } => cmd_status(&env, out, &selector, &cancel),
         Command::Log { limit } => cmd_log(out, limit),
+        Command::Hook { action } => cmd_hook(&env, out, action),
         Command::Drives => cmd_drives(&env),
         Command::Doctor => cmd_doctor(&env),
     }
@@ -991,6 +1010,107 @@ fn cmd_log(out: Output, limit: u32) -> Result<()> {
     Ok(())
 }
 
+/// The directories in a Steam library whose contents should inherit
+/// compression.
+///
+/// `downloading` and `temp` are where Steam stages a download before moving it
+/// into place, so covering them is what makes the saving cost nothing: the
+/// bytes are compressed the first and only time they are written.
+fn hook_dirs(library: &Path) -> Vec<PathBuf> {
+    let steamapps = library.join("steamapps");
+    ["", "common", "downloading", "temp"]
+        .iter()
+        .map(|sub| if sub.is_empty() { steamapps.clone() } else { steamapps.join(sub) })
+        .filter(|p| p.is_dir())
+        .collect()
+}
+
+/// Every Steam library on this machine, with duplicates removed.
+fn steam_libraries(env: &Env) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for root in crate::launchers::steam::roots(env) {
+        let Ok(libraries) = crate::launchers::steam::libraries(&root) else { continue };
+        for library in libraries {
+            if !out.contains(&library) {
+                out.push(library);
+            }
+        }
+    }
+    out
+}
+
+fn cmd_hook(env: &Env, out: Output, action: HookAction) -> Result<()> {
+    let libraries = steam_libraries(env);
+    if libraries.is_empty() {
+        bail!("no Steam libraries found; try `flummox doctor`");
+    }
+
+    #[derive(serde::Serialize)]
+    struct HookRow {
+        library: PathBuf,
+        filesystem: String,
+        supported: bool,
+        directories: usize,
+        compression: Option<String>,
+    }
+
+    let mut rows = Vec::new();
+    for library in libraries {
+        let fs = fsprobe::probe(&library).ok();
+        // The property only means anything on a filesystem that compresses.
+        let supported = fs
+            .as_ref()
+            .is_some_and(|f| matches!(fsprobe::tier_for(f), Tier::Native(_)));
+        let dirs = hook_dirs(&library);
+
+        if supported {
+            for dir in &dirs {
+                let result = match action {
+                    HookAction::On => backend::btrfs::set_dir_property(dir, true),
+                    HookAction::Off => backend::btrfs::set_dir_property(dir, false),
+                    HookAction::Status => Ok(()),
+                };
+                if let Err(e) = result {
+                    eprintln!("warning: {}: {e}", dir.display());
+                }
+            }
+        }
+
+        let compression = dirs
+            .first()
+            .and_then(|dir| backend::btrfs::dir_property(dir).ok().flatten());
+        rows.push(HookRow {
+            library,
+            filesystem: fs.map_or_else(|| "unknown".to_owned(), |f| f.fstype),
+            supported,
+            directories: dirs.len(),
+            compression,
+        });
+    }
+
+    out.emit(&rows, || {
+        for row in &rows {
+            let state = match (&row.compression, row.supported) {
+                (Some(algo), _) => format!("on ({algo})"),
+                (None, true) => "off".to_owned(),
+                (None, false) => format!("not possible on {}", row.filesystem),
+            };
+            println!("{:<52}  {state}", row.library.display());
+        }
+        match action {
+            HookAction::On => println!(
+                "\nNew downloads and patches in these libraries will be compressed as they \
+                 are written. Games already installed are untouched; run `flummox compress` \
+                 for those."
+            ),
+            HookAction::Off => {
+                println!("\nFuture downloads land uncompressed. Nothing already compressed changed.");
+            }
+            HookAction::Status => {}
+        }
+    })
+}
+
 fn cmd_drives(env: &Env) -> Result<()> {
     let scan = scan(env);
     let mut seen: Vec<(PathBuf, FsInfo, u64, usize)> = Vec::new();
@@ -1069,6 +1189,19 @@ fn cmd_doctor(env: &Env) -> Result<()> {
         if fuse { "[ok]" } else { "[!] " },
         if fuse { "present (needed later for ext4/xfs drives)" } else { "missing" }
     );
+
+    for library in steam_libraries(env) {
+        let on = backend::btrfs::dir_property(&library.join("steamapps"))
+            .ok()
+            .flatten();
+        match on {
+            Some(algo) => println!("[ok] new downloads compress on arrival ({algo}): {}", library.display()),
+            None => println!(
+                "[ ]  new downloads land uncompressed: {}. Turn it on with `flummox hook on`",
+                library.display()
+            ),
+        }
+    }
 
     let games = scan(env).games;
     let idle = games.iter().filter(|g| g.state.is_idle() && !g.is_tool).count();

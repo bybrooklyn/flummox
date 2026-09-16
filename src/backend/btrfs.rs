@@ -165,11 +165,29 @@ pub fn decompress_fd(file: &File) -> io::Result<()> {
         .map_err(errno_to_io)
 }
 
+/// Whether the directory carries the `btrfs.compression` property.
+///
+/// Reports the algorithm, or `None` when the property is unset.
+pub fn dir_property(dir: &Path) -> io::Result<Option<String>> {
+    match xattr::get(dir, "btrfs.compression") {
+        Ok(Some(raw)) => Ok(Some(String::from_utf8_lossy(&raw).into_owned())),
+        Ok(None) => Ok(None),
+        // Not btrfs, or the property was never set.
+        Err(e) if e.raw_os_error() == Some(libc::ENODATA) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Sets the directory's `btrfs.compression` property.
 ///
-/// New files inherit it, which is what keeps a game compressed after Steam
-/// patches it. The property carries the algorithm only; the level comes from
-/// the mount, so our own passes still set it per file.
+/// Both new files and new subdirectories inherit it, so setting it on a Steam
+/// library makes every future download land compressed as it is written,
+/// costing no extra reading or rewriting. Measured on this filesystem: a file
+/// created after the property was set had every mapped byte in a compressed
+/// extent.
+///
+/// The property names the algorithm only. The level comes from the mount, so
+/// a pass at a chosen level still sets that per file.
 pub fn set_dir_property(dir: &Path, enabled: bool) -> io::Result<()> {
     if enabled {
         xattr::set(dir, "btrfs.compression", b"zstd")

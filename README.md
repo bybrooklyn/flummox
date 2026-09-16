@@ -29,7 +29,8 @@ expect more.
 
 ## Get it
 
-**[Download the latest release](https://github.com/bybrooklyn/flummox/releases/latest)**
+No prebuilt downloads yet. Build it from source, which takes a couple of
+minutes.
 
 Arch and CachyOS:
 
@@ -66,6 +67,23 @@ compiling the entire window stack with it.
 | **Windows and macOS** | Planned. Windows will use its own compression, not zstd |
 | **Heroic, Lutris, Bottles** | Planned. Steam only for now |
 | **Flatpak build** | Not possible. The sandbox hides other processes, so Flummox could not tell whether a game was running, which is the check that keeps it from touching a game you are playing |
+
+## Compress new downloads automatically
+
+Turn this on once:
+
+```sh
+flummox hook on
+```
+
+Every game you install or patch after that arrives compressed, because the
+filesystem compresses the bytes the first and only time they are written. It
+costs nothing: there is no second pass, no rewriting, and no time added to the
+download. Games already installed are untouched, so run `flummox compress` for
+those.
+
+`flummox hook off` stops it applying to future downloads and leaves everything
+already compressed exactly as it is.
 
 ## Use it
 
