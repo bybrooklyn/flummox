@@ -99,10 +99,10 @@ nix::ioctl_readwrite!(fs_ioc_fiemap, b'f', 11, Fiemap);
 
 /// Rewrites an already-open file as compressed extents at `level`.
 ///
-/// Taking a handle rather than a path is the point: the caller obtained it
-/// from an [`Anchor`], so the path could not have been swapped for a symlink
-/// between the walk and the rewrite. There is deliberately no path-taking
-/// version, because that would be a route around the check.
+/// Takes a handle, not a path. The caller got it from an [`Anchor`], so the
+/// path could not have been swapped for a symlink between the walk and the
+/// rewrite. No path-taking version exists, because that would be a route
+/// around the check.
 ///
 /// The handle may be read-only. The kernel checks write *permission*, not the
 /// open mode, so this still works on a game executable that is running.

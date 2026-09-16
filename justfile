@@ -55,4 +55,7 @@ win:
     cargo xwin build --release --target x86_64-pc-windows-msvc
 
 # Everything CI runs, in the order CI runs it.
-ci: lint test deny
+#
+# `prose` is in here because it was not, and a push went through with the
+# style rules broken. A check nothing runs is a check that does not exist.
+ci: lint test deny prose
