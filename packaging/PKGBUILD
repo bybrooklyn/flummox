@@ -7,13 +7,13 @@
 # release tarball with a checksum rather than at the working tree, and
 # `pkgver()` should read the tag.
 
-pkgname=gamecompressor
+pkgname=flummox
 pkgver=0.1.0
 pkgrel=1
 pkgdesc="Compress installed games with zstd on Linux, and keep playing them"
 arch=('x86_64')
-url="https://github.com/bybrooklyn/gamecompressor"
-license=('GPL-3.0-or-later')
+url="https://github.com/bybrooklyn/flummox"
+license=('AGPL-3.0-or-later')
 # The command-line tool needs nothing beyond libc: it talks to btrfs through
 # ioctls rather than through btrfs-progs. The rest are what the GUI links
 # against for its window, input and text.
@@ -42,7 +42,7 @@ prepare() {
 build() {
     cd "$_tree"
     export RUSTUP_TOOLCHAIN=stable
-    cargo build --frozen --release
+    cargo build --frozen --release --features gui
 }
 
 check() {
@@ -50,7 +50,7 @@ check() {
     export RUSTUP_TOOLCHAIN=stable
     # The btrfs tests check the filesystem they are running on and skip
     # themselves elsewhere, so this passes on any build host.
-    cargo test --frozen --workspace
+    cargo test --frozen --all-features
 }
 
 package() {

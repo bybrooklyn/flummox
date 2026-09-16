@@ -1,22 +1,31 @@
-[workspace]
-resolver = "3"
-members = ["crates/*", "bins/*"]
-
-[workspace.package]
+[package]
+name = "flummox"
+description = "Compress your game library and keep playing it"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
-license = "GPL-3.0-or-later"
-repository = "https://github.com/bybrooklyn/gamecompressor"
-authors = ["gamecompressor contributors"]
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/bybrooklyn/flummox"
+authors = ["Flummox contributors"]
 
-[workspace.dependencies]
-# Version as well as path: a path-only dependency is a wildcard requirement,
-# which cargo-deny rejects and which would publish as `*` if these crates ever
-# went to a registry.
-gc-core = { path = "crates/gc-core", version = "0.1.0" }
-gc-launchers = { path = "crates/gc-launchers", version = "0.1.0" }
-gc-testutil = { path = "crates/gc-testutil", version = "0.1.0" }
+[features]
+default = []
+# The window stack is about 135 of the crates in the lock file and needs X and
+# Wayland headers. A headless CLI user should not have to install either, so
+# the GUI is opt in. CI must pass --all-features or the GUI stops being built,
+# tested and linted.
+gui = ["dep:iced"]
+
+[[bin]]
+name = "flummox"
+path = "src/bin/flummox.rs"
+
+[[bin]]
+name = "flummox-gui"
+path = "src/bin/flummox-gui.rs"
+required-features = ["gui"]
+
+[dependencies]
 anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive", "env"] }
@@ -28,32 +37,30 @@ walkdir = "2"
 rayon = "1"
 nix = { version = "0.31", features = ["fs", "ioctl", "user"] }
 libc = "0.2"
-# openat2(2) with RESOLVE_BENEATH/RESOLVE_NO_SYMLINKS: every game file is
-# opened relative to a directory handle, so a swapped symlink cannot redirect
-# a job outside the install directory.
+# openat2 with RESOLVE_BENEATH and RESOLVE_NO_SYMLINKS, so a swapped symlink
+# cannot redirect a job outside the install directory.
 rustix = { version = "1", features = ["fs"] }
-# Landlock: an unprivileged process can drop its own filesystem rights, so a
-# compression job can only reach the game it was asked to work on.
+# Landlock lets an unprivileged process drop its own filesystem rights.
 landlock = "0.4"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-signal-hook = "0.3"
-proptest = "1"
 xattr = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
 directories = "6"
 humansize = "2"
-tempfile = "3"
-# Pinned exactly: iced's API still moves between patch releases, and the GUI
-# is the one place a surprise break costs a rewrite rather than a fix.
-iced = "=0.14.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+signal-hook = "0.3"
+iced = { version = "=0.14.0", optional = true }
 
-[workspace.lints.rust]
+[dev-dependencies]
+tempfile = "3"
+# The VDF parser reads files Steam writes, not files we write. Its robustness
+# against arbitrary input is a property, not a list of examples.
+proptest = "1"
+
+[lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
-# Strict from day one (the bav-gui table): clippy.toml relaxes the panicking
-# lints inside #[test] code only.
-[workspace.lints.clippy]
+[lints.clippy]
 all = { level = "warn", priority = -1 }
 todo = "deny"
 unimplemented = "deny"
@@ -82,6 +89,7 @@ debug = "line-tables-only"
 panic = "abort"
 debug = "line-tables-only"
 
-# zstd at high levels is painfully slow unoptimized; tests compress real data.
+# zstd at high levels is painfully slow unoptimised, and the tests compress
+# real data.
 [profile.dev.package.zstd-sys]
 opt-level = 3

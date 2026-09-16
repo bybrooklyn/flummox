@@ -33,17 +33,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --workspace --all-targets
+        run: cargo build --all-features --all-targets
 
       # The btrfs-specific tests check the filesystem they are running on and
       # skip themselves elsewhere, so this is honest but not complete: the
       # ioctl paths are only really exercised on a btrfs machine. See the
       # `fs-matrix` job below.
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --all-features
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --all-features --all-targets -- -D warnings
 
   deny:
     name: Dependency policy
@@ -81,6 +81,6 @@ jobs:
       # the current directory, so running from the mount is what selects them.
       - name: Run the backend tests on btrfs
         run: |
-          cargo build --tests -p gc-core
+          cargo build --tests -p flummox
           cd /tmp/btrfs
-          cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" -p gc-core backend::btrfs
+          cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" -p flummox backend::btrfs

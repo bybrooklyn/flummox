@@ -1,4 +1,4 @@
-# cargo-deny policy for gamecompressor.
+# cargo-deny policy for flummox.
 #
 # Run with:  cargo deny check
 #
@@ -7,7 +7,7 @@
 # ioctls and `openat2`. A dependency that is compromised, unvendorable, or
 # licensed incompatibly is therefore not a paperwork problem: it is either a
 # supply-chain foothold in something that rewrites files, or a licence
-# violation in a GPL-3.0-or-later program that we cannot legally ship.
+# violation in an AGPL-3.0-or-later program that we cannot legally ship.
 #
 # The four sections below correspond to the four questions worth asking of a
 # dependency tree: is anything known to be broken, may we legally link it, are
@@ -68,7 +68,7 @@ ignore = [
 # Licences
 # ---------------------------------------------------------------------------
 [licenses]
-# gamecompressor is GPL-3.0-or-later, so the binary may only link libraries
+# flummox is AGPL-3.0-or-later, so the binary may only link libraries
 # under licences that are GPL-3-compatible. Permissive licences are; anything
 # reciprocal on a different footing (AGPL, SSPL, proprietary) is not, and
 # would have to be removed rather than debated.
@@ -79,7 +79,7 @@ ignore = [
 # looked at, and `unused-allowed-license` below makes a stale entry visible.
 allow = [
     # Our own crates, and the terms the whole work ships under.
-    "GPL-3.0-or-later",
+    "AGPL-3.0-or-later",
     # The overwhelming majority of the tree: the Rust ecosystem's usual
     # `MIT OR Apache-2.0` dual licence. Between them these two also satisfy
     # every `OR` expression here — `Unlicense OR MIT`,

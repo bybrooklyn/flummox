@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Game Compressor
+GenericName=Game storage compressor
+Comment=Compress installed games with zstd and keep playing them
+Exec=flummox-gui
+Terminal=false
+Categories=Utility;System;FileTools;
+Keywords=games;steam;compression;zstd;btrfs;disk;storage;
+StartupNotify=true
+# No Icon= line on purpose: pointing at an icon that is not installed leaves a
+# blank tile in the launcher, which looks more broken than the generic icon a
+# desktop environment picks on its own. Add one here when there is an icon to
+# install alongside it.

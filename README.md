@@ -1,6 +1,7 @@
-# Game Compressor
+# Flummox
 
-Compress installed games with zstd on Linux, and keep playing them.
+Compress your game library and keep playing it. Named for the reaction to how
+much space comes back.
 
 This is a Linux counterpart to the Windows tool of the same idea: instead of NTFS
 LZX compression, it uses the filesystem's own transparent zstd support, so a
@@ -36,24 +37,24 @@ warns before compressing on a snapshotted subvolume, where rewriting extents can
 Requires a recent Rust toolchain and a btrfs filesystem.
 
 ```sh
-git clone https://github.com/bybrooklyn/gamecompressor
-cd gamecompressor
+git clone https://github.com/bybrooklyn/flummox
+cd flummox
 cargo build --release
 ```
 
-The binaries are `target/release/gamecompressor` (command line) and
-`target/release/gamecompressor-gui` (desktop window).
+The binaries are `target/release/flummox` (command line) and
+`target/release/flummox-gui` (desktop window).
 
 ## Use
 
 ```sh
-gamecompressor scan                     # what is installed, and where
-gamecompressor estimate 105600          # what compressing it would save
-gamecompressor compress 105600 --preset max
-gamecompressor status 105600            # how much is stored compressed
-gamecompressor decompress 105600        # put it back
-gamecompressor log                      # what this tool has done
-gamecompressor doctor                   # check this machine
+flummox scan                     # what is installed, and where
+flummox estimate 105600          # what compressing it would save
+flummox compress 105600 --preset max
+flummox status 105600            # how much is stored compressed
+flummox decompress 105600        # put it back
+flummox log                      # what this tool has done
+flummox doctor                   # check this machine
 ```
 
 A game can be named by app ID, by `steam:105600`, or by part of its title.
@@ -102,4 +103,4 @@ Estimates are sampled, so treat them as a guide.
 
 ## Licence
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+AGPL-3.0-or-later. See [LICENSE](LICENSE).
