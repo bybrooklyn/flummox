@@ -8,6 +8,8 @@
 //! Only the text format lives here. `shortcuts.vdf` is binary and gets its own
 //! module when non-Steam shortcuts are supported.
 
+#![cfg_attr(windows, allow(dead_code))]
+
 use std::fmt;
 
 /// A parse failure, with the 1-based line it happened on.
@@ -212,11 +214,18 @@ struct Lexer<'a> {
 
 impl<'a> Lexer<'a> {
     fn new(text: &'a str) -> Self {
-        Self { rest: text.chars(), peeked: None, line: 1 }
+        Self {
+            rest: text.chars(),
+            peeked: None,
+            line: 1,
+        }
     }
 
     fn err(&self, kind: ErrorKind) -> Error {
-        Error { line: self.line, kind }
+        Error {
+            line: self.line,
+            kind,
+        }
     }
 
     fn bump(&mut self) -> Option<char> {
@@ -266,7 +275,9 @@ impl<'a> Lexer<'a> {
 
     fn next_token(&mut self) -> Result<Option<Token>, Error> {
         self.skip_trivia();
-        let Some(c) = self.peek() else { return Ok(None) };
+        let Some(c) = self.peek() else {
+            return Ok(None);
+        };
         match c {
             '{' => {
                 self.bump();
@@ -397,7 +408,11 @@ mod tests {
         check_eq(obj.get_u32("StateFlags"), Some(4), "StateFlags")?;
         // Keys are case-insensitive, like Steam's own lookups.
         check_eq(obj.get_u64("appid"), Some(105600), "appid")?;
-        check_eq(obj.get_u64("AppID"), Some(105600), "appid, looked up as AppID")?;
+        check_eq(
+            obj.get_u64("AppID"),
+            Some(105600),
+            "appid, looked up as AppID",
+        )?;
         let depot = obj
             .path(&["InstalledDepots", "105602"])
             .ctx("the InstalledDepots/105602 object")?;
@@ -415,8 +430,16 @@ mod tests {
 }
 "#;
         let obj = parse(text).ctx("parsing a document with comments")?;
-        check_eq(obj.get_str("a"), Some("1"), "the value before the conditional")?;
-        check_eq(obj.get_str("b"), Some("2"), "the value after the conditional")
+        check_eq(
+            obj.get_str("a"),
+            Some("1"),
+            "the value before the conditional",
+        )?;
+        check_eq(
+            obj.get_str("b"),
+            Some("2"),
+            "the value after the conditional",
+        )
     }
 
     #[test]
@@ -432,7 +455,11 @@ mod tests {
         let obj = parse(r#""root" { "p" "C:\\games\\x" bare value }"#)
             .ctx("parsing escapes and bare tokens")?;
         check_eq(obj.get_str("p"), Some(r"C:\games\x"), "the unescaped path")?;
-        check_eq(obj.get_str("bare"), Some("value"), "the unquoted key/value pair")
+        check_eq(
+            obj.get_str("bare"),
+            Some("value"),
+            "the unquoted key/value pair",
+        )
     }
 
     #[test]
@@ -441,7 +468,11 @@ mod tests {
             "RunningAppID"  "105600"
         } } } } }"#;
         let obj = parse(text).ctx("parsing a nested registry document")?;
-        check_eq(obj.find_str("RunningAppID"), Some("105600"), "the nested search")?;
+        check_eq(
+            obj.find_str("RunningAppID"),
+            Some("105600"),
+            "the nested search",
+        )?;
         check_eq(
             obj.path(&["HKCU", "Software", "Valve", "Steam"])
                 .and_then(|o| o.get_u32("RunningAppID")),

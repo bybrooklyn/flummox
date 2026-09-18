@@ -92,7 +92,10 @@ impl SandboxPlan {
         let keep = |paths: Vec<PathBuf>| -> Vec<PathBuf> {
             paths.into_iter().filter(|p| p.exists()).collect()
         };
-        Self { writable: keep(writable), readable: keep(readable) }
+        Self {
+            writable: keep(writable),
+            readable: keep(readable),
+        }
     }
 
     /// The plan for a compression job on one game.
@@ -105,10 +108,18 @@ impl SandboxPlan {
     pub fn for_job(install_dir: &Path, state_dir: Option<&Path>) -> Self {
         let mut writable = vec![install_dir.to_path_buf()];
         writable.extend(state_dir.map(Path::to_path_buf));
-        let readable = ["/usr", "/etc", "/proc", "/sys", "/lib", "/lib64", "/dev/urandom"]
-            .iter()
-            .map(PathBuf::from)
-            .collect();
+        let readable = [
+            "/usr",
+            "/etc",
+            "/proc",
+            "/sys",
+            "/lib",
+            "/lib64",
+            "/dev/urandom",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
         Self::for_paths(writable, readable)
     }
 }
@@ -128,8 +139,18 @@ pub fn restrict(plan: &SandboxPlan) -> SandboxStatus {
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::from_all(TARGET_ABI))
         .and_then(|r| r.create())
-        .and_then(|r| r.add_rules(path_beneath_rules(&plan.readable, AccessFs::from_read(TARGET_ABI))))
-        .and_then(|r| r.add_rules(path_beneath_rules(&plan.writable, AccessFs::from_all(TARGET_ABI))))
+        .and_then(|r| {
+            r.add_rules(path_beneath_rules(
+                &plan.readable,
+                AccessFs::from_read(TARGET_ABI),
+            ))
+        })
+        .and_then(|r| {
+            r.add_rules(path_beneath_rules(
+                &plan.writable,
+                AccessFs::from_all(TARGET_ABI),
+            ))
+        })
         .and_then(|r| r.restrict_self());
 
     match result {
@@ -183,11 +204,20 @@ mod tests {
     fn a_plan_drops_paths_that_do_not_exist() -> TestResult {
         let tmp = tempfile::tempdir().ctx("temporary directory")?;
         let plan = SandboxPlan::for_paths(
-            vec![tmp.path().to_path_buf(), PathBuf::from("/nonexistent-game-dir")],
+            vec![
+                tmp.path().to_path_buf(),
+                PathBuf::from("/nonexistent-game-dir"),
+            ],
             vec![PathBuf::from("/nonexistent-system-dir")],
         );
-        check(plan.writable.len() == 1, "the missing writable path should be dropped")?;
-        check(plan.readable.is_empty(), "the missing readable path should be dropped")
+        check(
+            plan.writable.len() == 1,
+            "the missing writable path should be dropped",
+        )?;
+        check(
+            plan.readable.is_empty(),
+            "the missing readable path should be dropped",
+        )
     }
 
     #[test]
@@ -196,17 +226,29 @@ mod tests {
         let state = tmp.path().join("state");
         std::fs::create_dir(&state).ctx("create the state directory")?;
         let plan = SandboxPlan::for_job(tmp.path(), Some(&state));
-        check(plan.writable.contains(&tmp.path().to_path_buf()), "the game must be writable")?;
-        check(plan.writable.contains(&state), "the state directory must be writable")?;
+        check(
+            plan.writable.contains(&tmp.path().to_path_buf()),
+            "the game must be writable",
+        )?;
+        check(
+            plan.writable.contains(&state),
+            "the state directory must be writable",
+        )?;
         // /usr exists on any Linux system this runs on; its presence shows the
         // read-only set is actually populated.
-        check(plan.readable.contains(&PathBuf::from("/usr")), "system paths must be readable")
+        check(
+            plan.readable.contains(&PathBuf::from("/usr")),
+            "system paths must be readable",
+        )
     }
 
     #[test]
     fn refuses_to_sandbox_with_nothing_writable() -> TestResult {
         let status = restrict(&SandboxPlan::default());
-        check(!status.is_active(), "an empty plan must not be treated as enforced")
+        check(
+            !status.is_active(),
+            "an empty plan must not be treated as enforced",
+        )
     }
 
     #[test]

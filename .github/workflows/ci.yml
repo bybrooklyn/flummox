@@ -11,6 +11,20 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  windows:
+    name: Windows native app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the toolchain
+        run: rustup toolchain install stable --profile minimal
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-xwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the Windows CLI and GUI
+        run: cargo xwin build --release --target x86_64-pc-windows-msvc --features gui --bins
+
   check:
     name: Build, test, lint and dependency policy
     runs-on: ubuntu-latest
@@ -72,6 +86,52 @@ jobs:
       # else they skip themselves, which would make a green run misleading.
       - name: Run the backend tests on btrfs
         run: |
-          cargo build --tests
-          cd /tmp/btrfs
-          cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" backend::btrfs
+          cargo test --no-run --message-format=json > /tmp/flummox-test-build.jsonl
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          with open('/tmp/flummox-test-build.jsonl') as build:
+              artifacts = [json.loads(line) for line in build]
+          tests = [item for item in artifacts
+                   if item.get('reason') == 'compiler-artifact'
+                   and item.get('profile', {}).get('test')
+                   and item.get('executable')
+                   and (item['target']['kind'] == ['lib']
+                        or item['target']['name'] == 'jobs_lifecycle')]
+          if len(tests) != 2:
+              raise RuntimeError('Expected library and coordinator lifecycle test executables')
+          # Cargo sets test cwd to the package root. Invoke the artifacts directly
+          # so their temporary files actually live on the mounted filesystem.
+          os.chdir('/tmp/btrfs')
+          for test in tests:
+              args = [test['executable']]
+              if test['target']['kind'] == ['lib']:
+                  args.append('backend::btrfs')
+              result = subprocess.run(args + ['--nocapture'], text=True,
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              print(result.stdout)
+              result.check_returncode()
+              if 'skipped:' in result.stdout:
+                  raise RuntimeError('A required native filesystem test was skipped')
+          PY
+
+  pack-mount:
+    name: Compressed store mount and executable reads
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Enable unprivileged FUSE mounts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fuse3
+          sudo modprobe fuse
+          test -c /dev/fuse
+      - uses: Swatinem/rust-cache@v2
+      - name: Require mounted reads and fixture execution
+        env:
+          FLUMMOX_REQUIRE_FUSE: '1'
+        run: cargo test --features pack-mount --test pack_mount -- --nocapture

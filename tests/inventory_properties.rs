@@ -30,8 +30,8 @@ use proptest::prelude::*;
 /// expectation: if someone deletes an entry from the crate's own list, this
 /// list still says `.mp4` must not be recompressed.
 const PRECOMPRESSED: &[&str] = &[
-    "zst", "xz", "gz", "bz2", "7z", "rar", "zip", "lz4", "mp4", "mkv", "webm", "bik", "mp3",
-    "ogg", "flac", "wem", "jpg", "png", "webp", "dds", "ktx2", "woff2",
+    "zst", "xz", "gz", "bz2", "7z", "rar", "zip", "lz4", "mp4", "mkv", "webm", "bik", "mp3", "ogg",
+    "flac", "wem", "jpg", "png", "webp", "dds", "ktx2", "woff2",
 ];
 
 /// Both size floors the workspace ships: the pack tier's and the native one's.
@@ -51,7 +51,11 @@ fn precompressed_path() -> impl Strategy<Value = PathBuf> {
         "a known precompressed extension",
         |(stem, index, upper)| {
             let ext = PRECOMPRESSED.get(index)?;
-            let ext = if upper { ext.to_ascii_uppercase() } else { (*ext).to_owned() };
+            let ext = if upper {
+                ext.to_ascii_uppercase()
+            } else {
+                (*ext).to_owned()
+            };
             Some(PathBuf::from(format!("data/{stem}.{ext}")))
         },
     )
@@ -82,7 +86,9 @@ fn plain_path() -> impl Strategy<Value = PathBuf> {
                 PathBuf::from(format!("data/{stem}.{ext}"))
             }
         })
-        .prop_filter("the stem itself must not look precompressed", |p| !is_precompressed_name(p))
+        .prop_filter("the stem itself must not look precompressed", |p| {
+            !is_precompressed_name(p)
+        })
 }
 
 /// Any relative path at all.
@@ -143,25 +149,12 @@ proptest! {
         }
     }
 
-    /// A name that says the contents are already compressed is never
-    /// compressed, at any size and under either floor.
-    ///
-    /// Size must not be able to override the extension. It would be a natural
-    /// mistake to decide that a big enough archive is worth a try anyway, and
-    /// large media files are exactly the ones where rewriting every extent
-    /// costs the most and gains the least.
+    /// Stored archives and raw textures still reach content sampling.
     #[test]
-    fn a_precompressed_name_is_never_compressed(
-        path in precompressed_path(),
-        size in file_sizes(),
-        opts in floors(),
+    fn an_extension_never_overrides_content_eligibility(
+        path in precompressed_path(), size in file_sizes(), opts in floors(),
     ) {
-        let action = decide(&path, size, &opts);
-        prop_assert!(!action.is_compress(), "{path:?} is already compressed");
-        prop_assert!(
-            matches!(action, Action::SkipTiny | Action::SkipPrecompressed),
-            "and it is skipped for one of the two stated reasons, not silently"
-        );
+        prop_assert_eq!(decide(&path, size, &opts).is_compress(), size > opts.min_size);
     }
 
     /// The native floor selects a superset of what the pack floor selects.

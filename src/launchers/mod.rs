@@ -4,6 +4,7 @@
 //! [`crate::model::Game`] values. Nothing here touches game files; it only
 //! reads launcher metadata, so a scan is always safe to run.
 
+mod desktop;
 pub mod steam;
 pub mod vdf;
 
@@ -51,7 +52,10 @@ impl DetectError {
         context: impl Into<String>,
         source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
     ) -> Self {
-        Self { context: context.into(), source: source.into() }
+        Self {
+            context: context.into(),
+            source: source.into(),
+        }
     }
 }
 
@@ -74,5 +78,11 @@ pub fn scan_all(env: &Env) -> Scan {
         Ok(mut games) => scan.games.append(&mut games),
         Err(e) => scan.warnings.push(e),
     }
+    desktop::discover(env, &mut scan);
+    // Fixture environments must never read the real user's custom libraries.
+    if Env::current().is_some_and(|current| current.home == env.home) {
+        desktop::custom(&mut scan);
+    }
+    desktop::merge(&mut scan);
     scan
 }

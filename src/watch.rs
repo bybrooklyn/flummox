@@ -20,7 +20,10 @@ use crate::launchers::steam::{self, App, state_flags};
 /// `signal-hook` registers handlers with `SA_RESTART`, so a blocking read is
 /// resumed after a signal and never sees the flag. Waking regularly is what
 /// lets Ctrl-C and `systemctl stop` end the watcher.
-const WAIT: Timespec = Timespec { tv_sec: 1, tv_nsec: 0 };
+const WAIT: Timespec = Timespec {
+    tv_sec: 1,
+    tv_nsec: 0,
+};
 
 /// How many bytes of events to read at a time.
 const BUF_BYTES: usize = 4096;
@@ -41,7 +44,10 @@ pub fn is_settled(app: &App) -> bool {
 /// `None` for anything else, including the temporary files Steam writes
 /// alongside a manifest before renaming it into place.
 pub fn appid_from_manifest(name: &str) -> Option<u32> {
-    name.strip_prefix("appmanifest_")?.strip_suffix(".acf")?.parse().ok()
+    name.strip_prefix("appmanifest_")?
+        .strip_suffix(".acf")?
+        .parse()
+        .ok()
 }
 
 /// Watches each library's `steamapps` directory, reporting apps as they settle.
@@ -77,7 +83,10 @@ pub fn run(
         watched.push(library.clone());
     }
     if watched.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "no Steam library could be watched"));
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no Steam library could be watched",
+        ));
     }
 
     let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); BUF_BYTES];
@@ -155,23 +164,54 @@ mod tests {
 
     #[test]
     fn a_manifest_name_yields_its_appid() -> TestResult {
-        check_eq(appid_from_manifest("appmanifest_105600.acf"), Some(105_600), "a manifest")?;
+        check_eq(
+            appid_from_manifest("appmanifest_105600.acf"),
+            Some(105_600),
+            "a manifest",
+        )?;
         check_eq(appid_from_manifest("appmanifest_.acf"), None, "no digits")?;
-        check_eq(appid_from_manifest("libraryfolders.vdf"), None, "not a manifest")?;
-        check_eq(appid_from_manifest("appmanifest_105600.acf.tmp"), None, "a temporary file")?;
-        check_eq(appid_from_manifest("appmanifest_-1.acf"), None, "not an appid")
+        check_eq(
+            appid_from_manifest("libraryfolders.vdf"),
+            None,
+            "not a manifest",
+        )?;
+        check_eq(
+            appid_from_manifest("appmanifest_105600.acf.tmp"),
+            None,
+            "a temporary file",
+        )?;
+        check_eq(
+            appid_from_manifest("appmanifest_-1.acf"),
+            None,
+            "not an appid",
+        )
     }
 
     #[test]
     fn an_install_still_being_worked_on_is_not_settled() -> TestResult {
-        let downloading =
-            app(state_flags::FULLY_INSTALLED | state_flags::DOWNLOADING, (0, 0), (0, 0));
-        check(!is_settled(&downloading), "a download in progress is not settled")?;
-        let validating =
-            app(state_flags::FULLY_INSTALLED | state_flags::VALIDATING, (0, 0), (0, 0));
-        check(!is_settled(&validating), "a validating install is not settled")?;
+        let downloading = app(
+            state_flags::FULLY_INSTALLED | state_flags::DOWNLOADING,
+            (0, 0),
+            (0, 0),
+        );
+        check(
+            !is_settled(&downloading),
+            "a download in progress is not settled",
+        )?;
+        let validating = app(
+            state_flags::FULLY_INSTALLED | state_flags::VALIDATING,
+            (0, 0),
+            (0, 0),
+        );
+        check(
+            !is_settled(&validating),
+            "a validating install is not settled",
+        )?;
         let uninstalled = app(state_flags::UNINSTALLED, (0, 0), (0, 0));
-        check(!is_settled(&uninstalled), "an uninstalled app is not settled")
+        check(
+            !is_settled(&uninstalled),
+            "an uninstalled app is not settled",
+        )
     }
 
     #[test]
@@ -181,6 +221,9 @@ mod tests {
         let staging = app(state_flags::FULLY_INSTALLED, (0, 0), (100, 20));
         check(!is_settled(&staging), "bytes left to stage is not settled")?;
         let done = app(state_flags::FULLY_INSTALLED, (0, 0), (0, 0));
-        check(is_settled(&done), "installed with nothing pending is settled")
+        check(
+            is_settled(&done),
+            "installed with nothing pending is settled",
+        )
     }
 }

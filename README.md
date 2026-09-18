@@ -3,29 +3,19 @@
 Your games take up less space and still work. Named for the reaction to how
 much comes back.
 
-Flummox tells the filesystem to store your installed games compressed. The
+By default, Flummox tells the filesystem to store installed games compressed. The
 files stay where they are, the game still launches, and nothing is packed into
 an archive you have to unpack first. One command puts it all back.
 
-How much you get back depends entirely on the game. Video, audio, textures and
-packed archives give back nothing, and Flummox skips them instead of burning
-CPU to prove it. A few real examples from one library, estimated at the
-strongest setting:
+Savings depend on the actual bytes and the drive's starting state. Encoded
+video and audio often have little left to gain, but raw textures and stored
+archive entries can still compress well. Flummox samples content instead of
+rejecting a file because its name ends in `.dds`, `.zip`, or `.pak`.
 
-| Game                  | Installed | Estimated saving |
-|-----------------------|-----------|------------------|
-| Detroit: Become Human | 65.8 GB   | 4.34 GB          |
-| Warframe              | 55.3 GB   | 958 MB           |
-| Celeste               | 1.20 GB   | 45 MB            |
-| Just Cause 3          | 88.3 GB   | 56 MB            |
-
-Just Cause 3 is the honest counterexample: 88 GB that is already packed tight,
-so there is almost nothing to win. Flummox tells you that before it does any
-work, which is the whole reason it estimates first.
-
-Those figures come from a drive **already** compressing everything at the
-weakest setting, so they are gains on top of that. On an uncompressed drive,
-expect more.
+A drive already mounted with compression has already collected part of the
+saving. Flummox labels its sampled predictions as estimates of **additional**
+space. Whole-drive free-space changes include other applications' writes and
+are shown separately.
 
 ## Get it
 
@@ -39,34 +29,143 @@ git clone https://github.com/bybrooklyn/flummox
 cd flummox/packaging && makepkg -si
 ```
 
-Anything else, with a Rust toolchain installed:
+Linux, with a Rust toolchain and FUSE development files installed:
 
 ```sh
 git clone https://github.com/bybrooklyn/flummox
 cd flummox
-cargo build --release --features gui
+cargo build --release --features gui,pack-mount
 ```
 
 That gives you `flummox` for the terminal and `flummox-gui` for the window.
-Leave off `--features gui` if you only want the command line tool, and you skip
+Leave off both features if you only want native btrfs commands, and you skip
 compiling the entire window stack with it.
+
+On Windows with the Rust MSVC toolchain:
+
+```powershell
+cargo build --release --features gui
+```
+
+The same `flummox-gui` application builds on Linux and Windows. Rust selects
+the storage implementation for the target at compile time. Windows uses the
+operating system's WOF/LZX storage and does not need a filesystem driver.
 
 ## What works today
 
 | | |
 |---|---|
-| **Games** | Steam, including native, Flatpak and snap installs |
-| **Drives** | btrfs |
-| **Desktop** | Any Linux desktop. The window runs on Wayland and X11 |
+| **Linux games** | Steam (native, Flatpak and snap), Heroic installed manifests, Lutris, and custom game folders |
+| **Linux storage** | Native btrfs compression; verified writable Maximum Space stores on ext4, XFS, F2FS, ZFS, and btrfs with FUSE |
+| **Windows** | Local Steam discovery and custom folders on NTFS using transparent WOF/LZX compression |
+| **Desktop** | Wayland and X11 on Linux; native window on Windows |
 
 ## What does not work yet
 
 | | |
 |---|---|
-| **ext4, XFS, F2FS** | Designed, not built. This is what the Steam Deck's internal drive uses, so the Deck is not supported yet |
-| **Windows and macOS** | Planned. Windows will use its own compression, not zstd |
-| **Heroic, Lutris, Bottles** | Planned. Steam only for now |
+| **Linux native compression outside btrfs** | Maximum Space works through a writable FUSE store, but these filesystems have no in-place native backend |
+| **Windows launcher parity** | Steam and manual folders work. Heroic, Xbox, GOG Galaxy, background maintenance, and Maximum Space are still Linux-only |
+| **macOS** | Deferred until there is user demand |
+| **Bottles** | Discovery is planned |
 | **Flatpak build** | Not possible. The sandbox hides other processes, so Flummox could not tell whether a game was running, which is the check that keeps it from touching a game you are playing |
+
+## Use the window
+
+Open `flummox-gui` on Linux, choose Games, select your games, and press **Free
+up space**. Analysis starts in the background. Search, drive and launcher
+filters, and sorting help with larger libraries. Expanding a game shows its
+path, compression preset, analysis, and recovery actions. Maximum compares
+levels 9, 15, 19, and 22 per unique chunk and keeps the smallest result;
+ties use the cheaper level. Balanced remains the quicker native default.
+
+On Windows, choose a detected Steam game or paste another installed-game
+folder, then press **Optimize**. Flummox reports files processed and actual
+allocated bytes freed while Windows works. **Stop** finishes the current file
+and keeps completed work valid. **Restore** removes WOF backing and leaves the
+same files at the same paths.
+
+The window theme and responsive layout are shared across targets. Linux-only
+storage controls appear only when their backend and FUSE support are available.
+Other desktop targets build the shared shell with compression disabled until a
+safe storage backend exists.
+
+Queue supports pause, resume, cancel, and retry. Closing the window leaves jobs
+with the background coordinator; reopening reconnects. Analysis and compression
+pause when a detected game is running. Current filesystem operations finish
+before workers stop at 16 MiB range boundaries, including inside large files.
+
+Drives lets you add a game folder and opt each library into maintenance. An
+opt-in starts observing from that point, so existing installs are not all
+compressed immediately. Subsequent installations and completed updates queue
+work. The coordinator stays running after the window closes and starts at
+desktop login while any library has maintenance enabled. Disabling the last
+library removes Flummox's startup entry.
+
+`Ctrl+F` focuses game search, `Ctrl+R` refreshes, and `Escape` clears selection
+and closes details. Tab and Shift+Tab move focus. Reduce motion is saved in
+Drives. Artwork comes from Steam's local cache; no artwork or telemetry is sent
+to a server.
+
+The command line shares ordinary compression and decompression jobs with the
+window. Interrupting the CLI disconnects the client and leaves its job running:
+
+```sh
+flummox jobs
+flummox jobs pause 12
+flummox jobs resume 12
+flummox jobs cancel 12
+flummox jobs retry 12
+```
+
+The advanced `--force` and `--no-pause` paths retain their direct execution
+behavior and share an operation lock with coordinator workers.
+
+## Compare compression approaches
+
+```sh
+flummox benchmark /path/to/game --budget-mib 32 --json
+```
+
+This read-only experiment compares zstd levels 3, 9, and 15 in independent
+128 KiB blocks with levels 9, 15, and 19 in frames up to 4 MiB. Every candidate
+uses the same source samples, and every frame is decoded and checked against
+its input. The report includes input coverage, encoded size, and encode/decode
+time. It does not change the game's storage or measure recovered disk space.
+
+Larger frames can reuse repetition outside btrfs's native compression window.
+They also require more decompression work per random read. The frame-sampling
+rows exclude store metadata and allocation costs. The complete store benchmark provides full-corpus measurements that include
+metadata, content-defined chunk deduplication, verified restoration, and an
+optional read-only or writable FUSE mount. Content-derived boundaries recover
+sharing after insertions and removals instead of losing every later match.
+Directory stores also hard-link matching chunk objects through a same-drive
+pool, sharing physical allocation across games while keeping every store
+independently readable.
+The checked-in [WOF/LZX comparison](docs/benchmarks/2026-09-18-lzx.md) measures
+four complete game corpora against a verified 32 KiB LZX proxy. Flummox retained
+62.46% in aggregate versus 65.51% for the proxy. The repository also includes a
+Windows `compact.exe` measurement script for the native result required before
+making a general Game Compressor claim. Related-game pool tests saved another
+227.5 MB, or 14.76% of already-compressed allocation, across two game families.
+
+```sh
+flummox pack benchmark /path/to/game --maximum --json
+flummox pack benchmark /path/to/game --maximum \
+  --wof-lzx-helper /path/to/wof-lzx-helper --json
+flummox pack create /path/to/game /path/to/game.flumpack --maximum
+flummox pack verify /path/to/game.flumpack
+flummox pack restore /path/to/game.flumpack /path/to/new-folder
+flummox pack activate /path/to/game.flumpack /launcher/game/path
+```
+
+Source folders are retained. Builds with `pack-mount` can use a persistent
+copy-on-write directory, so game writes and launcher file replacements survive
+without changing the base store. A stopped layer can be committed into a new
+verified store. Automatic installation replacement and GUI activation are
+available when the app is built with `gui,pack-mount`. Activation keeps
+the launcher's existing path, remounts at login, and retains the original until
+an explicit reclaim action. See [store commands and format](docs/pack-store.md).
 
 ## Compress new downloads automatically
 
@@ -120,7 +219,14 @@ flummox decompress 105600           # put it back
 flummox status 105600               # how much is stored compressed
 flummox log                         # what Flummox has done
 flummox doctor                      # check this machine
+flummox compatibility list --json  # export path-free qualification records
 ```
+
+Import a locally produced compatibility qualification with `flummox
+compatibility import report.json`. Reports identify a launcher key, build and
+corpus hash. They contain no game title, install path, user name or machine
+identifier. Maximum Space automation accepts only a matching verified build
+whose measured load-time change stays within policy.
 
 Steam reports some folders that are not games, like shared redistributables
 and runtimes. Flummox filters the obvious ones, and you can correct the rest:
@@ -196,6 +302,9 @@ about 20 KB of nested braces would overflow the stack and abort the process.
 A pre-push hook runs the same thing, so CI is a second opinion rather than the
 first one. `unwrap`, `expect`, `panic` and indexing are banned throughout,
 including in tests.
+
+See [the job and compression design](docs/jobs-and-compression.md) for state
+transitions, recovery guarantees, sampling policy, and current boundaries.
 
 ## Licence
 

@@ -258,10 +258,14 @@ pub fn running_app_id(root: &Path) -> Option<u32> {
     // The registry lives next to the root, not inside it.
     let candidates = [
         root.join("registry.vdf"),
-        root.parent().map(|p| p.join("registry.vdf")).unwrap_or_default(),
+        root.parent()
+            .map(|p| p.join("registry.vdf"))
+            .unwrap_or_default(),
     ];
     for path in candidates {
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
         let Ok(obj) = vdf::parse(&text) else { continue };
         if let Some(id) = obj.find_str("RunningAppID").and_then(|s| s.parse().ok())
             && id != 0
@@ -299,16 +303,22 @@ pub fn group_state(apps: &[App], running: Option<u32>) -> InstallState {
         return InstallState::Busy(BusyReason::LauncherBusy("transfer in progress".to_owned()));
     }
     if union & state_flags::FILES_MISSING != 0 {
-        return InstallState::Broken("files missing".to_owned());
+        return InstallState::Broken {
+            detail: "files missing".to_owned(),
+        };
     }
     if union & state_flags::FILES_CORRUPT != 0 {
-        return InstallState::Broken("files corrupt".to_owned());
+        return InstallState::Broken {
+            detail: "files corrupt".to_owned(),
+        };
     }
     if union & state_flags::UPDATE_REQUIRED != 0 {
         return InstallState::UpdatePending;
     }
     if union & state_flags::FULLY_INSTALLED == 0 {
-        return InstallState::Broken("not fully installed".to_owned());
+        return InstallState::Broken {
+            detail: "not fully installed".to_owned(),
+        };
     }
     // Installed and idle as far as the flags go, except Steam sometimes
     // leaves the running bit set after a crash. `RunningAppID` already said
@@ -346,7 +356,10 @@ pub fn discover(env: &Env) -> Result<Vec<Game>, DetectError> {
                 if !app.install_dir.is_dir() {
                     continue;
                 }
-                let key = app.install_dir.canonicalize().unwrap_or(app.install_dir.clone());
+                let key = app
+                    .install_dir
+                    .canonicalize()
+                    .unwrap_or(app.install_dir.clone());
                 groups.entry(key).or_default().push(app);
             }
         }
@@ -355,7 +368,9 @@ pub fn discover(env: &Env) -> Result<Vec<Game>, DetectError> {
     let mut games = Vec::new();
     for (install_dir, mut apps) in groups {
         apps.sort_by_key(|a| a.appid);
-        let Some(primary) = apps.first() else { continue };
+        let Some(primary) = apps.first() else {
+            continue;
+        };
         let state = group_state(&apps, running);
         games.push(Game {
             id: GameId::new(Launcher::Steam, primary.appid.to_string()),
@@ -433,8 +448,18 @@ mod tests {
         let tmp = tempfile::tempdir().ctx("creating a temporary directory")?;
         let steam = FakeSteam::new(tmp.path())?;
         steam
-            .app(105_600, "Terraria", state_flags::FULLY_INSTALLED, "Terraria")?
-            .app(220, "Half-Life 2", state_flags::FULLY_INSTALLED, "Half-Life 2")?
+            .app(
+                105_600,
+                "Terraria",
+                state_flags::FULLY_INSTALLED,
+                "Terraria",
+            )?
+            .app(
+                220,
+                "Half-Life 2",
+                state_flags::FULLY_INSTALLED,
+                "Half-Life 2",
+            )?
             // Shares the Half-Life 2 folder, and carries the stale running bit
             // this machine actually has.
             .app(
@@ -460,7 +485,12 @@ mod tests {
         let titles: Vec<&str> = games.iter().map(|g| g.title.as_str()).collect();
         check_eq(
             titles.as_slice(),
-            ["Half-Life 2", "Steamworks Common Redistributables", "Terraria"].as_slice(),
+            [
+                "Half-Life 2",
+                "Steamworks Common Redistributables",
+                "Terraria",
+            ]
+            .as_slice(),
             "the discovered titles",
         )?;
 
@@ -491,7 +521,10 @@ mod tests {
             .iter()
             .find(|g| g.title.starts_with("Steamworks"))
             .ctx("the Steamworks entry")?;
-        check(steamworks.is_tool, "Steamworks Common Redistributables is a tool")
+        check(
+            steamworks.is_tool,
+            "Steamworks Common Redistributables is a tool",
+        )
     }
 
     #[test]
@@ -511,7 +544,11 @@ mod tests {
             }]
         };
         let installed = state_flags::FULLY_INSTALLED;
-        check_eq(group_state(&apps(installed), None), InstallState::Idle, "installed and idle")?;
+        check_eq(
+            group_state(&apps(installed), None),
+            InstallState::Idle,
+            "installed and idle",
+        )?;
         check_eq(
             group_state(&apps(installed), Some(105_600)),
             InstallState::Busy(BusyReason::Running),
@@ -529,7 +566,9 @@ mod tests {
         )?;
         check_eq(
             group_state(&apps(installed | state_flags::FILES_MISSING), None),
-            InstallState::Broken("files missing".to_owned()),
+            InstallState::Broken {
+                detail: "files missing".to_owned(),
+            },
             "the files-missing flag",
         )
     }
@@ -548,7 +587,10 @@ mod tests {
             stage: (0, 0),
             library: PathBuf::from("/nonexistent"),
         };
-        check(app.transfer_pending(), "an unfinished download is a pending transfer")?;
+        check(
+            app.transfer_pending(),
+            "an unfinished download is a pending transfer",
+        )?;
         check(!app.is_tool(), "a plain app is not a tool")?;
         check_eq(
             group_state(std::slice::from_ref(&app), None),

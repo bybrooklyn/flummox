@@ -5,7 +5,7 @@ check: lint test
 
 # Build both binaries.
 build:
-    cargo build --release --features gui
+    cargo build --release --features gui,pack-mount
 
 # Build the command line tool only, with no window stack.
 build-cli:
@@ -28,7 +28,7 @@ deny:
 
 # Run the window from the working tree.
 gui:
-    cargo run --features gui --bin flummox-gui
+    cargo run --features gui,pack-mount --bin flummox-gui
 
 # Run the command line tool, for example: just cli scan
 cli *ARGS:
@@ -43,7 +43,7 @@ prose:
     #!/usr/bin/env bash
     set -uo pipefail
     fail=0
-    targets=(src tests packaging justfile deny.toml README.md CLAUDE.md .github)
+    targets=(src tests docs packaging justfile deny.toml README.md CLAUDE.md .github)
     for pattern in '—' 'on purpose' 'deliberately' 'by design' 'worth knowing' 'is the point'; do
         hits=$(grep -rn "$pattern" "${targets[@]}" 2>/dev/null | grep -v '^CLAUDE.md:' | grep -v '^justfile:' || true)
         if [ -n "$hits" ]; then
@@ -57,7 +57,7 @@ prose:
 
 # Cross-compile for Windows. Needs cargo-xwin, which is installed here.
 win:
-    cargo xwin build --release --target x86_64-pc-windows-msvc
+    cargo xwin build --release --target x86_64-pc-windows-msvc --features gui --bins
 
 # Everything CI runs, in the order CI runs it.
 #

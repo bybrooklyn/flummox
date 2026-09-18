@@ -314,9 +314,16 @@ fn deeply_nested_objects_are_refused_rather_than_overflowing_the_stack() -> Test
     let Err(e) = vdf::parse(&deep) else {
         return check(false, "a 10,000-level document must be refused, not parsed");
     };
-    check_eq(e.kind, vdf::ErrorKind::TooDeep, "it should be refused for depth, not by accident")?;
+    check_eq(
+        e.kind,
+        vdf::ErrorKind::TooDeep,
+        "it should be refused for depth, not by accident",
+    )?;
 
     let limit = usize::try_from(vdf::MAX_DEPTH).unwrap_or(usize::MAX);
     let within = nested_document(limit.saturating_sub(2));
-    check(vdf::parse(&within).is_ok(), "a document inside the limit must still parse")
+    check(
+        vdf::parse(&within).is_ok(),
+        "a document inside the limit must still parse",
+    )
 }

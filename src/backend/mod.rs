@@ -10,12 +10,12 @@ use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::estimate::{BtrfsModel, UnitModel};
+use crate::estimate::{BtrfsModel, PackModel, UnitModel};
 use crate::fsprobe::BackendKind;
 use crate::inventory::{Inventory, WalkOpts};
 
 /// How hard to compress.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Preset {
     /// Quick pass, small gain.
     Fast,
@@ -76,6 +76,14 @@ pub enum LevelPlan {
 }
 
 impl LevelPlan {
+    /// The lowest level a successful application of this policy permits.
+    pub fn floor(self) -> i32 {
+        match self {
+            Self::Fixed(level) => level,
+            Self::PerFile { low, .. } => low,
+        }
+    }
+
     /// The highest level this plan can apply.
     ///
     /// What an estimate targets, and what a later pass compares against to
@@ -89,7 +97,7 @@ impl LevelPlan {
 }
 
 /// Settings for one compression job.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct CompressOpts {
     /// The preset, unless `level` overrides it.
     pub preset: Preset,
@@ -101,11 +109,22 @@ pub struct CompressOpts {
 
 impl Default for CompressOpts {
     fn default() -> Self {
-        Self { preset: Preset::Balanced, level: None, threads: 2 }
+        Self {
+            preset: Preset::Balanced,
+            level: None,
+            threads: 2,
+        }
     }
 }
 
 impl CompressOpts {
+    /// Level selection after applying an explicit override.
+    pub fn level_plan(&self) -> LevelPlan {
+        self.level
+            .map(LevelPlan::Fixed)
+            .unwrap_or_else(|| self.preset.level_plan())
+    }
+
     /// The level this job will use on btrfs.
     pub fn btrfs_level(&self) -> i32 {
         self.level.unwrap_or_else(|| self.preset.btrfs_level())
@@ -113,7 +132,7 @@ impl CompressOpts {
 }
 
 /// Progress reported while a job runs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Event {
     /// The job started, with the number of files and bytes it will touch.
     Started {
@@ -140,6 +159,13 @@ pub enum Event {
     Resumed,
     /// Something went wrong that did not stop the job.
     Warning(String),
+    /// A file was successfully processed and may be checkpointed.
+    FileCompleted {
+        /// Identity captured before processing.
+        entry: crate::inventory::FileEntry,
+        /// Actual compression level.
+        level: i32,
+    },
     /// The job ended.
     Finished(Box<Outcome>),
 }
@@ -179,6 +205,10 @@ pub struct JobCtx<'a> {
 pub trait BusyCheck: Sync {
     /// Who is using the game, or `None` when nothing is.
     fn in_use_by(&self) -> Option<String>;
+    /// Expensive process scans are throttled; an in-memory control can use zero.
+    fn check_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(2)
+    }
 }
 
 impl JobCtx<'_> {
@@ -194,14 +224,17 @@ impl JobCtx<'_> {
     /// rate limited: a scan per file would cost more than the compression on
     /// a library with hundreds of thousands of files.
     pub fn wait_while_busy(&self, last_check: &std::sync::Mutex<std::time::Instant>) -> bool {
-        const CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
         const POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
-        let Some(busy) = self.busy else { return !self.cancelled() };
-        match last_check.lock() {
-            Ok(mut at) if at.elapsed() >= CHECK_EVERY => *at = std::time::Instant::now(),
-            Ok(_) => return !self.cancelled(),
-            Err(_) => return !self.cancelled(),
+        let Some(busy) = self.busy else {
+            return !self.cancelled();
+        };
+        // Hold the gate while paused so every worker waits at this boundary.
+        let Ok(mut checked) = last_check.lock() else {
+            return false;
+        };
+        if checked.elapsed() < busy.check_interval() {
+            return !self.cancelled();
         }
 
         let mut announced = false;
@@ -215,6 +248,7 @@ impl JobCtx<'_> {
             }
             std::thread::sleep(POLL);
         }
+        *checked = std::time::Instant::now();
         if announced {
             self.events.event(Event::Resumed);
         }
@@ -223,7 +257,7 @@ impl JobCtx<'_> {
 }
 
 /// What a finished job did.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Outcome {
     /// Files rewritten.
     pub files: u64,
@@ -248,6 +282,9 @@ pub struct Outcome {
     pub effective_level: Option<i32>,
     /// Whether the job stopped early because it was cancelled.
     pub cancelled: bool,
+    /// Confirmed file outcomes; pending and failed files are absent.
+    #[serde(skip)]
+    pub completed: Vec<(crate::inventory::FileEntry, i32)>,
     /// Per-file failures, as messages.
     pub errors: Vec<String>,
 }
@@ -330,29 +367,75 @@ pub trait Backend: Sync {
     fn status(&self, install_dir: &Path, inv: &Inventory) -> io::Result<CompressionStatus>;
 }
 
+/// Analysis model for filesystems that use a writable pack store.
+struct PackBackend;
+
+impl Backend for PackBackend {
+    fn kind(&self) -> BackendKind {
+        BackendKind::Pack
+    }
+
+    fn model(&self, _opts: &CompressOpts) -> Box<dyn UnitModel> {
+        Box::new(PackModel { level: 19 })
+    }
+
+    fn walk_opts(&self) -> WalkOpts {
+        WalkOpts::default()
+    }
+
+    fn compress(
+        &self,
+        _install_dir: &Path,
+        _inv: &Inventory,
+        _opts: &CompressOpts,
+        _ctx: &JobCtx<'_>,
+    ) -> io::Result<Outcome> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Maximum Space activation must use the verified pack transaction",
+        ))
+    }
+
+    fn decompress(
+        &self,
+        _install_dir: &Path,
+        _inv: &Inventory,
+        _ctx: &JobCtx<'_>,
+    ) -> io::Result<Outcome> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Restore this game through its Maximum Space controls",
+        ))
+    }
+
+    fn status(&self, _install_dir: &Path, _inv: &Inventory) -> io::Result<CompressionStatus> {
+        Ok(CompressionStatus::default())
+    }
+}
+
 /// Builds the backend for a filesystem kind.
 pub fn for_kind(kind: BackendKind) -> Option<Box<dyn Backend>> {
     match kind {
         BackendKind::Btrfs => Some(Box::new(btrfs::BtrfsBackend)),
-        // Not implemented yet; the pack tier lands with the FUSE layer.
-        BackendKind::Bcachefs | BackendKind::Pack => None,
+        BackendKind::Pack => Some(Box::new(PackBackend)),
+        BackendKind::Bcachefs => None,
     }
 }
 
 /// Free bytes on the filesystem holding `path`.
 pub fn free_bytes(path: &Path) -> io::Result<u64> {
-    let stat = nix::sys::statvfs::statvfs(path)
-        .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+    let stat =
+        nix::sys::statvfs::statvfs(path).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
     Ok(stat.blocks_available() as u64 * stat.fragment_size() as u64)
 }
 
 /// The estimator model matching a backend and its options.
 pub fn model_for(kind: BackendKind, opts: &CompressOpts) -> Box<dyn UnitModel> {
     match kind {
-        BackendKind::Btrfs | BackendKind::Bcachefs => {
-            Box::new(BtrfsModel { level: opts.btrfs_level() })
-        }
-        BackendKind::Pack => Box::new(BtrfsModel { level: opts.btrfs_level() }),
+        BackendKind::Btrfs | BackendKind::Bcachefs => Box::new(BtrfsModel {
+            level: opts.btrfs_level(),
+        }),
+        BackendKind::Pack => Box::new(PackModel { level: 19 }),
     }
 }
 
@@ -394,6 +477,7 @@ mod pause_tests {
                 Event::Progress { .. } => "progress".to_owned(),
                 Event::Warning(m) => format!("warning {m}"),
                 Event::Finished(_) => "finished".to_owned(),
+                Event::FileCompleted { .. } => "file completed".to_owned(),
             };
             if let Ok(mut events) = self.events.lock() {
                 events.push(name);
@@ -412,8 +496,15 @@ mod pause_tests {
         let events = Recorder::default();
         // Busy for two polls, which at 500ms each means it blocks about a
         // second before the game "closes".
-        let game = FakeGame { calls: AtomicUsize::new(0), busy_for: 2 };
-        let ctx = JobCtx { events: &events, cancel: &cancel, busy: Some(&game) };
+        let game = FakeGame {
+            calls: AtomicUsize::new(0),
+            busy_for: 2,
+        };
+        let ctx = JobCtx {
+            events: &events,
+            cancel: &cancel,
+            busy: Some(&game),
+        };
 
         let started = Instant::now();
         let carry_on = ctx.wait_while_busy(&due());
@@ -427,7 +518,10 @@ mod pause_tests {
         let seen = events.events.lock().map_err(|e| e.to_string())?.clone();
         check_eq(
             seen,
-            vec!["paused by Portal 2 (pid 1234)".to_owned(), "resumed".to_owned()],
+            vec![
+                "paused by Portal 2 (pid 1234)".to_owned(),
+                "resumed".to_owned(),
+            ],
             "it announces the pause once and the resume once",
         )
     }
@@ -436,10 +530,20 @@ mod pause_tests {
     fn a_free_game_does_not_pause_or_announce() -> TestResult {
         let cancel = AtomicBool::new(false);
         let events = Recorder::default();
-        let game = FakeGame { calls: AtomicUsize::new(0), busy_for: 0 };
-        let ctx = JobCtx { events: &events, cancel: &cancel, busy: Some(&game) };
+        let game = FakeGame {
+            calls: AtomicUsize::new(0),
+            busy_for: 0,
+        };
+        let ctx = JobCtx {
+            events: &events,
+            cancel: &cancel,
+            busy: Some(&game),
+        };
 
-        check(ctx.wait_while_busy(&due()), "a free game continues immediately")?;
+        check(
+            ctx.wait_while_busy(&due()),
+            "a free game continues immediately",
+        )?;
         let seen = events.events.lock().map_err(|e| e.to_string())?.len();
         check_eq(seen, 0, "nothing to announce when nothing was waiting")
     }
@@ -449,8 +553,15 @@ mod pause_tests {
         let cancel = AtomicBool::new(true);
         let events = Recorder::default();
         // Busy forever: only the cancel can end this wait.
-        let game = FakeGame { calls: AtomicUsize::new(0), busy_for: usize::MAX };
-        let ctx = JobCtx { events: &events, cancel: &cancel, busy: Some(&game) };
+        let game = FakeGame {
+            calls: AtomicUsize::new(0),
+            busy_for: usize::MAX,
+        };
+        let ctx = JobCtx {
+            events: &events,
+            cancel: &cancel,
+            busy: Some(&game),
+        };
 
         check(
             !ctx.wait_while_busy(&due()),
@@ -462,7 +573,11 @@ mod pause_tests {
     fn without_a_check_it_never_waits() -> TestResult {
         let cancel = AtomicBool::new(false);
         let events = Recorder::default();
-        let ctx = JobCtx { events: &events, cancel: &cancel, busy: None };
+        let ctx = JobCtx {
+            events: &events,
+            cancel: &cancel,
+            busy: None,
+        };
 
         check(ctx.wait_while_busy(&due()), "no check means no pausing")?;
         let seen = events.events.lock().map_err(|e| e.to_string())?.len();
@@ -473,14 +588,24 @@ mod pause_tests {
     fn checks_are_rate_limited() -> TestResult {
         let cancel = AtomicBool::new(false);
         let events = Recorder::default();
-        let game = FakeGame { calls: AtomicUsize::new(0), busy_for: usize::MAX };
-        let ctx = JobCtx { events: &events, cancel: &cancel, busy: Some(&game) };
+        let game = FakeGame {
+            calls: AtomicUsize::new(0),
+            busy_for: usize::MAX,
+        };
+        let ctx = JobCtx {
+            events: &events,
+            cancel: &cancel,
+            busy: Some(&game),
+        };
 
         // Checked a moment ago, so this call must skip the scan entirely. A
         // scan per file would cost more than the compression on a library
         // with hundreds of thousands of files.
         let recent = Mutex::new(Instant::now());
-        check(ctx.wait_while_busy(&recent), "a recent check means carry on")?;
+        check(
+            ctx.wait_while_busy(&recent),
+            "a recent check means carry on",
+        )?;
         check_eq(
             game.calls.load(Ordering::Relaxed),
             0,
@@ -499,19 +624,51 @@ mod tests {
     fn presets_map_to_levels() -> TestResult {
         check_eq(Preset::Fast.btrfs_level(), 3, "the fast preset's level")?;
         check_eq(Preset::Max.btrfs_level(), 15, "the max preset's level")?;
-        let opts = CompressOpts { preset: Preset::Fast, level: Some(12), ..CompressOpts::default() };
-        check_eq(opts.btrfs_level(), 12, "an explicit level overrides the preset")
+        let opts = CompressOpts {
+            preset: Preset::Fast,
+            level: Some(12),
+            ..CompressOpts::default()
+        };
+        check_eq(
+            opts.btrfs_level(),
+            12,
+            "an explicit level overrides the preset",
+        )
     }
 
     #[test]
     fn free_space_is_readable_here() -> TestResult {
-        check(free_bytes(Path::new(".")).ctx("read free space")? > 0, "some space is free here")
+        check(
+            free_bytes(Path::new(".")).ctx("read free space")? > 0,
+            "some space is free here",
+        )
     }
 
     #[test]
     fn status_ratio_handles_empty_directories() -> TestResult {
-        check_eq(CompressionStatus::default().ratio(), 0.0, "an empty status has no ratio")?;
-        let s = CompressionStatus { compressed_bytes: 50, total_bytes: 200, files: 1 };
-        check((s.ratio() - 0.25).abs() < f64::EPSILON, "50 of 200 bytes is a quarter")
+        check_eq(
+            CompressionStatus::default().ratio(),
+            0.0,
+            "an empty status has no ratio",
+        )?;
+        let s = CompressionStatus {
+            compressed_bytes: 50,
+            total_bytes: 200,
+            files: 1,
+        };
+        check(
+            (s.ratio() - 0.25).abs() < f64::EPSILON,
+            "50 of 200 bytes is a quarter",
+        )
+    }
+}
+
+impl std::fmt::Display for Preset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Fast => "Fast",
+            Self::Balanced => "Balanced",
+            Self::Max => "Maximum",
+        })
     }
 }

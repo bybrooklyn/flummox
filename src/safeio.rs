@@ -57,7 +57,11 @@ impl Anchor {
             Err(e) if e == rustix::io::Errno::NOSYS || e == rustix::io::Errno::OPNOTSUPP => false,
             Err(e) => return Err(e.into()),
         };
-        Ok(Self { dir, path: path.to_path_buf(), fully_resolved })
+        Ok(Self {
+            dir,
+            path: path.to_path_buf(),
+            fully_resolved,
+        })
     }
 
     /// The directory this anchor was opened on.
@@ -143,10 +147,15 @@ mod tests {
     fn opens_a_regular_file_below_the_anchor() -> TestResult {
         let (_tmp, game) = fixture()?;
         let anchor = Anchor::open(&game).ctx("open the anchor")?;
-        let mut file = anchor.open_file(Path::new("data/real.dat")).ctx("open a real file")?;
+        let mut file = anchor
+            .open_file(Path::new("data/real.dat"))
+            .ctx("open a real file")?;
         let mut buf = String::new();
         std::io::Read::read_to_string(&mut file, &mut buf).ctx("read it back")?;
-        check(buf == "payload", "the file's contents should come back intact")
+        check(
+            buf == "payload",
+            "the file's contents should come back intact",
+        )
     }
 
     #[test]
@@ -154,8 +163,11 @@ mod tests {
         let (tmp, game) = fixture()?;
         // The classic swap: the walk saw a regular file, and by the time the
         // job opens it the name is a symlink to somewhere else entirely.
-        std::os::unix::fs::symlink(tmp.path().join("outside.dat"), game.join("data/swapped.dat"))
-            .ctx("plant the symlink")?;
+        std::os::unix::fs::symlink(
+            tmp.path().join("outside.dat"),
+            game.join("data/swapped.dat"),
+        )
+        .ctx("plant the symlink")?;
         let anchor = Anchor::open(&game).ctx("open the anchor")?;
         check(
             anchor.open_file(Path::new("data/swapped.dat")).is_err(),
@@ -170,7 +182,10 @@ mod tests {
         let anchor = Anchor::open(&game).ctx("open the anchor")?;
         let result = anchor.open_file(Path::new("escape/outside.dat"));
         if anchor.fully_resolved() {
-            check(result.is_err(), "openat2 must refuse a symlinked parent component")
+            check(
+                result.is_err(),
+                "openat2 must refuse a symlinked parent component",
+            )
         } else {
             // Without openat2 only the last component is policed, so this is
             // documented as the weaker guarantee rather than asserted away.
@@ -182,12 +197,27 @@ mod tests {
     fn refuses_paths_that_escape_by_name() -> TestResult {
         let (_tmp, game) = fixture()?;
         let anchor = Anchor::open(&game).ctx("open the anchor")?;
-        check(anchor.open_file(Path::new("../outside.dat")).is_err(), "`..` must be refused")?;
-        check(anchor.open_file(Path::new("/etc/passwd")).is_err(), "absolute paths refused")?;
-        check(anchor.open_file(Path::new("")).is_err(), "the empty path is not a file")?;
-        check(!is_contained(Path::new("a/../../b")), "`..` anywhere must be refused")?;
+        check(
+            anchor.open_file(Path::new("../outside.dat")).is_err(),
+            "`..` must be refused",
+        )?;
+        check(
+            anchor.open_file(Path::new("/etc/passwd")).is_err(),
+            "absolute paths refused",
+        )?;
+        check(
+            anchor.open_file(Path::new("")).is_err(),
+            "the empty path is not a file",
+        )?;
+        check(
+            !is_contained(Path::new("a/../../b")),
+            "`..` anywhere must be refused",
+        )?;
         check(is_contained(Path::new("./a/b.dat")), "a leading ./ is fine")?;
-        check(is_contained(Path::new("a/..weird/b")), "dots inside a name are fine")
+        check(
+            is_contained(Path::new("a/..weird/b")),
+            "dots inside a name are fine",
+        )
     }
 
     #[test]
@@ -199,6 +229,9 @@ mod tests {
         if !anchor.fully_resolved() {
             eprintln!("note: openat2 unavailable; only the final component is checked");
         }
-        check(anchor.path() == game, "the anchor should remember its directory")
+        check(
+            anchor.path() == game,
+            "the anchor should remember its directory",
+        )
     }
 }

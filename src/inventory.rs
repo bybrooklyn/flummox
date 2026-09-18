@@ -27,14 +27,18 @@ pub struct WalkOpts {
 
 impl Default for WalkOpts {
     fn default() -> Self {
-        Self { min_size: TINY_FILE_BYTES }
+        Self {
+            min_size: TINY_FILE_BYTES,
+        }
     }
 }
 
 impl WalkOpts {
     /// Walk settings for a backend that compresses files in place.
     pub fn native() -> Self {
-        Self { min_size: NATIVE_TINY_FILE_BYTES }
+        Self {
+            min_size: NATIVE_TINY_FILE_BYTES,
+        }
     }
 }
 
@@ -42,9 +46,10 @@ impl WalkOpts {
 pub const STORE_DIR: &str = ".flummox";
 
 /// One regular file in an install directory.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileEntry {
     /// Path relative to the install directory.
+    #[serde(with = "crate::path_serde")]
     pub rel: PathBuf,
     /// Size in bytes.
     pub size: u64,
@@ -64,6 +69,19 @@ impl FileEntry {
         install_dir.join(&self.rel)
     }
 
+    /// Verifies the open file still has the identity captured by the walk.
+    pub fn matches_file(&self, file: &std::fs::File) -> io::Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        Ok(meta.is_file()
+            && self.size == meta.size()
+            && self.ino == meta.ino()
+            && self.mtime_ns
+                == i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec())
+            && self.ctime_ns
+                == i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec()))
+    }
+
     /// Whether this file changed since the fingerprint was taken.
     pub fn changed_since(&self, other: &Self) -> bool {
         self.size != other.size
@@ -74,7 +92,7 @@ impl FileEntry {
 }
 
 /// What the planner decided about a file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Action {
     /// Compress it.
     Compress,
@@ -161,7 +179,10 @@ pub fn walk_cancellable(
         .filter_entry(|e| e.file_name() != std::ffi::OsStr::new(STORE_DIR));
     for entry in walker {
         if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled while walking"));
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "cancelled while walking",
+            ));
         }
         let entry = match entry {
             Ok(e) => e,
@@ -198,28 +219,24 @@ pub fn walk_cancellable(
     Ok(inv)
 }
 
-/// Decides what to do with one file, from its name and size alone.
+/// Applies the backend size floor before content sampling.
 ///
 /// Content-based checks happen later, during sampling: this is the cheap pass
 /// that keeps the walk fast on a 60 GB install.
-pub fn decide(rel: &Path, size: u64, opts: &WalkOpts) -> Action {
+pub fn decide(_rel: &Path, size: u64, opts: &WalkOpts) -> Action {
     if size <= opts.min_size {
         return Action::SkipTiny;
-    }
-    if is_precompressed_name(rel) {
-        return Action::SkipPrecompressed;
     }
     Action::Compress
 }
 
-/// Extensions whose contents are already compressed or encrypted.
+/// Extensions commonly associated with encoded content.
 ///
 /// Game archives such as `.pak` are absent: some are compressed
 /// and some are not, so sampling decides those.
 const PRECOMPRESSED_EXTENSIONS: &[&str] = &[
     // Archives and containers
-    "zst", "xz", "gz", "bz2", "7z", "rar", "zip", "lz4", "lzma", "cab", "wim",
-    // Video
+    "zst", "xz", "gz", "bz2", "7z", "rar", "zip", "lz4", "lzma", "cab", "wim", // Video
     "mp4", "m4v", "mkv", "webm", "avi", "mov", "bik", "bk2", "usm", "wmv", "ogv",
     // Audio
     "mp3", "ogg", "oga", "opus", "flac", "aac", "m4a", "wem", "fsb", "bnk", "xwb",
@@ -229,7 +246,7 @@ const PRECOMPRESSED_EXTENSIONS: &[&str] = &[
     "woff", "woff2",
 ];
 
-/// Whether a path's extension says its contents are already compressed.
+/// Whether a path's extension hints at encoded content. Sampling decides eligibility.
 pub fn is_precompressed_name(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -276,12 +293,18 @@ mod tests {
         std::fs::write(dir.join("small.cfg"), b"x").ctx("write small.cfg")?;
         // The pack store is never part of an inventory.
         std::fs::create_dir_all(dir.join(STORE_DIR)).ctx("create the store dir")?;
-        std::fs::write(dir.join(STORE_DIR).join("manifest.gcm"), vec![0u8; 100 * 1024])
-            .ctx("write the store manifest")?;
+        std::fs::write(
+            dir.join(STORE_DIR).join("manifest.gcm"),
+            vec![0u8; 100 * 1024],
+        )
+        .ctx("write the store manifest")?;
 
         let inv = walk(dir, &WalkOpts::default()).ctx("walk the tree")?;
-        let mut names: Vec<String> =
-            inv.files.iter().map(|f| f.rel.display().to_string()).collect();
+        let mut names: Vec<String> = inv
+            .files
+            .iter()
+            .map(|f| f.rel.display().to_string())
+            .collect();
         names.sort();
         let expected: Vec<String> = ["data/big.dat", "data/movie.bik", "small.cfg"]
             .iter()
@@ -296,14 +319,18 @@ mod tests {
                 .map(|f| f.action)
                 .ctx(format!("no inventory entry for {name}"))
         };
-        check_eq(by("data/big.dat")?, Action::Compress, "a big plain file is compressed")?;
+        check_eq(
+            by("data/big.dat")?,
+            Action::Compress,
+            "a big plain file is compressed",
+        )?;
         check_eq(
             by("data/movie.bik")?,
-            Action::SkipPrecompressed,
-            "a video file is already compressed",
+            Action::Compress,
+            "a video name alone cannot exclude its contents",
         )?;
         check_eq(by("small.cfg")?, Action::SkipTiny, "a tiny file is skipped")?;
-        check_eq(inv.compressible_bytes(), 200 * 1024, "compressible bytes")?;
+        check_eq(inv.compressible_bytes(), 400 * 1024, "compressible bytes")?;
         check_eq(inv.total_bytes(), 400 * 1024 + 1, "total bytes")
     }
 
@@ -312,13 +339,17 @@ mod tests {
         let tmp = tempfile::tempdir().ctx("tempdir")?;
         let outside = tmp.path().join("outside");
         std::fs::create_dir_all(&outside).ctx("create outside/")?;
-        std::fs::write(outside.join("secret.dat"), vec![0u8; 200 * 1024]).ctx("write secret.dat")?;
+        std::fs::write(outside.join("secret.dat"), vec![0u8; 200 * 1024])
+            .ctx("write secret.dat")?;
         let game = tmp.path().join("game");
         std::fs::create_dir_all(&game).ctx("create game/")?;
         std::os::unix::fs::symlink(&outside, game.join("link")).ctx("symlink into outside/")?;
 
         let inv = walk(&game, &WalkOpts::default()).ctx("walk the game dir")?;
-        check(inv.files.is_empty(), format!("symlinked tree must not be walked: {inv:?}"))
+        check(
+            inv.files.is_empty(),
+            format!("symlinked tree must not be walked: {inv:?}"),
+        )
     }
 
     #[test]
@@ -331,10 +362,18 @@ mod tests {
         std::fs::write(dir.join("sector.dat"), vec![b'a'; 2048]).ctx("write sector.dat")?;
 
         let pack = walk(dir, &WalkOpts::default()).ctx("walk with the pack floor")?;
-        check_eq(pack.compressible_bytes(), 0, "the pack floor skips both files")?;
+        check_eq(
+            pack.compressible_bytes(),
+            0,
+            "the pack floor skips both files",
+        )?;
 
         let native = walk(dir, &WalkOpts::native()).ctx("walk with the native floor")?;
-        check_eq(native.compressible_bytes(), 32 * 1024, "the native floor keeps the 32 KiB file")
+        check_eq(
+            native.compressible_bytes(),
+            32 * 1024,
+            "the native floor keeps the 32 KiB file",
+        )
     }
 
     #[test]
@@ -347,17 +386,35 @@ mod tests {
             ctime_ns: 5,
             action: Action::Compress,
         };
-        check(!a.changed_since(&a.clone()), "an identical fingerprint is unchanged")?;
-        let b = FileEntry { mtime_ns: 6, ..a.clone() };
+        check(
+            !a.changed_since(&a.clone()),
+            "an identical fingerprint is unchanged",
+        )?;
+        let b = FileEntry {
+            mtime_ns: 6,
+            ..a.clone()
+        };
         check(b.changed_since(&a), "a newer mtime counts as changed")
     }
 
     #[test]
     fn magic_bytes_catch_archives_with_game_extensions() -> TestResult {
-        check(is_precompressed_magic(&[0x28, 0xB5, 0x2F, 0xFD, 0, 0]), "zstd magic")?;
+        check(
+            is_precompressed_magic(&[0x28, 0xB5, 0x2F, 0xFD, 0, 0]),
+            "zstd magic",
+        )?;
         check(is_precompressed_magic(b"OggS...."), "ogg magic")?;
-        check(!is_precompressed_magic(b"RIFF...."), "RIFF is not a compressed container")?;
-        check(is_precompressed_name(Path::new("a/b/c.BIK")), "a .BIK name, case-insensitively")?;
-        check(!is_precompressed_name(Path::new("a/b/c.pak")), "a .pak name is left to sampling")
+        check(
+            !is_precompressed_magic(b"RIFF...."),
+            "RIFF is not a compressed container",
+        )?;
+        check(
+            is_precompressed_name(Path::new("a/b/c.BIK")),
+            "a .BIK name, case-insensitively",
+        )?;
+        check(
+            !is_precompressed_name(Path::new("a/b/c.pak")),
+            "a .pak name is left to sampling",
+        )
     }
 }

@@ -13,7 +13,7 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use crate::fsprobe::FsInfo;
-use crate::inventory::{self, Inventory};
+use crate::inventory::Inventory;
 
 /// How many blocks are sampled from one file at most.
 const MAX_BLOCKS_PER_FILE: u64 = 32;
@@ -29,14 +29,14 @@ const CONTAINER_BLOCKS: u64 = 8;
 
 /// How much of a file's head is read to look for a container's magic number.
 ///
-/// The longest magic checked is five bytes.
-const MAGIC_PEEK: usize = 16;
+/// Includes the DDS DX10 extension; no payload lengths control allocation.
+const MAGIC_PEEK: usize = 148;
 
 /// Sampling stops once this many bytes have been read for one game.
 const MAX_SAMPLE_BYTES: u64 = 512 * 1024 * 1024;
 
-/// A file must save at least this fraction to be worth rewriting.
-const MIN_SAVING_RATIO: f64 = 0.03;
+/// Whole-sector minimum shared by desktop and CLI native estimates.
+const MIN_SAVING_BYTES: u64 = 4096;
 
 /// Models how a backend turns compressed bytes into disk usage.
 pub trait UnitModel: Sync {
@@ -85,6 +85,39 @@ impl UnitModel for BtrfsModel {
     }
 }
 
+/// The writable pack's independently decodable frame model.
+#[derive(Debug, Clone, Copy)]
+pub struct PackModel {
+    /// zstd level used for the projection.
+    pub level: i32,
+}
+
+impl PackModel {
+    /// Largest independently decoded frame in the current store.
+    pub const BLOCK: u32 = 4 * 1024 * 1024;
+    /// Allocation unit used for conservative projections.
+    pub const SECTOR: u32 = 4096;
+}
+
+impl UnitModel for PackModel {
+    fn block_size(&self) -> u32 {
+        Self::BLOCK
+    }
+
+    fn disk_cost(&self, uncompressed: u32, compressed: u32) -> u64 {
+        let rounded = |n: u32| u64::from(n.div_ceil(Self::SECTOR)) * u64::from(Self::SECTOR);
+        if compressed.saturating_add(Self::SECTOR) >= uncompressed {
+            rounded(uncompressed)
+        } else {
+            rounded(compressed)
+        }
+    }
+
+    fn level(&self) -> i32 {
+        self.level
+    }
+}
+
 /// What sampling one file concluded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FileEstimate {
@@ -96,6 +129,8 @@ pub struct FileEstimate {
     pub disk_after: u64,
     /// Bytes actually read while sampling.
     pub sampled: u64,
+    /// Header evidence used to choose the sampling effort.
+    pub inspection: crate::classify::Inspection,
 }
 
 impl FileEstimate {
@@ -106,14 +141,67 @@ impl FileEstimate {
 
     /// Whether the saving clears the "worth rewriting" bar.
     pub fn worthwhile(&self) -> bool {
-        self.disk_now > 0
-            && (self.saving() as f64 / self.disk_now as f64) >= MIN_SAVING_RATIO
-            && self.saving() >= u64::from(BtrfsModel::BLOCK)
+        self.disk_now > 0 && self.saving() >= MIN_SAVING_BYTES
+    }
+}
+
+/// Counts format evidence gathered from sampled file headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct FormatEvidence {
+    /// Files whose header matched a known family.
+    pub recognized_files: u64,
+    /// Files kept eligible despite an unknown header.
+    pub unknown_files: u64,
+    /// Encoded media, streams, and block textures.
+    pub encoded_files: u64,
+    /// Archives and mixed game containers.
+    pub container_files: u64,
+    /// Texture payloads stored without block compression.
+    pub raw_texture_files: u64,
+    /// Unencoded audio or video payloads that remain good candidates.
+    #[serde(default)]
+    pub raw_media_files: u64,
+    /// PE and ELF executables.
+    pub executable_files: u64,
+    /// Encrypted archive members, which are still sampled.
+    pub encrypted_files: u64,
+}
+
+impl FormatEvidence {
+    /// Adds one inspected header to the counters.
+    pub fn observe(&mut self, inspection: crate::classify::Inspection) {
+        use crate::classify::{Family, Format, Protection};
+        if inspection.family == Family::Unknown {
+            self.unknown_files = self.unknown_files.saturating_add(1);
+        } else {
+            self.recognized_files = self.recognized_files.saturating_add(1);
+        }
+        match inspection.format {
+            Format::Encoded | Format::BlockTexture => {
+                self.encoded_files = self.encoded_files.saturating_add(1);
+            }
+            Format::StoredArchive | Format::MixedContainer => {
+                self.container_files = self.container_files.saturating_add(1);
+            }
+            Format::RawTexture => {
+                self.raw_texture_files = self.raw_texture_files.saturating_add(1);
+            }
+            Format::RawMedia => {
+                self.raw_media_files = self.raw_media_files.saturating_add(1);
+            }
+            Format::Executable => {
+                self.executable_files = self.executable_files.saturating_add(1);
+            }
+            Format::Unknown | Format::Malformed => {}
+        }
+        if inspection.protection == Protection::EncryptedMember {
+            self.encrypted_files = self.encrypted_files.saturating_add(1);
+        }
     }
 }
 
 /// The result for a whole game.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Estimate {
     /// Files a compress pass would rewrite.
     ///
@@ -130,6 +218,9 @@ pub struct Estimate {
     pub disk_now: u64,
     /// Estimated disk usage after.
     pub disk_after: u64,
+    /// Projected usage in the stronger writable pack over the same files.
+    #[serde(default)]
+    pub maximum_after: Option<u64>,
     /// Files skipped as too small, already compressed, or not worth it.
     pub skipped_files: u64,
     /// Bytes actually read while sampling.
@@ -140,6 +231,15 @@ pub struct Estimate {
     /// Whether the mount already compresses, making `disk_now` a guess at
     /// what the filesystem has already achieved rather than the raw size.
     pub already_compressed_mount: bool,
+    /// Eligible files not sampled because of limits, cancellation, or read errors.
+    #[serde(default)]
+    pub unsampled_files: u64,
+    /// Eligible files with actual content samples, including those with no gain.
+    #[serde(default)]
+    pub inspected_files: u64,
+    /// Header evidence explaining which formats were recognized and sampled.
+    #[serde(default)]
+    pub format_evidence: FormatEvidence,
 }
 
 impl Estimate {
@@ -154,6 +254,12 @@ impl Estimate {
             return 0.0;
         }
         self.saving() as f64 / self.disk_now as f64
+    }
+
+    /// Bytes a writable pack is projected to free, when it was sampled.
+    pub fn maximum_saving(&self) -> Option<u64> {
+        self.maximum_after
+            .map(|after| self.disk_now.saturating_sub(after))
     }
 }
 
@@ -237,29 +343,52 @@ pub fn estimate_file_with(
     opts: &EstimateOpts,
     measured: Option<f64>,
 ) -> io::Result<FileEstimate> {
+    let file = std::fs::File::open(path)?;
+    estimate_open_file(&file, size, model, opts, measured)
+}
+
+/// Samples an anchored file handle without resolving its path again.
+pub fn estimate_open_file(
+    mut file: &std::fs::File,
+    size: u64,
+    model: &dyn UnitModel,
+    opts: &EstimateOpts,
+    measured: Option<f64>,
+) -> io::Result<FileEstimate> {
     let block = u64::from(model.block_size());
     let blocks = size.div_ceil(block).max(1);
-
-    let mut file = std::fs::File::open(path)?;
     let mut buf = vec![0u8; model.block_size() as usize];
     // A container's magic number lowers how much of the file is sampled. It
     // used to end the estimate at the first block, which reported no saving
     // for every file starting with one, including archives holding entries
     // that were never compressed.
     let head = read_full(&mut file, buf.get_mut(..MAGIC_PEEK).unwrap_or(&mut []))?;
-    let container = inventory::is_precompressed_magic(buf.get(..head).unwrap_or(&[]));
-    let sample_count =
-        blocks.min(if container { CONTAINER_BLOCKS } else { MAX_BLOCKS_PER_FILE });
+    let inspection = crate::classify::inspect(buf.get(..head).unwrap_or(&[]));
+    let container = inspection.format.cheap_sample();
+    let byte_cap = if model.block_size() > BtrfsModel::BLOCK {
+        16 * 1024 * 1024u64
+    } else {
+        u64::from(BtrfsModel::BLOCK) * MAX_BLOCKS_PER_FILE
+    };
+    let bounded_samples = byte_cap.div_ceil(block).max(1);
+    let sample_count = blocks.min(bounded_samples).min(if container {
+        CONTAINER_BLOCKS
+    } else {
+        MAX_BLOCKS_PER_FILE
+    });
     // Spread the samples evenly, so a file with a compressible header and
     // incompressible body is not judged by its header alone.
-    let stride = blocks / sample_count;
-    let mut est = FileEstimate { size, ..FileEstimate::default() };
+    let mut est = FileEstimate {
+        size,
+        inspection,
+        ..FileEstimate::default()
+    };
     let mut sampled_now = 0u64;
     let mut sampled_after = 0u64;
     let mut sampled_in = 0u64;
 
     for i in 0..sample_count {
-        let offset = i.saturating_mul(stride).saturating_mul(block);
+        let offset = sample_block(i, blocks, sample_count).saturating_mul(block);
         if offset >= size {
             break;
         }
@@ -357,16 +486,20 @@ pub fn estimate_game_cancellable(
     probe: &dyn DiskProbe,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Estimate {
-    let cancelled = || {
-        cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
-    };
+    let cancelled = || cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
     let candidates: Vec<_> = inv.to_compress().collect();
     let budget = std::sync::atomic::AtomicU64::new(MAX_SAMPLE_BYTES);
     let results: Vec<(FileEstimate, bool)> = candidates
         .par_iter()
         .map(|entry| {
             if cancelled() {
-                return (FileEstimate { size: entry.size, ..FileEstimate::default() }, false);
+                return (
+                    FileEstimate {
+                        size: entry.size,
+                        ..FileEstimate::default()
+                    },
+                    false,
+                );
             }
             // Read once and clamp. Two threads can both pass a bare `== 0`
             // check and both subtract, wrapping the counter to about 1.8e19,
@@ -375,20 +508,30 @@ pub fn estimate_game_cancellable(
             if remaining == 0 {
                 // Out of sampling budget: assume the file behaves like the
                 // ones already measured by leaving it out of both totals.
-                return (FileEstimate { size: entry.size, ..FileEstimate::default() }, false);
+                return (
+                    FileEstimate {
+                        size: entry.size,
+                        ..FileEstimate::default()
+                    },
+                    false,
+                );
             }
             let path = entry.path(install_dir);
             // A pass at this level or higher has already had its chance at
             // this file; whatever it left uncompressed, it left uncompressed
             // for a reason. Claiming a further saving here is how the
             // estimator used to promise space that a rerun could not deliver.
-            if probe.attempted_level(&path).is_some_and(|applied| applied >= opts.level) {
+            if probe
+                .attempted_level(&path)
+                .is_some_and(|applied| applied >= opts.level)
+            {
                 return (
                     FileEstimate {
                         size: entry.size,
                         disk_now: entry.size,
                         disk_after: entry.size,
                         sampled: 0,
+                        inspection: crate::classify::Inspection::default(),
                     },
                     false,
                 );
@@ -410,7 +553,13 @@ pub fn estimate_game_cancellable(
                     (est, worth)
                 }
                 // An unreadable file is simply not a candidate.
-                Err(_) => (FileEstimate { size: entry.size, ..FileEstimate::default() }, false),
+                Err(_) => (
+                    FileEstimate {
+                        size: entry.size,
+                        ..FileEstimate::default()
+                    },
+                    false,
+                ),
             }
         })
         .collect();
@@ -424,6 +573,13 @@ pub fn estimate_game_cancellable(
     };
     for (est, worthwhile) in results {
         out.sampled = out.sampled.saturating_add(est.sampled);
+        out.inspected_files += u64::from(est.sampled > 0);
+        if est.sampled > 0 {
+            out.format_evidence.observe(est.inspection);
+        }
+        if est.sampled == 0 && est.disk_now == 0 && est.disk_after == 0 {
+            out.unsampled_files += 1;
+        }
         if !worthwhile {
             out.skipped_files = out.skipped_files.saturating_add(1);
             continue;
@@ -439,20 +595,11 @@ pub fn estimate_game_cancellable(
 /// How many blocks are sampled when choosing a file's level.
 const LEVEL_SAMPLE_BLOCKS: u64 = 8;
 
-/// How much of a file the slower level must save before it is used.
-///
-/// Measured across real game files, level 15 beats level 3 by 3 to 13 points
-/// of the original size and costs 5 to 10 times the processor time. Below this
-/// the file is one of the ones where it buys close to nothing, and on some it
-/// is worse than level 9.
-const LEVEL_GAIN: f64 = 0.02;
-
-/// Whether the slower level earns its cost on what was sampled.
+/// Maximum keeps any whole-sector improvement in the samples. A percentage
+/// floor would discard small ratios that still mean substantial space on a
+/// large file. Ties and regressions keep the cheaper level.
 fn worth_the_level(cost_low: u64, cost_high: u64, sampled: u64) -> bool {
-    if sampled == 0 {
-        return false;
-    }
-    cost_low.saturating_sub(cost_high) as f64 / sampled as f64 >= LEVEL_GAIN
+    sampled > 0 && cost_low.saturating_sub(cost_high) >= 4096
 }
 
 /// The level to compress one file at, given a cheap and an expensive choice.
@@ -472,13 +619,12 @@ pub fn choose_level(
     let block = u64::from(model.block_size());
     let blocks = size.div_ceil(block).max(1);
     let samples = blocks.min(LEVEL_SAMPLE_BLOCKS);
-    let stride = blocks / samples;
     let mut handle = file;
     let mut buf = vec![0u8; model.block_size() as usize];
     let (mut cost_low, mut cost_high, mut sampled) = (0u64, 0u64, 0u64);
 
     for i in 0..samples {
-        let offset = i.saturating_mul(stride).saturating_mul(block);
+        let offset = sample_block(i, blocks, samples).saturating_mul(block);
         if offset >= size {
             break;
         }
@@ -496,14 +642,29 @@ pub fn choose_level(
         cost_high = cost_high.saturating_add(model.disk_cost(raw, at_high));
         sampled = sampled.saturating_add(read as u64);
     }
-    Ok(if worth_the_level(cost_low, cost_high, sampled) { high } else { low })
+    Ok(if worth_the_level(cost_low, cost_high, sampled) {
+        high
+    } else {
+        low
+    })
+}
+
+/// Spaces bounded samples across the head, middle, and tail.
+fn sample_block(index: u64, blocks: u64, samples: u64) -> u64 {
+    if samples <= 1 {
+        0
+    } else {
+        index.saturating_mul(blocks.saturating_sub(1)) / (samples - 1)
+    }
 }
 
 /// Reads until the buffer is full or the file ends.
 fn read_full<R: Read>(file: &mut R, buf: &mut [u8]) -> io::Result<usize> {
     let mut total = 0;
     while total < buf.len() {
-        let Some(rest) = buf.get_mut(total..) else { break };
+        let Some(rest) = buf.get_mut(total..) else {
+            break;
+        };
         match file.read(rest) {
             Ok(0) => break,
             Ok(n) => total += n,
@@ -519,12 +680,64 @@ mod tests {
     use crate::testutil::{Ctx, TestResult, check, check_eq};
 
     use super::*;
+    use crate::inventory;
+
+    #[test]
+    fn distributed_samples_include_the_last_block() -> TestResult {
+        check_eq(sample_block(0, 1000, 32), 0, "head included")?;
+        check_eq(sample_block(31, 1000, 32), 999, "tail included")?;
+        for index in 1..32 {
+            check(
+                sample_block(index, 1000, 32) > sample_block(index - 1, 1000, 32),
+                "no duplicate sampled blocks",
+            )?;
+        }
+        check_eq(sample_block(0, 1, 1), 0, "single-block file")
+    }
+
+    #[test]
+    fn low_ratios_and_small_files_still_contribute_real_savings() -> TestResult {
+        let large = FileEstimate {
+            size: 1_000_000_000,
+            disk_now: 1_000_000_000,
+            disk_after: 990_000_000,
+            sampled: 1_048_576,
+            inspection: crate::classify::Inspection::default(),
+        };
+        check(
+            large.worthwhile(),
+            "one percent of a large file is useful space",
+        )?;
+        let small = FileEstimate {
+            size: 65_536,
+            disk_now: 65_536,
+            disk_after: 4_096,
+            sampled: 65_536,
+            inspection: crate::classify::Inspection::default(),
+        };
+        check(
+            small.worthwhile(),
+            "a file smaller than 128 KiB can save space",
+        )?;
+        check(
+            !FileEstimate {
+                disk_after: 65_535,
+                ..small
+            }
+            .worthwhile(),
+            "subsector gain is not claimed",
+        )
+    }
 
     #[test]
     fn btrfs_costs_round_up_and_give_up_on_bad_ratios() -> TestResult {
         let m = BtrfsModel { level: 9 };
         // Compressible: rounded up to a sector.
-        check_eq(m.disk_cost(131_072, 5000), 8192, "a compressible block rounds up to a sector")?;
+        check_eq(
+            m.disk_cost(131_072, 5000),
+            8192,
+            "a compressible block rounds up to a sector",
+        )?;
         // Barely smaller: btrfs stores it uncompressed.
         check_eq(
             m.disk_cost(131_072, 130_000),
@@ -532,7 +745,11 @@ mod tests {
             "a barely smaller block is stored as-is",
         )?;
         // Exactly one sector.
-        check_eq(m.disk_cost(131_072, 4096), 4096, "a block that fits one sector costs one")
+        check_eq(
+            m.disk_cost(131_072, 4096),
+            4096,
+            "a block that fits one sector costs one",
+        )
     }
 
     fn write_file(path: &Path, bytes: Vec<u8>) -> Result<u64, String> {
@@ -562,7 +779,10 @@ mod tests {
     fn estimates_compressible_and_random_files() -> TestResult {
         let tmp = tempfile::tempdir().ctx("tempdir")?;
         let model = BtrfsModel { level: 9 };
-        let opts = EstimateOpts { level: 9, mount_level: None };
+        let opts = EstimateOpts {
+            level: 9,
+            mount_level: None,
+        };
 
         let zeros = tmp.path().join("zeros.dat");
         let size = write_file(&zeros, vec![0u8; 4 * 1024 * 1024])?;
@@ -579,11 +799,26 @@ mod tests {
     #[test]
     fn the_slower_level_is_used_only_where_it_pays() -> TestResult {
         let block = u64::from(BtrfsModel::BLOCK);
-        check(!worth_the_level(block, block, block), "no gain does not earn it")?;
-        check(!worth_the_level(0, 0, 0), "nothing sampled does not earn it")?;
-        // One percent of what was sampled, against a two percent bar.
-        check(!worth_the_level(1000, 990, 1000), "a gain under the bar does not earn it")?;
-        check(worth_the_level(1000, 950, 1000), "a gain over the bar earns it")
+        check(
+            !worth_the_level(block, block, block),
+            "no gain does not earn it",
+        )?;
+        check(
+            !worth_the_level(0, 0, 0),
+            "nothing sampled does not earn it",
+        )?;
+        check(
+            !worth_the_level(1000, 990, 1000),
+            "subsector gains do not earn a rewrite",
+        )?;
+        check(
+            worth_the_level(1_048_576, 1_044_480, 1_048_576),
+            "maximum keeps a whole-sector gain below one percent",
+        )?;
+        check(
+            !worth_the_level(8192, 12288, 131072),
+            "a higher level that costs more is rejected",
+        )
     }
 
     #[test]
@@ -594,7 +829,11 @@ mod tests {
         let file = std::fs::File::open(&path).ctx("open noise.dat")?;
         let chosen = choose_level(&file, size, &BtrfsModel { level: 9 }, 9, 15)
             .ctx("choose a level for noise.dat")?;
-        check_eq(chosen, 9, "incompressible data does not earn the slower level")?;
+        check_eq(
+            chosen,
+            9,
+            "incompressible data does not earn the slower level",
+        )?;
         // A single candidate is answered without reading anything.
         let same = choose_level(&file, size, &BtrfsModel { level: 9 }, 15, 15)
             .ctx("choose between one level")?;
@@ -605,7 +844,10 @@ mod tests {
     fn a_container_header_is_measured_rather_than_assumed() -> TestResult {
         let tmp = tempfile::tempdir().ctx("tempdir")?;
         let model = BtrfsModel { level: 9 };
-        let opts = EstimateOpts { level: 9, mount_level: None };
+        let opts = EstimateOpts {
+            level: 9,
+            mount_level: None,
+        };
 
         // A zstd header over bytes that really are incompressible. This is the
         // case the magic number is a useful hint for, and it still reports
@@ -615,7 +857,15 @@ mod tests {
         bytes.extend_from_slice(&noise(1024 * 1024));
         let size = write_file(&packed, bytes)?;
         let est = estimate_file(&packed, size, &model, &opts).ctx("estimate packed.pak")?;
-        check(!est.worthwhile(), format!("a packed archive has nothing to give: {est:?}"))?;
+        check_eq(
+            est.inspection.family,
+            crate::classify::Family::Zstandard,
+            "the estimate retains its format evidence",
+        )?;
+        check(
+            !est.worthwhile(),
+            format!("a packed archive has nothing to give: {est:?}"),
+        )?;
 
         // The same header over bytes that compress. An archive can hold
         // entries it never compressed, and reading one block and stopping
@@ -625,7 +875,10 @@ mod tests {
         bytes.resize(1024 * 1024, 0);
         let size = write_file(&loose, bytes)?;
         let est = estimate_file(&loose, size, &model, &opts).ctx("estimate loose.pak")?;
-        check(est.worthwhile(), format!("a loose archive is worth rewriting: {est:?}"))?;
+        check(
+            est.worthwhile(),
+            format!("a loose archive is worth rewriting: {est:?}"),
+        )?;
         check(est.disk_after < est.disk_now / 2, format!("{est:?}"))
     }
 
@@ -636,19 +889,36 @@ mod tests {
         let size = write_file(&path, "the quick brown fox ".repeat(200_000).into_bytes())?;
         let model = BtrfsModel { level: 15 };
 
-        let raw = estimate_file(&path, size, &model, &EstimateOpts {
-            level: 15,
-            mount_level: None,
-        })
+        let raw = estimate_file(
+            &path,
+            size,
+            &model,
+            &EstimateOpts {
+                level: 15,
+                mount_level: None,
+            },
+        )
         .ctx("estimate on a plain mount")?;
-        let on_zstd1 = estimate_file(&path, size, &model, &EstimateOpts {
-            level: 15,
-            mount_level: Some(1),
-        })
+        let on_zstd1 = estimate_file(
+            &path,
+            size,
+            &model,
+            &EstimateOpts {
+                level: 15,
+                mount_level: Some(1),
+            },
+        )
         .ctx("estimate on a zstd:1 mount")?;
-        check_eq(raw.disk_after, on_zstd1.disk_after, "the target level is the same either way")?;
+        check_eq(
+            raw.disk_after,
+            on_zstd1.disk_after,
+            "the target level is the same either way",
+        )?;
         // Level 1 already banked most of it, so the remaining gain is smaller.
-        check(on_zstd1.saving() < raw.saving(), format!("raw {raw:?} vs {on_zstd1:?}"))
+        check(
+            on_zstd1.saving() < raw.saving(),
+            format!("raw {raw:?} vs {on_zstd1:?}"),
+        )
     }
 
     #[test]
@@ -657,12 +927,16 @@ mod tests {
         let dir = tmp.path();
         std::fs::write(dir.join("good.dat"), vec![b'a'; 2 * 1024 * 1024]).ctx("write good.dat")?;
         std::fs::write(dir.join("tiny.cfg"), b"x").ctx("write tiny.cfg")?;
-        let inv =
-            inventory::walk(dir, &inventory::WalkOpts::default()).ctx("walk the game dir")?;
-        let est = estimate_game(dir, &inv, &BtrfsModel { level: 9 }, &EstimateOpts {
-            level: 9,
-            mount_level: None,
-        });
+        let inv = inventory::walk(dir, &inventory::WalkOpts::default()).ctx("walk the game dir")?;
+        let est = estimate_game(
+            dir,
+            &inv,
+            &BtrfsModel { level: 9 },
+            &EstimateOpts {
+                level: 9,
+                mount_level: None,
+            },
+        );
         check_eq(est.files, 1, "one worthwhile file")?;
         check_eq(est.skipped_files, 1, "the tiny file is skipped")?;
         check(est.saving_ratio() > 0.9, format!("{est:?}"))

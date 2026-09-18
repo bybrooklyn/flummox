@@ -1,0 +1,82 @@
+[
+  {
+    "family": "Substrate family",
+    "games": [
+      {
+        "game": "Substrate: Emergence Demo",
+        "files": 218,
+        "logical_bytes": 192405645,
+        "archive_bytes": 97737759,
+        "metadata_bytes": 108962,
+        "raw_bytes": 13678142,
+        "compressed_input_bytes": 177473260,
+        "compressed_bytes": 83950655,
+        "zero_bytes": 0,
+        "shared_bytes": 88229941,
+        "unique_chunks": 273,
+        "duplicate_bytes": 1254243,
+        "allocated_bytes": 98353152
+      },
+      {
+        "game": "Substrate: Emergence",
+        "files": 231,
+        "logical_bytes": 212523360,
+        "archive_bytes": 111242571,
+        "metadata_bytes": 115269,
+        "raw_bytes": 13678142,
+        "compressed_input_bytes": 197590975,
+        "compressed_bytes": 97449160,
+        "zero_bytes": 0,
+        "shared_bytes": 88229941,
+        "unique_chunks": 290,
+        "duplicate_bytes": 1254243,
+        "allocated_bytes": 111894528
+      }
+    ],
+    "combined_logical_bytes": 404929005,
+    "independent_allocated_bytes": 210247680,
+    "pooled_allocated_bytes": 121470976,
+    "pool_savings_bytes": 88776704,
+    "elapsed_seconds": 24.318907662993297
+  },
+  {
+    "family": "Slay the Spire family",
+    "games": [
+      {
+        "game": "Slay the Spire",
+        "files": 328,
+        "logical_bytes": 573457556,
+        "archive_bytes": 431550559,
+        "metadata_bytes": 181887,
+        "raw_bytes": 316403265,
+        "compressed_input_bytes": 256981252,
+        "compressed_bytes": 114965407,
+        "zero_bytes": 0,
+        "shared_bytes": 138558379,
+        "unique_chunks": 488,
+        "duplicate_bytes": 73039,
+        "allocated_bytes": 432730112
+      },
+      {
+        "game": "Downfall - A Slay the Spire Fan Expansion",
+        "files": 161,
+        "logical_bytes": 978502286,
+        "archive_bytes": 897075964,
+        "metadata_bytes": 153799,
+        "raw_bytes": 678261638,
+        "compressed_input_bytes": 300187636,
+        "compressed_bytes": 218660527,
+        "zero_bytes": 0,
+        "shared_bytes": 138558379,
+        "unique_chunks": 515,
+        "duplicate_bytes": 53012,
+        "allocated_bytes": 898285568
+      }
+    ],
+    "combined_logical_bytes": 1551959842,
+    "independent_allocated_bytes": 1331015680,
+    "pooled_allocated_bytes": 1192247296,
+    "pool_savings_bytes": 138768384,
+    "elapsed_seconds": 40.041267950990004
+  }
+]

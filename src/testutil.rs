@@ -31,13 +31,19 @@ pub fn check_eq<T: PartialEq + Debug>(actual: T, expected: T, msg: impl Display)
     if actual == expected {
         Ok(())
     } else {
-        Err(format!("{msg}\n  actual:   {actual:?}\n  expected: {expected:?}"))
+        Err(format!(
+            "{msg}\n  actual:   {actual:?}\n  expected: {expected:?}"
+        ))
     }
 }
 
 /// Fails if the two values are equal.
 pub fn check_ne<T: PartialEq + Debug>(a: T, b: T, msg: impl Display) -> TestResult {
-    if a == b { Err(format!("{msg}\n  both were: {a:?}")) } else { Ok(()) }
+    if a == b {
+        Err(format!("{msg}\n  both were: {a:?}"))
+    } else {
+        Ok(())
+    }
 }
 
 /// Turns an error or a `None` into a test failure message.
@@ -72,7 +78,10 @@ mod tests {
         let failure = check_eq(1, 2, "mismatch");
         check(failure.is_err(), "a mismatch must fail")?;
         let msg = failure.err().unwrap_or_default();
-        check(msg.contains("expected: 2"), "the message should show both values")
+        check(
+            msg.contains("expected: 2"),
+            "the message should show both values",
+        )
     }
 
     #[test]

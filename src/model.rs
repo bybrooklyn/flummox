@@ -72,12 +72,17 @@ pub struct GameId {
 impl GameId {
     /// Builds an id.
     pub fn new(launcher: Launcher, key: impl Into<String>) -> Self {
-        Self { launcher, key: key.into() }
+        Self {
+            launcher,
+            key: key.into(),
+        }
     }
 
     /// The Steam appid, if this is a Steam game.
     pub fn steam_appid(&self) -> Option<u32> {
-        (self.launcher == Launcher::Steam).then(|| self.key.parse().ok()).flatten()
+        (self.launcher == Launcher::Steam)
+            .then(|| self.key.parse().ok())
+            .flatten()
     }
 }
 
@@ -127,7 +132,7 @@ pub enum InstallState {
     /// Busy for the given reason.
     Busy(BusyReason),
     /// Installed but not usable as-is (files missing, corrupt, …).
-    Broken(String),
+    Broken { detail: String },
 }
 
 impl InstallState {
@@ -143,7 +148,7 @@ impl fmt::Display for InstallState {
             Self::Idle => f.write_str("idle"),
             Self::UpdatePending => f.write_str("update pending"),
             Self::Busy(r) => write!(f, "busy ({r})"),
-            Self::Broken(why) => write!(f, "broken ({why})"),
+            Self::Broken { detail } => write!(f, "broken ({detail})"),
         }
     }
 }
@@ -161,6 +166,7 @@ pub struct Game {
     /// Display name.
     pub title: String,
     /// Absolute path to the install directory.
+    #[serde(with = "crate::path_serde")]
     pub install_dir: PathBuf,
     /// Build id or version string, used to notice updates.
     pub build: Option<String>,
@@ -183,7 +189,9 @@ impl Game {
     /// bare Steam appid, or a case-insensitive substring of the title.
     pub fn matches(&self, selector: &str) -> bool {
         let sel = selector.trim();
-        if self.ids().any(|id| id.to_string().eq_ignore_ascii_case(sel))
+        if self
+            .ids()
+            .any(|id| id.to_string().eq_ignore_ascii_case(sel))
             || self.ids().any(|id| id.key == sel)
         {
             return true;
@@ -213,8 +221,16 @@ mod tests {
     #[test]
     fn game_id_round_trips_through_display() -> TestResult {
         let id = GameId::new(Launcher::Steam, "105600");
-        check_eq(id.to_string(), "steam:105600".to_owned(), "an id displays as launcher:key")?;
-        check_eq(id.steam_appid(), Some(105600), "a Steam key parses as an appid")?;
+        check_eq(
+            id.to_string(),
+            "steam:105600".to_owned(),
+            "an id displays as launcher:key",
+        )?;
+        check_eq(
+            id.steam_appid(),
+            Some(105600),
+            "a Steam key parses as an appid",
+        )?;
         check_eq(
             GameId::new(Launcher::Lutris, "x").steam_appid(),
             None,
@@ -225,21 +241,47 @@ mod tests {
     #[test]
     fn selectors_match_id_appid_and_title() -> TestResult {
         let g = game();
-        check(g.matches("steam:220"), "a full launcher:key selector matches")?;
+        check(
+            g.matches("steam:220"),
+            "a full launcher:key selector matches",
+        )?;
         check(g.matches("220"), "a bare appid matches")?;
         // Secondary ids count, so any appid sharing the folder finds it.
         check(g.matches("steam:380"), "a secondary id matches too")?;
-        check(g.matches("half-life"), "a lowercase substring of the title matches")?;
+        check(
+            g.matches("half-life"),
+            "a lowercase substring of the title matches",
+        )?;
         check(!g.matches("portal"), "an unrelated title does not match")
     }
 
     #[test]
     fn only_idle_games_may_start_a_job() -> TestResult {
         check(InstallState::Idle.is_idle(), "an idle install is idle")?;
-        check(!InstallState::UpdatePending.is_idle(), "a pending update is not idle")?;
+        check(
+            !InstallState::UpdatePending.is_idle(),
+            "a pending update is not idle",
+        )?;
         check(
             !InstallState::Busy(BusyReason::Running).is_idle(),
             "a running game is not idle",
+        )
+    }
+
+    #[test]
+    fn broken_install_state_has_a_serializable_detail_field() -> TestResult {
+        let state = InstallState::Broken {
+            detail: "files missing".into(),
+        };
+        let json = serde_json::to_string(&state).map_err(|error| error.to_string())?;
+        check(
+            json.contains("\"state\":\"broken\"") && json.contains("\"detail\":\"files missing\""),
+            "the tagged state keeps its error detail",
+        )?;
+        check_eq(
+            serde_json::from_str(&json).map_err(|error| error.to_string())?,
+            state,
+            "broken state round trip",
         )
     }
 }

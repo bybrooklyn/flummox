@@ -84,12 +84,18 @@ impl ProcFs {
     pub fn new() -> Self {
         // SAFETY: getuid() takes no arguments and cannot fail.
         let uid = unsafe { libc::getuid() };
-        Self { root: PathBuf::from("/proc"), uid }
+        Self {
+            root: PathBuf::from("/proc"),
+            uid,
+        }
     }
 
     /// Reads a different `/proc`-shaped tree, for tests.
     pub fn with_root(root: impl Into<PathBuf>, uid: u32) -> Self {
-        Self { root: root.into(), uid }
+        Self {
+            root: root.into(),
+            uid,
+        }
     }
 
     fn read_one(&self, dir: &Path, pid: i32) -> Option<ProcInfo> {

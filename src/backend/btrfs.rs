@@ -107,9 +107,15 @@ nix::ioctl_readwrite!(fs_ioc_fiemap, b'f', 11, Fiemap);
 /// The handle may be read-only. The kernel checks write *permission*, not the
 /// open mode, so this still works on a game executable that is running.
 pub fn compress_fd(file: &File, level: i32) -> io::Result<i32> {
+    // Defrag must see extents for recently installed or patched dirty pages.
+    file.sync_all()?;
+    compress_range(file, level, 0, u64::MAX)
+}
+
+fn compress_range(file: &File, level: i32, start: u64, len: u64) -> io::Result<i32> {
     let args = DefragRangeArgs {
-        start: 0,
-        len: u64::MAX,
+        start,
+        len,
         flags: DEFRAG_RANGE_COMPRESS | DEFRAG_RANGE_START_IO | DEFRAG_RANGE_COMPRESS_LEVEL,
         extent_thresh: 0,
         compress_type: BTRFS_COMPRESS_ZSTD,
@@ -152,9 +158,16 @@ pub const DEFAULT_LEVEL: i32 = 3;
 ///
 /// Anchored for the same reason as [`compress_fd`].
 pub fn decompress_fd(file: &File) -> io::Result<()> {
+    // Materialize dirty pages first. Otherwise a defrag can finish before
+    // those pages become extents, then mount compression encodes them later.
+    file.sync_all()?;
+    decompress_range(file, 0, u64::MAX)
+}
+
+fn decompress_range(file: &File, start: u64, len: u64) -> io::Result<()> {
     let args = DefragRangeArgs {
-        start: 0,
-        len: u64::MAX,
+        start,
+        len,
         flags: DEFRAG_RANGE_NOCOMPRESS | DEFRAG_RANGE_START_IO,
         ..DefragRangeArgs::default()
     };
@@ -163,6 +176,34 @@ pub fn decompress_fd(file: &File) -> io::Result<()> {
     unsafe { btrfs_defrag_range(file.as_raw_fd(), &args) }
         .map(|_| ())
         .map_err(errno_to_io)
+}
+
+/// Limits each in-flight ioctl to 16 MiB. An interrupted file gets no success
+/// receipt, so retrying safely revisits it even if some ranges were rewritten.
+fn rewrite_ranges(
+    file: &File,
+    ctx: &JobCtx<'_>,
+    op: impl Fn(u64, u64) -> io::Result<i32>,
+) -> io::Result<i32> {
+    const RANGE: u64 = 16 * 1024 * 1024;
+    file.sync_all()?;
+    let length = file.metadata()?.len();
+    let gate =
+        std::sync::Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(60));
+    let mut start = 0;
+    let mut applied = i32::MAX;
+    while start < length {
+        if !ctx.wait_while_busy(&gate) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Stopped between file ranges; retry to finish this file",
+            ));
+        }
+        let size = RANGE.min(length - start);
+        applied = applied.min(op(start, size)?);
+        start += size;
+    }
+    Ok(if applied == i32::MAX { 0 } else { applied })
 }
 
 /// Whether the directory carries the `btrfs.compression` property.
@@ -249,7 +290,9 @@ pub fn compressed_bytes_fd(file: &File) -> io::Result<(u64, u64)> {
         let mut next_start = start;
         for i in 0..out.mapped_extents as usize {
             let offset = header + i * stride;
-            let Some(slice) = buf.get(offset..offset + stride) else { break };
+            let Some(slice) = buf.get(offset..offset + stride) else {
+                break;
+            };
             // SAFETY: `slice` is exactly one extent's worth of bytes the
             // kernel just wrote, read back without assuming alignment.
             let ext = unsafe { std::ptr::read_unaligned(slice.as_ptr().cast::<FiemapExtent>()) };
@@ -315,6 +358,13 @@ impl BtrfsBackend {
         let files = targets.len() as u64;
         let bytes = targets.iter().map(|f| f.size).sum();
         ctx.events.event(Event::Started { files, bytes });
+        if files == 0 {
+            return Ok(Outcome {
+                skipped: inv.files.len() as u64,
+                cancelled: ctx.cancelled(),
+                ..Outcome::default()
+            });
+        }
 
         let free_before = free_bytes(install_dir).ok();
         let files_done = AtomicU64::new(0);
@@ -322,20 +372,21 @@ impl BtrfsBackend {
         // Starts above any real zstd level so the first file lowers it.
         let applied_level = std::sync::atomic::AtomicI64::new(i64::from(i32::MAX));
         let errors = std::sync::Mutex::new(Vec::new());
+        let completed = std::sync::Mutex::new(Vec::new());
 
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads.max(1))
             .build()
             .map_err(|e| io::Error::other(e.to_string()))?;
         pool.install(|| {
-            let last_busy_check =
-                std::sync::Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(60));
+            let last_busy_check = std::sync::Mutex::new(
+                std::time::Instant::now() - std::time::Duration::from_secs(60),
+            );
             targets.par_iter().for_each(|entry| {
                 if ctx.cancelled() {
                     return;
                 }
-                // Between files, never inside one. A file's rewrite is a
-                // single ioctl and cannot be interrupted part way.
+                // Admission gate; large files have additional range checkpoints.
                 if !ctx.wait_while_busy(&last_busy_check) {
                     return;
                 }
@@ -350,11 +401,26 @@ impl BtrfsBackend {
                     Ok(file) => file,
                     Err(e) => return fail(e),
                 };
+                if !entry.matches_file(&file).unwrap_or(false) {
+                    return fail(io::Error::other("file changed since analysis; retry it"));
+                }
                 match op(&file) {
                     // Every file in a pass gets the same treatment, so the
                     // lowest level seen is the level the pass achieved.
                     Ok(applied) => {
+                        if !entry.matches_file(&file).unwrap_or(false) {
+                            return fail(io::Error::other(
+                                "file changed during processing; retry it",
+                            ));
+                        }
                         applied_level.fetch_min(i64::from(applied), Ordering::Relaxed);
+                        if let Ok(mut done) = completed.lock() {
+                            done.push(((**entry).clone(), applied));
+                        }
+                        ctx.events.event(Event::FileCompleted {
+                            entry: (**entry).clone(),
+                            level: applied,
+                        });
                     }
                     Err(e) => return fail(e),
                 }
@@ -374,7 +440,9 @@ impl BtrfsBackend {
         // filesystem, ignores Ctrl-C, and can stall for tens of seconds on an
         // unrelated slow drive.
         if let Err(e) = rustix::fs::syncfs(anchor.as_fd()) {
-            ctx.events.event(Event::Warning(format!("could not flush the filesystem: {e}")));
+            ctx.events.event(Event::Warning(format!(
+                "could not flush the filesystem: {e}"
+            )));
         }
         Ok(Outcome {
             files: files_done.load(Ordering::Relaxed),
@@ -386,6 +454,9 @@ impl BtrfsBackend {
                 .ok()
                 .filter(|level| *level != i32::MAX),
             cancelled: ctx.cancelled(),
+            completed: completed
+                .into_inner()
+                .map_err(|_| io::Error::other("outcome lock poisoned"))?,
             errors: errors.into_inner().unwrap_or_default(),
         })
     }
@@ -397,7 +468,9 @@ impl Backend for BtrfsBackend {
     }
 
     fn model(&self, opts: &CompressOpts) -> Box<dyn UnitModel> {
-        Box::new(BtrfsModel { level: opts.btrfs_level() })
+        Box::new(BtrfsModel {
+            level: opts.btrfs_level(),
+        })
     }
 
     fn walk_opts(&self) -> crate::inventory::WalkOpts {
@@ -415,11 +488,24 @@ impl Backend for BtrfsBackend {
         opts: &CompressOpts,
         ctx: &JobCtx<'_>,
     ) -> io::Result<Outcome> {
-        let level = opts.btrfs_level();
-        let outcome = self.run(install_dir, inv, opts.threads, ctx, &|f| compress_fd(f, level))?;
+        let plan = opts.level_plan();
+        let outcome = self.run(install_dir, inv, opts.threads, ctx, &|f| {
+            let level = match plan {
+                crate::backend::LevelPlan::Fixed(level) => level,
+                crate::backend::LevelPlan::PerFile { low, high } => crate::estimate::choose_level(
+                    f,
+                    f.metadata()?.len(),
+                    &BtrfsModel { level: low },
+                    low,
+                    high,
+                )?,
+            };
+            rewrite_ranges(f, ctx, |start, len| compress_range(f, level, start, len))
+        })?;
         // Do this last: if the job failed or was cancelled, the directory
         // should not claim to be compressed.
         if !outcome.cancelled
+            && outcome.errors.is_empty()
             && let Err(e) = set_dir_property(install_dir, true)
         {
             ctx.events.event(Event::Warning(format!(
@@ -452,9 +538,14 @@ impl Backend for BtrfsBackend {
             warnings: Vec::new(),
         };
         if let Err(e) = set_dir_property(install_dir, false) {
-            ctx.events.event(Event::Warning(format!("clearing btrfs.compression: {e}")));
+            ctx.events
+                .event(Event::Warning(format!("clearing btrfs.compression: {e}")));
         }
-        let outcome = self.run(install_dir, &all, 2, ctx, &|f| decompress_fd(f).map(|()| 0))?;
+        let outcome = self.run(install_dir, &all, 2, ctx, &|f| {
+            rewrite_ranges(f, ctx, |start, len| {
+                decompress_range(f, start, len).map(|()| 0)
+            })
+        })?;
         ctx.events.event(Event::Finished(Box::new(outcome.clone())));
         Ok(outcome)
     }
@@ -467,7 +558,10 @@ impl Backend for BtrfsBackend {
             .files
             .par_iter()
             .map(|entry| {
-                match anchor.open_file(&entry.rel).and_then(|f| compressed_bytes_fd(&f)) {
+                match anchor
+                    .open_file(&entry.rel)
+                    .and_then(|f| compressed_bytes_fd(&f))
+                {
                     Ok((c, t)) => (c, t, 1),
                     // A file that vanished or cannot be read simply does not
                     // contribute; status is a report, not a job.
@@ -478,7 +572,11 @@ impl Backend for BtrfsBackend {
                 || (0u64, 0u64, 0u64),
                 |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
             );
-        Ok(CompressionStatus { compressed_bytes: compressed, total_bytes: total, files })
+        Ok(CompressionStatus {
+            compressed_bytes: compressed,
+            total_bytes: total,
+            files,
+        })
     }
 }
 
@@ -493,8 +591,16 @@ mod tests {
     /// kernel reads the level from the wrong offset.
     #[test]
     fn defrag_args_match_the_kernel_layout() -> TestResult {
-        check_eq(size_of::<DefragRangeArgs>(), 48, "DefragRangeArgs is 48 bytes")?;
-        check_eq(align_of::<DefragRangeArgs>(), 8, "DefragRangeArgs is 8-byte aligned")?;
+        check_eq(
+            size_of::<DefragRangeArgs>(),
+            48,
+            "DefragRangeArgs is 48 bytes",
+        )?;
+        check_eq(
+            align_of::<DefragRangeArgs>(),
+            8,
+            "DefragRangeArgs is 8-byte aligned",
+        )?;
         check_eq(size_of::<FiemapExtent>(), 56, "FiemapExtent is 56 bytes")?;
         check_eq(size_of::<Fiemap>(), 32, "Fiemap is 32 bytes")
     }
@@ -507,6 +613,85 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_between_ranges_preserves_bytes_and_leaves_no_success_receipt() -> TestResult {
+        use crate::backend::{BusyCheck, EventSink};
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        let Some(tmp) = btrfs_tempdir() else {
+            eprintln!("skipped: range cancellation requires btrfs");
+            return Ok(());
+        };
+        let path = tmp.path().join("large.dat");
+        let data = vec![b'A'; 32 * 1024 * 1024];
+        std::fs::write(&path, &data).ctx("large fixture")?;
+        let anchor = Anchor::open(tmp.path()).ctx("anchor")?;
+        decompress_fd(
+            &anchor
+                .open_file(Path::new("large.dat"))
+                .ctx("fixture file")?,
+        )
+        .ctx("uncompressed baseline")?;
+        let (before, _) = compressed_bytes(&path).ctx("baseline")?;
+        check_eq(before, 0, "baseline starts raw")?;
+        struct Sink;
+        impl EventSink for Sink {
+            fn event(&self, _: Event) {}
+        }
+        struct Stop<'a> {
+            calls: AtomicUsize,
+            cancel: &'a AtomicBool,
+        }
+        impl BusyCheck for Stop<'_> {
+            fn check_interval(&self) -> std::time::Duration {
+                std::time::Duration::ZERO
+            }
+            fn in_use_by(&self) -> Option<String> {
+                if self.calls.fetch_add(1, Ordering::Relaxed) >= 2 {
+                    self.cancel.store(true, Ordering::Relaxed);
+                }
+                None
+            }
+        }
+        let cancel = AtomicBool::new(false);
+        let stop = Stop {
+            calls: AtomicUsize::new(0),
+            cancel: &cancel,
+        };
+        let ctx = JobCtx {
+            events: &Sink,
+            cancel: &cancel,
+            busy: Some(&stop),
+        };
+        let inv = crate::inventory::walk(tmp.path(), &crate::inventory::WalkOpts::native())
+            .ctx("inventory")?;
+        let outcome = BtrfsBackend
+            .compress(
+                tmp.path(),
+                &inv,
+                &CompressOpts {
+                    threads: 1,
+                    ..Default::default()
+                },
+                &ctx,
+            )
+            .ctx("cancelled pass")?;
+        check(outcome.cancelled, "cancel is reported")?;
+        check(
+            outcome.completed.is_empty(),
+            "a partial file has no success receipt",
+        )?;
+        let (compressed, total) = compressed_bytes(&path).ctx("partial extents")?;
+        check(
+            compressed > 0 && compressed < total,
+            "only a bounded range was compressed",
+        )?;
+        check_eq(
+            std::fs::read(&path).ctx("bytes after cancellation")?,
+            data,
+            "partial compression preserves every byte",
+        )
+    }
+
+    #[test]
     fn compresses_and_decompresses_a_real_file() -> TestResult {
         let Some(tmp) = btrfs_tempdir() else {
             eprintln!("skipped: not running on btrfs");
@@ -516,12 +701,17 @@ mod tests {
         std::fs::write(&path, "compress me ".repeat(500_000).into_bytes()).ctx("write text.dat")?;
         // Reached the way a job reaches it, through an anchored open.
         let anchor = Anchor::open(tmp.path()).ctx("open the anchor")?;
-        let file = anchor.open_file(Path::new("text.dat")).ctx("open text.dat")?;
+        let file = anchor
+            .open_file(Path::new("text.dat"))
+            .ctx("open text.dat")?;
 
         compress_fd(&file, 15).ctx("compress text.dat")?;
         let (compressed, total) = compressed_bytes(&path).ctx("map extents after compressing")?;
         check(total > 0, "the file maps at least one extent")?;
-        check(compressed > 0, format!("expected compressed extents, got {compressed}/{total}"))?;
+        check(
+            compressed > 0,
+            format!("expected compressed extents, got {compressed}/{total}"),
+        )?;
 
         decompress_fd(&file).ctx("decompress text.dat")?;
         let (compressed, total) = compressed_bytes(&path).ctx("map extents after decompressing")?;
@@ -533,7 +723,11 @@ mod tests {
 
         // Contents must survive both passes.
         let back = std::fs::read(&path).ctx("read text.dat back")?;
-        check_eq(back.len(), 12 * 500_000, "the file's length after both passes")
+        check_eq(
+            back,
+            "compress me ".repeat(500_000).into_bytes(),
+            "every byte survives both passes",
+        )
     }
 
     /// Compressing a file must not disturb the fields the incremental pass
@@ -559,13 +753,23 @@ mod tests {
         let before = std::fs::metadata(&path).ctx("stat before")?;
 
         let anchor = Anchor::open(tmp.path()).ctx("open the anchor")?;
-        let file = anchor.open_file(Path::new("fingerprint.dat")).ctx("open the file")?;
+        let file = anchor
+            .open_file(Path::new("fingerprint.dat"))
+            .ctx("open the file")?;
         compress_fd(&file, 15).ctx("compress the file")?;
         let after = std::fs::metadata(&path).ctx("stat after")?;
 
         check_eq(after.ino(), before.ino(), "the inode must survive")?;
-        check_eq(after.size(), before.size(), "the logical size must not move")?;
-        check_eq(after.mtime_nsec(), before.mtime_nsec(), "mtime must not move")?;
+        check_eq(
+            after.size(),
+            before.size(),
+            "the logical size must not move",
+        )?;
+        check_eq(
+            after.mtime_nsec(),
+            before.mtime_nsec(),
+            "mtime must not move",
+        )?;
         check_eq(
             after.ctime_nsec(),
             before.ctime_nsec(),
@@ -581,13 +785,17 @@ mod tests {
         };
         set_dir_property(tmp.path(), true).ctx("set btrfs.compression")?;
         check_eq(
-            xattr::get(tmp.path(), "btrfs.compression").ctx("read btrfs.compression")?.as_deref(),
+            xattr::get(tmp.path(), "btrfs.compression")
+                .ctx("read btrfs.compression")?
+                .as_deref(),
             Some(b"zstd".as_slice()),
             "the directory property after setting it",
         )?;
         set_dir_property(tmp.path(), false).ctx("clear btrfs.compression")?;
         check(
-            xattr::get(tmp.path(), "btrfs.compression").ctx("re-read btrfs.compression")?.is_none(),
+            xattr::get(tmp.path(), "btrfs.compression")
+                .ctx("re-read btrfs.compression")?
+                .is_none(),
             "the property is gone after clearing",
         )?;
         // Clearing twice must not fail.

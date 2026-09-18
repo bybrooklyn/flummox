@@ -361,8 +361,10 @@ impl Db {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
-            std::fs::create_dir_all(parent)
-                .map_err(|source| DbError::Io { path: parent.to_path_buf(), source })?;
+            std::fs::create_dir_all(parent).map_err(|source| DbError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
         }
         let conn = Connection::open(path)?;
         tracing::debug!(path = %path.display(), "opened the state database");
@@ -385,7 +387,9 @@ impl Db {
         let base = std::env::var_os("XDG_STATE_HOME")
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))?;
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
+            })?;
         Some(base.join("flummox").join("state.sqlite"))
     }
 
@@ -421,6 +425,35 @@ impl Db {
     /// inventory is the complete truth about the install directory: a file the
     /// game update deleted must not keep a fingerprint.
     pub fn record_compression(&mut self, game: &GameRecord, inv: &Inventory) -> Result<()> {
+        self.record_with_levels(game, inv, None)
+    }
+
+    /// Records only confirmed outcomes, preserving unchanged earlier successes.
+    pub fn record_outcome(
+        &mut self,
+        game: &GameRecord,
+        inv: &Inventory,
+        completed: &[(FileEntry, i32)],
+    ) -> Result<()> {
+        let stored = self.fingerprints(&game.id)?;
+        let mut levels = HashMap::new();
+        for entry in &inv.files {
+            if let Some(fp) = stored.get(&entry.rel).filter(|fp| fp.matches(entry)) {
+                levels.insert(entry.rel.clone(), fp.level_applied);
+            }
+        }
+        for (entry, level) in completed {
+            levels.insert(entry.rel.clone(), *level);
+        }
+        self.record_with_levels(game, inv, Some(&levels))
+    }
+
+    fn record_with_levels(
+        &mut self,
+        game: &GameRecord,
+        inv: &Inventory,
+        levels: Option<&HashMap<PathBuf, i32>>,
+    ) -> Result<()> {
         let id = game.id.to_string();
         let tx = self.conn.transaction()?;
         // An explicit upsert rather than INSERT OR REPLACE: REPLACE deletes
@@ -471,7 +504,11 @@ impl Db {
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for file in &inv.files {
-                let applied = if file.action.is_compress() { game.level } else { NOT_ATTEMPTED };
+                let applied = match levels {
+                    Some(levels) => levels.get(&file.rel).copied().unwrap_or(NOT_ATTEMPTED),
+                    None if file.action.is_compress() => game.level,
+                    None => NOT_ATTEMPTED,
+                };
                 stmt.execute(params![
                     &id,
                     file.rel.as_os_str().as_bytes(),
@@ -533,25 +570,30 @@ impl Db {
         )?;
         let rows = stmt.query_map([], |row| {
             let id: String = row.get(0)?;
-            Ok((id, RawGame {
-                launcher: row.get(1)?,
-                title: row.get(2)?,
-                path: row.get(3)?,
-                backend: row.get(4)?,
-                level: row.get(5)?,
-                preset: row.get(6)?,
-                build: row.get(7)?,
-                compressed_at: row.get(8)?,
-                install_bytes: row.get(9)?,
-                disk_before: row.get(10)?,
-                disk_after: row.get(11)?,
-                est_saving: row.get(12)?,
-            }))
+            Ok((
+                id,
+                RawGame {
+                    launcher: row.get(1)?,
+                    title: row.get(2)?,
+                    path: row.get(3)?,
+                    backend: row.get(4)?,
+                    level: row.get(5)?,
+                    preset: row.get(6)?,
+                    build: row.get(7)?,
+                    compressed_at: row.get(8)?,
+                    install_bytes: row.get(9)?,
+                    disk_before: row.get(10)?,
+                    disk_after: row.get(11)?,
+                    est_saving: row.get(12)?,
+                },
+            ))
         })?;
         let mut out = Vec::new();
         for row in rows {
             let (id, raw) = row?;
-            let Some(id) = parse_game_id(&id) else { continue };
+            let Some(id) = parse_game_id(&id) else {
+                continue;
+            };
             out.push(raw.into_record(&id)?);
         }
         Ok(out)
@@ -601,7 +643,12 @@ impl Db {
         Ok(inv
             .files
             .iter()
-            .filter(|entry| stored.get(&entry.rel).is_none_or(|fp| !fp.matches(entry)))
+            .filter(|entry| {
+                stored.get(&entry.rel).is_none_or(|fp| {
+                    !fp.matches(entry)
+                        || (entry.action.is_compress() && fp.level_applied == NOT_ATTEMPTED)
+                })
+            })
             .cloned()
             .collect())
     }
@@ -694,14 +741,17 @@ impl Db {
     /// Returns whether it had been excluded, so a caller can say "that was not
     /// on the list" rather than claiming to have removed something.
     pub fn unexclude(&self, id: &GameId) -> Result<bool> {
-        let rows = self.conn.execute("DELETE FROM hidden WHERE id = ?1", params![id.to_string()])?;
+        let rows = self
+            .conn
+            .execute("DELETE FROM hidden WHERE id = ?1", params![id.to_string()])?;
         Ok(rows > 0)
     }
 
     /// Every excluded game, as id and title, oldest first.
     pub fn excluded(&self) -> Result<Vec<(GameId, String)>> {
-        let mut stmt =
-            self.conn.prepare("SELECT id, title FROM hidden ORDER BY added_at, id")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, title FROM hidden ORDER BY added_at, id")?;
         let rows = stmt.query_map([], |row| {
             let id: String = row.get(0)?;
             let title: String = row.get(1)?;
@@ -723,11 +773,29 @@ impl Db {
     pub fn is_excluded(&self, id: &GameId) -> Result<bool> {
         let found: Option<i64> = self
             .conn
-            .query_row("SELECT 1 FROM hidden WHERE id = ?1", params![id.to_string()], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT 1 FROM hidden WHERE id = ?1",
+                params![id.to_string()],
+                |row| row.get(0),
+            )
             .optional()?;
         Ok(found.is_some())
+    }
+
+    /// Invalidates compression evidence before an operation can undo it.
+    /// History survives, including aliases that refer to the same folder.
+    pub fn invalidate_compression(&mut self, path: &Path) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM files WHERE game_id IN (SELECT id FROM games WHERE path=?1)",
+            params![path.as_os_str().as_bytes()],
+        )?;
+        tx.execute(
+            "UPDATE games SET level=0, est_saving=0 WHERE path=?1",
+            params![path.as_os_str().as_bytes()],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Drops everything stored about a game, for a decompress.
@@ -773,12 +841,18 @@ struct RawGame {
 impl RawGame {
     /// Rebuilds a record, given the id it was looked up by.
     fn into_record(self, id: &GameId) -> Result<GameRecord> {
-        let launcher = launcher_from_slug(&self.launcher)
-            .ok_or_else(|| DbError::Unreadable { what: "launcher", value: self.launcher.clone() })?;
-        let backend = backend_from_label(&self.backend)
-            .ok_or_else(|| DbError::Unreadable { what: "backend", value: self.backend.clone() })?;
-        let preset = preset_from_label(&self.preset)
-            .ok_or_else(|| DbError::Unreadable { what: "preset", value: self.preset.clone() })?;
+        let launcher = launcher_from_slug(&self.launcher).ok_or_else(|| DbError::Unreadable {
+            what: "launcher",
+            value: self.launcher.clone(),
+        })?;
+        let backend = backend_from_label(&self.backend).ok_or_else(|| DbError::Unreadable {
+            what: "backend",
+            value: self.backend.clone(),
+        })?;
+        let preset = preset_from_label(&self.preset).ok_or_else(|| DbError::Unreadable {
+            what: "preset",
+            value: self.preset.clone(),
+        })?;
         Ok(GameRecord {
             // The launcher comes from its own column rather than from the id
             // text, so a query can group by it without parsing every id.
@@ -808,7 +882,11 @@ fn migrate(conn: &Connection) -> Result<()> {
     if current >= SCHEMA_VERSION {
         return Ok(());
     }
-    tracing::info!(from = current, to = SCHEMA_VERSION, "migrating the state database");
+    tracing::info!(
+        from = current,
+        to = SCHEMA_VERSION,
+        "migrating the state database"
+    );
     if current < 1 {
         conn.execute_batch(SCHEMA_V1)?;
     }
@@ -844,11 +922,13 @@ fn backend_from_label(label: &str) -> Option<BackendKind> {
 
 /// The preset a stored label names.
 fn preset_from_label(label: &str) -> Option<Preset> {
-    [Preset::Fast, Preset::Balanced, Preset::Max].into_iter().find(|p| p.label() == label)
+    [Preset::Fast, Preset::Balanced, Preset::Max]
+        .into_iter()
+        .find(|p| p.label() == label)
 }
 
 /// Parses the `launcher:key` text used as a game's primary key.
-fn parse_game_id(text: &str) -> Option<GameId> {
+pub(crate) fn parse_game_id(text: &str) -> Option<GameId> {
     let (slug, key) = text.split_once(':')?;
     Some(GameId::new(launcher_from_slug(slug)?, key))
 }
@@ -912,7 +992,10 @@ mod tests {
 
     /// An inventory holding exactly these files.
     fn inventory(files: Vec<FileEntry>) -> Inventory {
-        Inventory { files, warnings: Vec::new() }
+        Inventory {
+            files,
+            warnings: Vec::new(),
+        }
     }
 
     /// A game record with every field set to something distinguishable.
@@ -938,6 +1021,76 @@ mod tests {
     }
 
     #[test]
+    fn starting_undo_invalidates_aliases_without_erasing_history() -> TestResult {
+        let mut db = Db::open_in_memory().ctx("database")?;
+        let id = celeste();
+        let alias = GameId::new(Launcher::Manual, "celeste");
+        let inv = inventory(vec![entry("data.bin", 1_000_000)]);
+        for key in [&id, &alias] {
+            db.record_compression(&record(key), &inv)
+                .ctx("prior success")?;
+            db.log_activity(
+                &Activity::new(ActivityLevel::Info, "compress", "prior pass").for_game(key),
+            )
+            .ctx("history")?;
+        }
+        db.invalidate_compression(&record(&id).install_dir)
+            .ctx("begin undo")?;
+        for key in [&id, &alias] {
+            check_eq(
+                db.changed_since(key, &inv).ctx("next pass")?.len(),
+                1,
+                "unchanged timestamps cannot hide an interrupted undo",
+            )?;
+            check_eq(
+                db.game(key)
+                    .ctx("game history")?
+                    .ctx("record retained")?
+                    .est_saving,
+                0,
+                "old savings no longer advertised",
+            )?;
+        }
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM activity", [], |row| row.get(0))
+            .ctx("activity")?;
+        check_eq(count, 2, "operation history survives")
+    }
+
+    #[test]
+    fn partial_pass_keeps_untouched_files_eligible_and_preserves_successes() -> TestResult {
+        let mut db = Db::open_in_memory().ctx("database")?;
+        let first = entry("first", 100_000);
+        let second = entry("second", 100_000);
+        let full = inventory(vec![first.clone(), second.clone()]);
+        let game = record(&celeste());
+        db.record_outcome(&game, &full, &[(first.clone(), 9)])
+            .ctx("partial pass")?;
+        check_eq(
+            db.changed_since(&game.id, &full).ctx("remaining")?,
+            vec![second.clone()],
+            "only success is skipped",
+        )?;
+        db.record_outcome(&game, &full, &[(second.clone(), 15)])
+            .ctx("resume")?;
+        check(
+            db.changed_since(&game.id, &full)
+                .ctx("remaining")?
+                .is_empty(),
+            "resume completes both",
+        )?;
+        let mut replaced = first;
+        replaced.ctime_ns += 1;
+        let changed = inventory(vec![replaced.clone(), second]);
+        check_eq(
+            db.changed_since(&game.id, &changed).ctx("after update")?,
+            vec![replaced],
+            "a changed fingerprint is eligible again",
+        )
+    }
+
+    #[test]
     fn migrations_run_twice_without_complaint() -> TestResult {
         let db = Db::open_in_memory().ctx("open an in-memory database")?;
         // open_in_memory already migrated once; these are the second and third.
@@ -948,7 +1101,11 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .ctx("read user_version")?;
-        check_eq(version, SCHEMA_VERSION, "the schema version is recorded once")?;
+        check_eq(
+            version,
+            SCHEMA_VERSION,
+            "the schema version is recorded once",
+        )?;
         let foreign_keys: i32 = db
             .conn
             .pragma_query_value(None, "foreign_keys", |row| row.get(0))
@@ -961,16 +1118,24 @@ mod tests {
         let mut db = Db::open_in_memory().ctx("open")?;
         let id = celeste();
         let stored = record(&id);
-        let inv = inventory(vec![entry("Content/atlas.dat", 100), entry("Celeste.dll", 200)]);
-        db.record_compression(&stored, &inv).ctx("record the pass")?;
+        let inv = inventory(vec![
+            entry("Content/atlas.dat", 100),
+            entry("Celeste.dll", 200),
+        ]);
+        db.record_compression(&stored, &inv)
+            .ctx("record the pass")?;
 
-        let back = db.game(&id).ctx("read the game")?.ctx("the game should be stored")?;
+        let back = db
+            .game(&id)
+            .ctx("read the game")?
+            .ctx("the game should be stored")?;
         check_eq(back, stored.clone(), "every column comes back unchanged")?;
 
         let prints = db.fingerprints(&id).ctx("read the fingerprints")?;
         check_eq(prints.len(), 2, "one fingerprint per file")?;
-        let atlas =
-            prints.get(Path::new("Content/atlas.dat")).ctx("no fingerprint for the atlas")?;
+        let atlas = prints
+            .get(Path::new("Content/atlas.dat"))
+            .ctx("no fingerprint for the atlas")?;
         check_eq(atlas.size, 100, "the stored size")?;
         check_eq(atlas.ino, 42, "the stored inode")?;
         check_eq(atlas.mtime_ns, 1_000_000_000, "the stored mtime")?;
@@ -978,9 +1143,14 @@ mod tests {
 
         // A game update deleted one file; its fingerprint must not linger.
         let second = inventory(vec![entry("Content/atlas.dat", 100)]);
-        db.record_compression(&stored, &second).ctx("record a second pass")?;
+        db.record_compression(&stored, &second)
+            .ctx("record a second pass")?;
         let prints = db.fingerprints(&id).ctx("re-read the fingerprints")?;
-        check_eq(prints.len(), 1, "a file that went away loses its fingerprint")?;
+        check_eq(
+            prints.len(),
+            1,
+            "a file that went away loses its fingerprint",
+        )?;
         check(
             prints.contains_key(Path::new("Content/atlas.dat")),
             "the surviving file keeps its fingerprint",
@@ -991,31 +1161,53 @@ mod tests {
     fn changed_since_finds_rewritten_and_new_files_only() -> TestResult {
         let mut db = Db::open_in_memory().ctx("open")?;
         let id = celeste();
-        let original =
-            inventory(vec![entry("a.dat", 100), entry("b.dat", 200), entry("c.dat", 300)]);
-        db.record_compression(&record(&id), &original).ctx("record the pass")?;
+        let original = inventory(vec![
+            entry("a.dat", 100),
+            entry("b.dat", 200),
+            entry("c.dat", 300),
+        ]);
+        db.record_compression(&record(&id), &original)
+            .ctx("record the pass")?;
 
-        let unchanged = db.changed_since(&id, &original).ctx("compare an identical walk")?;
-        check(unchanged.is_empty(), format!("an identical inventory changed nothing: {unchanged:?}"))?;
+        let unchanged = db
+            .changed_since(&id, &original)
+            .ctx("compare an identical walk")?;
+        check(
+            unchanged.is_empty(),
+            format!("an identical inventory changed nothing: {unchanged:?}"),
+        )?;
 
         // One file rewritten in place, one grown, one added, one untouched.
         let later = inventory(vec![
-            FileEntry { mtime_ns: 9_000_000_000, ..entry("a.dat", 100) },
+            FileEntry {
+                mtime_ns: 9_000_000_000,
+                ..entry("a.dat", 100)
+            },
             entry("b.dat", 250),
             entry("c.dat", 300),
             entry("d.dat", 400),
         ]);
         let changed = db.changed_since(&id, &later).ctx("compare a later walk")?;
-        let mut names: Vec<String> =
-            changed.iter().map(|f| f.rel.display().to_string()).collect();
+        let mut names: Vec<String> = changed
+            .iter()
+            .map(|f| f.rel.display().to_string())
+            .collect();
         names.sort();
-        let expected: Vec<String> =
-            ["a.dat", "b.dat", "d.dat"].iter().map(|s| (*s).to_owned()).collect();
-        check_eq(names, expected, "a new mtime, a new size and a new file, but not c.dat")?;
+        let expected: Vec<String> = ["a.dat", "b.dat", "d.dat"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        check_eq(
+            names,
+            expected,
+            "a new mtime, a new size and a new file, but not c.dat",
+        )?;
 
         // Nothing recorded at all means everything is work to do.
         let fresh = GameId::new(Launcher::Steam, "220");
-        let all = db.changed_since(&fresh, &original).ctx("compare an unrecorded game")?;
+        let all = db
+            .changed_since(&fresh, &original)
+            .ctx("compare an unrecorded game")?;
         check_eq(all.len(), 3, "an unknown game has every file to do")
     }
 
@@ -1025,12 +1217,20 @@ mod tests {
         let id = celeste();
         let raw: &[u8] = b"bad\xff/name.dat";
         let rel = PathBuf::from(OsStr::from_bytes(raw));
-        let inv = inventory(vec![FileEntry { rel: rel.clone(), ..entry("placeholder", 500) }]);
-        db.record_compression(&record(&id), &inv).ctx("record a file SQLite cannot read as text")?;
+        let inv = inventory(vec![FileEntry {
+            rel: rel.clone(),
+            ..entry("placeholder", 500)
+        }]);
+        db.record_compression(&record(&id), &inv)
+            .ctx("record a file SQLite cannot read as text")?;
 
         let prints = db.fingerprints(&id).ctx("read the fingerprints")?;
         let stored = prints.keys().next().ctx("nothing was stored")?;
-        check_eq(stored.as_os_str().as_bytes(), raw, "the path comes back byte for byte")?;
+        check_eq(
+            stored.as_os_str().as_bytes(),
+            raw,
+            "the path comes back byte for byte",
+        )?;
         check_eq(prints.len(), 1, "exactly one fingerprint")?;
 
         // Looking it up by the same path must find it, not miss and report it
@@ -1041,7 +1241,10 @@ mod tests {
             "the level is found under the non-UTF-8 name",
         )?;
         let again = db.changed_since(&id, &inv).ctx("compare the same walk")?;
-        check(again.is_empty(), format!("a non-UTF-8 path must not look changed: {again:?}"))
+        check(
+            again.is_empty(),
+            format!("a non-UTF-8 path must not look changed: {again:?}"),
+        )
     }
 
     #[test]
@@ -1050,28 +1253,39 @@ mod tests {
         let id = celeste();
         let inv = inventory(vec![
             entry("big.dat", 1_000_000),
-            FileEntry { action: Action::SkipTiny, ..entry("tiny.cfg", 10) },
-            FileEntry { action: Action::SkipPrecompressed, ..entry("movie.bik", 900_000) },
+            FileEntry {
+                action: Action::SkipTiny,
+                ..entry("tiny.cfg", 10)
+            },
+            FileEntry {
+                action: Action::SkipPrecompressed,
+                ..entry("movie.bik", 900_000)
+            },
         ]);
-        db.record_compression(&record(&id), &inv).ctx("record the pass")?;
+        db.record_compression(&record(&id), &inv)
+            .ctx("record the pass")?;
 
         check_eq(
-            db.level_applied(&id, Path::new("big.dat")).ctx("look up a compressed file")?,
+            db.level_applied(&id, Path::new("big.dat"))
+                .ctx("look up a compressed file")?,
             Some(15),
             "a compressed file records the level the job used",
         )?;
         check_eq(
-            db.level_applied(&id, Path::new("tiny.cfg")).ctx("look up a skipped file")?,
+            db.level_applied(&id, Path::new("tiny.cfg"))
+                .ctx("look up a skipped file")?,
             Some(NOT_ATTEMPTED),
             "a skipped file records that nothing was attempted",
         )?;
         check_eq(
-            db.level_applied(&id, Path::new("movie.bik")).ctx("look up a precompressed file")?,
+            db.level_applied(&id, Path::new("movie.bik"))
+                .ctx("look up a precompressed file")?,
             Some(NOT_ATTEMPTED),
             "an already-compressed file was never attempted either",
         )?;
         check_eq(
-            db.level_applied(&id, Path::new("never-walked.dat")).ctx("look up an unknown file")?,
+            db.level_applied(&id, Path::new("never-walked.dat"))
+                .ctx("look up an unknown file")?,
             None,
             "a file we have never seen is not the same as one we skipped",
         )
@@ -1097,19 +1311,33 @@ mod tests {
         let rows = db.recent_activity(3).ctx("read the log")?;
         check_eq(rows.len(), 3, "the limit is honoured")?;
         let messages: Vec<String> = rows.iter().map(|r| r.message.clone()).collect();
-        let expected: Vec<String> =
-            ["third", "a warning", "second"].iter().map(|s| (*s).to_owned()).collect();
+        let expected: Vec<String> = ["third", "a warning", "second"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
         check_eq(messages, expected, "newest first, by timestamp")?;
 
         let newest = rows.first().ctx("no rows came back")?;
-        check_eq(newest.game_id.clone(), Some(id), "the game id survives the round trip")?;
+        check_eq(
+            newest.game_id.clone(),
+            Some(id),
+            "the game id survives the round trip",
+        )?;
         check_eq(newest.level, ActivityLevel::Info, "the level survives too")?;
         check(newest.id > 0, "a stored entry has a real row id")?;
 
         let warning = rows.get(1).ctx("no second row")?;
-        check_eq(warning.level, ActivityLevel::Warn, "the warning kept its level")?;
+        check_eq(
+            warning.level,
+            ActivityLevel::Warn,
+            "the warning kept its level",
+        )?;
         check_eq(warning.bytes_delta, -512, "freed bytes are negative")?;
-        check_eq(warning.game_id.clone(), None, "an entry with no game has no id")
+        check_eq(
+            warning.game_id.clone(),
+            None,
+            "an entry with no game has no id",
+        )
     }
 
     #[test]
@@ -1118,14 +1346,25 @@ mod tests {
         let id = celeste();
         let other = GameId::new(Launcher::Steam, "228980");
 
-        check(!db.is_excluded(&id).ctx("check before")?, "nothing is hidden to begin with")?;
-        check(db.excluded().ctx("list before")?.is_empty(), "the list starts empty")?;
+        check(
+            !db.is_excluded(&id).ctx("check before")?,
+            "nothing is hidden to begin with",
+        )?;
+        check(
+            db.excluded().ctx("list before")?.is_empty(),
+            "the list starts empty",
+        )?;
 
         db.exclude(&id, "Celeste").ctx("exclude Celeste")?;
-        db.exclude(&other, "Steamworks Common Redistributables").ctx("exclude the redist")?;
+        db.exclude(&other, "Steamworks Common Redistributables")
+            .ctx("exclude the redist")?;
 
         check(db.is_excluded(&id).ctx("check after")?, "Celeste is hidden")?;
-        check_eq(db.excluded().ctx("list after")?.len(), 2, "both are on the list")?;
+        check_eq(
+            db.excluded().ctx("list after")?.len(),
+            2,
+            "both are on the list",
+        )?;
 
         // Excluding twice updates the title instead of failing on the key.
         db.exclude(&id, "Celeste (renamed)").ctx("exclude again")?;
@@ -1136,15 +1375,29 @@ mod tests {
             .find(|(listed_id, _)| *listed_id == id)
             .map(|(_, title)| title.clone())
             .ctx("Celeste missing from the list")?;
-        check_eq(title, "Celeste (renamed)".to_owned(), "the title is updated")?;
+        check_eq(
+            title,
+            "Celeste (renamed)".to_owned(),
+            "the title is updated",
+        )?;
 
-        check(db.unexclude(&id).ctx("unexclude")?, "removing reports that it was there")?;
-        check(!db.is_excluded(&id).ctx("check removed")?, "Celeste is visible again")?;
+        check(
+            db.unexclude(&id).ctx("unexclude")?,
+            "removing reports that it was there",
+        )?;
+        check(
+            !db.is_excluded(&id).ctx("check removed")?,
+            "Celeste is visible again",
+        )?;
         check(
             !db.unexclude(&id).ctx("unexclude twice")?,
             "removing something absent reports that it was not there",
         )?;
-        check_eq(db.excluded().ctx("final list")?.len(), 1, "the other game stays hidden")
+        check_eq(
+            db.excluded().ctx("final list")?.len(),
+            1,
+            "the other game stays hidden",
+        )
     }
 
     #[test]
@@ -1153,8 +1406,10 @@ mod tests {
         let id = celeste();
         let other = GameId::new(Launcher::Lutris, "balatro");
         let inv = inventory(vec![entry("a.dat", 100), entry("b.dat", 200)]);
-        db.record_compression(&record(&id), &inv).ctx("record Celeste")?;
-        db.record_compression(&record(&other), &inv).ctx("record the other game")?;
+        db.record_compression(&record(&id), &inv)
+            .ctx("record Celeste")?;
+        db.record_compression(&record(&other), &inv)
+            .ctx("record the other game")?;
         db.log_activity(&Activity::new(ActivityLevel::Info, "compress", "done").for_game(&id))
             .ctx("log for Celeste")?;
         db.log_activity(&Activity::new(ActivityLevel::Info, "compress", "done").for_game(&other))
@@ -1162,15 +1417,30 @@ mod tests {
 
         db.forget(&id).ctx("forget Celeste")?;
 
-        check(db.game(&id).ctx("look Celeste up")?.is_none(), "the game row is gone")?;
-        check(db.fingerprints(&id).ctx("read fingerprints")?.is_empty(), "the file rows are gone")?;
+        check(
+            db.game(&id).ctx("look Celeste up")?.is_none(),
+            "the game row is gone",
+        )?;
+        check(
+            db.fingerprints(&id).ctx("read fingerprints")?.is_empty(),
+            "the file rows are gone",
+        )?;
         let log = db.recent_activity(10).ctx("read the log")?;
         check_eq(log.len(), 1, "only the other game's log entry is left")?;
         let left = log.first().ctx("no rows came back")?;
-        check_eq(left.game_id.clone(), Some(other.clone()), "and it belongs to the other game")?;
-        check(db.game(&other).ctx("look the other game up")?.is_some(), "the other game stays")?;
         check_eq(
-            db.fingerprints(&other).ctx("read the other game's fingerprints")?.len(),
+            left.game_id.clone(),
+            Some(other.clone()),
+            "and it belongs to the other game",
+        )?;
+        check(
+            db.game(&other).ctx("look the other game up")?.is_some(),
+            "the other game stays",
+        )?;
+        check_eq(
+            db.fingerprints(&other)
+                .ctx("read the other game's fingerprints")?
+                .len(),
             2,
             "so do its fingerprints",
         )

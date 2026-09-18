@@ -241,7 +241,10 @@ fn unescape_octal(s: &str) -> String {
             continue;
         }
         let digits: String = chars.clone().take(3).collect();
-        match u32::from_str_radix(&digits, 8).ok().and_then(char::from_u32) {
+        match u32::from_str_radix(&digits, 8)
+            .ok()
+            .and_then(char::from_u32)
+        {
             Some(decoded) if digits.len() == 3 => {
                 out.push(decoded);
                 let _ = chars.nth(2);
@@ -339,7 +342,10 @@ mod snapshot_tests {
         )?;
         std::fs::create_dir(tmp.path().join(".snapshots")).ctx("create .snapshots")?;
         let why = snapshot_risk_in(&fs, tmp.path()).ctx("expected a warning")?;
-        check(why.contains(".snapshots"), "the warning should name what it found")
+        check(
+            why.contains(".snapshots"),
+            "the warning should name what it found",
+        )
     }
 
     #[test]
@@ -357,7 +363,10 @@ mod snapshot_tests {
         // snapshots.
         std::fs::write(
             configs.join("root"),
-            format!("SUBVOLUME=\"{}\"\nTIMELINE_CREATE=\"no\"\n", covered.display()),
+            format!(
+                "SUBVOLUME=\"{}\"\nTIMELINE_CREATE=\"no\"\n",
+                covered.display()
+            ),
         )
         .ctx("write the snapper config")?;
 
@@ -368,15 +377,25 @@ mod snapshot_tests {
 
         let why = snapshot_risk_in(&btrfs_at(covered), tmp.path())
             .ctx("expected a warning for the covered subvolume")?;
-        check(why.contains("snapper"), "the warning should mention snapper")
+        check(
+            why.contains("snapper"),
+            "the warning should mention snapper",
+        )
     }
 
     #[test]
     fn filesystems_without_snapshots_never_warn() -> TestResult {
         let tmp = tempfile::tempdir().ctx("temporary directory")?;
         std::fs::create_dir(tmp.path().join(".snapshots")).ctx("create .snapshots")?;
-        let ext4 = FsInfo { fstype: "ext4".to_owned(), ..btrfs_at(tmp.path().to_path_buf()) };
-        check_eq(snapshot_risk_in(&ext4, tmp.path()), None, "ext4 does not share extents")
+        let ext4 = FsInfo {
+            fstype: "ext4".to_owned(),
+            ..btrfs_at(tmp.path().to_path_buf())
+        };
+        check_eq(
+            snapshot_risk_in(&ext4, tmp.path()),
+            None,
+            "ext4 does not share extents",
+        )
     }
 }
 
@@ -408,7 +427,9 @@ pub fn snapshot_risk_in(fs: &FsInfo, sysroot: &Path) -> Option<String> {
     let configs = sysroot.join("etc/snapper/configs");
     let entries = std::fs::read_dir(&configs).ok()?;
     for entry in entries.flatten() {
-        let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
         let covers = text.lines().any(|line| {
             line.trim()
                 .strip_prefix("SUBVOLUME=")
@@ -467,7 +488,11 @@ mod tests {
             .find(|m| m.mountpoint == Path::new("/home"))
             .ctx("find the /home mount")?;
         check_eq(home.fstype.as_str(), "btrfs", "the /home filesystem type")?;
-        check_eq(home.source.as_str(), "/dev/nvme0n1p2", "the /home backing device")?;
+        check_eq(
+            home.source.as_str(),
+            "/dev/nvme0n1p2",
+            "the /home backing device",
+        )?;
         check(
             home.super_options.iter().any(|o| o == "compress=zstd:1"),
             "the superblock options should carry the compression setting",
@@ -478,7 +503,10 @@ mod tests {
             Path::new("/run/media/brook/my disk"),
             "the octal escape should be decoded back to a space",
         )?;
-        check(removable.read_only(), "a mount with the ro option is read-only")
+        check(
+            removable.read_only(),
+            "a mount with the ro option is read-only",
+        )
     }
 
     #[test]
@@ -507,7 +535,10 @@ mod tests {
             "compress-force counts too, and needs no level",
         )?;
 
-        let plain = FsInfo { options: vec!["rw".to_owned()], ..fs };
+        let plain = FsInfo {
+            options: vec!["rw".to_owned()],
+            ..fs
+        };
         check_eq(
             plain.mount_compression(),
             None,
@@ -535,9 +566,17 @@ mod tests {
             Tier::Native(BackendKind::Bcachefs),
             "bcachefs compresses itself",
         )?;
-        check_eq(tier_for(&fs("ext4")), Tier::Pack, "ext4 needs the pack store")?;
+        check_eq(
+            tier_for(&fs("ext4")),
+            Tier::Pack,
+            "ext4 needs the pack store",
+        )?;
         check_eq(tier_for(&fs("xfs")), Tier::Pack, "xfs needs the pack store")?;
-        check_eq(tier_for(&fs("f2fs")), Tier::Pack, "f2fs needs the pack store")?;
+        check_eq(
+            tier_for(&fs("f2fs")),
+            Tier::Pack,
+            "f2fs needs the pack store",
+        )?;
         check(
             matches!(tier_for(&fs("nfs")), Tier::Unsupported(_)),
             "a network filesystem is unsupported",
@@ -547,7 +586,10 @@ mod tests {
             "exfat is unsupported",
         )?;
         // Read-only wins over the type.
-        let ro = FsInfo { read_only: true, ..fs("btrfs") };
+        let ro = FsInfo {
+            read_only: true,
+            ..fs("btrfs")
+        };
         check(
             matches!(tier_for(&ro), Tier::Unsupported(_)),
             "a read-only mount is unsupported even on btrfs",
@@ -557,11 +599,18 @@ mod tests {
     #[test]
     fn probes_this_machine() -> TestResult {
         let info = probe(Path::new(".")).ctx("probe the current directory")?;
-        check(!info.fstype.is_empty(), "the probe should name a filesystem")?;
+        check(
+            !info.fstype.is_empty(),
+            "the probe should name a filesystem",
+        )?;
         // Whatever this runs on, the magic and the name must agree when we
         // know the name for that magic.
         if let Some(name) = fstype_from_magic(info.magic) {
-            check_eq(name, info.fstype.as_str(), "the magic and the mountinfo name must agree")?;
+            check_eq(
+                name,
+                info.fstype.as_str(),
+                "the magic and the mountinfo name must agree",
+            )?;
         }
         Ok(())
     }

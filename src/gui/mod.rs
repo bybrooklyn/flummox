@@ -1,21 +1,32 @@
 //! `flummox-gui`: the desktop front end.
 //!
-//! [`app`] holds the state and the update function and knows nothing about
-//! `iced`, [`view`] builds widgets and changes nothing, and [`theme`] holds
+//! [`app`] holds state and schedules background tasks, [`view`] builds
+//! widgets from cached data, and [`theme`] holds
 //! the colours.
 
+#[cfg(target_os = "linux")]
 mod app;
 mod theme;
+#[cfg(not(any(target_os = "linux", windows)))]
+mod unsupported;
+#[cfg(target_os = "linux")]
 mod view;
+#[cfg(windows)]
+mod windows;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+
+#[cfg(target_os = "linux")]
 use crate::launchers::Env;
+#[cfg(target_os = "linux")]
+use anyhow::Context;
 
 /// The window's theme.
 ///
 /// A function item rather than a closure, for the same reason `view::view` is
 /// one: iced needs something that accepts a reference of *any* lifetime, and
 /// an inline closure gets inferred for one specific lifetime instead.
+#[cfg(target_os = "linux")]
 fn theme_of(_state: &app::State) -> iced::Theme {
     theme::theme()
 }
@@ -24,29 +35,38 @@ fn theme_of(_state: &app::State) -> iced::Theme {
 ///
 /// Subscribing unconditionally would redraw at the display's rate forever,
 /// which costs power for a window that is usually still.
+#[cfg(target_os = "linux")]
 fn animation_frames(state: &app::State) -> iced::Subscription<app::Message> {
-    if state.nav.is_animating(std::time::Instant::now()) {
+    let moving = !state.reduced_motion
+        && (state
+            .nav
+            .iter()
+            .any(|(_, a)| a.is_animating(std::time::Instant::now()))
+            || state.page_reveal.is_animating(std::time::Instant::now())
+            || state.status_reveal.is_animating(std::time::Instant::now())
+            || state.detail.is_animating(std::time::Instant::now())
+            || state
+                .progress
+                .values()
+                .any(|p| p.is_animating(std::time::Instant::now())));
+    let frames = if moving || state.status_deadline.is_some() {
         iced::window::frames().map(|_| app::Message::Tick)
     } else {
         iced::Subscription::none()
-    }
+    };
+    let polling = if state.polling {
+        iced::Subscription::run(app::polls)
+    } else {
+        iced::Subscription::none()
+    };
+    iced::Subscription::batch([
+        frames,
+        polling,
+        iced::keyboard::listen().map(app::Message::Keyboard),
+    ])
 }
 
-/// The state database, or `None` when it cannot be opened.
-///
-/// The window still works without it, showing what a scan finds and no
-/// history.
-fn open_db() -> Option<crate::db::Db> {
-    let path = crate::db::Db::default_path()?;
-    match crate::db::Db::open(&path) {
-        Ok(db) => Some(db),
-        Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "cannot read the state database");
-            None
-        }
-    }
-}
-
+#[cfg(target_os = "linux")]
 pub fn run() -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
@@ -61,7 +81,11 @@ pub fn run() -> Result<()> {
     // closure's return lifetime is a fresh one rather than tied to its
     // argument, which is exactly the higher-ranked bound `ViewFn` needs.
     iced::application(
-        move || app::State::new(env.clone(), open_db()),
+        move || {
+            let mut state = app::State::new(env.clone());
+            let task = app::update(&mut state, app::Message::Refresh);
+            (state, task)
+        },
         |state: &mut app::State, message: app::Message| app::update(state, message),
         view::view,
     )
@@ -72,4 +96,14 @@ pub fn run() -> Result<()> {
     .window_size((1100.0, 720.0))
     .run()?;
     Ok(())
+}
+
+#[cfg(windows)]
+pub fn run() -> Result<()> {
+    windows::run()
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+pub fn run() -> Result<()> {
+    unsupported::run()
 }
