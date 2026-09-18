@@ -63,7 +63,6 @@ pub fn view(state: &State) -> Element<'_, Message> {
 fn layout(state: &State, compact: bool) -> Element<'_, Message> {
     let mut nav = column![
         text("Flummox").size(23),
-        theme::muted("More room to play"),
         Space::new().height(16)
     ]
     .spacing(6)
