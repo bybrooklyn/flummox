@@ -4,7 +4,7 @@ use super::*;
 use crate::{
     backend::{self, BusyCheck, Event, EventSink, JobCtx},
     db::{Db, GameRecord},
-    estimate::{self, Estimate, EstimateOpts, PackModel},
+    estimate::{self, Estimate, EstimateOpts, PackModel, PreviewEstimate},
     inventory::{self, Inventory},
     safeio::Anchor,
 };
@@ -175,7 +175,9 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
         let model = backend.model(&job.options);
         let opts = EstimateOpts::new(job.options.btrfs_level(), &fs);
         let probe = backend.disk_probe();
-        let mut budget = 32 * 1024 * 1024u64;
+        const ANALYSIS_BUDGET: u64 = 32 * 1024 * 1024;
+        const FILE_SAMPLE_CAP: u64 = 1024 * 1024;
+        let mut budget = ANALYSIS_BUDGET;
         let mut candidates = Vec::new();
         let mut inspected_bytes = 0u64;
         for (index, entry) in inv.files.iter().enumerate() {
@@ -196,29 +198,30 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
                 let measured = probe
                     .measure(&path.join(&entry.rel))
                     .and_then(|(c, n)| (n > 0).then_some(c as f64 / n as f64));
-                let native = estimate::estimate_open_file(
+                let sample_cap = budget.min(FILE_SAMPLE_CAP);
+                let (native, maximum) = estimate::estimate_open_file_pair(
                     &file,
                     entry.size,
-                    model.as_ref(),
-                    &opts,
-                    measured,
-                )?;
-                let maximum = estimate::estimate_open_file(
-                    &file,
-                    entry.size,
-                    &PackModel { level: 19 },
-                    &EstimateOpts {
-                        level: 19,
-                        mount_level: None,
+                    PreviewEstimate {
+                        native: model.as_ref(),
+                        native_opts: &opts,
+                        measured,
+                        maximum: &PackModel { level: 19 },
+                        maximum_opts: &EstimateOpts {
+                            level: 19,
+                            mount_level: None,
+                        },
+                        byte_cap: sample_cap,
                     },
-                    None,
                 )?;
                 ensure!(entry.matches_file(&file)?, "File changed during analysis");
                 Ok((native, maximum))
             })();
             match sampled {
                 Ok((native, maximum)) => {
-                    let sampled = native.sampled.saturating_add(maximum.sampled);
+                    // Both projections score the same bytes, so charge the
+                    // analysis budget once.
+                    let sampled = native.sampled;
                     budget = budget.saturating_sub(sampled);
                     summary.sampled = summary.sampled.saturating_add(sampled);
                     summary.inspected_files += 1;

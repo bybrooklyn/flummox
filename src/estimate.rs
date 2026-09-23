@@ -38,6 +38,13 @@ const MAX_SAMPLE_BYTES: u64 = 512 * 1024 * 1024;
 /// Whole-sector minimum shared by desktop and CLI native estimates.
 const MIN_SAVING_BYTES: u64 = 4096;
 
+/// Window used by the desktop preview shared by native and pack estimates.
+///
+/// It is large enough to give zstd useful history, but smaller than the pack's
+/// real frame. That keeps the projection conservative and lets a fixed budget
+/// cover many files instead of being spent on one or two large archives.
+const PREVIEW_WINDOW: u64 = 512 * 1024;
+
 /// Models how a backend turns compressed bytes into disk usage.
 pub trait UnitModel: Sync {
     /// The unit the backend compresses independently.
@@ -446,6 +453,126 @@ pub fn estimate_open_file(
     Ok(est)
 }
 
+/// Models used to score one shared desktop preview sample.
+pub(crate) struct PreviewEstimate<'a> {
+    /// Native filesystem model.
+    pub native: &'a dyn UnitModel,
+    /// Native target and current-mount settings.
+    pub native_opts: &'a EstimateOpts,
+    /// Fraction of the file already stored compressed.
+    pub measured: Option<f64>,
+    /// Writable pack model.
+    pub maximum: &'a dyn UnitModel,
+    /// Writable pack compression settings.
+    pub maximum_opts: &'a EstimateOpts,
+    /// Most source data this file may consume from the analysis budget.
+    pub byte_cap: u64,
+}
+
+/// Samples one anchored file once and scores the bytes for both native and
+/// writable-pack compression.
+///
+/// The two estimates report the same `sampled` byte count because they share
+/// the reads. Callers accounting for I/O should add it only once.
+pub(crate) fn estimate_open_file_pair(
+    mut file: &std::fs::File,
+    size: u64,
+    preview: PreviewEstimate<'_>,
+) -> io::Result<(FileEstimate, FileEstimate)> {
+    let fits_in_budget = size <= preview.byte_cap;
+    let window = if fits_in_budget {
+        size.max(1)
+    } else {
+        PREVIEW_WINDOW.min(preview.byte_cap.max(1))
+    };
+    let samples = if fits_in_budget {
+        1
+    } else {
+        (preview.byte_cap / window).max(1)
+    };
+    let buffer_len = usize::try_from(window).unwrap_or(usize::MAX);
+    let mut buf = vec![0u8; buffer_len];
+    let head = read_full(&mut file, buf.get_mut(..MAGIC_PEEK).unwrap_or(&mut []))?;
+    let inspection = crate::classify::inspect(buf.get(..head).unwrap_or(&[]));
+    let mut sampled_in = 0u64;
+    let mut native_now = 0u64;
+    let mut native_after = 0u64;
+    let mut maximum_after = 0u64;
+
+    for index in 0..samples {
+        let offset = sample_offset(index, size, window, samples);
+        if offset >= size {
+            break;
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let want = window.min(size - offset) as usize;
+        let read = read_full(&mut file, buf.get_mut(..want).unwrap_or(&mut []))?;
+        let Some(sample) = buf.get(..read) else { break };
+        if sample.is_empty() {
+            break;
+        }
+
+        let native_block = preview.native.block_size() as usize;
+        for chunk in sample.chunks(native_block) {
+            let raw = chunk.len() as u32;
+            let compressed = zstd::bulk::compress(chunk, preview.native_opts.level)?.len() as u32;
+            let raw_cost = preview.native.disk_cost(raw, raw) as f64;
+            let mount_cost = |level: i32| -> io::Result<f64> {
+                let bytes = if level == preview.native_opts.level {
+                    compressed
+                } else {
+                    zstd::bulk::compress(chunk, level)?.len() as u32
+                };
+                Ok(preview.native.disk_cost(raw, bytes) as f64)
+            };
+            let cost_now = match preview.measured {
+                Some(fraction) => {
+                    let fraction = fraction.clamp(0.0, 1.0);
+                    if fraction <= 0.0 {
+                        raw_cost
+                    } else {
+                        mount_cost(preview.native_opts.mount_level.unwrap_or(3))? * fraction
+                            + raw_cost * (1.0 - fraction)
+                    }
+                }
+                None => match preview.native_opts.mount_level {
+                    Some(level) => mount_cost(level)?,
+                    None => raw_cost,
+                },
+            };
+            native_now = native_now.saturating_add(cost_now as u64);
+            native_after = native_after.saturating_add(preview.native.disk_cost(raw, compressed));
+        }
+
+        let raw = sample.len() as u32;
+        let compressed = zstd::bulk::compress(sample, preview.maximum_opts.level)?.len() as u32;
+        maximum_after = maximum_after.saturating_add(preview.maximum.disk_cost(raw, compressed));
+        sampled_in = sampled_in.saturating_add(read as u64);
+    }
+
+    let mut native_estimate = FileEstimate {
+        size,
+        sampled: sampled_in,
+        inspection,
+        ..FileEstimate::default()
+    };
+    let mut maximum_estimate = native_estimate;
+    if sampled_in == 0 {
+        native_estimate.disk_now = size;
+        native_estimate.disk_after = size;
+        maximum_estimate.disk_now = size;
+        maximum_estimate.disk_after = size;
+        return Ok((native_estimate, maximum_estimate));
+    }
+
+    let scale = size as f64 / sampled_in as f64;
+    native_estimate.disk_now = (native_now as f64 * scale) as u64;
+    native_estimate.disk_after = (native_after as f64 * scale) as u64;
+    maximum_estimate.disk_now = native_estimate.disk_now;
+    maximum_estimate.disk_after = (maximum_after as f64 * scale) as u64;
+    Ok((native_estimate, maximum_estimate))
+}
+
 /// Estimates a whole game from an inventory.
 ///
 /// Files are sampled in parallel; `install_dir` is the directory the
@@ -652,9 +779,19 @@ pub fn choose_level(
 /// Spaces bounded samples across the head, middle, and tail.
 fn sample_block(index: u64, blocks: u64, samples: u64) -> u64 {
     if samples <= 1 {
-        0
+        blocks.saturating_sub(1) / 2
     } else {
         index.saturating_mul(blocks.saturating_sub(1)) / (samples - 1)
+    }
+}
+
+/// Spaces byte windows without leaving the tail sample short.
+fn sample_offset(index: u64, size: u64, window: u64, samples: u64) -> u64 {
+    let last_start = size.saturating_sub(window);
+    if samples <= 1 {
+        last_start / 2
+    } else {
+        index.saturating_mul(last_start) / (samples - 1)
     }
 }
 
@@ -692,7 +829,70 @@ mod tests {
                 "no duplicate sampled blocks",
             )?;
         }
-        check_eq(sample_block(0, 1, 1), 0, "single-block file")
+        check_eq(sample_block(0, 1, 1), 0, "single-block file")?;
+        check_eq(sample_block(0, 9, 1), 4, "one sample uses the middle")
+    }
+
+    #[test]
+    fn paired_estimate_reads_once_and_scores_both_backends() -> TestResult {
+        let tmp = tempfile::tempdir().ctx("tempdir")?;
+        let path = tmp.path().join("mixed.dat");
+        let size = write_file(&path, "the quick brown fox ".repeat(400_000).into_bytes())?;
+        let file = std::fs::File::open(&path).ctx("open mixed.dat")?;
+        let native_opts = EstimateOpts {
+            level: 9,
+            mount_level: None,
+        };
+        let maximum_opts = EstimateOpts {
+            level: 19,
+            mount_level: None,
+        };
+        let (native, maximum) = estimate_open_file_pair(
+            &file,
+            size,
+            PreviewEstimate {
+                native: &BtrfsModel { level: 9 },
+                native_opts: &native_opts,
+                measured: None,
+                maximum: &PackModel { level: 19 },
+                maximum_opts: &maximum_opts,
+                byte_cap: 1024 * 1024,
+            },
+        )
+        .ctx("estimate both backends")?;
+        check_eq(
+            native.sampled,
+            maximum.sampled,
+            "the projections share their reads",
+        )?;
+        check_eq(native.sampled, 1024 * 1024, "the file cap is exact")?;
+        check(native.worthwhile(), format!("native estimate: {native:?}"))?;
+        check(
+            maximum.disk_after <= native.disk_after,
+            format!("native {native:?}, maximum {maximum:?}"),
+        )?;
+
+        let small_path = tmp.path().join("small.dat");
+        let small_size = write_file(&small_path, vec![b'a'; 700 * 1024])?;
+        let small_file = std::fs::File::open(&small_path).ctx("open small.dat")?;
+        let (small, _) = estimate_open_file_pair(
+            &small_file,
+            small_size,
+            PreviewEstimate {
+                native: &BtrfsModel { level: 9 },
+                native_opts: &native_opts,
+                measured: None,
+                maximum: &PackModel { level: 19 },
+                maximum_opts: &maximum_opts,
+                byte_cap: 1024 * 1024,
+            },
+        )
+        .ctx("estimate a file smaller than the cap")?;
+        check_eq(
+            small.sampled,
+            small_size,
+            "a small file is not sampled twice",
+        )
     }
 
     #[test]
