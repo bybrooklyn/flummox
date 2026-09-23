@@ -3,7 +3,9 @@
 use crate::{
     db::{Activity, Db, GameRecord},
     fsprobe,
-    jobs::{self, Command, Job, Library, Operation, Phase, Snapshot},
+    jobs::{
+        self, Command, Job, Library, MotionPreference, Operation, Phase, Snapshot, ThemePreference,
+    },
     launchers::Env,
     model::Game,
 };
@@ -19,6 +21,7 @@ pub enum Page {
     Updates,
     Drives,
     Activity,
+    Settings,
 }
 pub const PAGES: [Page; 6] = [
     Page::Overview,
@@ -37,6 +40,7 @@ impl Page {
             Self::Updates => "Updates",
             Self::Drives => "Drives",
             Self::Activity => "Activity",
+            Self::Settings => "Settings",
         }
     }
 }
@@ -201,8 +205,12 @@ pub struct State {
     pub launcher_filter: Option<String>,
     pub presets: std::collections::HashMap<String, crate::backend::Preset>,
     pub reduced_motion: bool,
+    pub motion: MotionPreference,
+    pub theme: ThemePreference,
+    pub system_theme: iced::theme::Mode,
     pub scanning: bool,
     pub folder: String,
+    pub folder_error: Option<String>,
     pub shown: usize,
     pub detail: Animation<bool>,
     pub polling: bool,
@@ -254,8 +262,12 @@ impl State {
             launcher_filter: None,
             presets: Default::default(),
             reduced_motion: false,
+            motion: MotionPreference::Expressive,
+            theme: ThemePreference::System,
+            system_theme: iced::theme::Mode::Dark,
             scanning: false,
             folder: String::new(),
+            folder_error: None,
             shown: 40,
             detail: Animation::new(false).duration(Duration::from_millis(200)),
             polling: false,
@@ -270,12 +282,27 @@ impl State {
         }
     }
     pub fn show_status(&mut self, status: Status) {
-        self.status_deadline = (!status.is_error).then(|| Instant::now() + Duration::from_secs(5));
+        self.status_deadline = (!status.is_error).then(|| Instant::now() + Duration::from_secs(4));
         self.status = Some(status);
         self.status_reveal = Animation::new(false)
-            .duration(Duration::from_millis(180))
-            .easing(Easing::EaseOutCubic)
+            .duration(self.motion_duration(240, 150))
+            .easing(self.motion_easing())
             .go(true, Instant::now());
+    }
+
+    fn motion_duration(&self, expressive: u64, subtle: u64) -> Duration {
+        Duration::from_millis(match self.motion {
+            MotionPreference::Expressive => expressive,
+            MotionPreference::Subtle => subtle,
+            MotionPreference::Reduced => 0,
+        })
+    }
+
+    fn motion_easing(&self) -> Easing {
+        match self.motion {
+            MotionPreference::Expressive => Easing::EaseOutBack,
+            MotionPreference::Subtle | MotionPreference::Reduced => Easing::EaseOutCubic,
+        }
     }
 
     fn dismiss_status(&mut self) {
@@ -346,6 +373,33 @@ impl State {
             .filter(|choice| choice.mode != crate::recommendation::StorageMode::Skip)
             .map(|choice| choice.predicted_saving)
             .sum()
+    }
+
+    pub fn current_saving(&self) -> u64 {
+        let native = self
+            .records
+            .iter()
+            .filter(|record| {
+                self.games.iter().any(|row| {
+                    row.game.id == record.id
+                        && row.game.build == record.build
+                        && !self
+                            .snapshot
+                            .packs
+                            .iter()
+                            .any(|pack| pack.game_path == row.game.install_dir)
+                })
+            })
+            .filter_map(|record| u64::try_from(record.est_saving).ok())
+            .sum::<u64>();
+        let packed = self
+            .snapshot
+            .packs
+            .iter()
+            .filter_map(|install| install.summary.as_ref())
+            .map(|summary| summary.logical_bytes.saturating_sub(summary.archive_bytes))
+            .sum::<u64>();
+        native.saturating_add(packed)
     }
     pub fn analysis_queuing(&self) -> bool {
         self.analysis_queuing
@@ -477,7 +531,9 @@ pub enum Message {
     AddFolder,
     Preset(String, crate::backend::Preset),
     Keyboard(iced::keyboard::Event),
-    ReducedMotion(bool),
+    Motion(MotionPreference),
+    Theme(ThemePreference),
+    SystemTheme(iced::theme::Mode),
     DriveFilter(Option<PathBuf>),
     LauncherFilter(Option<String>),
     PackPath(String, String),
@@ -746,8 +802,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             if state.page != page {
                 state.page = page;
                 state.page_reveal = Animation::new(false)
-                    .duration(Duration::from_millis(240))
-                    .easing(Easing::EaseOutCubic)
+                    .duration(state.motion_duration(280, 160))
+                    .easing(state.motion_easing())
                     .go(true, Instant::now());
             }
             state.confirm_reclaim.clear();
@@ -839,6 +895,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                     .progress
                     .retain(|id, _| snapshot.jobs.iter().any(|j| j.id == *id));
                 state.reduced_motion = snapshot.reduced_motion;
+                state.motion = snapshot.motion;
+                state.theme = snapshot.theme;
                 state.snapshot = snapshot;
                 state.polling = true;
                 if libraries_changed {
@@ -891,8 +949,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             } else {
                 state.expanded = Some(id);
                 state.detail = Animation::new(false)
-                    .duration(Duration::from_millis(200))
-                    .easing(Easing::EaseOutCubic)
+                    .duration(state.motion_duration(260, 150))
+                    .easing(state.motion_easing())
                     .go(true, Instant::now());
             }
         }
@@ -1105,13 +1163,17 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             return send(command);
         }
-        Message::Folder(folder) => state.folder = folder,
+        Message::Folder(folder) => {
+            state.folder = folder;
+            state.folder_error = None;
+        }
         Message::AddFolder => {
             let folder = PathBuf::from(state.folder.trim());
             if !folder.is_dir() || folder.parent().is_none() {
-                state.show_status(Status::error("Choose an existing game folder."));
+                state.folder_error = Some("Choose an existing game folder.".into());
                 return Task::none();
             }
+            state.folder_error = None;
             return send(Command::Library(Library {
                 path: folder,
                 automatic: false,
@@ -1121,10 +1183,23 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::Preset(id, preset) => {
             state.presets.insert(id, preset);
         }
-        Message::ReducedMotion(reduced) => {
-            state.reduced_motion = reduced;
-            return send(Command::ReducedMotion(reduced));
+        Message::Motion(motion) => {
+            state.motion = motion;
+            state.reduced_motion = motion == MotionPreference::Reduced;
+            let duration = state.motion_duration(220, 140);
+            let easing = state.motion_easing();
+            for (_, animation) in &mut state.nav {
+                *animation = Animation::new(animation.value())
+                    .duration(duration)
+                    .easing(easing);
+            }
+            return send(Command::Motion(motion));
         }
+        Message::Theme(theme) => {
+            state.theme = theme;
+            return send(Command::Theme(theme));
+        }
+        Message::SystemTheme(theme) => state.system_theme = theme,
         Message::DriveFilter(path) => state.drive_filter = path,
         Message::LauncherFilter(launcher) => state.launcher_filter = launcher,
         Message::PackPath(id, path) => {

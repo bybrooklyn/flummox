@@ -29,6 +29,7 @@ struct State {
     scanning: bool,
     progress: Option<crate::windows::Progress>,
     cancel: Option<Arc<AtomicBool>>,
+    system_theme: iced::theme::Mode,
 }
 
 impl Default for State {
@@ -41,6 +42,7 @@ impl Default for State {
             scanning: true,
             progress: None,
             cancel: None,
+            system_theme: iced::theme::Mode::Dark,
         }
     }
 }
@@ -56,6 +58,7 @@ enum Message {
     Stop,
     Progress(crate::windows::Progress),
     Finished(std::result::Result<String, String>),
+    SystemTheme(iced::theme::Mode),
 }
 
 async fn background<T: Send + 'static>(
@@ -174,6 +177,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 (false, Err(text)) => Status { error: true, text },
             });
         }
+        Message::SystemTheme(theme) => state.system_theme = theme,
     }
     Task::none()
 }
@@ -185,12 +189,11 @@ fn view(state: &State) -> Element<'_, Message> {
 fn layout(state: &State, compact: bool) -> Element<'_, Message> {
     let hero = container(
         column![
-            text("Make room. Keep playing.").size(28),
-            text("Flummox uses Windows' transparent LZX storage. Games stay at the same path and launch normally.")
-                .size(14),
+            text("Save space with LZX").size(28),
+            theme::muted("Games stay in place and launch normally"),
             row![
-                theme::stat(state.games.len().to_string(), "Detected games"),
-                theme::stat("LZX".into(), "Storage mode")
+                theme::stat(state.games.len().to_string(), "Games"),
+                theme::stat("LZX".into(), "Mode")
             ]
             .spacing(32),
         ]
@@ -216,9 +219,9 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
     ]
     .spacing(8);
     if state.games.is_empty() {
-        game_list = game_list.push(
-            text("No Steam installs were found. You can still paste any game folder.").size(13),
-        );
+        game_list = game_list.push(theme::muted(
+            "No Steam games found. Paste a folder to continue",
+        ));
     }
     for game in &state.games {
         game_list = game_list.push(
@@ -257,9 +260,11 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
             .on_press_maybe((!state.working).then_some(Message::Optimize)),
         button("Restore")
             .padding([11, 18])
+            .style(theme::secondary_button)
             .on_press_maybe((!state.working).then_some(Message::Restore)),
         button("Stop")
             .padding([11, 18])
+            .style(theme::secondary_button)
             .on_press_maybe(state.working.then_some(Message::Stop)),
     ]
     .spacing(10);
@@ -269,8 +274,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
             .on_input(Message::Folder)
             .padding(12)
             .width(Length::Fill),
-        text("Optimize skips tiny files and content Windows cannot shrink. Restore removes WOF backing without changing file bytes.")
-            .size(12),
+        theme::muted("Optimize skips files LZX cannot shrink"),
         controls,
     ]
     .spacing(14);
@@ -347,16 +351,19 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
     .into()
 }
 
-fn theme(_state: &State) -> Theme {
-    theme::theme()
+fn theme(state: &State) -> Theme {
+    theme::theme(state.system_theme != iced::theme::Mode::Light)
 }
 
 fn boot() -> (State, Task<Message>) {
     let state = State::default();
-    let task = Task::perform(
-        background(|| Ok(crate::windows::discover_steam())),
-        |result| Message::Scanned(result.unwrap_or_default()),
-    );
+    let task = Task::batch([
+        Task::perform(
+            background(|| Ok(crate::windows::discover_steam())),
+            |result| Message::Scanned(result.unwrap_or_default()),
+        ),
+        iced::system::theme().map(Message::SystemTheme),
+    ]);
     (state, task)
 }
 
@@ -365,6 +372,7 @@ pub fn run() -> Result<()> {
     iced::application(boot, update, view)
         .title("Flummox")
         .theme(theme)
+        .subscription(|_| iced::system::theme_changes().map(Message::SystemTheme))
         .default_font(theme::BODY_FONT)
         .window_size((900.0, 620.0))
         .run()?;

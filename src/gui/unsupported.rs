@@ -6,24 +6,36 @@ use iced::{Element, Length, Task, Theme};
 
 use super::theme;
 
-#[derive(Default)]
-struct State;
+struct State {
+    system_theme: iced::theme::Mode,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            system_theme: iced::theme::Mode::Dark,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
-enum Message {}
+enum Message {
+    SystemTheme(iced::theme::Mode),
+}
 
-fn update(_state: &mut State, message: Message) -> Task<Message> {
-    match message {}
+fn update(state: &mut State, message: Message) -> Task<Message> {
+    match message {
+        Message::SystemTheme(theme) => state.system_theme = theme,
+    }
+    Task::none()
 }
 
 fn view(_state: &State) -> Element<'_, Message> {
     container(
         column![
             text("Flummox").size(26),
-            text("This platform does not have a transparent storage backend yet.").size(16),
-            theme::muted(
-                "The shared desktop application is available, but compression remains disabled until a safe native backend is implemented.",
-            ),
+            text("Compression is not available on this platform yet").size(16),
+            theme::muted("Game files are unchanged"),
         ]
         .spacing(12),
     )
@@ -34,14 +46,22 @@ fn view(_state: &State) -> Element<'_, Message> {
     .into()
 }
 
-fn theme_of(_state: &State) -> Theme {
-    theme::theme()
+fn theme_of(state: &State) -> Theme {
+    theme::theme(state.system_theme != iced::theme::Mode::Light)
+}
+
+fn boot() -> (State, Task<Message>) {
+    (
+        State::default(),
+        iced::system::theme().map(Message::SystemTheme),
+    )
 }
 
 pub fn run() -> Result<()> {
-    iced::application(State::default, update, view)
+    iced::application(boot, update, view)
         .title("Flummox")
         .theme(theme_of)
+        .subscription(|_| iced::system::theme_changes().map(Message::SystemTheme))
         .default_font(theme::BODY_FONT)
         .window_size((900.0, 620.0))
         .run()?;

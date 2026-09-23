@@ -606,6 +606,60 @@ fn settings(db: &Connection, snapshot: &Snapshot) -> Result<()> {
     Ok(())
 }
 
+fn steam_write_dirs(library: &Path) -> Vec<PathBuf> {
+    let steamapps = library.join("steamapps");
+    ["", "common", "downloading", "temp"]
+        .iter()
+        .map(|name| {
+            if name.is_empty() {
+                steamapps.clone()
+            } else {
+                steamapps.join(name)
+            }
+        })
+        .filter(|path| path.is_dir())
+        .collect()
+}
+
+const LIVE_COMPRESSION_MARKER: &str = "user.flummox.live-compression";
+
+fn set_live_compression(dir: &Path, enabled: bool) -> Result<()> {
+    let owned = xattr::get(dir, LIVE_COMPRESSION_MARKER)?.is_some();
+    if enabled {
+        if crate::backend::btrfs::dir_property(dir)?.is_some() {
+            return Ok(());
+        }
+        crate::backend::btrfs::set_dir_property(dir, true)?;
+        if let Err(error) = xattr::set(dir, LIVE_COMPRESSION_MARKER, b"1") {
+            let _cleared = crate::backend::btrfs::set_dir_property(dir, false);
+            return Err(error.into());
+        }
+    } else if owned {
+        crate::backend::btrfs::set_dir_property(dir, false)?;
+        xattr::remove(dir, LIVE_COMPRESSION_MARKER)?;
+    }
+    Ok(())
+}
+
+fn update_live_compression(library: &Library) -> Result<()> {
+    let dirs = steam_write_dirs(&library.path);
+    if dirs.is_empty() {
+        return Ok(());
+    }
+    let info = crate::fsprobe::probe(&library.path)?;
+    if !matches!(
+        crate::fsprobe::tier_for(&info),
+        crate::fsprobe::Tier::Native(crate::fsprobe::BackendKind::Btrfs)
+    ) {
+        return Ok(());
+    }
+    for dir in dirs {
+        set_live_compression(&dir, library.automatic)
+            .with_context(|| format!("Updating live compression for {}", dir.display()))?;
+    }
+    Ok(())
+}
+
 fn open_store(path: &Path) -> Result<(Connection, Snapshot)> {
     let db = Connection::open(path)?;
     db.busy_timeout(Duration::from_secs(5))?;
@@ -637,6 +691,27 @@ fn open_store(path: &Path) -> Result<(Connection, Snapshot)> {
         })
         .optional()?
         .is_some_and(|value| value == "true");
+    snapshot.theme = db
+        .query_row("SELECT data FROM settings WHERE id=5", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default();
+    snapshot.motion = db
+        .query_row("SELECT data FROM settings WHERE id=6", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or({
+            if snapshot.reduced_motion {
+                super::MotionPreference::Reduced
+            } else {
+                super::MotionPreference::Expressive
+            }
+        });
+    snapshot.reduced_motion = snapshot.motion == super::MotionPreference::Reduced;
     snapshot.packs = db
         .query_row("SELECT data FROM settings WHERE id=4", [], |row| {
             row.get::<_, String>(0)
@@ -737,6 +812,34 @@ fn apply(
                 [value.to_string()],
             )?;
             snapshot.reduced_motion = value;
+            snapshot.motion = if value {
+                super::MotionPreference::Reduced
+            } else {
+                super::MotionPreference::Expressive
+            };
+            db.execute(
+                "INSERT OR REPLACE INTO settings(id,data) VALUES(6,?1)",
+                [serde_json::to_string(&snapshot.motion)?],
+            )?;
+        }
+        Command::Theme(value) => {
+            db.execute(
+                "INSERT OR REPLACE INTO settings(id,data) VALUES(5,?1)",
+                [serde_json::to_string(&value)?],
+            )?;
+            snapshot.theme = value;
+        }
+        Command::Motion(value) => {
+            db.execute(
+                "INSERT OR REPLACE INTO settings(id,data) VALUES(6,?1)",
+                [serde_json::to_string(&value)?],
+            )?;
+            snapshot.motion = value;
+            snapshot.reduced_motion = value == super::MotionPreference::Reduced;
+            db.execute(
+                "INSERT OR REPLACE INTO settings(id,data) VALUES(3,?1)",
+                [snapshot.reduced_motion.to_string()],
+            )?;
         }
         Command::Enqueue {
             game,
@@ -800,6 +903,7 @@ fn apply(
         }
         Command::Library(mut library) => {
             library.path = validate_folder(&library.path)?;
+            update_live_compression(&library)?;
             snapshot.libraries.retain(|l| l.path != library.path);
             snapshot.libraries.push(library);
             settings(db, snapshot)?;
@@ -1024,6 +1128,13 @@ pub(super) fn run() -> Result<()> {
     let (db, mut snapshot) = open_store(&dir.join("queue.sqlite"))?;
     let mut mounts: Vec<PackMount> = Vec::new();
     recover_packs(&mut snapshot, &db, &mut mounts)?;
+    for library in &snapshot.libraries {
+        if library.automatic
+            && let Err(error) = update_live_compression(library)
+        {
+            tracing::warn!(%error, path = %library.path.display(), "live compression was not enabled");
+        }
+    }
     super::autostart::configure(
         &binary()?,
         snapshot.libraries.iter().any(|library| library.automatic) || !snapshot.packs.is_empty(),
@@ -1376,6 +1487,61 @@ mod tests {
         check(
             !reopened.observe(&old, &off, true),
             "turning maintenance off stops jobs",
+        )
+    }
+
+    #[test]
+    fn appearance_settings_survive_a_coordinator_restart() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let path = temp.path().join("jobs.sqlite");
+        let (db, mut snapshot) = open_store(&path).ctx("open store")?;
+        let mut mounts = Vec::new();
+        apply(
+            Command::Theme(super::super::ThemePreference::Light),
+            &mut snapshot,
+            &db,
+            &mut None,
+            &mut mounts,
+        )
+        .ctx("save theme")?;
+        apply(
+            Command::Motion(super::super::MotionPreference::Subtle),
+            &mut snapshot,
+            &db,
+            &mut None,
+            &mut mounts,
+        )
+        .ctx("save motion")?;
+        drop(db);
+
+        let (_db, restored) = open_store(&path).ctx("restart")?;
+        check_eq(
+            restored.theme,
+            super::super::ThemePreference::Light,
+            "theme",
+        )?;
+        check_eq(
+            restored.motion,
+            super::super::MotionPreference::Subtle,
+            "motion",
+        )?;
+        check(
+            !restored.reduced_motion,
+            "compatibility setting follows motion",
+        )
+    }
+
+    #[test]
+    fn steam_write_directories_only_include_existing_paths() -> TestResult {
+        let temp = tempfile::tempdir().ctx("library")?;
+        let steamapps = temp.path().join("steamapps");
+        std::fs::create_dir_all(steamapps.join("downloading")).ctx("download directory")?;
+        let dirs = steam_write_dirs(temp.path());
+        check_eq(dirs.len(), 2, "existing write directories")?;
+        check(dirs.contains(&steamapps), "steamapps included")?;
+        check(
+            dirs.contains(&steamapps.join("downloading")),
+            "downloads included",
         )
     }
 

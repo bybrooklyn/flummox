@@ -18,7 +18,59 @@ use std::path::PathBuf;
 pub use service::{configured_libraries, request, state_dir};
 
 /// Protocol version. A mismatched installed worker is rejected before work.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
+
+/// Which application palette the desktop shell follows.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThemePreference {
+    #[default]
+    System,
+    Dark,
+    Light,
+}
+
+impl ThemePreference {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::Dark => "Dark",
+            Self::Light => "Light",
+        }
+    }
+}
+
+impl std::fmt::Display for ThemePreference {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
+/// How much interface motion the desktop shell uses.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MotionPreference {
+    #[default]
+    Expressive,
+    Subtle,
+    Reduced,
+}
+
+impl MotionPreference {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Expressive => "Expressive",
+            Self::Subtle => "Subtle",
+            Self::Reduced => "Reduced",
+        }
+    }
+}
+
+impl std::fmt::Display for MotionPreference {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
 
 /// Operation requested for a game.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +167,10 @@ pub struct Snapshot {
     #[serde(default)]
     pub reduced_motion: bool,
     #[serde(default)]
+    pub theme: ThemePreference,
+    #[serde(default)]
+    pub motion: MotionPreference,
+    #[serde(default)]
     pub packs: Vec<crate::pack::Install>,
 }
 
@@ -139,6 +195,8 @@ pub enum Command {
         excluded: bool,
     },
     ReducedMotion(bool),
+    Theme(ThemePreference),
+    Motion(MotionPreference),
     PackActivate {
         #[serde(with = "crate::path_serde")]
         game_path: PathBuf,

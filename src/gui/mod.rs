@@ -27,8 +27,13 @@ use anyhow::Context;
 /// one: iced needs something that accepts a reference of *any* lifetime, and
 /// an inline closure gets inferred for one specific lifetime instead.
 #[cfg(target_os = "linux")]
-fn theme_of(_state: &app::State) -> iced::Theme {
-    theme::theme()
+fn theme_of(state: &app::State) -> iced::Theme {
+    let dark = match state.theme {
+        crate::jobs::ThemePreference::System => state.system_theme != iced::theme::Mode::Light,
+        crate::jobs::ThemePreference::Dark => true,
+        crate::jobs::ThemePreference::Light => false,
+    };
+    theme::theme(dark)
 }
 
 /// Frames, but only while something is moving.
@@ -63,6 +68,7 @@ fn animation_frames(state: &app::State) -> iced::Subscription<app::Message> {
         frames,
         polling,
         iced::keyboard::listen().map(app::Message::Keyboard),
+        iced::system::theme_changes().map(app::Message::SystemTheme),
     ])
 }
 
@@ -83,8 +89,9 @@ pub fn run() -> Result<()> {
     iced::application(
         move || {
             let mut state = app::State::new(env.clone());
-            let task = app::update(&mut state, app::Message::Refresh);
-            (state, task)
+            let refresh = app::update(&mut state, app::Message::Refresh);
+            let system_theme = iced::system::theme().map(app::Message::SystemTheme);
+            (state, iced::Task::batch([refresh, system_theme]))
         },
         |state: &mut app::State, message: app::Message| app::update(state, message),
         view::view,

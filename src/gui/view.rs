@@ -6,12 +6,12 @@ use super::{
 };
 use crate::{
     backend::Preset,
-    jobs::{Command, Job, Library, Operation, Phase},
+    jobs::{Command, Job, Library, MotionPreference, Operation, Phase, ThemePreference},
 };
 use humansize::{DECIMAL, format_size};
 use iced::widget::{
     Space, button, checkbox, column, container, image, pick_list, progress_bar, responsive, row,
-    scrollable, stack, text, text_input,
+    scrollable, stack, text, text_input, tooltip,
 };
 use iced::{Alignment, Element, Length};
 
@@ -23,7 +23,7 @@ fn action(label: impl Into<String>, message: Message) -> Element<'static, Messag
 }
 fn action_maybe(label: impl Into<String>, message: Option<Message>) -> Element<'static, Message> {
     button(text(label.into()))
-        .padding([8, 14])
+        .padding([10, 14])
         .style(theme::action_button)
         .on_press_maybe(message)
         .into()
@@ -36,8 +36,8 @@ fn secondary_maybe(
     message: Option<Message>,
 ) -> Element<'static, Message> {
     button(text(label.into()))
-        .padding([7, 10])
-        .style(button::secondary)
+        .padding([9, 12])
+        .style(theme::secondary_button)
         .on_press_maybe(message)
         .into()
 }
@@ -62,53 +62,111 @@ pub fn view(state: &State) -> Element<'_, Message> {
 
 fn layout(state: &State, compact: bool) -> Element<'_, Message> {
     let mut nav = column![
-        text("Flummox").size(23),
+        if compact {
+            Element::from(text("F").size(24))
+        } else {
+            Element::from(text("Flummox").size(23))
+        },
         Space::new().height(16)
     ]
     .spacing(6)
-    .padding(16);
+    .padding(if compact { 10 } else { 16 });
     for page in PAGES {
         let selected = state.page == page;
-        // A page's selected state never passes through unrelated buttons.
-        nav = nav.push(
-            button(text(page.label()).size(15))
-                .width(Length::Fill)
-                .padding(11)
-                .style(theme::nav_button(if state.reduced_motion {
-                    if selected { 1. } else { 0. }
-                } else {
-                    state
-                        .nav
-                        .iter()
-                        .find(|(target, _)| *target == page)
-                        .map(|(_, a)| a.interpolate(0., 1., std::time::Instant::now()))
-                        .unwrap_or(0.)
-                }))
-                .on_press(Message::GoTo(page)),
-        );
+        let highlight = if state.reduced_motion {
+            if selected { 1. } else { 0. }
+        } else {
+            state
+                .nav
+                .iter()
+                .find(|(target, _)| *target == page)
+                .map(|(_, a)| a.interpolate(0., 1., std::time::Instant::now()))
+                .unwrap_or(0.)
+        };
+        let label: Element<'_, Message> = if compact {
+            text(page_icon(page))
+                .size(20)
+                .style(theme::nav_icon(highlight))
+                .into()
+        } else {
+            row![
+                text(page_icon(page))
+                    .size(18)
+                    .style(theme::nav_icon(highlight)),
+                text(page.label()).size(15)
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .into()
+        };
+        let item = button(label)
+            .width(Length::Fill)
+            .padding(if compact { 11 } else { 12 })
+            .style(theme::nav_button(highlight))
+            .on_press(Message::GoTo(page));
+        nav = nav.push(if compact {
+            Element::from(tooltip(item, page.label(), tooltip::Position::Right))
+        } else {
+            Element::from(item)
+        });
     }
+    let settings_label: Element<'_, Message> = if compact {
+        text(page_icon(Page::Settings))
+            .size(20)
+            .style(theme::nav_icon(if state.page == Page::Settings {
+                1.0
+            } else {
+                0.0
+            }))
+            .into()
+    } else {
+        row![
+            text(page_icon(Page::Settings))
+                .size(18)
+                .style(theme::nav_icon(if state.page == Page::Settings {
+                    1.0
+                } else {
+                    0.0
+                })),
+            text(Page::Settings.label()).size(15)
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center)
+        .into()
+    };
+    let settings = button(settings_label)
+        .width(Length::Fill)
+        .padding(if compact { 11 } else { 12 })
+        .style(theme::nav_button(if state.page == Page::Settings {
+            1.0
+        } else {
+            0.0
+        }))
+        .on_press(Message::GoTo(Page::Settings));
     nav = nav
         .push(Space::new().height(Length::Fill))
-        .push(theme::muted(if state.snapshot.gaming.is_some() {
-            "Paused while gaming"
+        .push(if compact {
+            Element::from(tooltip(
+                settings,
+                Page::Settings.label(),
+                tooltip::Position::Right,
+            ))
         } else {
-            "Works in the background"
-        }));
+            Element::from(settings)
+        });
     let sidebar = container(nav)
-        .width(if compact { 150 } else { 190 })
+        .width(if compact { 72 } else { 208 })
         .height(Length::Fill)
         .style(theme::sidebar);
-    let mut body = column![]
-        .spacing(12)
-        .padding(if compact { 14 } else { 24 })
-        .width(Length::Fill);
+    let mut body = column![].spacing(0).width(Length::Fill);
     let page = match state.page {
-        Page::Overview => overview(state),
+        Page::Overview => overview(state, compact),
         Page::Games => games(state, compact),
         Page::Queue => queue(state),
         Page::Updates => updates(state, compact),
         Page::Drives => drives(state),
         Page::Activity => activity(state),
+        Page::Settings => settings_page(state),
     };
     let page_reveal = if state.reduced_motion {
         1.0
@@ -120,26 +178,34 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
     body = body.push(
         column![
             Space::new().height(Length::Fixed(12.0 * (1.0 - page_reveal))),
-            scrollable(container(page).padding(iced::Padding::default().right(14)))
-                .id(iced::widget::Id::new(state.page.label()))
-                .height(Length::Fill)
+            scrollable(
+                container(page)
+                    .padding(if compact { 16 } else { 24 })
+                    .width(Length::Fill)
+            )
+            .id(iced::widget::Id::new(state.page.label()))
+            .style(theme::scrollable)
+            .height(Length::Fill)
         ]
         .height(Length::Fill),
     );
     if let Some(job) = state.active() {
-        body = body.push(panel(
-            row![
-                column![
-                    text(format!("{} · {}", job.game.title, job.phase.label())).size(14),
-                    progress(state, job)
+        body = body.push(
+            container(panel(
+                row![
+                    column![
+                        text(format!("{} · {}", job.game.title, job.phase.label())).size(14),
+                        progress(state, job)
+                    ]
+                    .spacing(6)
+                    .width(Length::Fill),
+                    secondary("View queue", Message::GoTo(Page::Queue))
                 ]
-                .spacing(6)
-                .width(Length::Fill),
-                secondary("View queue", Message::GoTo(Page::Queue))
-            ]
-            .spacing(16)
-            .align_y(Alignment::Center),
-        ));
+                .spacing(16)
+                .align_y(Alignment::Center),
+            ))
+            .padding(iced::Padding::default().left(24).right(24).bottom(20)),
+        );
     }
     let base: Element<'_, Message> = container(row![sidebar, body])
         .width(Length::Fill)
@@ -158,20 +224,11 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
     };
     let toast = container(
         row![
-            column![
-                text(if status.is_error {
-                    "Needs attention"
-                } else {
-                    "Flummox"
-                })
-                .size(13),
-                text(&status.text).size(14)
-            ]
-            .spacing(4)
-            .width(Length::Fill),
-            button(text("Dismiss").size(12))
+            text("●").size(12).style(theme::toast_mark(status.is_error)),
+            text(&status.text).size(14).width(Length::Fill),
+            button(text("×").size(18))
                 .style(button::text)
-                .padding([5, 7])
+                .padding([3, 6])
                 .on_press(Message::Dismiss)
         ]
         .spacing(12)
@@ -179,78 +236,166 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
     )
     .padding(14)
     .width(Length::Fill)
-    .max_width(480)
+    .max_width(380)
     .style(theme::toast(status.is_error, reveal));
     let overlay = container(toast)
         .padding(
             iced::Padding::default()
-                .top(18.0 + 12.0 * (1.0 - reveal))
-                .right(18),
+                .right(20)
+                .bottom(20.0 + 14.0 * (1.0 - reveal)),
         )
         .width(Length::Fill)
         .height(Length::Fill)
         .align_x(Alignment::End)
-        .align_y(Alignment::Start);
+        .align_y(Alignment::End);
     stack([base, overlay.into()])
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
 }
 
-fn overview(state: &State) -> Element<'_, Message> {
+fn page_icon(page: Page) -> &'static str {
+    match page {
+        Page::Overview => "⌂",
+        Page::Games => "◈",
+        Page::Queue => "☷",
+        Page::Updates => "↻",
+        Page::Drives => "▰",
+        Page::Activity => "⌁",
+        Page::Settings => "⚙",
+    }
+}
+
+fn overview(state: &State, compact: bool) -> Element<'_, Message> {
     let compressed = state
         .games
         .iter()
         .filter(|g| state.compressed(&g.game))
         .count();
+    let current = state.current_saving();
+    let potential = state.potential_saving();
+    let total = state.total_bytes();
+    let attention = state
+        .games
+        .iter()
+        .filter(|row| {
+            !row.supported
+                || state.latest(&row.game).is_some_and(|job| {
+                    matches!(
+                        job.phase,
+                        Phase::Failed | Phase::Partial | Phase::Interrupted
+                    )
+                })
+        })
+        .count();
     let mut content = column![
-        theme::page_title("Overview"),
-        theme::muted("Keep your games. Make more room."),
-        panel(
-            row![
-                theme::stat(size(state.total_bytes()), "Installed"),
-                theme::stat(state.games.len().to_string(), "Games"),
-                theme::stat(compressed.to_string(), "Compressed")
-            ]
-            .spacing(32)
-        ),
+        row![
+            theme::page_title("Overview").width(Length::Fill),
+            secondary(
+                if state.scanning {
+                    "Refreshing…"
+                } else {
+                    "Refresh"
+                },
+                Message::Refresh
+            )
+        ]
+        .align_y(Alignment::Center),
         hero(
             column![
-                text(if state.potential_saving() > 0 {
-                    format!("{} ready to recover", size(state.potential_saving()))
+                theme::muted(if current > 0 {
+                    "SPACE SAVED"
                 } else {
-                    "Your library, ready when you are".into()
-                })
-                .size(19),
-                theme::muted(if state.scanning {
-                    "Finding your games…"
-                } else {
-                    "Flummox chooses worthwhile games and keeps them playable."
+                    "SMART COMPRESSION"
                 }),
-                action(
-                    if state.potential_saving() > 0 {
-                        format!("Free up about {}", size(state.potential_saving()))
-                    } else if state.scanning || state.analysis_queuing() {
-                        "Analyzing library…".into()
-                    } else {
-                        "Check library".into()
-                    },
-                    if state.potential_saving() > 0 {
-                        Message::OptimizeLibrary
-                    } else {
-                        Message::GoTo(Page::Games)
-                    }
-                )
+                text(if current > 0 {
+                    size(current)
+                } else if state.scanning || state.analysis_queuing() {
+                    "Checking your library…".into()
+                } else {
+                    "Analyze your games".into()
+                })
+                .size(if current > 0 { 38 } else { 27 }),
+                theme::muted(if state.scanning {
+                    "Scanning…".into()
+                } else if current > 0 && potential > 0 {
+                    format!("About {} more available", size(potential))
+                } else if current > 0 {
+                    "Up to date".into()
+                } else {
+                    "Only worthwhile files are compressed".into()
+                }),
+                row![
+                    action_maybe(
+                        if potential > 0 {
+                            format!("Free up about {}", size(potential))
+                        } else if state.scanning || state.analysis_queuing() {
+                            "Analyzing…".into()
+                        } else {
+                            "Scan again".into()
+                        },
+                        if potential > 0 {
+                            Some(Message::OptimizeLibrary)
+                        } else if state.scanning || state.analysis_queuing() {
+                            None
+                        } else {
+                            Some(Message::Refresh)
+                        }
+                    ),
+                    secondary("Games", Message::GoTo(Page::Games))
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
             ]
-            .spacing(12)
+            .spacing(14)
         ),
-        theme::section_title("Your drives")
+        panel(
+            row![
+                theme::stat(size(total), "Installed"),
+                theme::stat(state.games.len().to_string(), "Games"),
+                theme::stat(compressed.to_string(), "Optimized")
+            ]
+            .spacing(36)
+        )
     ]
     .spacing(16);
+    if attention > 0 || !state.warnings.is_empty() {
+        content = content.push(panel(
+            row![
+                column![
+                    text(format!(
+                        "{} item{} need attention",
+                        attention + state.warnings.len(),
+                        if attention + state.warnings.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    ))
+                    .size(16),
+                    theme::muted("Open Games for details")
+                ]
+                .spacing(4)
+                .width(Length::Fill),
+                secondary("Review", Message::GoTo(Page::Games))
+            ]
+            .align_y(Alignment::Center),
+        ));
+    }
+    content = content.push(theme::section_title("Drives"));
     for drive in &state.drives {
         content = content.push(panel(
             row![
-                text(drive.path.display().to_string()).width(Length::Fill),
+                column![
+                    text(drive.path.display().to_string()),
+                    theme::muted(format!(
+                        "{} game{}",
+                        drive.games,
+                        if drive.games == 1 { "" } else { "s" }
+                    ))
+                ]
+                .spacing(3)
+                .width(Length::Fill),
                 text(
                     drive
                         .free
@@ -270,24 +415,16 @@ fn overview(state: &State) -> Element<'_, Message> {
         .filter(|j| j.operation != Operation::Analyze)
         .take(3)
         .collect();
-    if !recent.is_empty() {
+    if !recent.is_empty() && !compact {
         content = content.push(theme::section_title("Recent work"));
     }
-    for job in recent {
-        content = content.push(panel(row![
-            text(&job.game.title).width(Length::Fill),
-            theme::muted(job.phase.label())
-        ]));
-    }
-    if !state.warnings.is_empty() {
-        content = content.push(panel(
-            column![
-                theme::section_title("Some information is unavailable"),
-                theme::muted(state.warnings.join("\n")),
-                secondary("Refresh", Message::Refresh)
-            ]
-            .spacing(8),
-        ));
+    if !compact {
+        for job in recent {
+            content = content.push(panel(row![
+                text(&job.game.title).width(Length::Fill),
+                theme::muted(job.phase.label())
+            ]));
+        }
     }
     content.into()
 }
@@ -417,7 +554,7 @@ fn games(state: &State, compact: bool) -> Element<'_, Message> {
                         "No games match"
                     })
                     .size(18),
-                    theme::muted("Try another search, or add a game folder in Drives."),
+                    theme::muted("Change the filters or add a folder"),
                     secondary("Add a folder", Message::GoTo(Page::Drives))
                 ]
                 .spacing(10),
@@ -554,9 +691,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                     .into_iter()
                     .map(Element::from),
                 )
-                .push(theme::muted(
-                    "Balanced is recommended. Your games remain playable.",
-                ))
+                .push(theme::muted("Balanced is recommended"))
                 .push(
                     row![
                         secondary("Analyze", Message::One(id.clone(), Operation::Analyze)),
@@ -633,9 +768,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                             previous.display()
                         )))
                     } else {
-                        Element::from(theme::muted(
-                            "Compact after large launcher updates to fold them into the store.",
-                        ))
+                        Element::from(theme::muted("Compact after large updates"))
                     })
                     .push(
                         row![
@@ -712,9 +845,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                 let store = state.pack_paths.get(&id).cloned().unwrap_or_default();
                 details = details
                     .push(text("Writable pack store").size(16))
-                    .push(theme::muted(
-                        "Uses verified content-defined chunks and shares matching data with stores in the same folder.",
-                    ))
+                    .push(theme::muted("Verified chunks can be shared across games"))
                     .push(
                         text_input("Store path", &store)
                             .on_input(move |path| Message::PackPath(path_id.clone(), path))
@@ -763,7 +894,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                     .push(theme::muted(choice.reasons.join("\n")));
             }
             details = details.push(theme::muted(format!(
-                "Sampled {} · {} files inspected · {} skipped. Savings are estimates{}.",
+                "Sampled {} · {} inspected · {} skipped. Estimated saving{}.",
                 size(est.sampled),
                 est.inspected_files,
                 est.skipped_files,
@@ -775,17 +906,14 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
             )));
             let evidence = est.format_evidence;
             details = details.push(theme::muted(format!(
-                "Format evidence: {} recognized · {} unknown · {} encoded · {} containers · {} raw media{}.",
+                "Formats: {} known · {} unknown · {} encoded · {} containers · {} raw{}",
                 evidence.recognized_files,
                 evidence.unknown_files,
                 evidence.encoded_files,
                 evidence.container_files,
                 evidence.raw_media_files,
                 if evidence.encrypted_files > 0 {
-                    format!(
-                        " · {} encrypted and still sampled",
-                        evidence.encrypted_files
-                    )
+                    format!(" · {} encrypted", evidence.encrypted_files)
                 } else {
                     String::new()
                 }
@@ -795,7 +923,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
             && est.unsampled_files > 0
         {
             details = details.push(theme::muted(format!(
-                "Partial estimate: {} files were outside the sampling budget.",
+                "{} files were not sampled",
                 est.unsampled_files
             )));
         }
@@ -897,7 +1025,7 @@ fn job_row<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
 fn queue(state: &State) -> Element<'_, Message> {
     let mut content = column![
         theme::page_title("Queue"),
-        theme::muted("You can close this window. Your jobs will keep running.")
+        theme::muted("Jobs keep running when Flummox closes")
     ]
     .spacing(14);
     if let Some(game) = &state.snapshot.gaming {
@@ -913,7 +1041,7 @@ fn queue(state: &State) -> Element<'_, Message> {
         content = content.push(panel(
             column![
                 text("Nothing waiting"),
-                theme::muted("Choose games and press Compress to add work here."),
+                theme::muted("Choose games to start"),
                 action("Choose games", Message::GoTo(Page::Games))
             ]
             .spacing(10),
@@ -937,7 +1065,7 @@ fn queue(state: &State) -> Element<'_, Message> {
 fn updates(state: &State, compact: bool) -> Element<'_, Message> {
     let mut content = column![
         theme::page_title("Updates"),
-        theme::muted("Only new or changed files need processing again.")
+        theme::muted("Changed files appear here")
     ]
     .spacing(14);
     let mut count = 0;
@@ -952,16 +1080,14 @@ fn updates(state: &State, compact: bool) -> Element<'_, Message> {
         }
     }
     if count == 0 {
-        content = content.push(panel(text("No updates need attention.")));
+        content = content.push(panel(text("No updates found")));
     }
     content.into()
 }
 fn drives(state: &State) -> Element<'_, Message> {
     let mut content = column![
         theme::page_title("Drives & libraries"),
-        theme::muted(
-            "Automatic maintenance is opt-in. Enabling it also starts Flummox at sign-in."
-        ),
+        theme::muted("Keep selected libraries compressed after updates"),
         panel(
             column![
                 text("Add a game folder").size(17),
@@ -972,7 +1098,12 @@ fn drives(state: &State) -> Element<'_, Message> {
                         .width(Length::Fill),
                     action("Add folder", Message::AddFolder)
                 ]
-                .spacing(8)
+                .spacing(8),
+                if let Some(error) = &state.folder_error {
+                    Element::from(theme::danger_text(error))
+                } else {
+                    Element::from(Space::new().height(0))
+                }
             ]
             .spacing(10)
         )
@@ -1028,24 +1159,174 @@ fn drives(state: &State) -> Element<'_, Message> {
             )
         ]));
     }
-    content = content.push(panel(
-        checkbox(state.reduced_motion)
-            .label("Reduce motion")
-            .on_toggle(Message::ReducedMotion),
-    ));
     content.into()
 }
+
+fn settings_page(state: &State) -> Element<'_, Message> {
+    let maintained = state
+        .snapshot
+        .libraries
+        .iter()
+        .filter(|library| library.automatic)
+        .count();
+    column![
+        theme::page_title("Settings"),
+        panel(
+            column![
+                text("Appearance").size(17),
+                row![
+                    column![text("Theme"), theme::muted("Use the desktop theme")]
+                        .spacing(3)
+                        .width(Length::Fill),
+                    pick_list(
+                        [
+                            ThemePreference::System,
+                            ThemePreference::Dark,
+                            ThemePreference::Light
+                        ],
+                        Some(state.theme),
+                        Message::Theme
+                    )
+                ]
+                .spacing(16)
+                .align_y(Alignment::Center),
+                row![
+                    column![
+                        text("Motion"),
+                        theme::muted(match state.motion {
+                            MotionPreference::Expressive => {
+                                "Smooth transitions"
+                            }
+                            MotionPreference::Subtle => "Short transitions",
+                            MotionPreference::Reduced => {
+                                "No transitions"
+                            }
+                        })
+                    ]
+                    .spacing(3)
+                    .width(Length::Fill),
+                    pick_list(
+                        [
+                            MotionPreference::Expressive,
+                            MotionPreference::Subtle,
+                            MotionPreference::Reduced
+                        ],
+                        Some(state.motion),
+                        Message::Motion
+                    )
+                ]
+                .spacing(16)
+                .align_y(Alignment::Center)
+            ]
+            .spacing(18)
+        ),
+        panel(
+            row![
+                column![
+                    text("Automatic maintenance").size(17),
+                    theme::muted(if maintained == 0 {
+                        "Off".into()
+                    } else {
+                        format!(
+                            "{} librar{} maintained",
+                            maintained,
+                            if maintained == 1 { "y is" } else { "ies are" }
+                        )
+                    })
+                ]
+                .spacing(4)
+                .width(Length::Fill),
+                secondary("Libraries", Message::GoTo(Page::Drives))
+            ]
+            .spacing(16)
+            .align_y(Alignment::Center)
+        ),
+        panel(
+            column![
+                text("About Flummox").size(17),
+                theme::muted(format!("Version {}", env!("CARGO_PKG_VERSION")))
+            ]
+            .spacing(5)
+        )
+    ]
+    .spacing(16)
+    .into()
+}
+
+fn completed_job_row(job: &Job) -> Element<'_, Message> {
+    let kind = match job.operation {
+        Operation::Analyze => "Analysis",
+        Operation::Compress => "Compression",
+        Operation::Decompress => "Decompression",
+    };
+    panel(
+        row![
+            text("✓").size(18),
+            column![
+                text(&job.game.title).size(15),
+                theme::muted(format!(
+                    "{} · {} files · {} · {}s",
+                    kind,
+                    job.files_done,
+                    size(job.bytes_done),
+                    job.elapsed
+                ))
+            ]
+            .spacing(3)
+            .width(Length::Fill),
+            theme::muted("Completed")
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+    )
+}
+
 fn activity(state: &State) -> Element<'_, Message> {
     let mut content = column![theme::page_title("Activity")].spacing(14);
-    for job in state
+    let active: Vec<_> = state
+        .snapshot
+        .jobs
+        .iter()
+        .filter(|job| job.operation != Operation::Analyze && job.phase.active())
+        .collect();
+    if !active.is_empty() {
+        content = content.push(theme::section_title("In progress"));
+        for job in active {
+            content = content.push(job_row(state, job));
+        }
+    }
+    let attention: Vec<_> = state
         .snapshot
         .jobs
         .iter()
         .rev()
-        .filter(|j| j.operation != Operation::Analyze)
+        .filter(|job| {
+            job.operation != Operation::Analyze
+                && matches!(
+                    job.phase,
+                    Phase::Failed | Phase::Partial | Phase::Interrupted
+                )
+        })
+        .collect();
+    if !attention.is_empty() {
+        content = content.push(theme::section_title("Needs attention"));
+        for job in attention {
+            content = content.push(job_row(state, job));
+        }
+    }
+    let completed: Vec<_> = state
+        .snapshot
+        .jobs
+        .iter()
+        .rev()
+        .filter(|job| job.operation != Operation::Analyze && job.phase == Phase::Completed)
         .take(50)
-    {
-        content = content.push(job_row(state, job));
+        .collect();
+    if !completed.is_empty() {
+        content = content.push(theme::section_title("Recent results"));
+        for job in completed {
+            content = content.push(completed_job_row(job));
+        }
     }
     for entry in &state.activity {
         content = content.push(panel(text(&entry.message)));
