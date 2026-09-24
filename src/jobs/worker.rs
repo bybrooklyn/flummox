@@ -245,7 +245,9 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
                         });
                         summary.bytes += entry.size;
                         summary.files += 1;
-                        candidates.push(entry.clone());
+                        if native.worthwhile() {
+                            candidates.push(entry.clone());
+                        }
                     } else {
                         summary.skipped_files += 1;
                     }
@@ -264,6 +266,7 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
                 current: entry.rel.display().to_string(),
             });
         }
+        summary.rewrite_files = candidates.len() as u64;
         inv.files = candidates;
         output.send(WorkerEvent::Estimate(summary));
     }

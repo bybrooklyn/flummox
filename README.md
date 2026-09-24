@@ -145,13 +145,12 @@ independently readable.
 The current store groups similar small files only when the group beats their
 separate encodings. See the [small-file comparison](docs/benchmarks/2026-09-24-small-files.md)
 for its measured space and read-time tradeoff.
-The checked-in [WOF/LZX comparison](docs/benchmarks/2026-09-18-lzx.md) measures
-four complete game corpora using an earlier store version against a verified
-32 KiB LZX proxy. Flummox retained
-62.46% in aggregate versus 65.51% for the proxy. The repository also includes a
-Windows `compact.exe` measurement script for the native result required before
-making a general Game Compressor claim. Related-game pool tests saved another
-227.5 MB, or 14.76% of already-compressed allocation, across two game families.
+The [full-game comparison](docs/benchmarks/2026-09-24-lzx.md) measures four
+complete installs against a verified 32 KiB WOF/LZX proxy. Flummox retained
+59.70% of the 1.81 GB corpus versus 65.51% for the proxy, using 105.2 MB less
+allocated space. A direct Game Compressor claim still needs the included Windows
+`compact.exe` measurement. Related-game pool tests saved another 227.5 MB,
+or 14.76% of already-compressed allocation, across two game families.
 
 ```sh
 flummox pack benchmark /path/to/game --maximum --json

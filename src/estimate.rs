@@ -210,14 +210,10 @@ impl FormatEvidence {
 /// The result for a whole game.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Estimate {
-    /// Files a compress pass would rewrite.
-    ///
-    /// Larger than `files`: the job rewrites everything the inventory picked,
-    /// while `files` counts only those sampling expects to shrink. Reporting
-    /// just the latter made an estimate look like it described a much smaller
-    /// job than it does.
+    /// Files a native compress pass would rewrite, including eligible files
+    /// left unsampled when the analysis budget ran out.
     pub rewrite_files: u64,
-    /// Files expected to actually get smaller.
+    /// Sampled files expected to shrink with native compression or Maximum Space.
     pub files: u64,
     /// Their total size.
     pub bytes: u64,

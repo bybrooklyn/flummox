@@ -73,10 +73,12 @@ Three different quantities must stay separate:
 | FIEMAP coverage | Logical bytes mapped to compressed extents, not their physical size |
 | Drive free-space change | Whole-filesystem change, including other writers and snapshots |
 
-Desktop analysis checks the largest files first, using a roughly 32 MiB
-sampling budget plus its current file.
-Files beyond that budget are marked unsampled; compression still considers
-them. Completed compression consumes the earlier potential estimate.
+Desktop analysis samples the largest files first, up to 32 MiB total and
+1 MiB per file. Unsampled eligible files still reach the native pass. A
+sampled file with a pack-only gain does not trigger a native rewrite. The
+one-click choice requires at least 16 MiB and 5% projected saving; Maximum
+Space also needs a game-specific compatibility result. Completed compression
+consumes the earlier potential estimate.
 
 `flummox benchmark` compares identical source samples using native-sized block
 models and larger frames. `flummox pack benchmark` builds and verifies a full

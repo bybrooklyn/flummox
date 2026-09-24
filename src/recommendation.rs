@@ -18,7 +18,7 @@ impl StorageMode {
     /// Short product-facing name.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Skip => "Already efficient",
+            Self::Skip => "No change recommended",
             Self::Native => "Transparent compression",
             Self::MaximumSpace => "Maximum Space",
         }
@@ -55,7 +55,7 @@ pub struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         Self {
-            minimum_saving: 256 * 1024 * 1024,
+            minimum_saving: 16 * 1024 * 1024,
             minimum_ratio_bps: 500,
             maximum_advantage_bps: 500,
         }
@@ -212,6 +212,23 @@ mod tests {
             choose(&measured, true, false, Policy::default()).mode,
             StorageMode::Skip,
             "automatic work needs an absolute and relative return",
+        )
+    }
+
+    #[test]
+    fn smaller_games_can_still_receive_a_useful_recommendation() -> TestResult {
+        let mut measured = estimate(100 * 1024 * 1024, None);
+        measured.disk_now = 200 * 1024 * 1024;
+        check_eq(
+            choose(&measured, true, false, Policy::default()).mode,
+            StorageMode::Native,
+            "a small game with a large relative saving is worth compressing",
+        )?;
+        measured.disk_after = measured.disk_now - 8 * 1024 * 1024;
+        check_eq(
+            choose(&measured, true, false, Policy::default()).mode,
+            StorageMode::Skip,
+            "a small absolute saving still avoids a rewrite",
         )
     }
 
