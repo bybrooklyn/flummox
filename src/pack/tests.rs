@@ -223,6 +223,197 @@ fn content_defined_chunks_reuse_data_after_an_insertion() -> TestResult {
 }
 
 #[test]
+fn shared_small_file_frames_round_trip_and_reject_bad_ranges() -> TestResult {
+    use format::Index;
+
+    let temp = tempfile::tempdir().ctx("fixture")?;
+    let source = temp.path().join("source");
+    fs::create_dir(&source).ctx("source")?;
+    let common = noise(32 * 1024);
+    let mut expected = Vec::new();
+    for number in 0..12u32 {
+        let name = format!("part-{number:02}.dat");
+        let mut bytes = common.clone();
+        bytes.extend_from_slice(&number.to_le_bytes());
+        fs::write(source.join(&name), &bytes).ctx("small file")?;
+        expected.push((name, bytes));
+    }
+    fs::hard_link(source.join("part-00.dat"), source.join("zz-alias.dat"))
+        .ctx("small hard link")?;
+    let archive = temp.path().join("archive.flumpack");
+    let shared = temp.path().join("shared.flumpack");
+    let pool = temp.path().join("pool");
+    let cancel = AtomicBool::new(false);
+    create(&source, &archive, Options::default(), &cancel).ctx("archive")?;
+    create_shared(&source, &shared, &pool, Options::default(), &cancel).ctx("shared")?;
+
+    for (store, version, restored_name) in [
+        (&archive, 6, "restored-archive"),
+        (&shared, 7, "restored-shared"),
+    ] {
+        let reader = Reader::open(store).ctx("reader")?;
+        reader.verify(&cancel).ctx("verify frames")?;
+        check(
+            reader
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry.kind, Kind::SlicedFile { .. })),
+            "similar files share a frame",
+        )?;
+        for (name, bytes) in &expected {
+            for offset in [0, 17, bytes.len() as u64 - 3, bytes.len() as u64] {
+                let start = usize::try_from(offset).ctx("offset")?;
+                check_eq(
+                    reader
+                        .read(Path::new(name), offset, 128)
+                        .ctx("random read")?,
+                    bytes
+                        .get(start..(start + 128).min(bytes.len()))
+                        .ctx("expected range")?
+                        .to_vec(),
+                    "shared frame serves bounded file reads",
+                )?;
+            }
+        }
+        let restored = temp.path().join(restored_name);
+        restore(store, &restored, &cancel).ctx("restore")?;
+        for (name, bytes) in &expected {
+            check_eq(
+                fs::read(restored.join(name)).ctx("file")?,
+                bytes.clone(),
+                "bytes",
+            )?;
+        }
+        check_eq(
+            fs::metadata(restored.join("part-00.dat"))
+                .ctx("primary")?
+                .ino(),
+            fs::metadata(restored.join("zz-alias.dat"))
+                .ctx("alias")?
+                .ino(),
+            "small hard-link identity",
+        )?;
+
+        #[cfg(feature = "pack-mount")]
+        {
+            let updates = temp.path().join(format!("updates-{version}"));
+            let mut overlay = overlay::Overlay::open(&updates).ctx("update layer")?;
+            let upper = overlay
+                .copy_up(&reader, Path::new("part-00.dat"))
+                .ctx("copy up shared file")?;
+            check_eq(
+                fs::read(&upper).ctx("copy-up bytes")?,
+                expected.first().ctx("first file")?.1.clone(),
+                "copy-up preserves the small file",
+            )?;
+            check_eq(
+                fs::metadata(&upper).ctx("copy-up primary")?.ino(),
+                fs::metadata(updates.join("files/zz-alias.dat"))
+                    .ctx("copy-up alias")?
+                    .ino(),
+                "copy-up preserves hard-link aliases",
+            )?;
+        }
+
+        let mut index = Index {
+            entries: reader.index.entries.clone(),
+            chunks: reader.index.chunks.clone(),
+        };
+        let payload_end = if version == 6 {
+            let last = index.chunks.last().ctx("last chunk")?;
+            last.offset + u64::from(last.stored)
+        } else {
+            0
+        };
+        index.validate(payload_end, version).ctx("valid index")?;
+        let mut slices = index.entries.iter_mut().filter_map(|entry| {
+            if let Kind::SlicedFile { offset, .. } = &mut entry.kind {
+                Some(offset)
+            } else {
+                None
+            }
+        });
+        *slices.next().ctx("first slice")? = u32::MAX;
+        check(
+            index.validate(payload_end, version).is_err(),
+            "out-of-frame slice is rejected",
+        )?;
+
+        let mut index = Index {
+            entries: reader.index.entries.clone(),
+            chunks: reader.index.chunks.clone(),
+        };
+        let mut slices = index.entries.iter_mut().filter_map(|entry| {
+            if let Kind::SlicedFile { offset, .. } = &mut entry.kind {
+                Some(offset)
+            } else {
+                None
+            }
+        });
+        let _first = slices.next().ctx("first slice")?;
+        *slices.next().ctx("second slice")? = 0;
+        check(
+            index.validate(payload_end, version).is_err(),
+            "overlapping shared slices are rejected",
+        )?;
+        check(
+            index.validate(payload_end, version - 2).is_err(),
+            "older store versions reject shared slices",
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn duplicate_small_files_keep_exact_chunk_sharing() -> TestResult {
+    let temp = tempfile::tempdir().ctx("fixture")?;
+    let source = temp.path().join("source");
+    fs::create_dir(&source).ctx("source")?;
+    let bytes = noise(64 * 1024);
+    for number in 0..8 {
+        fs::write(source.join(format!("copy-{number}.dat")), &bytes).ctx("duplicate")?;
+    }
+    let store = temp.path().join("store.flumpack");
+    let report =
+        create(&source, &store, Options::default(), &AtomicBool::new(false)).ctx("create")?;
+    let reader = Reader::open(&store).ctx("reader")?;
+    check(
+        reader
+            .entries()
+            .iter()
+            .all(|entry| !matches!(entry.kind, Kind::SlicedFile { .. })),
+        "duplicate small files retain exact sharing",
+    )?;
+    check_eq(
+        report.unique_chunks,
+        1,
+        "one payload serves all duplicate files",
+    )
+}
+
+#[test]
+fn incompressible_small_files_keep_independent_reads() -> TestResult {
+    let temp = tempfile::tempdir().ctx("fixture")?;
+    let source = temp.path().join("source");
+    fs::create_dir(&source).ctx("source")?;
+    let data = noise(8 * 64 * 1024);
+    for (number, bytes) in data.chunks(64 * 1024).enumerate() {
+        fs::write(source.join(format!("random-{number}.bin")), bytes).ctx("random file")?;
+    }
+    let store = temp.path().join("store.flumpack");
+    create(&source, &store, Options::default(), &AtomicBool::new(false)).ctx("create")?;
+    let reader = Reader::open(&store).ctx("reader")?;
+    check(
+        reader
+            .entries()
+            .iter()
+            .all(|entry| !matches!(entry.kind, Kind::SlicedFile { .. })),
+        "random files do not pay for a shared frame",
+    )?;
+    check_eq(reader.summary().raw_bytes, data.len() as u64, "raw data")
+}
+
+#[test]
 fn version_one_fixed_chunk_stores_remain_readable() -> TestResult {
     use format::{Chunk, Codec, HEADER_BYTES, Index, MAGIC};
 

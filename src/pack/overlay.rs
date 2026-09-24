@@ -233,6 +233,40 @@ impl Overlay {
                     }
                 }
             }
+            Kind::SlicedFile { size, .. } => {
+                let parent = output.parent().context("Missing update parent")?;
+                let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+                staged.write_all(&reader.read(path, 0, usize::try_from(*size)?)?)?;
+                staged
+                    .as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(entry.mode))?;
+                super::restore::apply_xattrs(staged.path(), &entry.xattrs)?;
+                staged
+                    .as_file()
+                    .set_times(
+                        std::fs::FileTimes::new().set_modified(super::restore::modified(
+                            entry.modified_secs,
+                            entry.modified_nanos,
+                        )?),
+                    )?;
+                staged.as_file().sync_all()?;
+                staged
+                    .persist_noclobber(&output)
+                    .map_err(|error| error.error)?;
+                File::open(parent)?.sync_all()?;
+                if entry.hardlink_to.is_none() {
+                    for alias in reader.hardlink_aliases(path) {
+                        if self.hidden(&alias) {
+                            continue;
+                        }
+                        self.ensure_parent(reader, &alias)?;
+                        let alias_output = self.checked_upper(&alias)?;
+                        if std::fs::symlink_metadata(&alias_output).is_err() {
+                            std::fs::hard_link(&output, alias_output)?;
+                        }
+                    }
+                }
+            }
             Kind::Symlink { target } => symlink(target, &output)?,
             Kind::Directory => {
                 std::fs::create_dir(&output)?;

@@ -300,7 +300,7 @@ impl StoreFs {
         }
         let entry = self.reader.entry(path).context("Missing base entry")?;
         let size = match &entry.kind {
-            Kind::File { size, .. } => *size,
+            Kind::File { size, .. } | Kind::SlicedFile { size, .. } => *size,
             Kind::Symlink { target } => target.as_os_str().as_encoded_bytes().len() as u64,
             Kind::Directory => 0,
         };
@@ -371,7 +371,7 @@ impl StoreFs {
 fn kind(entry: &Entry) -> FileType {
     match entry.kind {
         Kind::Directory => FileType::Directory,
-        Kind::File { .. } => FileType::RegularFile,
+        Kind::File { .. } | Kind::SlicedFile { .. } => FileType::RegularFile,
         Kind::Symlink { .. } => FileType::Symlink,
     }
 }

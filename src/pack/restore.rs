@@ -80,6 +80,17 @@ pub fn restore(store: &Path, destination: &Path, cancel: &AtomicBool) -> Result<
                 apply_xattrs(&path, &entry.xattrs)?;
                 file.sync_all()?;
             }
+            Kind::SlicedFile { size, .. } if entry.hardlink_to.is_none() => {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)?;
+                file.write_all(&reader.read(&entry.path, 0, usize::try_from(*size)?)?)?;
+                file.set_times(FileTimes::new().set_modified(timestamp(entry)?))?;
+                file.set_permissions(Permissions::from_mode(entry.mode))?;
+                apply_xattrs(&path, &entry.xattrs)?;
+                file.sync_all()?;
+            }
             _ => {}
         }
     }

@@ -178,14 +178,21 @@ pub fn run(command: Command, json: bool, cancel: &AtomicBool) -> Result<()> {
             for entry in reader
                 .entries()
                 .iter()
-                .filter(|e| matches!(e.kind, super::Kind::File { .. }))
+                .filter(|e| {
+                    matches!(
+                        e.kind,
+                        super::Kind::File { .. } | super::Kind::SlicedFile { .. }
+                    )
+                })
                 .take(256)
             {
                 anyhow::ensure!(
                     !cancel.load(std::sync::atomic::Ordering::Relaxed),
                     "Benchmark cancelled"
                 );
-                if let super::Kind::File { size, .. } = entry.kind {
+                if let super::Kind::File { size, .. } | super::Kind::SlicedFile { size, .. } =
+                    entry.kind
+                {
                     for offset in [0, size / 2, size.saturating_sub(65536)] {
                         random_read_bytes += reader.read(&entry.path, offset, 65536)?.len() as u64;
                     }

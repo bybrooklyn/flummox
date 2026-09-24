@@ -1,7 +1,9 @@
 # Experimental compressed stores
 
 The `pack` commands store game payloads in independently readable,
-content-defined chunks from 512 KiB to 4 MiB, targeting about 2 MiB. These
+content-defined chunks from 512 KiB to 4 MiB, targeting about 2 MiB. Similar
+small files can share one frame when its encoded size beats separate files by
+at least 4 KiB. Exact duplicate files keep their own shared chunk. These
 chunks can reuse matches beyond btrfs's 128 KiB compression window. Their
 content-derived boundaries converge again after inserted or removed bytes, so
 unchanged regions of shifted archives and patched files can still share one
@@ -37,7 +39,7 @@ shrink, while a large metadata count points to many paths or chunk references.
 Managed installs retain this verified summary and show it in the expanded game
 row.
 
-Passing `--pool` creates a version 3 directory store. Each encoded chunk is a
+Passing `--pool` creates a version 7 directory store. Each encoded chunk is a
 content-addressed file hard-linked from the pool into every game store that
 uses it. Matching chunks across games therefore occupy physical storage once.
 The pool and stores must use the same filesystem. Each store keeps its own hard
@@ -163,8 +165,8 @@ Verification rereads all unique payloads and bypasses that cache.
 | Index | UTF-8 JSON containing ordered entries and chunk descriptors |
 
 Each chunk descriptor contains its offset, encoded length, decoded length,
-codec, and decoded BLAKE3 digest. Files refer to chunk IDs in order. New
-version 2 monolithic stores use content-defined chunks; non-final chunks are at least
+codec, and decoded BLAKE3 digest. Ordinary files refer to chunk IDs in order.
+Version 2 monolithic stores use content-defined chunks; non-final chunks are at least
 512 KiB and every chunk is at most 4 MiB. The reader also accepts version 1
 stores, where all non-final chunks are exactly 4 MiB. The index preserves Unix
 filename bytes using the same lossless path encoding as job IPC.
@@ -178,7 +180,12 @@ boundaries as version 2. Readers use only the links inside the store.
 Version 4 extends the monolithic store with internal hard-link identity,
 extended attributes, ACL data exposed through those attributes, and special
 permission bits. Version 5 applies the same metadata model to directory stores.
-Readers continue to accept versions 1 through 3. Hard links that also point
+Version 6 adds small-file slices to monolithic stores; version 7 adds them to
+directory stores. Each slice names one chunk, an offset, and a length. The
+index requires every shared frame to be covered exactly, with no gaps or
+overlaps, before any read. A request decodes one bounded frame and returns only
+the named file's bytes. Readers continue to accept versions 1 through 5.
+Hard links that also point
 outside the game folder are refused because removing the original install
 would otherwise change their meaning.
 

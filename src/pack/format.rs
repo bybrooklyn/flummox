@@ -64,10 +64,25 @@ pub enum Kind {
         size: u64,
         chunks: Vec<u32>,
     },
+    /// One file inside a shared, independently decoded frame.
+    SlicedFile {
+        size: u64,
+        chunk: u32,
+        offset: u32,
+    },
     Symlink {
         #[serde(with = "crate::path_serde")]
         target: PathBuf,
     },
+}
+
+impl Kind {
+    pub fn size(&self) -> Option<u64> {
+        match self {
+            Self::File { size, .. } | Self::SlicedFile { size, .. } => Some(*size),
+            Self::Directory | Self::Symlink { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,8 +143,8 @@ impl Index {
         payload_end: u64,
         version: u32,
     ) -> Result<BTreeMap<PathBuf, usize>> {
-        ensure!(matches!(version, 1..=5), "Unsupported store version");
-        let external_chunks = matches!(version, 3 | 5);
+        ensure!(matches!(version, 1..=7), "Unsupported store version");
+        let external_chunks = matches!(version, 3 | 5 | 7);
         let extended_metadata = version >= 4;
         ensure!(
             !self.entries.is_empty() && self.entries.len() <= MAX_ENTRIES,
@@ -171,6 +186,7 @@ impl Index {
         let mut paths = BTreeMap::new();
         let mut used = vec![false; self.chunks.len()];
         let mut total = 0u64;
+        let mut slices = HashMap::<u32, Vec<(u32, u32)>>::new();
         for (number, entry) in self.entries.iter().enumerate() {
             let mode_mask = if extended_metadata { 0o7777 } else { 0o777 };
             ensure!(
@@ -295,10 +311,81 @@ impl Index {
                 ensure!(remaining == 0, "File chunks do not cover its size");
                 total = total.checked_add(*size).context("Install size overflow")?;
             }
+            if let Kind::SlicedFile {
+                size,
+                chunk,
+                offset,
+            } = &entry.kind
+            {
+                ensure!(
+                    version >= 6,
+                    "Shared file frames require a newer store version"
+                );
+                ensure!(
+                    *size > 0 && *size < MIN_CHUNK_BYTES as u64,
+                    "Invalid shared file length"
+                );
+                let frame = self.chunks.get(*chunk as usize).context("Missing frame")?;
+                if let Some(target) = &entry.hardlink_to {
+                    ensure!(safe_path(target), "Invalid hard-link target");
+                    let target_id = paths
+                        .get(target)
+                        .copied()
+                        .context("Hard-link target must precede its alias")?;
+                    let target_entry = self
+                        .entries
+                        .get(target_id)
+                        .context("Missing hard-link target")?;
+                    ensure!(
+                        matches!(
+                            &target_entry.kind,
+                            Kind::SlicedFile {
+                                size: target_size,
+                                chunk: target_chunk,
+                                offset: target_offset
+                            } if target_size == size
+                                && target_chunk == chunk
+                                && target_offset == offset
+                        ) && target_entry.hardlink_to.is_none()
+                            && target_entry.mode == entry.mode
+                            && target_entry.modified_secs == entry.modified_secs
+                            && target_entry.modified_nanos == entry.modified_nanos
+                            && target_entry.xattrs == entry.xattrs,
+                        "Hard-link metadata differs from its target"
+                    );
+                }
+                let end = u64::from(*offset)
+                    .checked_add(*size)
+                    .context("Shared file range overflow")?;
+                ensure!(end <= u64::from(frame.raw), "Shared file exceeds its frame");
+                *used
+                    .get_mut(*chunk as usize)
+                    .context("Missing frame usage")? = true;
+                slices
+                    .entry(*chunk)
+                    .or_default()
+                    .push((*offset, u32::try_from(end)?));
+                total = total.checked_add(*size).context("Install size overflow")?;
+            }
             ensure!(
-                entry.hardlink_to.is_none() || matches!(entry.kind, Kind::File { .. }),
+                entry.hardlink_to.is_none()
+                    || matches!(entry.kind, Kind::File { .. } | Kind::SlicedFile { .. }),
                 "Only regular files can be hard links"
             );
+        }
+        for (id, mut ranges) in slices {
+            ranges.sort_unstable();
+            ranges.dedup();
+            let mut covered = 0u32;
+            for (start, end) in ranges {
+                ensure!(start == covered, "Shared frame has a gap or overlap");
+                covered = end;
+            }
+            let frame = self
+                .chunks
+                .get(id as usize)
+                .context("Missing shared frame")?;
+            ensure!(covered == frame.raw, "Shared frame is not fully mapped");
         }
         ensure!(
             used.iter().all(|used| *used),
@@ -424,7 +511,7 @@ impl Reader {
         let len = metadata.len();
         let (version, block, offset, index_len, index) = read_index(&mut file)?;
         ensure!(
-            matches!(version, 1 | 2 | 4) && block as usize == CHUNK_BYTES,
+            matches!(version, 1 | 2 | 4 | 6) && block as usize == CHUNK_BYTES,
             "Unsupported store version or chunk size"
         );
         ensure!(
@@ -452,7 +539,7 @@ impl Reader {
         let manifest_len = manifest.metadata()?.len();
         let (version, block, offset, index_len, index) = read_index(&mut manifest)?;
         ensure!(
-            matches!(version, 3 | 5) && block as usize == CHUNK_BYTES && offset == HEADER_BYTES,
+            matches!(version, 3 | 5 | 7) && block as usize == CHUNK_BYTES && offset == HEADER_BYTES,
             "Unsupported shared store version or chunk size"
         );
         ensure!(
@@ -524,7 +611,7 @@ impl Reader {
         let mut files = 0;
         let mut logical_bytes = 0;
         for entry in &index.entries {
-            if let Kind::File { size, .. } = entry.kind {
+            if let Kind::File { size, .. } | Kind::SlicedFile { size, .. } = entry.kind {
                 files += 1;
                 logical_bytes += size;
             }
@@ -666,11 +753,31 @@ impl Reader {
         ensure!(length <= CHUNK_BYTES, "Read exceeds the per-request limit");
         let entry_id = self.paths.get(path).copied().context("File not found")?;
         let entry = self.index.entries.get(entry_id).context("File not found")?;
-        let Kind::File { size, chunks } = &entry.kind else {
+        let size = match &entry.kind {
+            Kind::File { size, .. } | Kind::SlicedFile { size, .. } => *size,
+            _ => anyhow::bail!("Entry is not a regular file"),
+        };
+        let count = u64::try_from(length)?.min(size.saturating_sub(offset)) as usize;
+        if let Kind::SlicedFile {
+            chunk,
+            offset: start,
+            ..
+        } = &entry.kind
+        {
+            if count == 0 {
+                return Ok(Vec::new());
+            }
+            let bytes = self.chunk(*chunk)?;
+            let start = usize::try_from(u64::from(*start) + offset)?;
+            return Ok(bytes
+                .get(start..start + count)
+                .context("Invalid shared file bounds")?
+                .to_vec());
+        }
+        let Kind::File { chunks, .. } = &entry.kind else {
             anyhow::bail!("Entry is not a regular file")
         };
         let starts = self.starts.get(entry_id).context("Missing file offsets")?;
-        let count = u64::try_from(length)?.min(size.saturating_sub(offset)) as usize;
         let mut result = Vec::with_capacity(count);
         let mut position = offset;
         while result.len() < count {
@@ -773,7 +880,7 @@ impl Reader {
                     "Symlink changed: {}",
                     relative.display()
                 ),
-                Kind::File { size, .. } => {
+                Kind::File { size, .. } | Kind::SlicedFile { size, .. } => {
                     ensure!(
                         metadata.is_file() && metadata.len() == *size,
                         "File size changed: {}",

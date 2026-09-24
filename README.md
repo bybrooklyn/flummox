@@ -142,8 +142,12 @@ sharing after insertions and removals instead of losing every later match.
 Directory stores also hard-link matching chunk objects through a same-drive
 pool, sharing physical allocation across games while keeping every store
 independently readable.
+The current store groups similar small files only when the group beats their
+separate encodings. See the [small-file comparison](docs/benchmarks/2026-09-24-small-files.md)
+for its measured space and read-time tradeoff.
 The checked-in [WOF/LZX comparison](docs/benchmarks/2026-09-18-lzx.md) measures
-four complete game corpora against a verified 32 KiB LZX proxy. Flummox retained
+four complete game corpora using an earlier store version against a verified
+32 KiB LZX proxy. Flummox retained
 62.46% in aggregate versus 65.51% for the proxy. The repository also includes a
 Windows `compact.exe` measurement script for the native result required before
 making a general Game Compressor claim. Related-game pool tests saved another

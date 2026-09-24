@@ -3,9 +3,9 @@
 use super::format::*;
 use anyhow::{Context, Result, ensure};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{File, Metadata},
-    io::{BufRead, BufReader, Seek, SeekFrom, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     os::unix::{
         ffi::OsStrExt,
         fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -15,6 +15,16 @@ use std::{
 };
 
 const CONTENT_MASK: u64 = (1 << 21) - 1;
+const SMALL_FILE_LIMIT: u64 = MIN_CHUNK_BYTES as u64;
+const GROUP_GAIN_FLOOR: usize = 4096;
+
+#[derive(Clone, Copy)]
+struct GroupParams<'a> {
+    anchor: &'a crate::safeio::Anchor,
+    options: Options,
+    cancel: &'a AtomicBool,
+    pool: Option<&'a Path>,
+}
 
 fn gear(byte: u8) -> u64 {
     let mut value = u64::from(byte).wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -197,6 +207,214 @@ fn snapshot(root: &Path, cancel: &AtomicBool) -> Result<Vec<Source>> {
     Ok(result)
 }
 
+fn intern_chunk(
+    index: &mut Index,
+    known: &mut HashMap<([u8; 32], u32), u32>,
+    bytes: &[u8],
+    options: Options,
+    prepared: Option<(Codec, Vec<u8>)>,
+    store: &mut impl FnMut(u32, Codec, &[u8], [u8; 32]) -> Result<Chunk>,
+) -> Result<u32> {
+    let count = u32::try_from(bytes.len())?;
+    let hash = *blake3::hash(bytes).as_bytes();
+    let key = (hash, count);
+    if let Some(id) = known.get(&key) {
+        return Ok(*id);
+    }
+    ensure!(
+        index.chunks.len() < MAX_CHUNKS,
+        "Install exceeds the store chunk limit"
+    );
+    let encoded = match prepared {
+        Some(encoded) => encoded,
+        None => encode(bytes, options)?,
+    };
+    let id = u32::try_from(index.chunks.len())?;
+    index
+        .chunks
+        .push(store(count, encoded.0, &encoded.1, hash)?);
+    known.insert(key, id);
+    Ok(id)
+}
+
+fn group_small_files(
+    params: GroupParams<'_>,
+    sources: &[Source],
+    index: &mut Index,
+    known: &mut HashMap<([u8; 32], u32), u32>,
+    store: &mut impl FnMut(u32, Codec, &[u8], [u8; 32]) -> Result<Chunk>,
+) -> Result<HashMap<PathBuf, Kind>> {
+    let mut counts = HashMap::<([u8; 32], u32), u32>::new();
+    let mut fingerprints = HashMap::<PathBuf, ([u8; 32], u32)>::new();
+    for source in sources {
+        if source.stamp.mode & libc::S_IFMT != libc::S_IFREG
+            || source.hardlink_to.is_some()
+            || !(1..SMALL_FILE_LIMIT).contains(&source.stamp.size)
+        {
+            continue;
+        }
+        ensure!(
+            !params.cancel.load(Ordering::Relaxed),
+            "Store creation cancelled"
+        );
+        let mut file = params.anchor.open_with(
+            &source.path,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NONBLOCK,
+        )?;
+        ensure!(
+            Stamp::from(&file.metadata()?) == source.stamp,
+            "{} changed before packing",
+            source.path.display()
+        );
+        let mut bytes = vec![0; usize::try_from(source.stamp.size)?];
+        file.read_exact(&mut bytes)?;
+        ensure!(
+            Stamp::from(&file.metadata()?) == source.stamp,
+            "{} changed during packing",
+            source.path.display()
+        );
+        let key = (
+            *blake3::hash(&bytes).as_bytes(),
+            u32::try_from(bytes.len())?,
+        );
+        *counts.entry(key).or_default() += 1;
+        fingerprints.insert(source.path.clone(), key);
+    }
+    let mut by_extension = BTreeMap::<Vec<u8>, Vec<&Source>>::new();
+    for source in sources {
+        if source.stamp.mode & libc::S_IFMT == libc::S_IFREG
+            && source.hardlink_to.is_none()
+            && (1..SMALL_FILE_LIMIT).contains(&source.stamp.size)
+            && fingerprints
+                .get(&source.path)
+                .and_then(|key| counts.get(key))
+                .copied()
+                == Some(1)
+        {
+            let extension = source
+                .path
+                .extension()
+                .map(OsStrExt::as_bytes)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            by_extension.entry(extension).or_default().push(source);
+        }
+    }
+    let mut grouped = HashMap::new();
+    for files in by_extension.values() {
+        let mut group = Vec::new();
+        let mut total = 0u64;
+        for source in files {
+            if total + source.stamp.size > CHUNK_BYTES as u64 {
+                store_group(params, &group, index, known, store, &mut grouped)?;
+                group.clear();
+                total = 0;
+            }
+            group.push(*source);
+            total += source.stamp.size;
+        }
+        store_group(params, &group, index, known, store, &mut grouped)?;
+    }
+    Ok(grouped)
+}
+
+fn store_group(
+    params: GroupParams<'_>,
+    group: &[&Source],
+    index: &mut Index,
+    known: &mut HashMap<([u8; 32], u32), u32>,
+    store: &mut impl FnMut(u32, Codec, &[u8], [u8; 32]) -> Result<Chunk>,
+    grouped: &mut HashMap<PathBuf, Kind>,
+) -> Result<()> {
+    if group.len() < 2 {
+        return Ok(());
+    }
+    let mut frame = Vec::with_capacity(CHUNK_BYTES);
+    let mut positions = Vec::with_capacity(group.len());
+    let mut individual_cost = 0usize;
+    let mut unique = HashSet::new();
+    for source in group {
+        ensure!(
+            !params.cancel.load(Ordering::Relaxed),
+            "Store creation cancelled"
+        );
+        let mut file = params.anchor.open_with(
+            &source.path,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NONBLOCK,
+        )?;
+        ensure!(
+            Stamp::from(&file.metadata()?) == source.stamp,
+            "{} changed before packing",
+            source.path.display()
+        );
+        let offset = u32::try_from(frame.len())?;
+        let start = frame.len();
+        frame.resize(start + usize::try_from(source.stamp.size)?, 0);
+        file.read_exact(frame.get_mut(start..).context("Missing group buffer")?)?;
+        ensure!(
+            Stamp::from(&file.metadata()?) == source.stamp,
+            "{} changed during packing",
+            source.path.display()
+        );
+        let bytes = frame.get(start..).context("Missing group bytes")?;
+        let key = (*blake3::hash(bytes).as_bytes(), u32::try_from(bytes.len())?);
+        if !known.contains_key(&key) && unique.insert(key) {
+            let encoded = encode(bytes, params.options)?;
+            let object = Chunk {
+                offset: 0,
+                stored: u32::try_from(encoded.1.len())?,
+                raw: key.1,
+                codec: encoded.0,
+                hash: key.0,
+            };
+            let pooled = params.pool.is_some_and(|root| {
+                std::fs::symlink_metadata(root.join(chunk_name(&object)))
+                    .is_ok_and(|metadata| metadata.is_file())
+            });
+            if !pooled {
+                individual_cost += encoded.1.len();
+            }
+        }
+        positions.push((source.path.clone(), source.stamp.size, offset));
+    }
+    let encoded = encode(&frame, params.options)?;
+    let group_key = (
+        *blake3::hash(&frame).as_bytes(),
+        u32::try_from(frame.len())?,
+    );
+    let group_object = Chunk {
+        offset: 0,
+        stored: u32::try_from(encoded.1.len())?,
+        raw: group_key.1,
+        codec: encoded.0,
+        hash: group_key.0,
+    };
+    let group_pooled = params.pool.is_some_and(|root| {
+        std::fs::symlink_metadata(root.join(chunk_name(&group_object)))
+            .is_ok_and(|metadata| metadata.is_file())
+    });
+    let group_cost = if known.contains_key(&group_key) || group_pooled {
+        0
+    } else {
+        encoded.1.len()
+    };
+    if group_cost.saturating_add(GROUP_GAIN_FLOOR) > individual_cost {
+        return Ok(());
+    }
+    let id = intern_chunk(index, known, &frame, params.options, Some(encoded), store)?;
+    for (path, size, offset) in positions {
+        grouped.insert(
+            path,
+            Kind::SlicedFile {
+                size,
+                chunk: id,
+                offset,
+            },
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn destination(path: &Path) -> Result<(PathBuf, PathBuf)> {
     let name = path.file_name().context("Choose a new destination name")?;
     let parent = path
@@ -217,6 +435,7 @@ fn build_index(
     root: &Path,
     options: Options,
     cancel: &AtomicBool,
+    pool: Option<&Path>,
     mut store: impl FnMut(u32, Codec, &[u8], [u8; 32]) -> Result<Chunk>,
 ) -> Result<(Index, Vec<Source>)> {
     let anchor = crate::safeio::Anchor::open(root)?;
@@ -230,7 +449,19 @@ fn build_index(
         chunks: Vec::new(),
     };
     let mut known = HashMap::<([u8; 32], u32), u32>::new();
-    let mut primary_files = HashMap::<PathBuf, (u64, Vec<u32>)>::new();
+    let grouped = group_small_files(
+        GroupParams {
+            anchor: &anchor,
+            options,
+            cancel,
+            pool,
+        },
+        &sources,
+        &mut index,
+        &mut known,
+        &mut store,
+    )?;
+    let mut primary_files = HashMap::<PathBuf, Kind>::new();
     let mut buffer = Vec::with_capacity(CHUNK_BYTES);
     for source in &sources {
         ensure!(!cancel.load(Ordering::Relaxed), "Store creation cancelled");
@@ -241,12 +472,18 @@ fn build_index(
         } else if source.stamp.mode & libc::S_IFMT == libc::S_IFDIR {
             Kind::Directory
         } else if let Some(target) = &source.hardlink_to {
-            let (size, chunks) = primary_files
+            let kind = primary_files
                 .get(target)
                 .cloned()
                 .context("Missing hard-link source")?;
-            ensure!(size == source.stamp.size, "Hard-link size changed");
-            Kind::File { size, chunks }
+            ensure!(
+                kind.size() == Some(source.stamp.size),
+                "Hard-link size changed"
+            );
+            kind
+        } else if let Some(kind) = grouped.get(&source.path) {
+            primary_files.insert(source.path.clone(), kind.clone());
+            kind.clone()
         } else {
             let mut file = anchor.open_with(
                 &source.path,
@@ -263,22 +500,8 @@ fn build_index(
                 while read_content_chunk(&mut reader, &mut buffer)? {
                     ensure!(!cancel.load(Ordering::Relaxed), "Store creation cancelled");
                     let bytes = buffer.as_slice();
-                    let count = u32::try_from(bytes.len())?;
-                    let hash = *blake3::hash(bytes).as_bytes();
-                    let key = (hash, count);
-                    let id = if let Some(id) = known.get(&key) {
-                        *id
-                    } else {
-                        ensure!(
-                            index.chunks.len() < MAX_CHUNKS,
-                            "Install exceeds the store chunk limit"
-                        );
-                        let id = u32::try_from(index.chunks.len())?;
-                        let (codec, encoded) = encode(bytes, options)?;
-                        index.chunks.push(store(count, codec, &encoded, hash)?);
-                        known.insert(key, id);
-                        id
-                    };
+                    let id =
+                        intern_chunk(&mut index, &mut known, bytes, options, None, &mut store)?;
                     chunks.push(id);
                 }
             }
@@ -291,9 +514,7 @@ fn build_index(
                 size: source.stamp.size,
                 chunks,
             };
-            if let Kind::File { size, chunks } = &kind {
-                primary_files.insert(source.path.clone(), (*size, chunks.clone()));
-            }
+            primary_files.insert(source.path.clone(), kind.clone());
             kind
         };
         index.entries.push(Entry {
@@ -331,21 +552,22 @@ pub fn create(
     let mut staged = tempfile::NamedTempFile::new_in(&parent)?;
     staged.write_all(&[0; HEADER_BYTES as usize])?;
     let mut position = HEADER_BYTES;
-    let (index, sources) = build_index(&root, options, cancel, |raw, codec, encoded, hash| {
-        staged.write_all(encoded)?;
-        let chunk = Chunk {
-            offset: position,
-            stored: u32::try_from(encoded.len())?,
-            raw,
-            codec,
-            hash,
-        };
-        position = position
-            .checked_add(encoded.len() as u64)
-            .context("Store size overflow")?;
-        Ok(chunk)
-    })?;
-    index.validate(position, 4)?;
+    let (index, sources) =
+        build_index(&root, options, cancel, None, |raw, codec, encoded, hash| {
+            staged.write_all(encoded)?;
+            let chunk = Chunk {
+                offset: position,
+                stored: u32::try_from(encoded.len())?,
+                raw,
+                codec,
+                hash,
+            };
+            position = position
+                .checked_add(encoded.len() as u64)
+                .context("Store size overflow")?;
+            Ok(chunk)
+        })?;
+    index.validate(position, 6)?;
     let bytes = serde_json::to_vec(&index)?;
     ensure!(
         bytes.len() as u64 <= MAX_INDEX,
@@ -354,7 +576,7 @@ pub fn create(
     staged.write_all(&bytes)?;
     staged.seek(SeekFrom::Start(0))?;
     staged.write_all(MAGIC)?;
-    staged.write_all(&4u32.to_le_bytes())?;
+    staged.write_all(&6u32.to_le_bytes())?;
     staged.write_all(&(CHUNK_BYTES as u32).to_le_bytes())?;
     staged.write_all(&position.to_le_bytes())?;
     staged.write_all(&(bytes.len() as u64).to_le_bytes())?;
@@ -434,7 +656,7 @@ fn publish_object(pool: &Path, chunk: &Chunk, encoded: &[u8]) -> Result<PathBuf>
 }
 
 fn write_manifest(path: &Path, index: &Index) -> Result<()> {
-    index.validate(0, 5)?;
+    index.validate(0, 7)?;
     let bytes = serde_json::to_vec(index)?;
     ensure!(
         bytes.len() as u64 <= MAX_INDEX,
@@ -446,7 +668,7 @@ fn write_manifest(path: &Path, index: &Index) -> Result<()> {
         .mode(0o600)
         .open(path)?;
     file.write_all(MAGIC)?;
-    file.write_all(&5u32.to_le_bytes())?;
+    file.write_all(&7u32.to_le_bytes())?;
     file.write_all(&(CHUNK_BYTES as u32).to_le_bytes())?;
     file.write_all(&HEADER_BYTES.to_le_bytes())?;
     file.write_all(&(bytes.len() as u64).to_le_bytes())?;
@@ -499,18 +721,24 @@ pub fn create_shared(
     std::fs::DirBuilder::new()
         .mode(0o700)
         .create(&chunks_path)?;
-    let (index, sources) = build_index(&root, options, cancel, |raw, codec, encoded, hash| {
-        let chunk = Chunk {
-            offset: 0,
-            stored: u32::try_from(encoded.len())?,
-            raw,
-            codec,
-            hash,
-        };
-        let object = publish_object(&pool, &chunk, encoded)?;
-        std::fs::hard_link(&object, chunks_path.join(chunk_name(&chunk)))?;
-        Ok(chunk)
-    })?;
+    let (index, sources) = build_index(
+        &root,
+        options,
+        cancel,
+        Some(&pool),
+        |raw, codec, encoded, hash| {
+            let chunk = Chunk {
+                offset: 0,
+                stored: u32::try_from(encoded.len())?,
+                raw,
+                codec,
+                hash,
+            };
+            let object = publish_object(&pool, &chunk, encoded)?;
+            std::fs::hard_link(&object, chunks_path.join(chunk_name(&chunk)))?;
+            Ok(chunk)
+        },
+    )?;
     write_manifest(&staged.path().join("manifest"), &index)?;
     let pool_record = PoolRecord { path: pool.clone() };
     let mut pool_file = std::fs::OpenOptions::new()
