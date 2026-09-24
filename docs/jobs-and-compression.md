@@ -80,6 +80,10 @@ one-click choice requires at least 16 MiB and 5% projected saving; Maximum
 Space also needs a game-specific compatibility result. Completed compression
 consumes the earlier potential estimate.
 
+The Maximum Space preview scores sampled files separately. It does not include
+extra savings from grouping small files; the verified store summary reports the
+actual result after creation.
+
 `flummox benchmark` compares identical source samples using native-sized block
 models and larger frames. `flummox pack benchmark` builds and verifies a full
 store, including index and allocation overhead. Neither synthetic timing nor a

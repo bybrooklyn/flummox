@@ -888,7 +888,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                         size(choice.native_saving),
                         choice
                             .maximum_saving
-                            .map(|saving| format!(" · Maximum Space ~{}", size(saving)))
+                            .map(|saving| format!(" · Maximum Space sample ~{}", size(saving)))
                             .unwrap_or_default()
                     )))
                     .push(theme::muted(choice.reasons.join("\n")));
