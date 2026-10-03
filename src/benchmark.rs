@@ -183,7 +183,11 @@ pub fn wof_lzx_proxy(
                     report.allocated_bytes_4k.saturating_add(raw_allocation);
             }
         }
-        report.corpus_sha256 = format!("{:x}", corpus.finalize());
+        report.corpus_sha256 = corpus
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         report.benchmark_ns = started.elapsed().as_nanos();
         Ok(report)
     })();
@@ -412,7 +416,10 @@ mod tests {
         hash.update(3u64.to_le_bytes());
         hash.update(b"abc");
         check_eq(
-            format!("{:x}", hash.finalize()),
+            hash.finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
             "02a59e4570844e8ab5f39860a50329a604937c943075d0bf736c7665df37b4b3".to_owned(),
             "PowerShell and Rust use the same path, size, and payload record",
         )

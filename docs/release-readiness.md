@@ -76,3 +76,6 @@ legacy registrations, collection discovery, hidden/symlink filtering, overlappin
 locations, persistent registration, and removal without deleting game files.
 The coordinator protocol is version 6; the version 5 restart command supports
 upgrading the previous coordinator.
+
+Prioritized acceptance work and proposed product improvements are tracked in
+[next-steps.md](next-steps.md).

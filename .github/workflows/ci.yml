@@ -15,13 +15,13 @@ jobs:
     name: Windows native app
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.1
       - name: Install the toolchain
         run: rustup toolchain install stable --profile minimal
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.87.22
         with:
           tool: cargo-xwin
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.2
       - name: Build the Windows CLI and GUI
         run: cargo xwin build --release --target x86_64-pc-windows-msvc --features gui --bins
 
@@ -29,7 +29,7 @@ jobs:
     name: Build, test, lint and dependency policy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.1
 
       - name: Install the toolchain
         run: rustup toolchain install stable --profile minimal --component clippy
@@ -47,11 +47,11 @@ jobs:
       # CI runs the same recipes the pre-push hook runs. While CI called cargo
       # directly the two drifted, and a licence failure reached main because
       # the local checks and the remote ones were not the same checks.
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.87.22
         with:
           tool: just,cargo-deny
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.2
 
       # lint, then test, then the dependency policy.
       - name: just ci
@@ -61,7 +61,7 @@ jobs:
     name: Filesystem matrix (btrfs)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.1
 
       - name: Install the toolchain
         run: rustup toolchain install stable --profile minimal
@@ -79,7 +79,7 @@ jobs:
           sudo mount -o loop,compress=zstd:1 /tmp/btrfs.img /tmp/btrfs
           sudo chown "$(id -u):$(id -g)" /tmp/btrfs
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.2
 
       # These tests create their temporary directories inside the current
       # directory, so running from the mount is what selects them. Anywhere
@@ -121,7 +121,7 @@ jobs:
     name: Compressed store mount and executable reads
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.1
       - name: Install the toolchain
         run: rustup toolchain install stable --profile minimal
       - name: Enable unprivileged FUSE mounts
@@ -130,7 +130,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends fuse3
           sudo modprobe fuse
           test -c /dev/fuse
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.2
       - name: Require mounted reads and fixture execution
         env:
           FLUMMOX_REQUIRE_FUSE: '1'

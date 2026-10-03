@@ -199,6 +199,7 @@ impl Store {
         Ok(Self { root })
     }
 
+    #[cfg(target_os = "linux")]
     pub fn local() -> Result<Self> {
         let database = crate::db::Db::default_path().context("Cannot locate state folder")?;
         let parent = database.parent().context("Invalid state folder")?;
@@ -367,7 +368,11 @@ pub fn corpus(
         "Game size changed during compatibility verification"
     );
     Ok(Corpus {
-        sha256: format!("{:x}", hash.finalize()),
+        sha256: hash
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
         files: inventory.files.len() as u64,
         bytes,
     })

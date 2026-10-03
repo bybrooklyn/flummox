@@ -1073,7 +1073,7 @@ pub fn mount(store: &Path, target: &Path, writes: Option<&Path>) -> Result<Sessi
     if writes.is_none() {
         config.mount_options.push(fuser::MountOption::RO);
     }
-    let inner = fuser::spawn_mount2(fs, target, &config).context("Mounting the store failed")?;
+    let inner = fuser::spawn_mount(fs, target, &config).context("Mounting the store failed")?;
     Ok(Session {
         inner,
         writes: control.map(WriteController),

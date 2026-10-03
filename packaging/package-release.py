@@ -26,6 +26,7 @@ def main():
         'share/doc/flummox/README.md': ROOT / 'README.md',
         'share/doc/flummox/release-readiness.md': ROOT / 'docs/release-readiness.md',
         'share/doc/flummox/install.md': ROOT / 'docs/install.md',
+        'share/doc/flummox/next-steps.md': ROOT / 'docs/next-steps.md',
         'share/licenses/flummox/LICENSE': ROOT / 'LICENSE',
     }
     for destination, source in files.items():
