@@ -137,7 +137,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Inno Setup installation failed' }
           $compiler = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*\ISCC.exe" | Select-Object -First 1
           if (!$compiler) { throw 'ISCC.exe is missing' }
-          & $compiler.FullName "/DAppVersion=$env:VERSION" "/DSourceDir=$env:GITHUB_WORKSPACE\target\$env:TARGET\release" packaging/windows/flummox.iss
+          & $compiler.FullName "/DAppVersion=$env:VERSION" "/DAppNumericVersion=$($env:VERSION.Split('-')[0])" "/DSourceDir=$env:GITHUB_WORKSPACE\target\$env:TARGET\release" packaging/windows/flummox.iss
           if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed' }
       - name: Bundle release files
         env:

@@ -4,11 +4,18 @@
 #ifndef SourceDir
   #error SourceDir is required
 #endif
+#ifndef AppNumericVersion
+  #define AppNumericVersion AppVersion
+#endif
 
 [Setup]
 AppId={{D0F57A65-E179-41A1-9096-EC094AF43D89}
 AppName=Flummox
 AppVersion={#AppVersion}
+VersionInfoVersion={#AppNumericVersion}
+VersionInfoProductVersion={#AppNumericVersion}
+VersionInfoTextVersion={#AppVersion}
+VersionInfoProductTextVersion={#AppVersion}
 AppPublisher=Brooklyn
 AppPublisherURL=https://github.com/bybrooklyn/flummox
 AppSupportURL=https://github.com/bybrooklyn/flummox/issues
