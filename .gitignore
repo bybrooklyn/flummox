@@ -4,3 +4,5 @@
 /packaging/pkg
 /packaging/src
 /packaging/*.pkg.tar.*
+/RELEASE-NOTES.md
+__pycache__/

@@ -15,5 +15,9 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(not(any(target_os = "linux", windows)))]
 fn main() -> anyhow::Result<()> {
+    let _matches = clap::Command::new("flummox")
+        .version(env!("CARGO_PKG_VERSION"))
+        .about("Flummox desktop shell; storage backend unavailable on this platform")
+        .get_matches();
     anyhow::bail!("Flummox does not have a storage backend for this platform yet")
 }

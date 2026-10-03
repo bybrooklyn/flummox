@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""Check tag versions, checksums, and release architecture validation."""
+import importlib.util
+from pathlib import Path
+import subprocess
+import tempfile
+import tomllib
+import unittest
+
+HERE = Path(__file__).resolve().parent
+
+
+def module(filename):
+    spec = importlib.util.spec_from_file_location(filename, HERE / filename)
+    loaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loaded)
+    return loaded
+
+
+class ReleaseTests(unittest.TestCase):
+    def test_tag_sets_manifest_and_lock_without_touching_dependencies(self):
+        prepare = module('prepare-release.py')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'Cargo.toml').write_text('[package]\nname = "flummox"\nversion = "0.1.0"\n\n[dependencies]\nexample = "1.2.3"\n')
+            (root / 'Cargo.lock').write_text('version = 4\n\n[[package]]\nname = "flummox"\nversion = "0.1.0"\n\n[[package]]\nname = "example"\nversion = "1.2.3"\n')
+            self.assertEqual(prepare.prepare(root, 'v0.0.1'), '0.0.1')
+            self.assertEqual(tomllib.loads((root / 'Cargo.toml').read_text())['package']['version'], '0.0.1')
+            packages = tomllib.loads((root / 'Cargo.lock').read_text())['package']
+            self.assertEqual({entry['name']: entry['version'] for entry in packages}, {'flummox': '0.0.1', 'example': '1.2.3'})
+            for tag in ['v1', '1.0.0', 'v01.0.0', 'v1.0.0/unsafe', 'v1.0.0\nextra']:
+                with self.assertRaises(ValueError):
+                    prepare.prepare(root, tag)
+
+    def test_distribution_checksums_match_release_bytes(self):
+        distributions = module('distributions.py')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for filename in ['linux-x86_64.tar.xz', 'linux-aarch64.tar.xz', 'macos-aarch64.zip']:
+                (root / f'flummox-0.0.1-{filename}').write_bytes(b'release fixture')
+            output = root / 'recipes'
+            distributions.generate('0.0.1', root, output)
+            cask = (output / 'homebrew/Casks/flummox.rb').read_text()
+            import hashlib
+            digest = hashlib.sha256(b'release fixture').hexdigest()
+            self.assertIn(digest, cask)
+            self.assertIn(digest, (output / 'aur/flummox-bin/PKGBUILD').read_text())
+            self.assertIn(digest, (output / 'aur/flummox-bin/.SRCINFO').read_text())
+            self.assertIn('/download/v0.0.1/', cask)
+            with self.assertRaises(ValueError):
+                distributions.generate('0.0.1-rc.1', root, output)
+
+    def test_linux_bundle_rejects_wrong_architecture(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for filename in ['flummox', 'flummox-gui']:
+                header = bytearray(20)
+                header[:6] = b'\x7fELF\x02\x01'
+                header[18:20] = b'\xb7\x00'
+                (root / filename).write_bytes(header)
+            result = subprocess.run(['python3', str(HERE / 'package-release.py'), '--arch', 'x86_64', '--binaries', str(root), '--output', str(root / 'dist')], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('Expected a Linux x86_64 ELF', result.stderr)
+            result = subprocess.run(['python3', str(HERE / 'package-release.py'), '--arch', 'aarch64', '--binaries', str(root), '--output', str(root / 'dist')], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            version = tomllib.loads((HERE.parent / 'Cargo.toml').read_text())['package']['version']
+            self.assertTrue((root / f'dist/flummox-{version}-linux-aarch64.tar.xz').is_file())
+
+
+if __name__ == '__main__':
+    unittest.main()

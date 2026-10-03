@@ -1,4 +1,4 @@
-# Linux installation and upgrades
+# Installation and upgrades
 
 ## Arch and CachyOS
 
@@ -7,8 +7,9 @@ From a source checkout, run `cd packaging && makepkg -si`. This builds both
 binaries with Maximum Space support. Install `fuse3` for Maximum Space and
 `kdialog` or `zenity` for the desktop folder picker.
 
-## Linux x86_64 archive
+## Linux x86_64 and ARM64 archives
 
+Choose `linux-x86_64` for Intel/AMD or `linux-aarch64` for ARM64.
 The archive contains both binaries, desktop integration, and documentation.
 It is built on Ubuntu 24.04 and requires glibc 2.39 or newer plus the windowing
 libraries listed in the Arch package. It is not a static portable executable.
@@ -47,13 +48,78 @@ from versions without the restart command require logging out and back in after
 the upgrade. Close Flummox windows before logging out. Do not kill a coordinator
 while storage work is running.
 
-## Build release files
+## macOS (Apple Silicon)
 
-Run `just release` to build the Linux binaries and place a versioned archive and
-SHA-256 checksum in `dist/`. The Release workflow can also be run manually to
-produce downloadable workflow artifacts. A matching `v` tag runs the checks and
-creates Linux archive and Arch package downloads in a draft GitHub release; desktop acceptance remains required before
-publishing the draft.
+Install from the Homebrew tap:
+
+```sh
+brew tap bybrooklyn/flummox
+brew install --cask flummox
+brew upgrade --cask flummox
+```
+
+Alternatively, download `flummox-VERSION-macos-aarch64.zip`, verify its SHA-256,
+and drag `Flummox.app` into Applications. macOS 14 or newer is required. The app
+is ad hoc signed; Apple Developer ID signing and notarization are not configured.
+macOS can require approval in System Settings > Privacy & Security when opening
+the downloaded app. Compression is not implemented on macOS yet; this download
+provides the desktop shell and displays its version.
+
+## Windows (64-bit)
+
+Download `flummox-VERSION-windows-x86_64-setup.exe` from GitHub Releases.
+The installer installs into your user account, creates a Start menu shortcut,
+and registers an uninstaller in Settings > Apps > Installed apps. No administrator
+password is needed. Run a newer installer to upgrade the existing installation;
+close Flummox and finish compression jobs first. Uninstalling removes the app
+and shortcuts; it does not remove game files or application data.
+
+A portable ZIP containing both executables is also available. The CLI is in the
+installation directory; the installer does not change your PATH. Windows builds
+are currently unsigned, so SmartScreen can display an unknown-publisher prompt.
+
+## Arch User Repository
+
+The stable binary package is `flummox-bin`, maintained by `bybrooklyn`:
+
+```sh
+yay -S flummox-bin
+```
+
+It supports x86_64 and ARM64, verifies each release archive with SHA-256, and
+installs the GUI, CLI, desktop entry, and optional user service. Publication
+requires the release automation's SSH key to be registered on the AUR account.
+
+## Publish a release
+
+Commit and push the changes first, then tag that commit and push the tag:
+
+```sh
+git add .
+git commit -m "Prepare release"
+git push origin main
+git tag -a v0.0.1 -m "Flummox 0.0.1"
+git push origin v0.0.1
+```
+
+Tags refer to the commit that exists when you create them. Creating a tag before
+committing your changes would release the earlier commit. `git push` alone does
+not normally push tags; push the tag explicitly as above.
+
+The tag supplies the version in the CI build's Cargo manifest and lockfile;
+there is no manual version bump required before later tags. The release includes
+a changelog of commits since the previous reachable version tag, versioned
+Linux x86_64/ARM64 archives, an Apple Silicon app bundle, Windows x64 installer
+and portable ZIP, an Arch package, and SHA-256 checksums. All native builds,
+tests, dependency checks, and installation checks must pass before the release
+is published. Stable releases then update the Homebrew tap and AUR recipes.
+`v0.0.2-rc.1` publishes a prerelease and leaves the stable package channels alone.
+Do not reuse published tags.
+
+The Release workflow can be run manually on a branch to build and test downloadable
+artifacts without publishing a release. `just release` builds a local Linux
+x86_64 archive. See [release automation](release-automation.md) for credentials,
+retries, and signing.
 
 ## Games in other locations
 

@@ -335,7 +335,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
             row![
                 theme::page_title("Flummox"),
                 Space::new().width(Length::Fill),
-                theme::muted("Windows · WOF/LZX")
+                theme::muted(format!("Windows · WOF/LZX · {}", env!("CARGO_PKG_VERSION")))
             ]
             .spacing(10)
             .align_y(iced::Alignment::Center),

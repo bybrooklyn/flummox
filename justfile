@@ -14,6 +14,7 @@ build-cli:
 # Every test, all features, including doctests.
 test:
     cargo test --all-features
+    python3 packaging/test_release.py
 
 # Clippy at deny-warnings, over every target and feature.
 #

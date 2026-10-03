@@ -17,98 +17,268 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  linux:
-    name: Linux x86_64 release
+  prepare:
     runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v7.0.1
-      - name: Verify the release tag
-        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          fetch-depth: 0
+      - id: tag
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          python3 - <<'PY'
-          import os, tomllib
-          with open('Cargo.toml', 'rb') as manifest:
-              version = tomllib.load(manifest)['package']['version']
-          if os.environ['GITHUB_REF_NAME'] != f'v{version}':
-              raise SystemExit('Release tag must match Cargo.toml version')
-          PY
-      - name: Install system dependencies
+          if [ "$REF_TYPE" = tag ]; then
+            echo "tag=$REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo 'tag=' >> "$GITHUB_OUTPUT"
+          fi
+      - id: version
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: python packaging/prepare-release.py --tag "$TAG"
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-notes
+          path: RELEASE-NOTES.md
+
+  build:
+    name: Build ${{ matrix.platform }} ${{ matrix.arch }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux
+            arch: x86_64
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            platform: linux
+            arch: aarch64
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-14
+            platform: macos
+            arch: aarch64
+            target: aarch64-apple-darwin
+          - runner: windows-2025
+            platform: windows
+            arch: x86_64
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Apply tag version
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: python packaging/prepare-release.py --tag "$TAG"
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libxrandr-dev \
             libxi-dev libxcursor-dev libgl1-mesa-dev libfontconfig1-dev desktop-file-utils
       - name: Install Rust
-        run: rustup toolchain install stable --profile minimal --component clippy
+        env:
+          TARGET: ${{ matrix.target }}
+        run: rustup toolchain install stable --profile minimal --component clippy --target "$TARGET"
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Lint
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo clippy --locked --all-features --all-targets --target "$TARGET" -- -D warnings
+      - name: Test
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo test --locked --all-features --target "$TARGET"
       - uses: taiki-e/install-action@v2.87.22
+        if: matrix.platform == 'linux' && matrix.arch == 'x86_64'
         with:
           tool: just,cargo-deny
-      - uses: Swatinem/rust-cache@v2.9.2
-      - name: Validate
-        run: just ci
-      - name: Build the release archive
-        run: just release
-      - name: Smoke test the bundle
+      - name: Dependency and prose policy
+        if: matrix.platform == 'linux' && matrix.arch == 'x86_64'
         run: |
-          cd dist
-          sha256sum -c *.sha256
-          tar -xJf *.tar.xz
-          ./flummox-*/bin/flummox --version
-          desktop-file-validate ./flummox-*/share/applications/flummox.desktop
+          just deny prose
+          python packaging/test_release.py
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --all-features --bins --target "$TARGET"
+      - name: Verify binary version
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          suffix=''
+          if [ "$PLATFORM" = windows ]; then suffix=.exe; fi
+          actual=$("target/$TARGET/release/flummox$suffix" --version)
+          test "$actual" = "flummox $VERSION"
+      - name: Compile Windows installer
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          choco install innosetup --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'Inno Setup installation failed' }
+          $compiler = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*\ISCC.exe" | Select-Object -First 1
+          if (!$compiler) { throw 'ISCC.exe is missing' }
+          & $compiler.FullName "/DAppVersion=$env:VERSION" "/DSourceDir=$env:GITHUB_WORKSPACE\target\$env:TARGET\release" packaging/windows/flummox.iss
+          if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed' }
+      - name: Bundle release files
+        env:
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+        run: python packaging/package-release.py --platform "$PLATFORM" --arch "$ARCH" --binaries "target/$TARGET/release"
+      - name: Check Linux desktop entry
+        if: matrix.platform == 'linux'
+        run: desktop-file-validate packaging/flummox.desktop
+      - name: Test Windows install, upgrade, and uninstall
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          $installer = (Resolve-Path "dist/flummox-$env:VERSION-windows-x86_64-setup.exe").Path
+          $destination = "$env:RUNNER_TEMP\Flummox installation"
+          1..2 | ForEach-Object {
+            $process = Start-Process -FilePath $installer -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$destination`"") -Wait -PassThru
+            if ($process.ExitCode -ne 0) { throw "Install failed: $($process.ExitCode)" }
+            $actual = & "$destination\flummox.exe" --version
+            if ($actual -ne "flummox $env:VERSION") { throw "Unexpected installed version: $actual" }
+          }
+          $process = Start-Process -FilePath "$destination\unins000.exe" -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
+          if ($process.ExitCode -ne 0 -or (Test-Path "$destination\flummox.exe")) { throw 'Uninstall failed' }
+      - name: Verify macOS app bundle
+        if: matrix.platform == 'macos'
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          ditto -x -k "dist/flummox-$VERSION-macos-aarch64.zip" "$RUNNER_TEMP/mac-app"
+          codesign --verify --deep --strict "$RUNNER_TEMP/mac-app/Flummox.app"
+          test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$RUNNER_TEMP/mac-app/Flummox.app/Contents/Info.plist")" = "${VERSION%%-*}"
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: flummox-linux-x86_64
+          name: flummox-${{ matrix.platform }}-${{ matrix.arch }}
           path: |
             dist/*.tar.xz
+            dist/*.zip
+            dist/*-setup.exe
             dist/*.sha256
           if-no-files-found: error
 
   arch:
-    name: Arch Linux package
+    name: Arch package and install checks
+    needs: [prepare, build]
+    if: needs.prepare.outputs.prerelease == 'false'
     runs-on: ubuntu-24.04
     container: archlinux:base
     steps:
-      - name: Install build dependencies
-        run: |
-          pacman -Syu --noconfirm --needed base-devel rust git python \
-            libxkbcommon libxkbcommon-x11 wayland libx11 libxcursor libxi libxrandr fontconfig
+      - name: Install packaging dependencies
+        run: pacman -Syu --noconfirm --needed base-devel git python
       - uses: actions/checkout@v7.0.1
-      - name: Verify package versions
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: flummox-*
+          merge-multiple: true
+          path: dist
+      - name: Generate package recipes
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: python packaging/distributions.py --version "$VERSION"
+      - name: Build Arch package from verified archives
         run: |
-          python3 - <<'PY'
-          import os, pathlib, re, tomllib
-          version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['package']['version']
-          package = pathlib.Path('packaging/PKGBUILD').read_text()
-          if re.search(r'^pkgver=(.+)$', package, re.M).group(1) != version:
-              raise SystemExit('Arch package version must match Cargo.toml')
-          if os.environ['GITHUB_REF'].startswith('refs/tags/') and os.environ['GITHUB_REF_NAME'] != f'v{version}':
-              raise SystemExit('Release tag must match Cargo.toml')
-          PY
-      - name: Build and test the Arch package
-        run: |
+          cp dist/*.tar.xz dist/recipes/aur/flummox-bin/
           useradd -m builder
-          chown -R builder "$GITHUB_WORKSPACE"
-          runuser -u builder -- bash -c 'cd packaging && makepkg --force --nodeps'
-          cd packaging
-          for package in *.pkg.tar.zst; do
-            sha256sum "$package" > "$package.sha256"
-          done
-      - name: Check clean install, upgrade, and GUI startup
+          chown -R builder dist
+          runuser -u builder -- bash -c 'cd dist/recipes/aur/flummox-bin && makepkg --force --nodeps'
+          runuser -u builder -- bash -c 'cd dist/recipes/aur/flummox-bin && makepkg --printsrcinfo' > /tmp/actual-srcinfo
+          python - <<'PY'
+          from pathlib import Path
+          actual = sorted(line.strip() for line in Path('/tmp/actual-srcinfo').read_text().splitlines() if line.strip())
+          expected = sorted(line.strip() for line in Path('dist/recipes/aur/flummox-bin/.SRCINFO').read_text().splitlines() if line.strip())
+          if actual != expected:
+              raise SystemExit('Generated .SRCINFO differs from makepkg output')
+          PY
+          cp dist/recipes/aur/flummox-bin/*.pkg.tar.zst dist/
+          cd dist
+          sha256sum *.pkg.tar.zst > arch-package.sha256
+      - name: Test Arch installation, upgrade, and GUI
         run: |
           mkdir -p /validation
-          bash packaging/smoke-arch.sh packaging/flummox-*-x86_64.pkg.tar.zst
+          bash packaging/smoke-arch.sh dist/flummox-bin-*-x86_64.pkg.tar.zst
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: flummox-arch-x86_64
+          name: flummox-packages
           path: |
-            packaging/*.pkg.tar.zst
-            packaging/*.pkg.tar.zst.sha256
+            dist/*.pkg.tar.zst
+            dist/arch-package.sha256
+            dist/recipes/aur/flummox-bin/PKGBUILD
+            dist/recipes/aur/flummox-bin/.SRCINFO
+            dist/recipes/homebrew/Casks/flummox.rb
+          include-hidden-files: true
           if-no-files-found: error
 
-  draft:
-    name: Create draft release
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: [linux, arch]
+  homebrew-check:
+    name: Homebrew install and uninstall
+    needs: [prepare, build]
+    if: needs.prepare.outputs.prerelease == 'false'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: flummox-*
+          merge-multiple: true
+          path: dist
+      - name: Validate the cask against built artifacts
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          python packaging/distributions.py --version "$VERSION"
+          ruby -c dist/recipes/homebrew/Casks/flummox.rb
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          recipe = Path('dist/recipes/homebrew/Casks/flummox.rb')
+          version = os.environ['VERSION']
+          url = f'https://github.com/bybrooklyn/flummox/releases/download/v{version}/flummox-{version}-macos-aarch64.zip'
+          archive = Path(f'dist/flummox-{version}-macos-aarch64.zip').resolve().as_uri()
+          recipe.write_text(recipe.read_text().replace(url, archive))
+          PY
+          git -C dist/recipes/homebrew init
+          git -C dist/recipes/homebrew add Casks
+          git -C dist/recipes/homebrew -c user.name=CI -c user.email=ci@example.com commit -m 'Test release cask'
+          brew tap bybrooklyn/flummox-test "$PWD/dist/recipes/homebrew"
+          brew install --cask bybrooklyn/flummox-test/flummox
+          test -d /Applications/Flummox.app
+          brew uninstall --cask bybrooklyn/flummox-test/flummox
+          test ! -d /Applications/Flummox.app
+          brew untap bybrooklyn/flummox-test
+
+  publish:
+    name: Publish tagged release
+    needs: [prepare, build, arch, homebrew-check]
+    if: >-
+      always() && startsWith(github.ref, 'refs/tags/') &&
+      needs.prepare.result == 'success' && needs.build.result == 'success' &&
+      (needs.arch.result == 'success' || needs.arch.result == 'skipped') &&
+      (needs.homebrew-check.result == 'success' || needs.homebrew-check.result == 'skipped')
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -119,10 +289,50 @@ jobs:
           pattern: flummox-*
           merge-multiple: true
           path: dist
-      - name: Create the draft
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: release-notes
+          path: notes
+      - name: Publish with changelog and checksums
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/*.tar.xz dist/*.pkg.tar.zst dist/*.sha256 \
-            --verify-tag --draft --generate-notes \
-            --title "Flummox $GITHUB_REF_NAME"
+          args=()
+          if [ "$PRERELEASE" = true ]; then args+=(--prerelease --latest=false); fi
+          mapfile -t assets < <(find dist -maxdepth 1 -type f | sort)
+          # Create as draft so an interrupted upload never exposes a partial release.
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --draft --title "Flummox $VERSION" --notes-file notes/RELEASE-NOTES.md
+          fi
+          gh release upload "$TAG" "${assets[@]}" --clobber
+          gh release edit "$TAG" --draft=false --title "Flummox $VERSION" --notes-file notes/RELEASE-NOTES.md "${args[@]}"
+
+  channels:
+    name: Update Homebrew and AUR
+    needs: [prepare, publish]
+    if: needs.prepare.outputs.prerelease == 'false'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: flummox-*
+          merge-multiple: true
+          path: dist
+      - name: Generate pinned recipes
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: python packaging/distributions.py --version "$VERSION"
+      - name: Update Homebrew tap
+        env:
+          DEPLOY_KEY: ${{ secrets.HOMEBREW_DEPLOY_KEY }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: python packaging/publish-channel.py homebrew --version "$VERSION"
+      - name: Update AUR
+        env:
+          DEPLOY_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: python packaging/publish-channel.py aur --version "$VERSION"

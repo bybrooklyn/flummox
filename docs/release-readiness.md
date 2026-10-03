@@ -59,10 +59,10 @@ installs are restored. Installation instructions are in [install.md](install.md)
   headless tests cover selection parsing and layout, not desktop interaction.
 - Run the release workflow on GitHub after pushing the changes. The workflow
   builds Linux archives and Arch packages, checks installation and upgrade, and
-  creates a draft for a matching version tag. Publish after desktop acceptance.
-  There is no published release from this change.
+  publishes a release for a version tag after native build and installation
+  checks pass. See release-automation.md for the current packaging pipeline.
 - Windows parity, native Windows tests and direct WOF/Game Compressor comparisons
-  remain separate work. macOS, Bottles, and community report sharing are deferred.
+  remain separate work. The macOS compression backend, Bottles, and community report sharing remain deferred.
 
 Small-file grouping is a bounded sample reported separately from the overall
 prediction. It is not a full-store allocation estimate. Restore and reclaim

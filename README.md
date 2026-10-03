@@ -322,3 +322,20 @@ AGPL-3.0-or-later. See [LICENSE](LICENSE).
 
 Installation, coordinator upgrades, and release builds are described in
 [the installation guide](docs/install.md).
+
+## Downloads and release tags
+
+[GitHub Releases](https://github.com/bybrooklyn/flummox/releases) provides Linux
+x86_64/ARM64 archives, an Apple Silicon macOS app, and a Windows x64 installer
+and portable ZIP. Each release shows its version and changelog, with SHA-256
+checksums for downloads. macOS currently provides the desktop shell only.
+
+On Arch, install `flummox-bin` from the AUR. On Apple Silicon, run
+`brew tap bybrooklyn/flummox` and `brew install --cask flummox`.
+Windows users can run the setup executable for Start menu integration, upgrades,
+and an uninstaller in Installed apps.
+
+Commit your changes, tag that commit with `git tag v0.0.1`, and push the tag with
+`git push origin v0.0.1`. CI builds the tag version and publishes after native
+build and installation checks pass. See [installation](docs/install.md) and
+[release automation](docs/release-automation.md) for details.

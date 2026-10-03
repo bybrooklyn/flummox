@@ -34,6 +34,7 @@ fn view(_state: &State) -> Element<'_, Message> {
     container(
         column![
             text("Flummox").size(26),
+            theme::muted(format!("Version {}", env!("CARGO_PKG_VERSION"))),
             text("Compression is not available on this platform yet").size(16),
             theme::muted("Game files are unchanged"),
         ]
