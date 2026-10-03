@@ -120,6 +120,10 @@ impl Default for Policy {
 }
 
 impl Report {
+    pub fn identity(&self) -> Result<[u8; 32]> {
+        Ok(*blake3::hash(&serde_json::to_vec(self)?).as_bytes())
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.version == VERSION,
@@ -195,6 +199,12 @@ impl Store {
         Ok(Self { root })
     }
 
+    pub fn local() -> Result<Self> {
+        let database = crate::db::Db::default_path().context("Cannot locate state folder")?;
+        let parent = database.parent().context("Invalid state folder")?;
+        Self::open(parent.join("compatibility"))
+    }
+
     pub fn save(&self, report: &Report) -> Result<PathBuf> {
         let path = self.root.join(report.filename()?);
         if path.exists() {
@@ -213,6 +223,10 @@ impl Store {
             if path.extension().is_none_or(|extension| extension != "json") {
                 continue;
             }
+            ensure!(
+                std::fs::metadata(&path)?.len() <= 1024 * 1024,
+                "Compatibility report exceeds 1 MiB"
+            );
             let bytes =
                 std::fs::read(&path).with_context(|| format!("Reading {}", path.display()))?;
             let report: Report = serde_json::from_slice(&bytes)
@@ -265,6 +279,98 @@ fn write_private_new(path: &Path, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
+}
+
+/// Hashes every regular file using the benchmark's path, size and payload records.
+#[cfg(target_os = "linux")]
+pub fn corpus(
+    root: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+    observer: &dyn crate::pack::Observer,
+) -> Result<Corpus> {
+    use sha2::{Digest, Sha256};
+    use std::{io::Read, os::unix::ffi::OsStrExt, sync::atomic::Ordering};
+    let root = crate::jobs::validate_folder(root)?;
+    let anchor = crate::safeio::Anchor::open(&root)?;
+    ensure!(
+        anchor.fully_resolved(),
+        "Safe path resolution is unavailable"
+    );
+    let mut inventory = crate::inventory::walk_cancellable(
+        &root,
+        &crate::inventory::WalkOpts { min_size: 0 },
+        Some(cancel),
+    )?;
+    ensure!(
+        inventory.warnings.is_empty(),
+        "Cannot verify every file in this game"
+    );
+    inventory.files.sort_by(|a, b| a.rel.cmp(&b.rel));
+    let mut hash = Sha256::new();
+    let mut bytes = 0u64;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    for (number, entry) in inventory.files.iter().enumerate() {
+        observer.checkpoint()?;
+        ensure!(
+            !cancel.load(Ordering::Relaxed),
+            "Compatibility verification stopped"
+        );
+        let mut file = anchor.open_file(&entry.rel)?;
+        ensure!(
+            entry.matches_file(&file)?,
+            "File changed before compatibility verification"
+        );
+        let path = entry.rel.as_os_str().as_bytes();
+        hash.update(u64::try_from(path.len())?.to_le_bytes());
+        hash.update(path);
+        hash.update(entry.size.to_le_bytes());
+        loop {
+            observer.checkpoint()?;
+            ensure!(
+                !cancel.load(Ordering::Relaxed),
+                "Compatibility verification stopped"
+            );
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hash.update(buffer.get(..count).context("Invalid read length")?);
+            bytes = bytes.saturating_add(count as u64);
+            observer.progress(
+                number as u64,
+                bytes,
+                "Checking compatibility against installed files",
+            );
+        }
+        ensure!(
+            entry.matches_file(&file)?,
+            "File changed during compatibility verification"
+        );
+    }
+    let after = crate::inventory::walk_cancellable(
+        &root,
+        &crate::inventory::WalkOpts { min_size: 0 },
+        Some(cancel),
+    )?;
+    ensure!(
+        after.warnings.is_empty() && after.files.len() == inventory.files.len(),
+        "Game changed during compatibility verification"
+    );
+    for entry in &inventory.files {
+        ensure!(
+            entry.matches_file(&anchor.open_file(&entry.rel)?)?,
+            "Game changed during compatibility verification"
+        );
+    }
+    ensure!(
+        bytes == inventory.total_bytes(),
+        "Game size changed during compatibility verification"
+    );
+    Ok(Corpus {
+        sha256: format!("{:x}", hash.finalize()),
+        files: inventory.files.len() as u64,
+        bytes,
+    })
 }
 
 #[cfg(test)]
@@ -369,5 +475,71 @@ mod tests {
         check(!json.contains("/home/person"), "install path is absent")?;
         let loaded = store.load().ctx("load reports")?;
         check_eq(loaded, vec![report()], "stored report round trip")
+    }
+}
+
+#[cfg(test)]
+mod corpus_tests {
+    use super::*;
+    use crate::testutil::{Ctx, TestResult, check, check_eq, check_ne};
+    use std::sync::atomic::AtomicBool;
+    #[test]
+    fn corpus_uses_benchmark_records_and_detects_renames() -> TestResult {
+        let temp = tempfile::tempdir().ctx("corpus fixture")?;
+        std::fs::create_dir(temp.path().join("dir")).ctx("fixture directory")?;
+        std::fs::write(temp.path().join("dir/file.bin"), b"abc").ctx("fixture bytes")?;
+        let initial = corpus(
+            temp.path(),
+            &AtomicBool::new(false),
+            &crate::pack::NoObserver,
+        )
+        .ctx("corpus")?;
+        check_eq(
+            initial.sha256.clone(),
+            "02a59e4570844e8ab5f39860a50329a604937c943075d0bf736c7665df37b4b3".to_owned(),
+            "same records as Windows comparison harness",
+        )?;
+        check_eq(initial.files, 1, "file count")?;
+        std::fs::rename(
+            temp.path().join("dir/file.bin"),
+            temp.path().join("dir/renamed.bin"),
+        )
+        .ctx("rename")?;
+        let changed = corpus(
+            temp.path(),
+            &AtomicBool::new(false),
+            &crate::pack::NoObserver,
+        )
+        .ctx("renamed corpus")?;
+        check_ne(
+            initial.sha256,
+            changed.sha256,
+            "names are part of qualification",
+        )?;
+        check(
+            corpus(
+                temp.path(),
+                &AtomicBool::new(true),
+                &crate::pack::NoObserver,
+            )
+            .is_err(),
+            "cancelled scan cannot qualify",
+        )
+    }
+    #[test]
+    fn writes_during_corpus_verification_are_rejected() -> TestResult {
+        struct Mutate(PathBuf);
+        impl crate::pack::Observer for Mutate {
+            fn progress(&self, _files: u64, _bytes: u64, _stage: &str) {
+                let _written = std::fs::write(&self.0, b"changed");
+            }
+        }
+        let temp = tempfile::tempdir().ctx("changing corpus")?;
+        let path = temp.path().join("asset");
+        std::fs::write(&path, b"original").ctx("asset")?;
+        check(
+            corpus(temp.path(), &AtomicBool::new(false), &Mutate(path)).is_err(),
+            "a concurrent write invalidates qualification",
+        )
     }
 }

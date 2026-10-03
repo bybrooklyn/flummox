@@ -64,3 +64,8 @@ win:
 # `prose` is in here because it was not, and a push went through with the
 # style rules broken. A check nothing runs is a check that does not exist.
 ci: lint test deny prose
+
+# Build and bundle Linux x86_64 binaries for download.
+release:
+    cargo build --locked --release --features gui,pack-mount --bins
+    python3 packaging/package-release.py

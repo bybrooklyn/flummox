@@ -707,3 +707,80 @@ proptest::proptest! {
         result.map_err(proptest::test_runner::TestCaseError::fail)?;
     }
 }
+
+#[test]
+fn observed_creation_stops_before_publication() -> TestResult {
+    struct StopAfterWork(std::sync::atomic::AtomicBool);
+    impl super::Observer for StopAfterWork {
+        fn checkpoint(&self) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                !self.0.load(std::sync::atomic::Ordering::Relaxed),
+                "fixture stop"
+            );
+            Ok(())
+        }
+        fn progress(&self, _files: u64, _bytes: u64, _stage: &str) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let temp = tempfile::tempdir().ctx("stoppable build")?;
+    let source = temp.path().join("game");
+    std::fs::create_dir(&source).ctx("source")?;
+    let bytes = vec![7u8; 1024 * 1024];
+    std::fs::write(source.join("asset.bin"), &bytes).ctx("source data")?;
+    let target = temp.path().join("store");
+    let observer = StopAfterWork(std::sync::atomic::AtomicBool::new(false));
+    check(
+        super::create_observed(
+            &source,
+            &target,
+            super::Options::default(),
+            &std::sync::atomic::AtomicBool::new(false),
+            &observer,
+        )
+        .is_err(),
+        "checkpoint stops build",
+    )?;
+    check(
+        !target.exists(),
+        "stopped build publishes no incomplete store",
+    )?;
+    check_eq(
+        std::fs::read(source.join("asset.bin")).ctx("source after stop")?,
+        bytes,
+        "cancel leaves original bytes intact",
+    )
+}
+
+#[test]
+fn grouped_preview_measures_extra_saving_without_writing() -> TestResult {
+    let temp = tempfile::tempdir().ctx("small-file sample")?;
+    for number in 0..24 {
+        let bytes: Vec<_> = (0..12000).map(|n| ((n * 7 + number) % 251) as u8).collect();
+        std::fs::write(temp.path().join(format!("{number:02}.dat")), bytes).ctx("small asset")?;
+    }
+    let inventory =
+        crate::inventory::walk(temp.path(), &crate::inventory::WalkOpts { min_size: 0 })
+            .ctx("sample inventory")?;
+    let sample = super::sample_small_files(
+        temp.path(),
+        &inventory,
+        1024 * 1024,
+        &std::sync::atomic::AtomicBool::new(false),
+        &super::NoObserver,
+    )
+    .ctx("group preview")?;
+    check_eq(sample.files, 24, "sample covers fixture")?;
+    check(sample.bytes <= 1024 * 1024, "sample stays within budget")?;
+    check(
+        sample.grouped_files > 0 && sample.extra_payload_saving > 0,
+        "grouping exposes extra saving",
+    )?;
+    check_eq(
+        std::fs::read_dir(temp.path())
+            .ctx("unchanged directory")?
+            .count(),
+        24,
+        "preview writes nothing",
+    )
+}

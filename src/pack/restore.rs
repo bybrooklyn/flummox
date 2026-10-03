@@ -37,6 +37,7 @@ pub(super) fn apply_xattrs(path: &Path, attributes: &[super::format::Xattr]) -> 
     Ok(())
 }
 
+#[cfg(feature = "pack-mount")]
 pub(super) fn copy_xattrs(source: &Path, destination: &Path) -> Result<()> {
     for name in xattr::list(source)? {
         let value = xattr::get(source, &name)?.context("Extended attribute disappeared")?;

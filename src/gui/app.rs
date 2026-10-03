@@ -4,7 +4,8 @@ use crate::{
     db::{Activity, Db, GameRecord},
     fsprobe,
     jobs::{
-        self, Command, Job, Library, MotionPreference, Operation, Phase, Snapshot, ThemePreference,
+        self, Command, Job, Library, MotionPreference, Operation, PackTask, Phase, Snapshot,
+        ThemePreference,
     },
     launchers::Env,
     model::Game,
@@ -124,6 +125,7 @@ pub struct Drive {
 }
 #[derive(Debug, Clone)]
 pub struct ScanResult {
+    pub reports: Vec<crate::compatibility::Report>,
     pub games: Vec<GameRow>,
     pub drives: Vec<Drive>,
     pub records: Vec<GameRecord>,
@@ -184,6 +186,7 @@ impl Filter {
 
 pub struct State {
     pub env: Env,
+    pub reports: Vec<crate::compatibility::Report>,
     pub page: Page,
     pub games: Vec<GameRow>,
     pub drives: Vec<Drive>,
@@ -211,6 +214,7 @@ pub struct State {
     pub scanning: bool,
     pub folder: String,
     pub folder_error: Option<String>,
+    pub picker_busy: bool,
     pub shown: usize,
     pub detail: Animation<bool>,
     pub polling: bool,
@@ -227,6 +231,7 @@ impl State {
     pub fn new(env: Env) -> Self {
         Self {
             env,
+            reports: vec![],
             page: Page::Overview,
             games: vec![],
             drives: vec![],
@@ -268,6 +273,7 @@ impl State {
             scanning: false,
             folder: String::new(),
             folder_error: None,
+            picker_busy: false,
             shown: 40,
             detail: Animation::new(false).duration(Duration::from_millis(200)),
             polling: false,
@@ -360,11 +366,85 @@ impl State {
             crate::recommendation::choose(
                 estimate,
                 row.native_supported,
-                false,
+                row.pack_supported && estimate.maximum_qualified,
                 crate::recommendation::Policy::default(),
             )
         })
     }
+    pub fn store_path(&self, game: &Game) -> PathBuf {
+        if let Some(path) = self
+            .pack_paths
+            .get(&game.id.to_string())
+            .filter(|path| !path.trim().is_empty())
+        {
+            return PathBuf::from(path);
+        }
+        use std::os::unix::ffi::OsStrExt;
+        let identity: String = blake3::hash(game.install_dir.as_os_str().as_bytes())
+            .to_hex()
+            .chars()
+            .take(16)
+            .collect();
+        game.install_dir
+            .parent()
+            .unwrap_or(&game.install_dir)
+            .join(".flummox")
+            .join(format!("{identity}.store"))
+    }
+
+    fn optimize_command(&self, game: Game) -> Result<Command, String> {
+        if self
+            .recommendation(&game)
+            .is_some_and(|r| r.mode == crate::recommendation::StorageMode::MaximumSpace)
+        {
+            let identity = self
+                .estimate(&game)
+                .and_then(|estimate| estimate.maximum_qualification);
+            let report = self
+                .reports
+                .iter()
+                .find(|r| {
+                    r.identity().ok() == identity
+                        && r.qualifies(
+                            &game,
+                            &r.corpus.sha256,
+                            crate::compatibility::Policy::default(),
+                        )
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    "Refresh and analyze this game after importing its compatibility report."
+                        .to_owned()
+                })?;
+            Ok(Command::EnqueuePack {
+                task: PackTask::Activate {
+                    store: self.store_path(&game),
+                    create: true,
+                    qualification: Some(Box::new(report)),
+                },
+                game,
+            })
+        } else {
+            let row = self
+                .games
+                .iter()
+                .find(|r| r.game.id == game.id)
+                .ok_or_else(|| "Game no longer exists".to_owned())?;
+            if !row.native_supported {
+                return Err("Maximum Space needs a matching qualification for the primary action. Use Advanced storage to test this game locally.".into());
+            }
+            let options = crate::backend::CompressOpts {
+                preset: self.preset_for(&game.id.to_string()),
+                ..Default::default()
+            };
+            Ok(Command::Enqueue {
+                game,
+                operation: Operation::Compress,
+                options,
+            })
+        }
+    }
+
     pub fn potential_saving(&self) -> u64 {
         self.games
             .iter()
@@ -513,7 +593,6 @@ pub enum Message {
     Refresh,
     Scanned(Result<ScanResult, String>),
     Snapshot(Result<Snapshot, String>),
-    PackFinished(Result<Snapshot, String>, &'static str, Option<String>),
     AnalysisQueued(Result<Snapshot, String>),
     Dismiss,
     Tick,
@@ -529,6 +608,9 @@ pub enum Message {
     Send(Command),
     Folder(String),
     AddFolder,
+    Browse(super::dialog::Target),
+    Chosen(super::dialog::Target, Result<Option<PathBuf>, String>),
+    ReportImported(Result<crate::compatibility::Report, String>),
     Preset(String, crate::backend::Preset),
     Keyboard(iced::keyboard::Event),
     Motion(MotionPreference),
@@ -538,6 +620,7 @@ pub enum Message {
     LauncherFilter(Option<String>),
     PackPath(String, String),
     PackActivate(String, bool),
+    PackCreate(String),
     PackReclaimPrompt(String),
     PackPrunePrompt(String),
     ToggleAdvanced(String),
@@ -562,156 +645,41 @@ fn send(command: Command) -> Task<Message> {
     )
 }
 
-fn send_pack(command: Command, completed: &'static str, id: String) -> Task<Message> {
+fn send_many(commands: Vec<Command>) -> Task<Message> {
     Task::perform(
-        background(move || jobs::request(command).map_err(|e| e.to_string())),
-        move |result| {
-            Message::PackFinished(result.and_then(|snapshot| snapshot), completed, Some(id))
-        },
+        background(move || {
+            let mut snapshot = jobs::request(Command::Snapshot).map_err(|e| e.to_string())?;
+            for command in commands {
+                snapshot = jobs::request(command).map_err(|e| e.to_string())?;
+            }
+            Ok(snapshot)
+        }),
+        |result| Message::Snapshot(result.and_then(|snapshot| snapshot)),
     )
 }
 
 fn pack_activate(state: &mut State, id: &str, create: bool) -> Task<Message> {
-    if state.pending.contains(id) {
-        return Task::none();
-    }
     let Some(game) = state
         .games
         .iter()
-        .find(|row| row.game.id.to_string() == id)
+        .find(|row| row.game.id.to_string() == id && row.pack_supported && row.game.state.is_idle())
         .map(|row| row.game.clone())
     else {
         return Task::none();
     };
-    let Some(store) = state
-        .pack_paths
-        .get(id)
-        .filter(|path| !path.trim().is_empty())
-        .map(PathBuf::from)
-    else {
-        state.show_status(Status::error("Choose where the pack store should live."));
-        return Task::none();
-    };
-    if store == game.install_dir || store.starts_with(&game.install_dir) {
-        state.show_status(Status::error(
-            "Keep the pack store outside the installed game folder.",
-        ));
-        return Task::none();
-    }
-    let Some(parent) = store.parent().filter(|parent| parent.is_dir()) else {
-        state.show_status(Status::error(
-            "Choose a store path inside an existing folder.",
-        ));
-        return Task::none();
-    };
-    let mut writes_name = store.as_os_str().to_os_string();
-    writes_name.push(".writes");
-    let writes = PathBuf::from(writes_name);
-    let pool = parent.join(".flummox-pool");
-    state.show_status(Status::info(if create {
-        "Building and verifying the store. The original game stays in place until it is ready."
-    } else {
-        "Verifying and activating the existing store."
-    }));
-    state.polling = false;
-    state.pending.insert(id.to_owned());
-    let pending_id = id.to_owned();
-    Task::perform(
-        background(move || {
-            if create {
-                let binary = std::env::current_exe()
-                    .map_err(|error| error.to_string())?
-                    .with_file_name("flummox");
-                let output = std::process::Command::new(binary)
-                    .args(["pack", "create"])
-                    .arg(&game.install_dir)
-                    .arg(&store)
-                    .arg("--maximum")
-                    .arg("--pool")
-                    .arg(&pool)
-                    .output()
-                    .map_err(|error| error.to_string())?;
-                if !output.status.success() {
-                    let error = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-                    return Err(if error.is_empty() {
-                        "Store creation stopped before completion.".into()
-                    } else {
-                        error
-                    });
-                }
-            }
-            jobs::request(Command::PackActivate {
-                game_path: game.install_dir,
-                store_path: store,
-                writes_path: writes,
-            })
-            .map_err(|error| error.to_string())
-        }),
-        move |result| {
-            Message::PackFinished(
-                result.and_then(|snapshot| snapshot),
-                if create {
-                    "The writable compressed install is ready."
-                } else {
-                    "The existing store is mounted and ready."
-                },
-                Some(pending_id),
-            )
+    let store = state.store_path(&game);
+    let command = Command::EnqueuePack {
+        game,
+        task: PackTask::Activate {
+            store,
+            create,
+            qualification: None,
         },
-    )
+    };
+    let _navigation = update(state, Message::GoTo(Page::Queue));
+    send(command)
 }
 
-fn automatic_pack(game: Game) -> Result<Snapshot, String> {
-    let parent = game
-        .install_dir
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| "The game folder has no usable parent directory.".to_owned())?;
-    let root = parent.join(".flummox");
-    std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
-    let identity = format!(
-        "{}:{}:{}",
-        game.id,
-        game.install_dir.display(),
-        game.build.as_deref().unwrap_or_default()
-    );
-    let short: String = blake3::hash(identity.as_bytes())
-        .to_hex()
-        .chars()
-        .take(16)
-        .collect();
-    let store = root.join(format!("{short}.store"));
-    let writes = root.join(format!("{short}.writes"));
-    let pool = root.join("pool");
-    if !store.exists() {
-        let binary = std::env::current_exe()
-            .map_err(|error| error.to_string())?
-            .with_file_name("flummox");
-        let output = std::process::Command::new(binary)
-            .args(["pack", "create"])
-            .arg(&game.install_dir)
-            .arg(&store)
-            .arg("--maximum")
-            .arg("--pool")
-            .arg(&pool)
-            .output()
-            .map_err(|error| error.to_string())?;
-        if !output.status.success() {
-            let error = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            return Err(if error.is_empty() {
-                "Store creation stopped before completion.".into()
-            } else {
-                error
-            });
-        }
-    }
-    jobs::request(Command::PackActivate {
-        game_path: game.install_dir,
-        store_path: store,
-        writes_path: writes,
-    })
-    .map_err(|error| error.to_string())
-}
 fn scan(env: Env) -> ScanResult {
     let scan = crate::launchers::scan_all(&env);
     let mut warnings: Vec<_> = scan.warnings.iter().map(ToString::to_string).collect();
@@ -746,7 +714,17 @@ fn scan(env: Env) -> ScanResult {
             Err(e) => warnings.push(format!("History is unavailable: {e}")),
         }
     }
+    let reports = match crate::compatibility::Store::local().and_then(|store| store.load()) {
+        Ok(reports) => reports,
+        Err(error) => {
+            warnings.push(format!(
+                "Compatibility reports could not be loaded: {error}"
+            ));
+            vec![]
+        }
+    };
     ScanResult {
+        reports,
         games,
         drives,
         records,
@@ -825,6 +803,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             match result {
                 Ok(scan) => {
                     state.games = scan.games;
+                    state.reports = scan.reports;
                     state.drives = scan.drives;
                     state.records = scan.records;
                     state.activity = scan.activity;
@@ -877,6 +856,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 for job in &snapshot.jobs {
                     let fraction = if job.bytes_total > 0 {
                         (job.bytes_done as f32 / job.bytes_total as f32).clamp(0., 1.)
+                    } else if job.files_total > 0 {
+                        (job.files_done as f32 / job.files_total as f32).clamp(0., 1.)
                     } else {
                         0.
                     };
@@ -897,6 +878,12 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.reduced_motion = snapshot.reduced_motion;
                 state.motion = snapshot.motion;
                 state.theme = snapshot.theme;
+                state.pending = snapshot
+                    .jobs
+                    .iter()
+                    .filter(|job| job.operation == Operation::Pack && job.phase.active())
+                    .map(|job| job.game.id.to_string())
+                    .collect();
                 state.snapshot = snapshot;
                 state.polling = true;
                 if libraries_changed {
@@ -913,17 +900,6 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.show_status(Status::error(e));
             }
         },
-        Message::PackFinished(result, completed, id) => {
-            if let Some(id) = id {
-                state.pending.remove(&id);
-                state.confirm_reclaim.remove(&id);
-                state.confirm_prune.remove(&id);
-            }
-            if result.is_ok() {
-                state.show_status(Status::info(completed));
-            }
-            return update(state, Message::Snapshot(result));
-        }
         Message::Query(query) => {
             state.query = query;
             state.shown = 40;
@@ -979,27 +955,17 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 .find(|g| g.game.id.to_string() == id && g.supported)
                 .map(|row| row.game.clone())
             {
-                if operation == Operation::Compress
-                    && state.recommendation(&game).is_some_and(|choice| {
-                        choice.mode == crate::recommendation::StorageMode::MaximumSpace
-                    })
-                {
-                    state.show_status(Status::info(
-                        "Building and verifying Maximum Space storage. The original remains recoverable.",
-                    ));
-                    let _navigation = update(state, Message::GoTo(Page::Queue));
-                    state.pending.insert(id.clone());
-                    let pending_id = id;
-                    return Task::perform(
-                        background(move || automatic_pack(game)),
-                        move |result| {
-                            Message::PackFinished(
-                                result.and_then(|snapshot| snapshot),
-                                "Maximum Space is active and launcher updates remain writable.",
-                                Some(pending_id),
-                            )
-                        },
-                    );
+                if operation == Operation::Compress {
+                    match state.optimize_command(game) {
+                        Ok(command) => {
+                            let _navigation = update(state, Message::GoTo(Page::Queue));
+                            return send(command);
+                        }
+                        Err(error) => {
+                            state.show_status(Status::error(error));
+                            return Task::none();
+                        }
+                    }
                 }
                 let options = crate::backend::CompressOpts {
                     preset: state.preset_for(&id),
@@ -1016,153 +982,172 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::Queue(operation) => {
-            let games: Vec<_> = state
+            let commands: Result<Vec<_>, _> = state
                 .actionable_selection()
                 .into_iter()
                 .map(|game| {
-                    (
-                        game.clone(),
-                        crate::backend::CompressOpts {
-                            preset: state.preset_for(&game.id.to_string()),
-                            ..Default::default()
-                        },
-                    )
-                })
-                .collect();
-            let _navigation = update(state, Message::GoTo(Page::Queue));
-            return Task::perform(
-                background(move || {
-                    let mut snapshot =
-                        jobs::request(Command::Snapshot).map_err(|e| e.to_string())?;
-                    for (game, options) in games {
-                        snapshot = jobs::request(Command::Enqueue {
+                    if operation == Operation::Compress {
+                        state.optimize_command(game)
+                    } else {
+                        Ok(Command::Enqueue {
+                            options: crate::backend::CompressOpts {
+                                preset: state.preset_for(&game.id.to_string()),
+                                ..Default::default()
+                            },
                             game,
                             operation,
-                            options,
                         })
-                        .map_err(|e| e.to_string())?;
                     }
-                    Ok(snapshot)
-                }),
-                |r| Message::Snapshot(r.and_then(|r| r)),
-            );
+                })
+                .collect();
+            let commands = match commands {
+                Ok(commands) => commands,
+                Err(error) => {
+                    state.show_status(Status::error(error));
+                    return Task::none();
+                }
+            };
+            let _navigation = update(state, Message::GoTo(Page::Queue));
+            return send_many(commands);
         }
         Message::OptimizeLibrary => {
-            let games: Vec<_> = state
+            let commands: Result<Vec<_>, _> = state
                 .games
                 .iter()
                 .filter(|row| {
                     row.supported
                         && row.game.state.is_idle()
                         && !state.compressed(&row.game)
-                        && state.recommendation(&row.game).is_some_and(|choice| {
-                            choice.mode != crate::recommendation::StorageMode::Skip
-                        })
-                })
-                .map(|row| {
-                    (
-                        row.game.clone(),
-                        state
+                        && state
                             .recommendation(&row.game)
-                            .map(|choice| choice.mode)
-                            .unwrap_or(crate::recommendation::StorageMode::Skip),
-                        crate::backend::CompressOpts {
-                            preset: state.preset_for(&row.game.id.to_string()),
-                            ..Default::default()
-                        },
-                    )
+                            .is_some_and(|r| r.mode != crate::recommendation::StorageMode::Skip)
                 })
+                .map(|row| state.optimize_command(row.game.clone()))
                 .collect();
-            if games.is_empty() {
-                state.show_status(Status::info(
-                    "Analysis has not found a worthwhile native compression job yet.",
-                ));
-                return Task::none();
+            match commands {
+                Ok(commands) if !commands.is_empty() => {
+                    let _navigation = update(state, Message::GoTo(Page::Queue));
+                    return send_many(commands);
+                }
+                Ok(_) => state.show_status(Status::info(
+                    "Analysis has not found a worthwhile compression job yet.",
+                )),
+                Err(error) => state.show_status(Status::error(error)),
             }
-            let _navigation = update(state, Message::GoTo(Page::Queue));
-            return Task::perform(
-                background(move || {
-                    let mut snapshot =
-                        jobs::request(Command::Snapshot).map_err(|e| e.to_string())?;
-                    let mut libraries = std::collections::BTreeSet::new();
-                    for (game, _, _) in &games {
-                        if let Some(parent) = game.install_dir.parent() {
-                            libraries.insert(parent.to_path_buf());
-                        }
-                    }
-                    for path in libraries {
-                        snapshot = jobs::request(Command::Library(Library {
-                            path,
-                            automatic: true,
-                            custom: false,
-                        }))
-                        .map_err(|error| error.to_string())?;
-                    }
-                    for (game, mode, options) in games {
-                        snapshot = match mode {
-                            crate::recommendation::StorageMode::Native => {
-                                jobs::request(Command::Enqueue {
-                                    game,
-                                    operation: Operation::Compress,
-                                    options,
-                                })
-                                .map_err(|e| e.to_string())?
-                            }
-                            crate::recommendation::StorageMode::MaximumSpace => {
-                                automatic_pack(game)?
-                            }
-                            crate::recommendation::StorageMode::Skip => snapshot,
-                        };
-                    }
-                    Ok(snapshot)
-                }),
-                |result| Message::Snapshot(result.and_then(|snapshot| snapshot)),
-            );
         }
         Message::Send(command) => {
-            state.polling = false;
             let pack = match &command {
-                Command::PackCompact { game_path } => Some((
-                    "Compacting launcher updates. The game path remains readable while the new store is built.",
-                    "Updates are compacted. Test the game before reclaiming the previous version.",
-                    game_path,
-                )),
-                Command::PackPrune { game_path } => Some((
-                    "Reclaiming the previous compacted version.",
-                    "The previous compacted version was reclaimed.",
-                    game_path,
-                )),
-                Command::PackRollback { game_path } => Some((
-                    "Restoring ordinary files at the launcher path.",
-                    "Ordinary game files were restored with launcher updates intact.",
-                    game_path,
-                )),
-                Command::PackReclaim { game_path } => Some((
-                    "Reclaiming the retained original files.",
-                    "The retained original files were reclaimed.",
-                    game_path,
-                )),
+                Command::PackCompact { game_path } => Some((game_path, PackTask::Compact)),
+                Command::PackPrune { game_path } => Some((game_path, PackTask::Prune)),
+                Command::PackRollback { game_path } => Some((game_path, PackTask::Restore)),
+                Command::PackReclaim { game_path } => Some((game_path, PackTask::Reclaim)),
                 _ => None,
             };
-            if let Some((working, completed, game_path)) = pack {
-                let Some(id) = state
+            if let Some((path, task)) = pack {
+                if let Some(game) = state
                     .games
                     .iter()
-                    .find(|row| row.game.install_dir == *game_path)
-                    .map(|row| row.game.id.to_string())
-                else {
-                    state.show_status(Status::error("The selected game is no longer installed."));
-                    return Task::none();
-                };
-                if state.pending.contains(&id) {
-                    return Task::none();
+                    .find(|row| row.game.install_dir == *path)
+                    .map(|row| row.game.clone())
+                {
+                    let _navigation = update(state, Message::GoTo(Page::Queue));
+                    return send(Command::EnqueuePack { game, task });
                 }
-                state.pending.insert(id.clone());
-                state.show_status(Status::info(working));
-                return send_pack(command, completed, id);
+                state.show_status(Status::error("The selected game is no longer installed."));
+                return Task::none();
             }
             return send(command);
         }
+        Message::Browse(target) => {
+            if state.picker_busy {
+                return Task::none();
+            }
+            state.picker_busy = true;
+            let dialog_target = target.clone();
+            return Task::perform(
+                background(move || super::dialog::choose(&dialog_target)),
+                move |result| Message::Chosen(target.clone(), result.and_then(|path| path)),
+            );
+        }
+        Message::Chosen(target, result) => {
+            state.picker_busy = false;
+            match result {
+                Ok(Some(path)) => match target {
+                    super::dialog::Target::Game => {
+                        if let Some(path) = path.to_str() {
+                            state.folder = path.to_owned();
+                            state.folder_error = None;
+                        } else {
+                            state.show_status(Status::error("This path cannot be shown in the folder field. Add it through the command line."));
+                        }
+                    }
+                    super::dialog::Target::Storage(id) => {
+                        let Some(game) = state
+                            .games
+                            .iter()
+                            .find(|row| row.game.id.to_string() == id)
+                            .map(|row| row.game.clone())
+                        else {
+                            return Task::none();
+                        };
+                        let name = state
+                            .store_path(&game)
+                            .file_name()
+                            .map(|n| n.to_os_string())
+                            .unwrap_or_else(|| "game.store".into());
+                        let destination = path.join(name);
+                        if let Some(path) = destination.to_str() {
+                            state.pack_paths.insert(id, path.to_owned());
+                        } else {
+                            state.show_status(Status::error("This path cannot be shown in the storage field. Choose another folder."));
+                        }
+                    }
+                    super::dialog::Target::Report => {
+                        return Task::perform(
+                            background(move || {
+                                let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+                                use std::io::Read;
+                                let mut bytes = Vec::new();
+                                file.take(1024 * 1024 + 1)
+                                    .read_to_end(&mut bytes)
+                                    .map_err(|e| e.to_string())?;
+                                if bytes.len() > 1024 * 1024 {
+                                    return Err("Compatibility report exceeds 1 MiB.".into());
+                                }
+                                let report: crate::compatibility::Report =
+                                    serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+                                crate::compatibility::Store::local()
+                                    .and_then(|store| store.save(&report))
+                                    .map_err(|e| e.to_string())?;
+                                Ok(report)
+                            }),
+                            |result| Message::ReportImported(result.and_then(|report| report)),
+                        );
+                    }
+                },
+                Ok(None) => {}
+                Err(error) => state.show_status(Status::error(error)),
+            }
+        }
+        Message::ReportImported(result) => match result {
+            Ok(report) => {
+                let game = state
+                    .games
+                    .iter()
+                    .find(|row| report.game.matches(&row.game))
+                    .map(|row| row.game.clone());
+                state.reports.push(report);
+                state.show_status(Status::info("Report imported. Analysis will verify the installed files before enabling Maximum Space."));
+                if let Some(game) = game {
+                    return send(Command::Enqueue {
+                        game,
+                        operation: Operation::Analyze,
+                        options: Default::default(),
+                    });
+                }
+            }
+            Err(error) => state.show_status(Status::error(error)),
+        },
         Message::Folder(folder) => {
             state.folder = folder;
             state.folder_error = None;
@@ -1206,6 +1191,23 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             state.pack_paths.insert(id, path);
         }
         Message::PackActivate(id, create) => return pack_activate(state, &id, create),
+        Message::PackCreate(id) => {
+            if let Some(game) = state
+                .games
+                .iter()
+                .find(|row| {
+                    row.game.id.to_string() == id && row.pack_supported && row.game.state.is_idle()
+                })
+                .map(|row| row.game.clone())
+            {
+                let store = state.store_path(&game);
+                let _navigation = update(state, Message::GoTo(Page::Queue));
+                return send(Command::EnqueuePack {
+                    game,
+                    task: PackTask::Create { store },
+                });
+            }
+        }
         Message::PackReclaimPrompt(id) => {
             state.confirm_prune.clear();
             state.confirm_reclaim.clear();
@@ -1347,6 +1349,8 @@ mod tests {
             elapsed: 0,
             drive_change: None,
             user_paused: false,
+            pack: None,
+            pack_interruptible: false,
         };
         state.snapshot.jobs.push(analysis.clone());
         check(state.estimate(&game).is_some(), "fresh analysis is shown")?;
@@ -1407,6 +1411,7 @@ mod tests {
         let _task = update(
             &mut state,
             Message::Scanned(Ok(ScanResult {
+                reports: vec![],
                 games: vec![],
                 drives: vec![],
                 records: vec![],

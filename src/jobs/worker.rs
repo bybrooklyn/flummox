@@ -44,6 +44,21 @@ impl BusyCheck for Pause {
     }
 }
 
+struct AnalysisObserver<'a> {
+    output: &'a Output,
+    ctx: &'a JobCtx<'a>,
+    gate: &'a Mutex<std::time::Instant>,
+}
+impl crate::pack::Observer for AnalysisObserver<'_> {
+    fn checkpoint(&self) -> Result<()> {
+        ensure!(
+            self.ctx.wait_while_busy(self.gate),
+            "Compatibility verification stopped"
+        );
+        Ok(())
+    }
+}
+
 fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Result<()> {
     ensure!(work.version == VERSION, "Worker version mismatch");
     let job = work.job;
@@ -52,6 +67,9 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
     let fs = crate::fsprobe::probe(&path)?;
     let kind = crate::fsprobe::tier_for(&fs)
         .backend()
+        .or_else(|| {
+            (job.operation == Operation::Analyze).then_some(crate::fsprobe::BackendKind::Btrfs)
+        })
         .context("Compression is not supported on this drive yet.")?;
     let backend =
         backend::for_kind(kind).context("Compression is not supported on this drive yet.")?;
@@ -166,6 +184,37 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
         ..Estimate::default()
     };
     let mut failures: Vec<_> = inv.warnings.iter().take(20).cloned().collect();
+    if job.operation == Operation::Analyze {
+        let reports = crate::compatibility::Store::local()?.load()?;
+        let candidates: Vec<_> = reports
+            .iter()
+            .filter(|report| {
+                report.qualifies(
+                    &job.game,
+                    &report.corpus.sha256,
+                    crate::compatibility::Policy::default(),
+                )
+            })
+            .collect();
+        if !candidates.is_empty() {
+            let observer = AnalysisObserver {
+                output,
+                ctx: &ctx,
+                gate: &gate,
+            };
+            observer.output.event(Event::Progress {
+                files_done: 0,
+                bytes_done: 0,
+                current: "Checking Maximum Space compatibility".into(),
+            });
+            let corpus = crate::compatibility::corpus(&path, &cancel, &observer)?;
+            if let Some(report) = candidates.iter().find(|report| report.corpus == corpus) {
+                summary.maximum_qualified = true;
+                summary.maximum_qualification = Some(report.identity()?);
+            }
+        }
+    }
+
     if job.operation != Operation::Decompress {
         summary.maximum_after = Some(0);
         output.event(Event::Started {
@@ -177,7 +226,19 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
         let probe = backend.disk_probe();
         const ANALYSIS_BUDGET: u64 = 32 * 1024 * 1024;
         const FILE_SAMPLE_CAP: u64 = 1024 * 1024;
-        let mut budget = ANALYSIS_BUDGET;
+        let observer = AnalysisObserver {
+            output,
+            ctx: &ctx,
+            gate: &gate,
+        };
+        output.event(Event::Progress {
+            files_done: 0,
+            bytes_done: 0,
+            current: "Sampling small-file grouping".into(),
+        });
+        summary.small_files =
+            crate::pack::sample_small_files(&path, &full, 4 * 1024 * 1024, &cancel, &observer)?;
+        let mut budget = ANALYSIS_BUDGET.saturating_sub(summary.small_files.bytes);
         let mut candidates = Vec::new();
         let mut inspected_bytes = 0u64;
         for (index, entry) in inv.files.iter().enumerate() {

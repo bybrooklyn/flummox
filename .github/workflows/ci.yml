@@ -41,8 +41,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev \
-            libxi-dev libgl1-mesa-dev libfontconfig1-dev
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libxrandr-dev \
+            libxi-dev libxcursor-dev libgl1-mesa-dev libfontconfig1-dev
 
       # CI runs the same recipes the pre-push hook runs. While CI called cargo
       # directly the two drifted, and a licence failure reached main because
@@ -134,4 +134,4 @@ jobs:
       - name: Require mounted reads and fixture execution
         env:
           FLUMMOX_REQUIRE_FUSE: '1'
-        run: cargo test --features pack-mount --test pack_mount -- --nocapture
+        run: cargo test --features pack-mount --test pack_mount --test jobs_lifecycle -- --nocapture

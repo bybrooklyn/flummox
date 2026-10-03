@@ -48,6 +48,28 @@ Launcher scans and process detection are periodic, so pause is not instantaneous
   a baseline; subsequent new installs and settled updates enqueue work.
   A managed desktop startup entry exists while any library opts in.
 
+## Maximum Space jobs
+
+The GUI queues store creation, activation, compaction, restoration, and reclaim
+with durable paths and task parameters. A coordinator-owned storage thread keeps
+client sockets responsive and owns all mount sessions during a transaction.
+Native workers and storage threads run one at a time under the operation lock.
+Closing the GUI leaves queued and running work with the coordinator.
+
+Creation, chunk verification, source comparison, and compaction preparation have
+pause/cancel checkpoints. Compression of one chunk finishes before a checkpoint.
+The final switch, restore, and deletion transactions finish uninterrupted;
+controls disappear while these phases run. Interrupted preparation retries from
+the beginning and can reuse already published pool objects. Existing activation
+records retain their recovery path across coordinator restart.
+
+A qualification must match the game build, platform, full corpus, and policy.
+Analysis records the identity of the matching report. Automatic activation
+rehashes the installed corpus before creation and again before the final switch.
+Manual Advanced storage remains available for local testing without a report.
+Creating or activating a store keeps the original allocation until explicit
+reclaim. Rebuilding ordinary files after reclaim requires additional free space.
+
 ## Decisions and evidence
 
 The inventory applies the backend's minimum file size. Bounded header inspection
@@ -80,9 +102,12 @@ one-click choice requires at least 16 MiB and 5% projected saving; Maximum
 Space also needs a game-specific compatibility result. Completed compression
 consumes the earlier potential estimate.
 
-The Maximum Space preview scores sampled files separately. It does not include
-extra savings from grouping small files; the verified store summary reports the
-actual result after creation.
+The Maximum Space preview scores large-file samples separately. Up to 4 MiB of
+small files are also compared with the store's grouping policy at level 19,
+within the 32 MiB distinct-payload sample budget. The GUI reports the extra
+grouped-payload saving separately; it is not added to the overall prediction,
+which avoids double-counting overlapping samples and omits store allocation and
+metadata overhead. The verified store summary reports the result after creation.
 
 `flummox benchmark` compares identical source samples using native-sized block
 models and larger frames. `flummox pack benchmark` builds and verifies a full
@@ -99,9 +124,21 @@ data. Windows background maintenance and pack mounting, Bottles discovery,
 and opt-in community data remain separate implementation work. Heroic and
 Lutris adapters depend on their installed metadata; missing or malformed
 sources produce warnings. The GUI's custom-folder control accepts a path;
-a native folder dialog is still pending.
+native selection uses an installed KDialog or Zenity helper.
 
 `just ci` checks code, tests, dependency policy, and prose. The IPC tests use
 temporary homes and games. The native lifecycle test checks compression,
 unchanged retries, updates, and byte preservation on btrfs. Tests that require
 btrfs announce a skip on other filesystems.
+
+## Updating the coordinator
+
+Settings exposes Restart worker; the CLI equivalent is `flummox jobs restart`.
+The coordinator refuses to exit while jobs are active or Maximum Space installs
+are mounted. It removes its socket on a successful idle restart; the requesting
+client waits for ownership to be released and starts the installed executable.
+Settings and completed queue history remain in SQLite. The restart request is
+accepted across protocol versions so future updates can replace an idle worker.
+Workers predating restart support require a logout/login after jobs finish and
+mounted installs are restored. A mismatched client checks the response version
+before decoding the snapshot and cannot submit work under the wrong protocol.

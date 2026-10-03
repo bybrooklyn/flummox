@@ -53,6 +53,7 @@ fn binary() -> Result<PathBuf> {
 /// Connects to the same user's coordinator, starting it when necessary.
 /// The socket is reachable only through an owner-only directory.
 pub fn request(command: Command) -> Result<Snapshot> {
+    let restarting = matches!(&command, Command::Restart);
     let dir = state_dir()?;
     let socket = dir.join("control.sock");
     let mut stream = match UnixStream::connect(&socket) {
@@ -105,15 +106,42 @@ pub fn request(command: Command) -> Result<Snapshot> {
         },
     )?;
     stream.write_all(b"\n")?;
-    let response: Response = read_message(&mut BufReader::new(stream))?;
-    ensure!(
-        response.version == VERSION,
-        "Restart Flummox's background worker after updating."
-    );
-    if let Some(error) = response.error {
-        bail!(error);
+    // Check the envelope before decoding a snapshot from a different schema.
+    let response: serde_json::Value = read_message(&mut BufReader::new(stream))?;
+    if !restarting {
+        ensure!(
+            response.get("version").and_then(serde_json::Value::as_u64) == Some(u64::from(VERSION)),
+            "The background worker uses an older protocol. Finish jobs, restore mounted games, then run flummox jobs restart. Workers predating restart support require logging out and back in."
+        );
     }
-    response.snapshot.context("The worker returned no state")
+    if let Some(error) = response.get("error").and_then(serde_json::Value::as_str) {
+        bail!("{error}");
+    }
+    if restarting {
+        let owner = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join("owner.lock"))?;
+        let started = Instant::now();
+        loop {
+            if owner.try_lock().is_ok() {
+                drop(owner);
+                return request(Command::Snapshot);
+            }
+            ensure!(
+                started.elapsed() < Duration::from_secs(5),
+                "The worker has not finished restarting. Try again shortly."
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    serde_json::from_value(
+        response
+            .get("snapshot")
+            .context("The worker returned no state")?
+            .clone(),
+    )
+    .context("Invalid worker state")
 }
 
 pub(super) fn read_message<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead) -> Result<T> {
@@ -190,6 +218,17 @@ fn pack_activate(
         writes_path,
         &std::sync::atomic::AtomicBool::new(false),
     )?;
+    activate_prepared(snapshot, db, mounts, install)
+}
+
+#[cfg(feature = "pack-mount")]
+fn activate_prepared(
+    snapshot: &mut Snapshot,
+    db: &Connection,
+    mounts: &mut Vec<PackMount>,
+    install: crate::pack::Install,
+) -> Result<()> {
+    let game_path = &install.game_path;
     ensure!(
         crate::busy::process_using(game_path, &crate::busy::ProcFs::new()).is_none(),
         "The game or launcher became active while its store was being verified"
@@ -351,6 +390,17 @@ fn pack_compact(
     mounts: &mut Vec<PackMount>,
     game_path: &Path,
 ) -> Result<()> {
+    pack_compact_observed(snapshot, db, mounts, game_path, &PackControl::default())
+}
+
+#[cfg(feature = "pack-mount")]
+fn pack_compact_observed(
+    snapshot: &mut Snapshot,
+    db: &Connection,
+    mounts: &mut Vec<PackMount>,
+    game_path: &Path,
+    control: &PackControl,
+) -> Result<()> {
     let canonical = game_path
         .canonicalize()
         .context("Finding the launcher path")?;
@@ -386,13 +436,24 @@ fn pack_compact(
     let baseline = controller.generation();
 
     let options = crate::pack::Options::maximum();
-    let cancel = std::sync::atomic::AtomicBool::new(false);
     let summary = if let Some(pool) = pool {
-        crate::pack::create_shared(&canonical, &new_store, &pool, options, &cancel)
+        crate::pack::create_shared_observed(
+            &canonical,
+            &new_store,
+            &pool,
+            options,
+            &control.cancel,
+            control,
+        )
     } else {
-        crate::pack::create(&canonical, &new_store, options, &cancel)
+        crate::pack::create_observed(&canonical, &new_store, options, &control.cancel, control)
     }
     .context("Building the compacted store from the live install")?;
+    if let Err(error) = control.transaction("Switching stores; this step finishes before stopping")
+    {
+        let _removed = remove_store(&new_store);
+        return Err(error);
+    }
     let frozen = controller.freeze()?;
     if frozen.generation() != baseline {
         let _removed = remove_store(&new_store);
@@ -730,6 +791,21 @@ fn enqueue(
     options: CompressOpts,
     db: &Connection,
 ) -> Result<()> {
+    ensure!(
+        operation != Operation::Pack,
+        "Pack jobs require a storage task"
+    );
+    enqueue_job(snapshot, game, operation, options, None, db)
+}
+
+fn enqueue_job(
+    snapshot: &mut Snapshot,
+    game: Game,
+    operation: Operation,
+    options: CompressOpts,
+    pack: Option<PackTask>,
+    db: &Connection,
+) -> Result<()> {
     let path = validate_folder(&game.install_dir)?;
     ensure!(
         (1..=32).contains(&options.threads),
@@ -779,6 +855,8 @@ fn enqueue(
         elapsed: 0,
         drive_change: None,
         user_paused: false,
+        pack,
+        pack_interruptible: true,
     };
     save(db, &job)?;
     snapshot.jobs.push(job);
@@ -797,15 +875,35 @@ fn enqueue(
     Ok(())
 }
 
+fn preempt_analysis(
+    snapshot: &mut Snapshot,
+    db: &Connection,
+    active: &mut Option<Active>,
+) -> Result<()> {
+    if let Some(worker) = active.as_mut()
+        && let Some(job) = snapshot
+            .jobs
+            .iter_mut()
+            .find(|job| job.id == worker.id && job.operation == Operation::Analyze)
+    {
+        send_control(&mut worker.input, Control::Cancel)?;
+        job.phase = Phase::Cancelling;
+        job.message = "Making room for your requested job".into();
+        save(db, job)?;
+    }
+    Ok(())
+}
+
 fn apply(
     command: Command,
     snapshot: &mut Snapshot,
     db: &Connection,
     active: &mut Option<Active>,
     mounts: &mut Vec<PackMount>,
+    running_pack: Option<i64>,
 ) -> Result<()> {
     match command {
-        Command::Snapshot => {}
+        Command::Snapshot | Command::Restart => {}
         Command::ReducedMotion(value) => {
             db.execute(
                 "INSERT OR REPLACE INTO settings(id,data) VALUES(3,?1)",
@@ -847,18 +945,24 @@ fn apply(
             options,
         } => {
             enqueue(snapshot, game, operation, options, db)?;
-            if operation != Operation::Analyze
-                && let Some(worker) = active.as_mut()
-                && let Some(job) = snapshot
-                    .jobs
-                    .iter_mut()
-                    .find(|j| j.id == worker.id && j.operation == Operation::Analyze)
-            {
-                send_control(&mut worker.input, Control::Cancel)?;
-                job.phase = Phase::Cancelling;
-                job.message = "Making room for your requested job".into();
-                save(db, job)?;
+            if operation != Operation::Analyze {
+                preempt_analysis(snapshot, db, active)?;
             }
+        }
+        Command::EnqueuePack { game, task } => {
+            ensure!(
+                cfg!(feature = "pack-mount"),
+                "Maximum Space requires a build with pack mounting"
+            );
+            enqueue_job(
+                snapshot,
+                game,
+                Operation::Pack,
+                CompressOpts::default(),
+                Some(task),
+                db,
+            )?;
+            preempt_analysis(snapshot, db, active)?;
         }
         Command::Pause { id, paused } => {
             let job = snapshot
@@ -869,7 +973,9 @@ fn apply(
             ensure!(job.phase.active(), "This job has finished");
             job.user_paused = paused;
             if job.phase == Phase::Queued
-                || (job.phase == Phase::Paused && active.as_ref().is_none_or(|a| a.id != id))
+                || (job.phase == Phase::Paused
+                    && active.as_ref().is_none_or(|a| a.id != id)
+                    && running_pack != Some(id))
             {
                 job.phase = if paused { Phase::Paused } else { Phase::Queued };
             }
@@ -883,6 +989,8 @@ fn apply(
                 .context("Job no longer exists")?;
             if let Some(a) = active.as_mut().filter(|a| a.id == id) {
                 send_control(&mut a.input, Control::Cancel)?;
+                job.phase = Phase::Cancelling;
+            } else if running_pack == Some(id) {
                 job.phase = Phase::Cancelling;
             } else if job.phase.active() {
                 job.phase = Phase::Cancelled;
@@ -899,7 +1007,8 @@ fn apply(
             let game = job.game.clone();
             let operation = job.operation;
             let options = job.options;
-            enqueue(snapshot, game, operation, options, db)?;
+            let pack = job.pack.clone();
+            enqueue_job(snapshot, game, operation, options, pack, db)?;
         }
         Command::Library(mut library) => {
             library.path = validate_folder(&library.path)?;
@@ -1108,6 +1217,362 @@ fn event(job: &mut Job, event: WorkerEvent, db: &Connection) -> Result<bool> {
     Ok(false)
 }
 
+#[derive(Default)]
+struct PackControl {
+    cancel: std::sync::atomic::AtomicBool,
+    paused: std::sync::atomic::AtomicBool,
+    interruptible: std::sync::atomic::AtomicBool,
+    events: Option<mpsc::SyncSender<crate::backend::Event>>,
+    transition: std::sync::Mutex<()>,
+}
+
+impl PackControl {
+    #[cfg(feature = "pack-mount")]
+    fn transaction(&self, message: &str) -> Result<()> {
+        use crate::pack::Observer;
+        use std::sync::atomic::Ordering;
+        self.checkpoint()?;
+        let _transition = self
+            .transition
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Storage control lock stopped"))?;
+        self.interruptible.store(false, Ordering::SeqCst);
+        ensure!(
+            !self.cancel.load(Ordering::SeqCst),
+            "Storage job stopped before switching files"
+        );
+        self.started(0, 0, message);
+        Ok(())
+    }
+    fn request_control(&self, command: &Command) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let _transition = self
+            .transition
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Storage control lock stopped"))?;
+        ensure!(
+            self.interruptible.load(Ordering::SeqCst),
+            "The storage switch is finishing; controls return when it is safe"
+        );
+        match command {
+            Command::Cancel(_) => self.cancel.store(true, Ordering::SeqCst),
+            Command::Pause { paused, .. } => self.paused.store(*paused, Ordering::SeqCst),
+            _ => {}
+        }
+        Ok(())
+    }
+    fn emit(&self, event: crate::backend::Event) {
+        if let Some(events) = &self.events {
+            let _sent = events.send(event);
+        }
+    }
+}
+
+impl crate::pack::Observer for PackControl {
+    fn checkpoint(&self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        ensure!(!self.cancel.load(Ordering::Relaxed), "Storage job stopped");
+        if self.paused.load(Ordering::Relaxed) {
+            self.emit(crate::backend::Event::Paused {
+                by: "Paused until resumed or launcher activity finishes".into(),
+            });
+            while self.paused.load(Ordering::Relaxed) {
+                ensure!(!self.cancel.load(Ordering::Relaxed), "Storage job stopped");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            self.emit(crate::backend::Event::Resumed);
+        }
+        Ok(())
+    }
+    fn started(&self, files: u64, bytes: u64, stage: &str) {
+        self.emit(crate::backend::Event::Started { files, bytes });
+        self.progress(0, 0, stage);
+    }
+    fn progress(&self, files: u64, bytes: u64, stage: &str) {
+        self.emit(crate::backend::Event::Progress {
+            files_done: files,
+            bytes_done: bytes,
+            current: stage.into(),
+        });
+    }
+}
+
+struct PackResult {
+    packs: Vec<crate::pack::Install>,
+    mounts: Vec<PackMount>,
+    result: Result<()>,
+}
+struct PackActive {
+    id: i64,
+    control: std::sync::Arc<PackControl>,
+    events: mpsc::Receiver<crate::backend::Event>,
+    thread: std::thread::JoinHandle<PackResult>,
+    started: Instant,
+}
+
+fn start_pack(
+    job: &Job,
+    packs: &[crate::pack::Install],
+    libraries: &[Library],
+    mounts: Vec<PackMount>,
+    database: &Path,
+) -> Result<PackActive> {
+    let task = job.pack.clone().context("Storage task is missing")?;
+    let (send, events) = mpsc::sync_channel(128);
+    let control = std::sync::Arc::new(PackControl {
+        interruptible: std::sync::atomic::AtomicBool::new(true),
+        events: Some(send),
+        ..Default::default()
+    });
+    let worker_control = control.clone();
+    let game = job.game.clone();
+    let database = database.to_path_buf();
+    let mut snapshot = Snapshot {
+        packs: packs.to_vec(),
+        libraries: libraries.to_vec(),
+        ..Snapshot::default()
+    };
+    let thread = std::thread::spawn(move || {
+        let mut mounts = mounts;
+        let result = (|| {
+            let db = Connection::open(database)?;
+            db.busy_timeout(Duration::from_secs(5))?;
+            let _operation = super::operation_lock()?;
+            run_pack_task(
+                &task,
+                &game,
+                &mut snapshot,
+                &db,
+                &mut mounts,
+                &worker_control,
+            )?;
+            Ok(())
+        })();
+        PackResult {
+            packs: snapshot.packs,
+            mounts,
+            result,
+        }
+    });
+    Ok(PackActive {
+        id: job.id,
+        control,
+        events,
+        thread,
+        started: Instant::now(),
+    })
+}
+
+#[cfg(feature = "pack-mount")]
+fn storage_parent(root: &Path, store: &Path) -> Result<PathBuf> {
+    ensure!(
+        store.is_absolute() && store.file_name().is_some(),
+        "Choose an absolute store path with a name"
+    );
+    ensure!(
+        !store
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir)),
+        "The store path cannot contain parent-directory steps"
+    );
+    let parent = store.parent().context("The store needs a parent folder")?;
+    let ancestor = parent
+        .ancestors()
+        .find(|path| path.exists())
+        .context("The storage drive is unavailable")?
+        .canonicalize()?;
+    ensure!(
+        !ancestor.starts_with(root),
+        "Keep the store outside the game folder"
+    );
+    std::fs::create_dir_all(parent)?;
+    let parent = parent.canonicalize()?;
+    ensure!(
+        !parent.starts_with(root),
+        "Keep the store outside the game folder"
+    );
+    Ok(parent)
+}
+
+#[cfg(feature = "pack-mount")]
+fn run_pack_task(
+    task: &PackTask,
+    game: &Game,
+    snapshot: &mut Snapshot,
+    db: &Connection,
+    mounts: &mut Vec<PackMount>,
+    control: &PackControl,
+) -> Result<()> {
+    use crate::pack::Observer;
+    control.checkpoint()?;
+    match task {
+        PackTask::Create { store } => {
+            let root = validate_folder(&game.install_dir)?;
+            let parent = storage_parent(&root, store)?;
+            crate::pack::create_shared_observed(
+                &root,
+                store,
+                &parent.join(".flummox-pool"),
+                crate::pack::Options::maximum(),
+                &control.cancel,
+                control,
+            )?;
+            Ok(())
+        }
+        PackTask::Activate {
+            store,
+            create,
+            qualification,
+        } => {
+            let root = validate_folder(&game.install_dir)?;
+            ensure!(
+                crate::busy::process_using(&root, &crate::busy::ProcFs::new()).is_none(),
+                "Close the game and launcher activity before activating storage"
+            );
+            if let Some(report) = qualification {
+                control.started(0, 0, "Checking game compatibility");
+                let corpus = crate::compatibility::corpus(&root, &control.cancel, control)?;
+                ensure!(
+                    report.corpus == corpus
+                        && report.qualifies(
+                            game,
+                            &corpus.sha256,
+                            crate::compatibility::Policy::default()
+                        ),
+                    "Compatibility no longer matches this game; analyze it again"
+                );
+            }
+            let parent = storage_parent(&root, store)?;
+            if *create && !store.exists() {
+                let pool = parent.join(".flummox-pool");
+                crate::pack::create_shared_observed(
+                    &root,
+                    store,
+                    &pool,
+                    crate::pack::Options::maximum(),
+                    &control.cancel,
+                    control,
+                )?;
+            }
+            let mut writes_name = store.as_os_str().to_os_string();
+            writes_name.push(".writes");
+            let writes = PathBuf::from(writes_name);
+            let install =
+                crate::pack::prepare_observed(&root, store, &writes, &control.cancel, control)?;
+            if let Some(report) = qualification {
+                let corpus = crate::compatibility::corpus(&root, &control.cancel, control)?;
+                ensure!(
+                    report.corpus == corpus
+                        && report.qualifies(
+                            game,
+                            &corpus.sha256,
+                            crate::compatibility::Policy::default()
+                        ),
+                    "Game files changed; automatic activation was stopped"
+                );
+            }
+            control
+                .transaction("Activating storage; the original remains available for rollback")?;
+            activate_prepared(snapshot, db, mounts, install)
+        }
+        PackTask::Compact => {
+            pack_compact_observed(snapshot, db, mounts, &game.install_dir, control)
+        }
+        PackTask::Restore => {
+            control.transaction("Restoring files; this step must finish before stopping")?;
+            pack_rollback(snapshot, db, mounts, &game.install_dir)
+        }
+        PackTask::Reclaim => {
+            control.transaction("Reclaiming the retained original; this step must finish")?;
+            pack_reclaim(snapshot, db, &game.install_dir)
+        }
+        PackTask::Prune => {
+            control.transaction("Reclaiming the previous version; this step must finish")?;
+            pack_prune(snapshot, db, &game.install_dir)
+        }
+    }
+}
+
+#[cfg(not(feature = "pack-mount"))]
+fn run_pack_task(
+    _task: &PackTask,
+    _game: &Game,
+    _snapshot: &mut Snapshot,
+    _db: &Connection,
+    _mounts: &mut Vec<PackMount>,
+    _control: &PackControl,
+) -> Result<()> {
+    bail!("Build Flummox with pack mounting to run storage jobs")
+}
+
+fn poll_pack(
+    active: &mut Option<PackActive>,
+    snapshot: &mut Snapshot,
+    db: &Connection,
+    mounts: &mut Vec<PackMount>,
+) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    if let Some(running) = active.as_ref() {
+        let job = snapshot
+            .jobs
+            .iter_mut()
+            .find(|job| job.id == running.id)
+            .context("Storage job is missing")?;
+        if job.phase == Phase::Cancelling || job.phase == Phase::Cancelled {
+            running.control.cancel.store(true, Ordering::SeqCst);
+        }
+        let paused = job.user_paused || snapshot.gaming.is_some() || !job.game.state.is_idle();
+        running.control.paused.store(paused, Ordering::Relaxed);
+        job.pack_interruptible = running.control.interruptible.load(Ordering::SeqCst);
+        for update in running.events.try_iter() {
+            let _finished = event(job, WorkerEvent::Progress(update), db)?;
+        }
+        job.elapsed = running.started.elapsed().as_secs();
+        save(db, job)?;
+    }
+    if active
+        .as_ref()
+        .is_some_and(|running| running.thread.is_finished())
+        && let Some(running) = active.take()
+    {
+        let job = snapshot
+            .jobs
+            .iter_mut()
+            .find(|job| job.id == running.id)
+            .context("Storage job is missing")?;
+        match running.thread.join() {
+            Ok(result) => {
+                snapshot.packs = result.packs;
+                *mounts = result.mounts;
+                job.phase = if result.result.is_ok() {
+                    Phase::Completed
+                } else if running.control.cancel.load(Ordering::SeqCst) {
+                    Phase::Cancelled
+                } else {
+                    Phase::Failed
+                };
+                job.message = match result.result {
+                    Ok(()) => "Storage job finished".into(),
+                    Err(error) => error.to_string(),
+                };
+            }
+            Err(_) => {
+                job.phase = Phase::Interrupted;
+                job.message = "Storage worker stopped; review recovery before retrying".into();
+            }
+        }
+        job.pack_interruptible = false;
+        save(db, job)?;
+        #[cfg(feature = "pack-mount")]
+        save_packs(db, snapshot)?;
+        super::autostart::configure(
+            &binary()?,
+            snapshot.libraries.iter().any(|l| l.automatic) || !snapshot.packs.is_empty(),
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn run() -> Result<()> {
     let dir = state_dir()?;
     let lock = std::fs::OpenOptions::new()
@@ -1155,6 +1620,7 @@ pub(super) fn run() -> Result<()> {
         }
     }
     let mut active: Option<Active> = None;
+    let mut pack_active: Option<PackActive> = None;
     let mut last_scan = Instant::now() - Duration::from_secs(60);
     let mut known: Observations = db
         .query_row("SELECT data FROM settings WHERE id=2", [], |r| {
@@ -1226,12 +1692,26 @@ pub(super) fn run() -> Result<()> {
                 last_client = Instant::now();
                 stream.set_read_timeout(Some(Duration::from_millis(500)))?;
                 stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+                let mut restart = false;
                 let result = (|| -> Result<()> {
                     let message: Request = read_message(&mut BufReader::new(&mut stream))?;
                     ensure!(
-                        message.version == VERSION,
+                        message.version == VERSION || matches!(&message.command, Command::Restart),
                         "Worker protocol changed. Restart Flummox."
                     );
+                    if matches!(&message.command, Command::Restart) {
+                        ensure!(
+                            active.is_none()
+                                && pack_active.is_none()
+                                && !snapshot.jobs.iter().any(|job| job.phase.active()),
+                            "Finish or cancel queued jobs before restarting the background worker."
+                        );
+                        ensure!(
+                            snapshot.packs.is_empty(),
+                            "Restore mounted Maximum Space games before restarting the background worker."
+                        );
+                        restart = true;
+                    }
                     let startup_changed = matches!(
                         &message.command,
                         Command::Library(_)
@@ -1245,12 +1725,31 @@ pub(super) fn run() -> Result<()> {
                         )),
                         _ => None,
                     };
+                    if matches!(
+                        &message.command,
+                        Command::PackActivate { .. }
+                            | Command::PackRollback { .. }
+                            | Command::PackReclaim { .. }
+                            | Command::PackCompact { .. }
+                            | Command::PackPrune { .. }
+                    ) {
+                        ensure!(
+                            active.is_none() && pack_active.is_none(),
+                            "A job is running. Wait for it to finish before changing storage."
+                        );
+                    }
+                    if let Some(running) = &pack_active
+                        && matches!(&message.command, Command::Pause { id, .. } | Command::Cancel(id) if *id == running.id)
+                    {
+                        running.control.request_control(&message.command)?;
+                    }
                     apply(
                         message.command,
                         &mut snapshot,
                         &db,
                         &mut active,
                         &mut mounts,
+                        pack_active.as_ref().map(|running| running.id),
                     )?;
                     if let Some((id, excluded)) = exclusion {
                         if excluded {
@@ -1278,6 +1777,7 @@ pub(super) fn run() -> Result<()> {
                     }
                     Ok(())
                 })();
+                let restart = restart && result.is_ok();
                 let response = Response {
                     version: VERSION,
                     snapshot: result.as_ref().ok().map(|_| snapshot.clone()),
@@ -1286,6 +1786,10 @@ pub(super) fn run() -> Result<()> {
                 let _sent = serde_json::to_writer(&mut stream, &response)
                     .map_err(std::io::Error::other)
                     .and_then(|_| stream.write_all(b"\n"));
+                if restart {
+                    std::fs::remove_file(&socket)?;
+                    return Ok(());
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => return Err(e.into()),
@@ -1334,7 +1838,26 @@ pub(super) fn run() -> Result<()> {
                 let _reaped = a.child.wait();
             });
         }
-        if active.is_none() && snapshot.gaming.is_none() {
+        if let Some(running) = &pack_active
+            && let Some(job) = snapshot.jobs.iter_mut().find(|job| job.id == running.id)
+        {
+            if let Some(current) = current_game(&job.game, &games) {
+                job.game = current.clone();
+            }
+            if is_excluded(&job.game, &snapshot.excluded)
+                && running
+                    .control
+                    .interruptible
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                running
+                    .control
+                    .cancel
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        poll_pack(&mut pack_active, &mut snapshot, &db, &mut mounts)?;
+        if active.is_none() && pack_active.is_none() && snapshot.gaming.is_none() {
             let next = snapshot
                 .jobs
                 .iter()
@@ -1359,6 +1882,23 @@ pub(super) fn run() -> Result<()> {
                 };
                 job.message = "Preparing files".into();
                 save(&db, job)?;
+                if job.operation == Operation::Pack {
+                    match start_pack(
+                        job,
+                        &snapshot.packs,
+                        &snapshot.libraries,
+                        std::mem::take(&mut mounts),
+                        &dir.join("queue.sqlite"),
+                    ) {
+                        Ok(running) => pack_active = Some(running),
+                        Err(error) => {
+                            job.phase = Phase::Failed;
+                            job.message = error.to_string();
+                            save(&db, job)?;
+                        }
+                    }
+                    continue;
+                }
                 match start(job, &db) {
                     Ok(a) => active = Some(a),
                     Err(e) => {
@@ -1388,13 +1928,15 @@ pub(super) fn run() -> Result<()> {
                 }
             }
         }
-        if mounts.len() < snapshot.packs.len()
+        if pack_active.is_none()
+            && mounts.len() < snapshot.packs.len()
             && last_pack_recovery.elapsed() >= Duration::from_secs(5)
         {
             recover_packs(&mut snapshot, &db, &mut mounts)?;
             last_pack_recovery = Instant::now();
         }
         if active.is_none()
+            && pack_active.is_none()
             && !snapshot.jobs.iter().any(|j| j.phase.active())
             && !snapshot.libraries.iter().any(|l| l.automatic)
             && snapshot.packs.is_empty()
@@ -1502,6 +2044,7 @@ mod tests {
             &db,
             &mut None,
             &mut mounts,
+            None,
         )
         .ctx("save theme")?;
         apply(
@@ -1510,6 +2053,7 @@ mod tests {
             &db,
             &mut None,
             &mut mounts,
+            None,
         )
         .ctx("save motion")?;
         drop(db);
@@ -1603,6 +2147,7 @@ mod tests {
             &db,
             &mut None,
             &mut mounts,
+            None,
         )
         .ctx("exclude")?;
         check(
@@ -1616,6 +2161,7 @@ mod tests {
                 &db,
                 &mut None,
                 &mut mounts,
+                None,
             )
             .is_err(),
             "retry cannot bypass exclusion",
@@ -1716,6 +2262,92 @@ mod tests {
             count,
             0,
             "interrupted undo cannot revive old compression receipts",
+        )
+    }
+    #[test]
+    fn pack_controls_and_retries_preserve_durable_task_parameters() -> TestResult {
+        use crate::pack::Observer;
+        let control = PackControl {
+            interruptible: std::sync::atomic::AtomicBool::new(true),
+            ..Default::default()
+        };
+        control
+            .request_control(&Command::Cancel(1))
+            .ctx("cancel preparing storage")?;
+        check(
+            control.checkpoint().is_err(),
+            "cancel is observed at the next checkpoint",
+        )?;
+        let control = PackControl {
+            interruptible: std::sync::atomic::AtomicBool::new(false),
+            ..Default::default()
+        };
+        check(
+            control.request_control(&Command::Cancel(1)).is_err(),
+            "transaction cannot be cancelled midway",
+        )?;
+        let temp = tempfile::tempdir().ctx("durable pack queue")?;
+        let source = temp.path().join("game");
+        std::fs::create_dir(&source).ctx("fixture game")?;
+        let database = temp.path().join("queue.sqlite");
+        let (db, mut snapshot) = open_store(&database).ctx("queue")?;
+        let game = Game {
+            id: crate::model::GameId::new(crate::model::Launcher::Manual, "storage"),
+            also: vec![],
+            title: "Storage fixture".into(),
+            install_dir: source,
+            build: Some("1".into()),
+            size_hint: Some(0),
+            state: crate::model::InstallState::Idle,
+            is_tool: false,
+        };
+        let task = PackTask::Create {
+            store: temp.path().join("store"),
+        };
+        enqueue_job(
+            &mut snapshot,
+            game,
+            Operation::Pack,
+            CompressOpts::default(),
+            Some(task.clone()),
+            &db,
+        )
+        .ctx("enqueue pack")?;
+        let id = snapshot.jobs.first().ctx("job")?.id;
+        apply(
+            Command::Pause { id, paused: true },
+            &mut snapshot,
+            &db,
+            &mut None,
+            &mut Vec::new(),
+            None,
+        )
+        .ctx("pause queued task")?;
+        drop(db);
+        let (db, mut snapshot) = open_store(&database).ctx("restart queue")?;
+        check_eq(
+            snapshot.jobs.first().ctx("restored task")?.pack.clone(),
+            Some(task.clone()),
+            "paths and task survive restart",
+        )?;
+        apply(
+            Command::Retry(id),
+            &mut snapshot,
+            &db,
+            &mut None,
+            &mut Vec::new(),
+            None,
+        )
+        .ctx("retry interrupted preparation")?;
+        check_eq(
+            snapshot.jobs.last().ctx("retry")?.pack.clone(),
+            Some(task),
+            "retry keeps storage destination",
+        )?;
+        check_eq(
+            snapshot.jobs.last().ctx("retry phase")?.phase,
+            Phase::Queued,
+            "retry is queued",
         )
     }
 }

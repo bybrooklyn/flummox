@@ -721,7 +721,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                 .find(|install| install.game_path == game.install_dir)
             {
                 details = details
-                    .push(text("Writable pack store").size(16))
+                    .push(text("Maximum Space storage").size(16))
                     .push(theme::muted(format!(
                         "{} · {}",
                         install.phase.label(),
@@ -807,6 +807,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                         ]
                         .spacing(8),
                     )
+                    .push(theme::muted(if install.backup_path.is_some() { "The original is retained. Test the game before reclaiming it; disk space is released when you reclaim." } else { "Restore rebuilds ordinary files from the store and updates. Keep enough free space for the restored game." }))
                     .push(
                         row![
                             secondary_maybe(
@@ -820,7 +821,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                             if install.backup_path.is_some() {
                                 if state.confirm_reclaim.contains(&id) {
                                     secondary_maybe(
-                                        "Confirm delete original",
+                                        "Confirm reclaim original",
                                         (!state.pending.contains(&id)).then(|| {
                                             Message::Send(Command::PackReclaim {
                                                 game_path: game.install_dir.clone(),
@@ -842,15 +843,18 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                     );
             } else {
                 let path_id = id.clone();
-                let store = state.pack_paths.get(&id).cloned().unwrap_or_default();
+                let store = state.store_path(game).display().to_string();
                 details = details
-                    .push(text("Writable pack store").size(16))
+                    .push(text("Maximum Space storage").size(16))
                     .push(theme::muted("Verified chunks can be shared across games"))
                     .push(
                         text_input("Store path", &store)
                             .on_input(move |path| Message::PackPath(path_id.clone(), path))
                             .padding(10),
                     )
+                    .push(secondary_maybe("Choose storage folder…", (!state.picker_busy).then(|| Message::Browse(super::dialog::Target::Storage(id.clone())))))
+                    .push(theme::muted("1. Create and verify a store. 2. Launch the game to test it. 3. Reclaim the original to release space."))
+                    .push(theme::muted("Creation needs room for the store alongside the original. Updates use additional space; restoring after reclaim needs room for ordinary files."))
                     .push(
                         row![
                             action_maybe(
@@ -858,6 +862,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                                 (!state.pending.contains(&id))
                                     .then(|| Message::PackActivate(id.clone(), true))
                             ),
+                            secondary_maybe("Create store only", (!state.pending.contains(&id)).then(|| Message::PackCreate(id.clone()))),
                             secondary_maybe(
                                 "Activate existing",
                                 (!state.pending.contains(&id))
@@ -893,6 +898,11 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                     )))
                     .push(theme::muted(choice.reasons.join("\n")));
             }
+            details = details.push(theme::muted(if est.maximum_qualified { "Maximum Space qualification matches this build and its installed files" } else { "Automatic Maximum Space requires an imported qualification and matching installed files" }));
+            details = details.push(secondary_maybe(
+                "Import compatibility report…",
+                (!state.picker_busy).then_some(Message::Browse(super::dialog::Target::Report)),
+            ));
             details = details.push(theme::muted(format!(
                 "Sampled {} · {} inspected · {} skipped. Estimated saving{}.",
                 size(est.sampled),
@@ -904,6 +914,9 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                     ""
                 }
             )));
+            if est.small_files.files > 0 {
+                details = details.push(theme::muted(format!("Small-file sample: {} across {} files · grouping saved an extra {} in {} files. This is separate from the estimate above.", size(est.small_files.bytes), est.small_files.files, size(est.small_files.extra_payload_saving), est.small_files.grouped_files)));
+            }
             let evidence = est.format_evidence;
             details = details.push(theme::muted(format!(
                 "Formats: {} known · {} unknown · {} encoded · {} containers · {} raw{}",
@@ -950,8 +963,10 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
 fn progress<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
     let fraction = if job.bytes_total > 0 {
         job.bytes_done as f32 / job.bytes_total as f32
+    } else if job.files_total > 0 {
+        job.files_done as f32 / job.files_total as f32
     } else {
-        0.
+        return Space::new().height(0).into();
     };
     progress_bar(
         0.0..=1.0,
@@ -971,7 +986,7 @@ fn progress<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
 }
 fn job_row<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
     let mut controls = row![].spacing(8);
-    if job.phase.active() {
+    if job.phase.active() && (job.operation != Operation::Pack || job.pack_interruptible) {
         controls = controls
             .push(secondary(
                 if job.user_paused { "Resume" } else { "Pause" },
@@ -981,13 +996,18 @@ fn job_row<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
                 }),
             ))
             .push(secondary("Cancel", Message::Send(Command::Cancel(job.id))));
-    } else if job.phase != Phase::Completed {
+    } else if !job.phase.active() && job.phase != Phase::Completed {
         controls = controls.push(secondary("Resume", Message::Send(Command::Retry(job.id))));
     }
     let kind = match job.operation {
         Operation::Analyze => "Analysis",
         Operation::Compress => "Compression",
         Operation::Decompress => "Decompression",
+        Operation::Pack => job
+            .pack
+            .as_ref()
+            .map(|task| task.label())
+            .unwrap_or("Maximum Space"),
     };
     let mut content = column![
         row![
@@ -997,13 +1017,19 @@ fn job_row<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
         progress(state, job),
         theme::muted(&job.message),
         row![
-            theme::muted(format!(
-                "{} / {} files · {} processed · {}s",
-                job.files_done,
-                job.files_total,
-                size(job.bytes_done),
-                job.elapsed
-            ))
+            theme::muted(if job.files_total > 0 {
+                format!(
+                    "{} / {} items · {} processed · {}s",
+                    job.files_done,
+                    job.files_total,
+                    size(job.bytes_done),
+                    job.elapsed
+                )
+            } else if job.bytes_done > 0 {
+                format!("{} processed · {}s", size(job.bytes_done), job.elapsed)
+            } else {
+                format!("{}s elapsed", job.elapsed)
+            })
             .width(Length::Fill),
             controls
         ]
@@ -1096,6 +1122,11 @@ fn drives(state: &State) -> Element<'_, Message> {
                         .on_input(Message::Folder)
                         .padding(10)
                         .width(Length::Fill),
+                    secondary_maybe(
+                        "Browse…",
+                        (!state.picker_busy)
+                            .then_some(Message::Browse(super::dialog::Target::Game))
+                    ),
                     action("Add folder", Message::AddFolder)
                 ]
                 .spacing(8),
@@ -1171,6 +1202,11 @@ fn settings_page(state: &State) -> Element<'_, Message> {
         .count();
     column![
         theme::page_title("Settings"),
+        panel(column![
+            text("Background worker").size(17),
+            theme::muted("After an upgrade, restart when the queue is empty and Maximum Space games have been restored."),
+            secondary("Restart worker", Message::Send(Command::Restart))
+        ].spacing(10)),
         panel(
             column![
                 text("Appearance").size(17),
@@ -1243,6 +1279,13 @@ fn settings_page(state: &State) -> Element<'_, Message> {
         ),
         panel(
             column![
+                text("Maximum Space compatibility").size(17),
+                theme::muted(format!("{} local reports. Analysis checks the exact build and installed files before enabling automatic activation.", state.reports.len())),
+                secondary_maybe("Import report…", (!state.picker_busy).then_some(Message::Browse(super::dialog::Target::Report)))
+            ].spacing(8)
+        ),
+        panel(
+            column![
                 text("About Flummox").size(17),
                 theme::muted(format!("Version {}", env!("CARGO_PKG_VERSION")))
             ]
@@ -1258,6 +1301,11 @@ fn completed_job_row(job: &Job) -> Element<'_, Message> {
         Operation::Analyze => "Analysis",
         Operation::Compress => "Compression",
         Operation::Decompress => "Decompression",
+        Operation::Pack => job
+            .pack
+            .as_ref()
+            .map(|task| task.label())
+            .unwrap_or("Maximum Space"),
     };
     panel(
         row![

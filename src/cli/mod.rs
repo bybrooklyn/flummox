@@ -155,10 +155,20 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum JobAction {
-    Pause { id: i64 },
-    Resume { id: i64 },
-    Cancel { id: i64 },
-    Retry { id: i64 },
+    /// Restart the background worker when jobs and mounted installs are idle.
+    Restart,
+    Pause {
+        id: i64,
+    },
+    Resume {
+        id: i64,
+    },
+    Cancel {
+        id: i64,
+    },
+    Retry {
+        id: i64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -287,6 +297,7 @@ pub fn run() -> Result<()> {
             use crate::jobs::Command as JobCommand;
             let command = match action {
                 None => JobCommand::Snapshot,
+                Some(JobAction::Restart) => JobCommand::Restart,
                 Some(JobAction::Pause { id }) => JobCommand::Pause { id, paused: true },
                 Some(JobAction::Resume { id }) => JobCommand::Pause { id, paused: false },
                 Some(JobAction::Cancel { id }) => JobCommand::Cancel(id),

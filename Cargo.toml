@@ -110,3 +110,8 @@ debug = "line-tables-only"
 # real data.
 [profile.dev.package.zstd-sys]
 opt-level = 3
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# Render the real desktop widgets without a display server for SSH review.
+iced_tiny_skia = { version = "0.14", features = ["image"] }
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }

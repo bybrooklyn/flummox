@@ -179,6 +179,16 @@ mod enabled {
         writes: &Path,
         cancel: &AtomicBool,
     ) -> Result<Install> {
+        prepare_observed(game, store, writes, cancel, &crate::pack::NoObserver)
+    }
+
+    pub(crate) fn prepare_observed(
+        game: &Path,
+        store: &Path,
+        writes: &Path,
+        cancel: &AtomicBool,
+        observer: &dyn crate::pack::Observer,
+    ) -> Result<Install> {
         let game = game.canonicalize().context("Finding the installed game")?;
         ensure!(game.is_dir(), "The game path must be a directory");
         let parent = game.parent().context("The game folder has no parent")?;
@@ -195,7 +205,7 @@ mod enabled {
         validate_paths(&game, &store, &writes)?;
         let reader = Reader::open(&store).context("Validating the pack store")?;
         reader
-            .verify_directory(&game, cancel)
+            .verify_directory_observed(&game, cancel, observer)
             .context("The store no longer matches the installed game")?;
         let backup = backup_for(&game)?;
         ensure!(

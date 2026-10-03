@@ -1,6 +1,7 @@
 //! Builds a new store, verifies it, then publishes it without replacement.
 
 use super::format::*;
+use super::{NoObserver, Observer};
 use anyhow::{Context, Result, ensure};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -24,6 +25,7 @@ struct GroupParams<'a> {
     options: Options,
     cancel: &'a AtomicBool,
     pool: Option<&'a Path>,
+    observer: &'a dyn Observer,
 }
 
 fn gear(byte: u8) -> u64 {
@@ -253,6 +255,7 @@ fn group_small_files(
         {
             continue;
         }
+        params.observer.checkpoint()?;
         ensure!(
             !params.cancel.load(Ordering::Relaxed),
             "Store creation cancelled"
@@ -334,6 +337,7 @@ fn store_group(
     let mut individual_cost = 0usize;
     let mut unique = HashSet::new();
     for source in group {
+        params.observer.checkpoint()?;
         ensure!(
             !params.cancel.load(Ordering::Relaxed),
             "Store creation cancelled"
@@ -436,6 +440,7 @@ fn build_index(
     options: Options,
     cancel: &AtomicBool,
     pool: Option<&Path>,
+    observer: &dyn Observer,
     mut store: impl FnMut(u32, Codec, &[u8], [u8; 32]) -> Result<Chunk>,
 ) -> Result<(Index, Vec<Source>)> {
     let anchor = crate::safeio::Anchor::open(root)?;
@@ -449,12 +454,26 @@ fn build_index(
         chunks: Vec::new(),
     };
     let mut known = HashMap::<([u8; 32], u32), u32>::new();
+    observer.started(
+        sources
+            .iter()
+            .filter(|s| s.stamp.mode & libc::S_IFMT == libc::S_IFREG)
+            .count() as u64,
+        sources
+            .iter()
+            .filter(|s| s.stamp.mode & libc::S_IFMT == libc::S_IFREG)
+            .map(|s| s.stamp.size)
+            .sum(),
+        "Building Maximum Space store",
+    );
+    observer.checkpoint()?;
     let grouped = group_small_files(
         GroupParams {
             anchor: &anchor,
             options,
             cancel,
             pool,
+            observer,
         },
         &sources,
         &mut index,
@@ -463,7 +482,10 @@ fn build_index(
     )?;
     let mut primary_files = HashMap::<PathBuf, Kind>::new();
     let mut buffer = Vec::with_capacity(CHUNK_BYTES);
+    let mut files_done = 0u64;
+    let mut bytes_done = 0u64;
     for source in &sources {
+        observer.checkpoint()?;
         ensure!(!cancel.load(Ordering::Relaxed), "Store creation cancelled");
         let kind = if let Some(target) = &source.link {
             Kind::Symlink {
@@ -498,6 +520,7 @@ fn build_index(
             {
                 let mut reader = BufReader::with_capacity(MIN_CHUNK_BYTES, &mut file);
                 while read_content_chunk(&mut reader, &mut buffer)? {
+                    observer.checkpoint()?;
                     ensure!(!cancel.load(Ordering::Relaxed), "Store creation cancelled");
                     let bytes = buffer.as_slice();
                     let id =
@@ -517,6 +540,11 @@ fn build_index(
             primary_files.insert(source.path.clone(), kind.clone());
             kind
         };
+        if source.stamp.mode & libc::S_IFMT == libc::S_IFREG {
+            files_done += 1;
+            bytes_done = bytes_done.saturating_add(source.stamp.size);
+            observer.progress(files_done, bytes_done, "Building Maximum Space store");
+        }
         index.entries.push(Entry {
             path: source.path.clone(),
             mode: source.stamp.mode & 0o7777,
@@ -538,6 +566,16 @@ pub fn create(
     options: Options,
     cancel: &AtomicBool,
 ) -> Result<Summary> {
+    create_observed(root, output, options, cancel, &NoObserver)
+}
+
+pub fn create_observed(
+    root: &Path,
+    output: &Path,
+    options: Options,
+    cancel: &AtomicBool,
+    observer: &dyn Observer,
+) -> Result<Summary> {
     ensure!(
         (1..=22).contains(&options.level)
             && options.compare_level.is_none_or(|n| (1..=22).contains(&n)),
@@ -552,8 +590,13 @@ pub fn create(
     let mut staged = tempfile::NamedTempFile::new_in(&parent)?;
     staged.write_all(&[0; HEADER_BYTES as usize])?;
     let mut position = HEADER_BYTES;
-    let (index, sources) =
-        build_index(&root, options, cancel, None, |raw, codec, encoded, hash| {
+    let (index, sources) = build_index(
+        &root,
+        options,
+        cancel,
+        None,
+        observer,
+        |raw, codec, encoded, hash| {
             staged.write_all(encoded)?;
             let chunk = Chunk {
                 offset: position,
@@ -566,7 +609,8 @@ pub fn create(
                 .checked_add(encoded.len() as u64)
                 .context("Store size overflow")?;
             Ok(chunk)
-        })?;
+        },
+    )?;
     index.validate(position, 6)?;
     let bytes = serde_json::to_vec(&index)?;
     ensure!(
@@ -583,7 +627,10 @@ pub fn create(
     staged.write_all(blake3::hash(&bytes).as_bytes())?;
     staged.as_file().sync_all()?;
     let reader = Reader::from_file(staged.reopen()?)?;
-    reader.verify(cancel)?;
+    observer.started(0, 0, "Verifying stored bytes");
+    reader.verify_observed(cancel, observer)?;
+    observer.started(0, 0, "Checking source files before publication");
+    observer.checkpoint()?;
     ensure!(
         snapshot(&root, cancel)? == sources,
         "Source tree changed; retry after the game and launcher finish writing"
@@ -687,6 +734,17 @@ pub fn create_shared(
     options: Options,
     cancel: &AtomicBool,
 ) -> Result<Summary> {
+    create_shared_observed(root, output, pool, options, cancel, &NoObserver)
+}
+
+pub fn create_shared_observed(
+    root: &Path,
+    output: &Path,
+    pool: &Path,
+    options: Options,
+    cancel: &AtomicBool,
+    observer: &dyn Observer,
+) -> Result<Summary> {
     ensure!(
         (1..=22).contains(&options.level)
             && options
@@ -726,6 +784,7 @@ pub fn create_shared(
         options,
         cancel,
         Some(&pool),
+        observer,
         |raw, codec, encoded, hash| {
             let chunk = Chunk {
                 offset: 0,
@@ -751,7 +810,10 @@ pub fn create_shared(
     File::open(&chunks_path)?.sync_all()?;
     File::open(staged.path())?.sync_all()?;
     let reader = Reader::open(staged.path())?;
-    reader.verify(cancel)?;
+    observer.started(0, 0, "Verifying stored bytes");
+    reader.verify_observed(cancel, observer)?;
+    observer.started(0, 0, "Checking source files before publication");
+    observer.checkpoint()?;
     ensure!(
         snapshot(&root, cancel)? == sources,
         "Source tree changed; retry after the game and launcher finish writing"
@@ -840,4 +902,123 @@ fn encode(bytes: &[u8], options: Options) -> Result<(Codec, Vec<u8>)> {
     } else {
         Ok((Codec::Raw, bytes.to_vec()))
     }
+}
+
+/// Compares grouped and separate encoding on a bounded sample, without writing a store.
+pub fn sample_small_files(
+    root: &Path,
+    inventory: &crate::inventory::Inventory,
+    budget: u64,
+    cancel: &AtomicBool,
+    observer: &dyn Observer,
+) -> Result<SmallFileSample> {
+    let anchor = crate::safeio::Anchor::open(root)?;
+    ensure!(
+        anchor.fully_resolved(),
+        "Safe path resolution is unavailable"
+    );
+    let mut files: Vec<_> = inventory
+        .files
+        .iter()
+        .filter(|file| (1..SMALL_FILE_LIMIT).contains(&file.size))
+        .collect();
+    files.sort_by(|a, b| a.rel.cmp(&b.rel));
+    let mut sources = Vec::new();
+    let mut bytes = 0u64;
+    let mut seen = HashSet::new();
+    for entry in files {
+        observer.checkpoint()?;
+        ensure!(
+            !cancel.load(Ordering::Relaxed),
+            "Small-file sampling stopped"
+        );
+        if bytes.saturating_add(entry.size) > budget {
+            continue;
+        }
+        let file = anchor.open_file(&entry.rel)?;
+        ensure!(
+            entry.matches_file(&file)?,
+            "File changed during small-file sampling"
+        );
+        let metadata = file.metadata()?;
+        if !seen.insert((metadata.dev(), metadata.ino())) {
+            continue;
+        }
+        sources.push(Source {
+            path: entry.rel.clone(),
+            stamp: Stamp::from(&metadata),
+            link: None,
+            xattrs: vec![],
+            hardlink_to: None,
+        });
+        bytes += entry.size;
+    }
+    let mut index = Index {
+        entries: vec![],
+        chunks: vec![],
+    };
+    let mut known = HashMap::new();
+    let options = Options {
+        level: 19,
+        compare_level: None,
+    };
+    let groups = group_small_files(
+        GroupParams {
+            anchor: &anchor,
+            options,
+            cancel,
+            pool: None,
+            observer,
+        },
+        &sources,
+        &mut index,
+        &mut known,
+        &mut |raw, codec, encoded, hash| {
+            Ok(Chunk {
+                raw,
+                codec,
+                stored: u32::try_from(encoded.len())?,
+                offset: 0,
+                hash,
+            })
+        },
+    )?;
+    let mut separate = 0u64;
+    for source in &sources {
+        if !groups.contains_key(&source.path) {
+            continue;
+        }
+        observer.checkpoint()?;
+        ensure!(
+            !cancel.load(Ordering::Relaxed),
+            "Small-file sampling stopped"
+        );
+        let mut file = anchor.open_file(&source.path)?;
+        let mut data = vec![0; usize::try_from(source.stamp.size)?];
+        file.read_exact(&mut data)?;
+        ensure!(
+            Stamp::from(&file.metadata()?) == source.stamp,
+            "File changed during small-file sampling"
+        );
+        separate += encode(&data, options)?.1.len() as u64;
+    }
+    let grouped: u64 = index
+        .chunks
+        .iter()
+        .map(|chunk| u64::from(chunk.stored))
+        .sum();
+    Ok(SmallFileSample {
+        files: sources.len() as u64,
+        bytes,
+        grouped_files: groups.len() as u64,
+        extra_payload_saving: separate.saturating_sub(grouped),
+    })
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SmallFileSample {
+    pub files: u64,
+    pub bytes: u64,
+    pub grouped_files: u64,
+    pub extra_payload_saving: u64,
 }

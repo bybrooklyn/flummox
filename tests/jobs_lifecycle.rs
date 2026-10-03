@@ -33,6 +33,7 @@ fn start(home: &Path) -> Result<Service, String> {
         .arg("__coordinator")
         .env("HOME", home)
         .env("XDG_STATE_HOME", home.join("state"))
+        .env("XDG_CONFIG_HOME", home.join("config"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -126,6 +127,10 @@ fn managed_pack_remounts_after_coordinator_restart_and_keeps_updates() -> TestRe
         },
     )?;
     check_eq(snapshot.packs.len(), 1, "activation is durable")?;
+    check(
+        request(&home, Request::Restart).is_err(),
+        "restart refuses to interrupt mounted game reads",
+    )?;
     std::fs::write(game.join("data"), b"launcher update").ctx("mounted update")?;
     service.stop()?;
 
@@ -448,5 +453,296 @@ fn closing_clients_keeps_jobs_and_restart_preserves_results() -> TestResult {
             .is_excluded(&GameId::new(Launcher::Manual, "fixture"))
             .ctx("restored")?,
         "restoring clears both views",
+    )
+}
+
+#[cfg(feature = "pack-mount")]
+#[test]
+fn queued_store_creation_survives_clients_and_keeps_source_bytes() -> TestResult {
+    use flummox::jobs::PackTask;
+    let temp = tempfile::tempdir().ctx("isolated storage queue")?;
+    let home = temp.path().join("home");
+    let source = temp.path().join("game");
+    std::fs::create_dir_all(&home).ctx("home")?;
+    std::fs::create_dir(&source).ctx("game")?;
+    let payload: Vec<_> = (0..128 * 1024u32)
+        .map(|n| (n.wrapping_mul(7919) >> 7) as u8)
+        .collect();
+    std::fs::write(source.join("assets.bin"), &payload).ctx("source bytes")?;
+    let store = temp.path().join("storage/game.store");
+    let _service = start(&home)?;
+    let game = Game {
+        id: GameId::new(Launcher::Manual, "pack-fixture"),
+        also: vec![],
+        title: "Pack fixture".into(),
+        install_dir: source.clone(),
+        state: InstallState::Idle,
+        size_hint: Some(payload.len() as u64),
+        build: Some("1".into()),
+        is_tool: false,
+    };
+    let snapshot = request(
+        &home,
+        Request::EnqueuePack {
+            game,
+            task: PackTask::Create {
+                store: store.clone(),
+            },
+        },
+    )?;
+    let id = snapshot.jobs.last().ctx("queued pack job")?.id;
+    // Every request opens and closes its own socket; the coordinator owns the work.
+    let result = finished(&home, id)?;
+    check_eq(
+        result.phase,
+        Phase::Completed,
+        format!("queued build: {}", result.message),
+    )?;
+    check(store.is_dir(), "verified store published by coordinator")?;
+    check_eq(
+        std::fs::read(source.join("assets.bin")).ctx("source after job")?,
+        payload.clone(),
+        "source stays intact",
+    )?;
+    let reader = flummox::pack::Reader::open(&store).ctx("published store")?;
+    reader
+        .verify(&std::sync::atomic::AtomicBool::new(false))
+        .ctx("verify queued result")?;
+    check_eq(
+        reader
+            .read(Path::new("assets.bin"), 0, payload.len())
+            .ctx("stored bytes")?,
+        payload,
+        "queued creation preserves every byte",
+    )
+}
+
+#[cfg(feature = "pack-mount")]
+#[test]
+fn automatic_storage_rejects_a_mismatched_qualification_before_creation() -> TestResult {
+    use flummox::{
+        compatibility::{Checks, Corpus, GameBuild, Platform, Report, StorageMode, StorageResult},
+        jobs::PackTask,
+    };
+    let temp = tempfile::tempdir().ctx("qualification queue")?;
+    let home = temp.path().join("home");
+    let source = temp.path().join("game");
+    std::fs::create_dir_all(&home).ctx("home")?;
+    std::fs::create_dir(&source).ctx("source")?;
+    std::fs::write(source.join("asset"), b"abc").ctx("source bytes")?;
+    let _service = start(&home)?;
+    let game = Game {
+        id: GameId::new(Launcher::Manual, "qualified-fixture"),
+        also: vec![],
+        title: "Qualified fixture".into(),
+        install_dir: source.clone(),
+        state: InstallState::Idle,
+        size_hint: Some(3),
+        build: Some("1".into()),
+        is_tool: false,
+    };
+    let report = Report {
+        version: flummox::compatibility::VERSION,
+        game: GameBuild {
+            launcher: Launcher::Manual,
+            key: "qualified-fixture".into(),
+            build: "1".into(),
+        },
+        corpus: Corpus {
+            sha256: "a".repeat(64),
+            files: 1,
+            bytes: 3,
+        },
+        platform: Platform::Linux,
+        mode: StorageMode::MaximumSpace,
+        checks: Checks {
+            bytes_verified: true,
+            metadata_verified: true,
+            writable_update_verified: true,
+            rollback_verified: true,
+            launched: true,
+            anti_cheat_issue: false,
+            gameplay_issue: false,
+            baseline_load_ms: 1000,
+            candidate_load_ms: 1000,
+        },
+        storage: StorageResult {
+            logical_bytes: 3,
+            allocated_before: 4096,
+            allocated_after: 2048,
+            random_read_p95_ns: None,
+        },
+        flummox_version: env!("CARGO_PKG_VERSION").into(),
+    };
+    let store = temp.path().join("storage/game.store");
+    let snapshot = request(
+        &home,
+        Request::EnqueuePack {
+            game,
+            task: PackTask::Activate {
+                store: store.clone(),
+                create: true,
+                qualification: Some(Box::new(report)),
+            },
+        },
+    )?;
+    let job = finished(&home, snapshot.jobs.last().ctx("qualification job")?.id)?;
+    check_eq(
+        job.phase,
+        Phase::Failed,
+        "mismatched corpus does not activate",
+    )?;
+    check(
+        job.message.contains("Compatibility no longer matches"),
+        format!("clear qualification error: {}", job.message),
+    )?;
+    check(
+        !store.exists(),
+        "no store created for mismatched automatic qualification",
+    )?;
+    check_eq(
+        std::fs::read(source.join("asset")).ctx("retained source")?,
+        b"abc".to_vec(),
+        "original remains intact",
+    )
+}
+
+#[cfg(feature = "pack-mount")]
+#[test]
+fn queued_activation_compaction_reclaim_and_restore_preserve_updates() -> TestResult {
+    use flummox::jobs::PackTask;
+    if !Path::new("/dev/fuse").exists() {
+        check(
+            std::env::var_os("FLUMMOX_REQUIRE_FUSE").is_none(),
+            "FUSE required for queued lifecycle",
+        )?;
+        eprintln!("skipped: queued storage lifecycle requires /dev/fuse");
+        return Ok(());
+    }
+    let temp = tempfile::tempdir().ctx("queued pack lifecycle")?;
+    let home = temp.path().join("home");
+    let source = temp.path().join("game");
+    std::fs::create_dir_all(&home).ctx("home")?;
+    std::fs::create_dir(&source).ctx("game")?;
+    std::fs::write(source.join("asset"), b"original").ctx("original")?;
+    let _service = start(&home)?;
+    let game = Game {
+        id: GameId::new(Launcher::Manual, "queued-pack"),
+        also: vec![],
+        title: "Queued pack".into(),
+        install_dir: source.clone(),
+        state: InstallState::Idle,
+        size_hint: Some(8),
+        build: Some("1".into()),
+        is_tool: false,
+    };
+    let store = temp.path().join("storage/game.store");
+    let enqueue = |task: PackTask| -> Result<Snapshot, String> {
+        let snapshot = request(
+            &home,
+            Request::EnqueuePack {
+                game: game.clone(),
+                task,
+            },
+        )?;
+        let job = finished(&home, snapshot.jobs.last().ctx("queued storage job")?.id)?;
+        check_eq(
+            job.phase,
+            Phase::Completed,
+            format!("storage operation: {}", job.message),
+        )?;
+        request(&home, Request::Snapshot)
+    };
+    let activated = enqueue(PackTask::Activate {
+        store,
+        create: true,
+        qualification: None,
+    })?;
+    let backup = activated
+        .packs
+        .first()
+        .ctx("activated install")?
+        .backup_path
+        .as_ref()
+        .ctx("retained original")?;
+    check(backup.is_dir(), "activation retains original")?;
+    std::fs::write(source.join("asset"), b"patched").ctx("mounted patch")?;
+    std::fs::write(source.join("download"), b"new content").ctx("mounted new file")?;
+    let compacted = enqueue(PackTask::Compact)?;
+    check(
+        compacted
+            .packs
+            .first()
+            .ctx("compacted install")?
+            .previous_store_path
+            .is_some(),
+        "compaction retains previous version",
+    )?;
+    enqueue(PackTask::Prune)?;
+    enqueue(PackTask::Reclaim)?;
+    let restored = enqueue(PackTask::Restore)?;
+    check(
+        restored.packs.is_empty(),
+        "ordinary files leave managed storage",
+    )?;
+    check_eq(
+        std::fs::read(source.join("asset")).ctx("restored patch")?,
+        b"patched".to_vec(),
+        "patch survives every queued transaction",
+    )?;
+    check_eq(
+        std::fs::read(source.join("download")).ctx("restored download")?,
+        b"new content".to_vec(),
+        "new file survives reclaim and restore",
+    )
+}
+
+#[test]
+fn graceful_restart_preserves_settings_and_rejects_old_mutations() -> TestResult {
+    let temp = tempfile::tempdir().ctx("upgrade fixture")?;
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).ctx("home")?;
+    let mut service = start(&home)?;
+    request(&home, Request::ReducedMotion(true))?;
+    let socket = home.join("state/flummox/desktop/control.sock");
+    let mut stream = UnixStream::connect(&socket).ctx("old client")?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .ctx("timeout")?;
+    serde_json::to_writer(
+        &mut stream,
+        &serde_json::json!({
+            "version": flummox::jobs::VERSION - 1,
+            "command": {"ReducedMotion": false}
+        }),
+    )
+    .ctx("old mutation")?;
+    stream.write_all(b"\n").ctx("delimiter")?;
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply).ctx("reply")?;
+    let reply: serde_json::Value = serde_json::from_str(&reply).ctx("response")?;
+    check(
+        reply.get("error").is_some_and(serde_json::Value::is_string),
+        "old mutations rejected",
+    )?;
+    check(
+        request(&home, Request::Snapshot)?.reduced_motion,
+        "rejected client leaves settings intact",
+    )?;
+    request(&home, Request::Restart)?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = service.0.try_wait().ctx("reap graceful exit")? {
+            check(status.success(), "restart exits successfully")?;
+            break;
+        }
+        check(Instant::now() < deadline, "coordinator did not exit")?;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    check(!socket.exists(), "graceful exit removes stale socket")?;
+    let _replacement = start(&home)?;
+    check(
+        request(&home, Request::Snapshot)?.reduced_motion,
+        "replacement keeps durable settings",
     )
 }

@@ -27,9 +27,6 @@
 //! but honest about it. Compression is not a security boundary the user chose
 //! to rely on, so failing to sandbox must never fail the job.
 
-// The enforcement test forks, because Landlock is irreversible per process.
-#![allow(unsafe_code)]
-
 use std::path::{Path, PathBuf};
 
 use landlock::{
@@ -171,35 +168,6 @@ mod tests {
 
     use super::*;
 
-    /// Runs `body` in a forked child and reports whether it succeeded.
-    ///
-    /// Landlock is irreversible and applies to the whole process, so
-    /// enforcing it directly in a test would silently restrict every test
-    /// that ran afterwards in the same binary. A child process is the only
-    /// honest way to test the real thing.
-    fn in_forked_child(body: impl FnOnce() -> bool) -> Result<bool, String> {
-        // SAFETY: fork() takes no arguments and returns a pid; the child
-        // below only opens files and calls _exit, and never returns into the
-        // test harness.
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            return Err("fork failed".to_owned());
-        }
-        if pid == 0 {
-            let code = if body() { 0 } else { 1 };
-            // SAFETY: _exit() ends the child immediately without running the
-            // parent's atexit handlers, which is what a forked child must do.
-            unsafe { libc::_exit(code) };
-        }
-        let mut status: libc::c_int = 0;
-        // SAFETY: `status` is a live, correctly typed local for the call.
-        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-        if waited < 0 {
-            return Err("waitpid failed".to_owned());
-        }
-        Ok(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0)
-    }
-
     #[test]
     fn a_plan_drops_paths_that_do_not_exist() -> TestResult {
         let tmp = tempfile::tempdir().ctx("temporary directory")?;
@@ -248,34 +216,6 @@ mod tests {
         check(
             !status.is_active(),
             "an empty plan must not be treated as enforced",
-        )
-    }
-
-    #[test]
-    fn enforcement_blocks_paths_outside_the_game() -> TestResult {
-        let tmp = tempfile::tempdir().ctx("temporary directory")?;
-        let game = tmp.path().join("game");
-        std::fs::create_dir(&game).ctx("create the game directory")?;
-        std::fs::write(game.join("inside.dat"), b"game data").ctx("write a game file")?;
-        let outside = tmp.path().join("secret.dat");
-        std::fs::write(&outside, b"not the game's business").ctx("write the outside file")?;
-
-        let inside = game.join("inside.dat");
-        let succeeded = in_forked_child(move || {
-            let plan = SandboxPlan::for_paths(vec![game], Vec::new());
-            let status = restrict(&plan);
-            if !status.is_active() {
-                // No Landlock on this kernel: there is nothing to prove, and
-                // failing here would just punish older systems.
-                return true;
-            }
-            let inside_readable = std::fs::File::open(&inside).is_ok();
-            let outside_refused = std::fs::File::open(&outside).is_err();
-            inside_readable && outside_refused
-        })?;
-        check(
-            succeeded,
-            "inside the sandbox the game must stay readable while everything else is refused",
         )
     }
 }

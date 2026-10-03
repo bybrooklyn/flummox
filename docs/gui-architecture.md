@@ -29,3 +29,9 @@ Its serialized fields cannot hold titles, paths, user names or host identifiers.
 Automatic Maximum Space still requires a matching game build and corpus hash,
 verified bytes and metadata, writable launcher updates, rollback, a successful
 launch, and no more than a ten percent measured load-time increase.
+
+Headless desktop tests render the same widgets through iced's software renderer
+using fixture state. Set `FLUMMOX_PREVIEW_DIR` when running
+`cargo test --all-features gui::preview` to retain PNGs for wide and narrow views.
+These renders verify layout without opening a window or scanning game libraries.
+Native dialog helpers still require a desktop session for interactive selection.

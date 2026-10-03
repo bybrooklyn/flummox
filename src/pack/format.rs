@@ -670,6 +670,7 @@ impl Reader {
             .and_then(|id| self.index.entries.get(*id))
     }
 
+    #[cfg(feature = "pack-mount")]
     pub(super) fn hardlink_aliases(&self, path: &Path) -> Vec<PathBuf> {
         self.index
             .entries
@@ -804,22 +805,48 @@ impl Reader {
 
     /// Rechecks every unique payload, bypassing cached data.
     pub fn verify(&self, cancel: &AtomicBool) -> Result<()> {
+        self.verify_observed(cancel, &super::NoObserver)
+    }
+
+    pub fn verify_observed(
+        &self,
+        cancel: &AtomicBool,
+        observer: &dyn super::Observer,
+    ) -> Result<()> {
+        observer.started(self.index.chunks.len() as u64, 0, "Verifying stored chunks");
         for id in 0..self.index.chunks.len() {
+            observer.checkpoint()?;
             ensure!(!cancel.load(Ordering::Relaxed), "Verification cancelled");
             self.decode(u32::try_from(id)?)?;
+            observer.progress(id as u64 + 1, 0, "Verifying stored chunks");
         }
         Ok(())
     }
 
     /// Verifies that a directory still contains the files represented by this store.
     pub fn verify_directory(&self, root: &Path, cancel: &AtomicBool) -> Result<()> {
+        self.verify_directory_observed(root, cancel, &super::NoObserver)
+    }
+
+    pub fn verify_directory_observed(
+        &self,
+        root: &Path,
+        cancel: &AtomicBool,
+        observer: &dyn super::Observer,
+    ) -> Result<()> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
         let root = root.canonicalize()?;
         ensure!(root.is_dir(), "The source must be a directory");
+        observer.started(
+            self.index.entries.len() as u64,
+            0,
+            "Comparing the store with installed files",
+        );
         let mut seen = 0usize;
         let mut identities = Vec::new();
         for item in walkdir::WalkDir::new(&root).follow_links(false) {
+            observer.checkpoint()?;
             ensure!(!cancel.load(Ordering::Relaxed), "Verification cancelled");
             let item = item?;
             let path = item.path();
@@ -892,6 +919,7 @@ impl Reader {
                         .open(path)?;
                     let mut offset = 0u64;
                     while offset < *size {
+                        observer.checkpoint()?;
                         let count = usize::try_from((*size - offset).min(CHUNK_BYTES as u64))?;
                         let mut source_bytes = vec![0; count];
                         source.read_exact(&mut source_bytes)?;
@@ -905,12 +933,14 @@ impl Reader {
                 }
             }
             seen = seen.saturating_add(1);
+            observer.progress(seen as u64, 0, "Comparing the store with installed files");
         }
         ensure!(
             seen == self.entries().len(),
             "The source is missing files contained in the store"
         );
         for (path, dev, ino, size, mtime, mtime_nsec, ctime, ctime_nsec, mode) in identities {
+            observer.checkpoint()?;
             ensure!(!cancel.load(Ordering::Relaxed), "Verification cancelled");
             let current = std::fs::symlink_metadata(&path)?;
             ensure!(

@@ -18,7 +18,7 @@ use std::path::PathBuf;
 pub use service::{configured_libraries, request, state_dir};
 
 /// Protocol version. A mismatched installed worker is rejected before work.
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 /// Which application palette the desktop shell follows.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +78,7 @@ pub enum Operation {
     Analyze,
     Compress,
     Decompress,
+    Pack,
 }
 
 /// Durable lifecycle, including outcomes that need another attempt.
@@ -146,6 +147,43 @@ pub struct Job {
     pub elapsed: u64,
     pub drive_change: Option<i64>,
     pub user_paused: bool,
+    #[serde(default)]
+    pub pack: Option<PackTask>,
+    #[serde(default)]
+    pub pack_interruptible: bool,
+}
+
+/// Durable work for Maximum Space. Paths survive client disconnection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PackTask {
+    Create {
+        #[serde(with = "crate::path_serde")]
+        store: PathBuf,
+    },
+    Activate {
+        #[serde(with = "crate::path_serde")]
+        store: PathBuf,
+        create: bool,
+        qualification: Option<Box<crate::compatibility::Report>>,
+    },
+    Compact,
+    Restore,
+    Reclaim,
+    Prune,
+}
+
+impl PackTask {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Create { .. } => "Create verified store",
+            Self::Activate { create: true, .. } => "Create Maximum Space",
+            Self::Activate { .. } => "Activate Maximum Space",
+            Self::Compact => "Compact updates",
+            Self::Restore => "Restore ordinary files",
+            Self::Reclaim => "Reclaim original",
+            Self::Prune => "Reclaim previous version",
+        }
+    }
 }
 
 /// Library policy. Enabling maintenance starts observing from that moment.
@@ -178,10 +216,16 @@ pub struct Snapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
     Snapshot,
+    /// Restart an idle coordinator after replacing the executable.
+    Restart,
     Enqueue {
         game: Game,
         operation: Operation,
         options: CompressOpts,
+    },
+    EnqueuePack {
+        game: Game,
+        task: PackTask,
     },
     Pause {
         id: i64,

@@ -6,6 +6,10 @@
 
 #[cfg(target_os = "linux")]
 mod app;
+#[cfg(target_os = "linux")]
+mod dialog;
+#[cfg(all(test, target_os = "linux"))]
+mod preview;
 mod theme;
 #[cfg(not(any(target_os = "linux", windows)))]
 mod unsupported;

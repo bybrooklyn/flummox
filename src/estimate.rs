@@ -210,6 +210,12 @@ impl FormatEvidence {
 /// The result for a whole game.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Estimate {
+    #[serde(default)]
+    pub maximum_qualified: bool,
+    #[serde(default)]
+    pub maximum_qualification: Option<[u8; 32]>,
+    #[serde(default)]
+    pub small_files: crate::pack::SmallFileSample,
     /// Files a native compress pass would rewrite, including eligible files
     /// left unsampled when the analysis budget ran out.
     pub rewrite_files: u64,

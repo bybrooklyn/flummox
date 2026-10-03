@@ -75,7 +75,9 @@ operating system's WOF/LZX storage and does not need a filesystem driver.
 Open `flummox-gui` on Linux, choose Games, select your games, and press **Free
 up space**. Analysis starts in the background. Search, drive and launcher
 filters, and sorting help with larger libraries. Expanding a game shows its
-path, compression preset, analysis, and recovery actions. Maximum compares
+path, compression preset, analysis, and recovery actions. Browse for a game folder
+or paste its path. Native dialogs use KDialog on KDE and Zenity elsewhere when
+available; a missing dialog helper leaves the path field usable. Maximum compares
 levels 9, 15, 19, and 22 per unique chunk and keeps the smallest result;
 ties use the cheaper level. Balanced remains the quicker native default.
 
@@ -90,7 +92,7 @@ storage controls appear only when their backend and FUSE support are available.
 Other desktop targets build the shared shell with compression disabled until a
 safe storage backend exists.
 
-Queue supports pause, resume, cancel, and retry. Closing the window leaves jobs
+Queue supports pause, resume, cancel, and retry for native jobs and Maximum Space preparation. Store creation and compaction report measured progress; verification reports checked items. File switches, restoration, and reclaim finish without interruption, with controls hidden during those phases. Closing the window leaves jobs
 with the background coordinator; reopening reconnects. Analysis and compression
 pause when a detected game is running. Current filesystem operations finish
 before workers stop at 16 MiB range boundaries, including inside large files.
@@ -225,8 +227,10 @@ flummox doctor                      # check this machine
 flummox compatibility list --json  # export path-free qualification records
 ```
 
-Import a locally produced compatibility qualification with `flummox
-compatibility import report.json`. Reports identify a launcher key, build and
+Import a locally produced compatibility qualification from Settings or an
+expanded game, or with `flummox compatibility import report.json`. Analysis
+hashes installed files when a candidate report matches the game build. Automatic
+activation checks the corpus again before creation and before switching storage. Reports identify a launcher key, build and
 corpus hash. They contain no game title, install path, user name or machine
 identifier. Maximum Space automation accepts only a matching verified build
 whose measured load-time change stays within policy.
@@ -258,7 +262,10 @@ compressed, still playable, and safe to resume.
 
 Compression changes how the filesystem stores a file, not the file. Every byte
 reads back identically, which the tests check by comparing checksums before and
-after. Nothing is deleted and nothing is moved.
+after. Native compression retains the same paths and files. Maximum Space moves the
+original into a retained rollback folder when activated. Test the mounted game
+before choosing Reclaim original; that explicit action deletes the retained copy.
+Restoration then rebuilds ordinary files from the verified store and update layer.
 
 The one case to know about: if your drive has snapshots, rewriting a file
 unshares it from its snapshots, so usage can go **up** until those snapshots
@@ -312,3 +319,6 @@ transitions, recovery guarantees, sampling policy, and current boundaries.
 ## Licence
 
 AGPL-3.0-or-later. See [LICENSE](LICENSE).
+
+Installation, coordinator upgrades, and release builds are described in
+[the installation guide](docs/install.md).
