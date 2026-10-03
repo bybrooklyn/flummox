@@ -43,7 +43,7 @@ handles.
   was inspected. This test found and fixed missing libXcursor and xkbcommon-X11
   runtime dependencies. Headless Settings previews cover the new restart button.
 - `actionlint` accepts both workflows. The release workflow runs the same Arch
-  install/upgrade/GUI startup smoke script. Remote execution remains untested.
+  install/upgrade/GUI startup smoke script. Remote execution passed for v0.0.1.
 
 The installed-binary upgrade fixture replaces the same version; the protocol
 fixture separately verifies rejection of an older client. Coordinators from
@@ -57,12 +57,12 @@ installs are restored. Installation instructions are in [install.md](install.md)
   qualification reports with measured load-time and gameplay results.
 - Exercise the folder/report dialogs in KDE and another desktop session. The
   headless tests cover selection parsing and layout, not desktop interaction.
-- Run the release workflow on GitHub after pushing the changes. The workflow
-  builds Linux archives and Arch packages, checks installation and upgrade, and
-  publishes a release for a version tag after native build and installation
-  checks pass. See release-automation.md for the current packaging pipeline.
-- Windows parity, native Windows tests and direct WOF/Game Compressor comparisons
-  remain separate work. The macOS compression backend, Bottles, and community report sharing remain deferred.
+- The tag-triggered release workflow passed and published v0.0.1, including
+  native Linux x64/ARM64, macOS ARM64, and Windows x64 builds, Windows installer
+  checks, Homebrew installation, and Arch install/upgrade/GUI startup. AUR and
+  Homebrew updates also passed. See release-automation.md for the pipeline.
+- Windows launcher/maintenance parity, real NTFS game tests, and direct
+  WOF/Game Compressor comparisons remain separate work. The macOS compression backend, Bottles, and community report sharing remain deferred.
 
 Small-file grouping is a bounded sample reported separately from the overall
 prediction. It is not a full-store allocation estimate. Restore and reclaim

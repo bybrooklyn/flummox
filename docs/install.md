@@ -17,9 +17,10 @@ libraries listed in the Arch package. It is not a static portable executable.
 Verify the archive before extracting it:
 
 ```sh
-sha256sum -c flummox-0.1.0-linux-x86_64.tar.xz.sha256
-tar -xJf flummox-0.1.0-linux-x86_64.tar.xz
-cd flummox-0.1.0-linux-x86_64
+sha256sum flummox-0.0.1-linux-x86_64.tar.xz
+# Compare the output with the SHA-256 digest beside this asset on GitHub.
+tar -xJf flummox-0.0.1-linux-x86_64.tar.xz
+cd flummox-0.0.1-linux-x86_64
 sudo install -Dm755 bin/flummox /usr/bin/flummox
 sudo install -Dm755 bin/flummox-gui /usr/bin/flummox-gui
 sudo install -Dm644 share/applications/flummox.desktop /usr/share/applications/flummox.desktop
@@ -110,11 +111,17 @@ The tag supplies the version in the CI build's Cargo manifest and lockfile;
 there is no manual version bump required before later tags. The release includes
 a changelog of commits since the previous reachable version tag, versioned
 Linux x86_64/ARM64 archives, an Apple Silicon app bundle, Windows x64 installer
-and portable ZIP, an Arch package, and SHA-256 checksums. All native builds,
+and portable ZIP, and an Arch package. GitHub displays each asset's SHA-256 digest;
+separate checksum downloads are omitted. All native builds,
 tests, dependency checks, and installation checks must pass before the release
 is published. Stable releases then update the Homebrew tap and AUR recipes.
 `v0.0.2-rc.1` publishes a prerelease and leaves the stable package channels alone.
 Do not reuse published tags.
+
+For curated release notes, add `docs/releases/VERSION.md` before tagging. CI uses
+that document when present; otherwise it generates the changelog from commits.
+The initial release uses a product introduction, features, installation choices,
+validation, and current limitations instead of the full development history.
 
 The Release workflow can be run manually on a branch to build and test downloadable
 artifacts without publishing a release. `just release` builds a local Linux

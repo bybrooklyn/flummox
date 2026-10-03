@@ -293,7 +293,7 @@ jobs:
         with:
           name: release-notes
           path: notes
-      - name: Publish with changelog and checksums
+      - name: Publish with changelog and download digests
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.prepare.outputs.tag }}
@@ -302,7 +302,7 @@ jobs:
         run: |
           args=()
           if [ "$PRERELEASE" = true ]; then args+=(--prerelease --latest=false); fi
-          mapfile -t assets < <(find dist -maxdepth 1 -type f | sort)
+          mapfile -t assets < <(find dist -maxdepth 1 -type f \( -name '*.tar.xz' -o -name '*.zip' -o -name '*-setup.exe' -o -name '*.pkg.tar.zst' \) | sort)
           # Create as draft so an interrupted upload never exposes a partial release.
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" --verify-tag --draft --title "Flummox $VERSION" --notes-file notes/RELEASE-NOTES.md

@@ -28,6 +28,19 @@ def prepare(root, tag):
     return version
 
 
+def release_notes(root, version, start, tag):
+    curated = root / 'docs/releases' / f'{version}.md'
+    if curated.is_file():
+        return curated.read_text()
+    commits = subprocess.check_output(['git', 'log', '--format=- %s (%h)', f'{start}..HEAD' if start else 'HEAD'], cwd=root, text=True)
+    notes = f'# Flummox {version}\n\n## Changes\n\n{commits}\n'
+    notes += '## Downloads\n\nLinux: x86_64 and ARM64 archives. macOS: Apple Silicon app bundle. Windows: x64 installer and portable ZIP. GitHub displays a SHA-256 digest beside each download.\n\n'
+    notes += 'macOS currently provides the desktop shell; compression is not implemented. Linux archives require glibc 2.39 or newer. Unsigned macOS and Windows downloads can trigger operating-system security prompts.\n'
+    if start:
+        notes += f'\n[Full changelog](https://github.com/bybrooklyn/flummox/compare/{start}...{tag or "HEAD"})\n'
+    return notes
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--tag', default='')
@@ -35,13 +48,7 @@ def main():
     version = prepare(ROOT, args.tag)
     previous = subprocess.run(['git', 'describe', '--tags', '--abbrev=0', '--match', 'v[0-9]*', 'HEAD^'], cwd=ROOT, text=True, capture_output=True)
     start = previous.stdout.strip() if previous.returncode == 0 else ''
-    commits = subprocess.check_output(['git', 'log', '--format=- %s (%h)', f'{start}..HEAD' if start else 'HEAD'], cwd=ROOT, text=True)
-    notes = f'# Flummox {version}\n\n{commits}\n'
-    notes += '## Downloads\n\nLinux: x86_64 and ARM64 archives. macOS: Apple Silicon app bundle. Windows: x64 installer and portable ZIP. SHA-256 checksums accompany every download.\n\n'
-    notes += 'macOS currently provides the desktop shell; compression is not implemented. Linux archives require glibc 2.39 or newer. Unsigned macOS and Windows downloads can trigger operating-system security prompts.\n'
-    if start:
-        notes += f'\n[Full changelog](https://github.com/bybrooklyn/flummox/compare/{start}...{args.tag or "HEAD"})\n'
-    (ROOT / 'RELEASE-NOTES.md').write_text(notes)
+    (ROOT / 'RELEASE-NOTES.md').write_text(release_notes(ROOT, version, start, args.tag))
     if output := os.environ.get('GITHUB_OUTPUT'):
         with open(output, 'a') as stream:
             stream.write(f'version={version}\nprerelease={str("-" in version).lower()}\n')

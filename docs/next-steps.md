@@ -9,10 +9,32 @@ These checks remain necessary before calling the release fully validated:
   Record load times and gameplay results against an ordinary-directory baseline.
 - Exercise folder and report dialogs in KDE and another desktop session,
   including selection, cancellation, spaces in paths, and disconnected drives.
-- Run the release workflow on GitHub and review its downloadable packages.
-  Publish its draft after desktop and game acceptance.
-- For a Windows release, complete workflow parity and test the WOF backend on
-  native NTFS. Cross-compilation establishes a build, not runtime acceptance.
+- Test the Windows WOF backend on real NTFS game installs, including launch,
+  gameplay, update, restore, and interrupted operations. Native CI and installer
+  tests pass, but they do not establish real-game compression compatibility.
+
+## Completed distribution work
+
+Version 0.0.1 is published. Tag-triggered native builds, embedded versions,
+release notes, installation tests, and automatic Homebrew/AUR updates passed in
+[the release workflow](https://github.com/bybrooklyn/flummox/actions/runs/37156256792).
+Linux x86_64/ARM64, Apple Silicon macOS, and Windows x64 downloads are available.
+macOS is currently a shell without a compression backend. This replaces the
+previous draft-release and cross-build-only acceptance items.
+
+## Recommended next release
+
+Prioritize temporary-space planning and recovery alongside real-game acceptance.
+Creating a store while retaining the original requires additional space, and
+users need to understand where it is needed before a job starts. Validate launch,
+patching, interruption, and restoration against ordinary installs before making
+broader compatibility or performance claims.
+
+After those core workflows, make the macOS download useful with a storage backend,
+and configure Windows publisher signing and Apple Developer ID/notarization.
+Choose the macOS backend through experiments with temporary game fixtures and
+verified restoration before exposing it as a supported storage mode. Credentials
+for trusted signing are separate from the currently configured release keys.
 
 ## Product improvements
 
@@ -36,9 +58,9 @@ These checks remain necessary before calling the release fully validated:
    folder entry, button labels, contrast, and reduced motion in real sessions.
    Preserve the current sidebar and theme while improving these interactions.
 
-Items above are proposed improvements, not features completed by the dependency
-update. Scheduling, macOS, Bottles integration, and community report sharing can
-follow the core release work.
+Items above are proposed improvements. Windows launcher and maintenance parity,
+scheduling, Bottles integration, and community report sharing can follow the core
+storage workflows.
 
 ## Dependency update (2026-10-03)
 
@@ -56,5 +78,5 @@ incompatible. This dependency must move with Iced's renderer.
 Validation passes: `just ci`, `just build`, CLI-only compilation, required FUSE
 mount/coordinator fixtures, Windows CLI/GUI cross-build (`just win`), and workflow
 linting (`actionlint`). A final Cargo update dry run finds no remaining compatible
-lockfile updates. Windows runtime and GitHub workflow execution remain part of
-release acceptance.
+lockfile updates. Native builds, portable-module tests, installation checks, and GitHub release
+execution now pass. Real-game storage acceptance remains outstanding.

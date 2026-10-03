@@ -19,8 +19,13 @@ are shown separately.
 
 ## Get it
 
-No prebuilt downloads yet. Build it from source, which takes a couple of
-minutes.
+Download the app from [GitHub Releases](https://github.com/bybrooklyn/flummox/releases).
+Windows has a per-user installer and portable ZIP; Linux has x86_64 and ARM64
+archives. Arch/CachyOS users can install `flummox-bin` from the AUR. The Apple
+Silicon Homebrew cask provides the macOS shell; compression is not implemented
+on macOS yet. See [installation instructions](docs/install.md).
+
+To build from source:
 
 Arch and CachyOS:
 
@@ -328,7 +333,7 @@ Installation, coordinator upgrades, and release builds are described in
 [GitHub Releases](https://github.com/bybrooklyn/flummox/releases) provides Linux
 x86_64/ARM64 archives, an Apple Silicon macOS app, and a Windows x64 installer
 and portable ZIP. Each release shows its version and changelog, with SHA-256
-checksums for downloads. macOS currently provides the desktop shell only.
+digests displayed beside each download. macOS currently provides the desktop shell only.
 
 On Arch, install `flummox-bin` from the AUR. On Apple Silicon, run
 `brew tap bybrooklyn/flummox` and `brew install --cask flummox`.

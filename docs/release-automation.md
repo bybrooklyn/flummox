@@ -15,7 +15,10 @@ the CLI, desktop app, macOS bundle metadata, installer, recipes, and filenames.
 | macOS Apple Silicon | macOS 14 ARM | Flummox.app ZIP | Clippy, tests, Mach-O architecture, bundle version/signature, Homebrew install/uninstall |
 | Windows x64 | Windows 2025 | setup.exe, portable ZIP | Clippy, tests, PE architecture, CLI version, installer install/upgrade/uninstall |
 
-Each download has a SHA-256 checksum. The Arch package and package recipes are
+GitHub displays a SHA-256 digest beside each download. Checksum files remain in
+local bundles and internal CI artifacts for verification but are not uploaded
+as public release downloads. AUR and Homebrew retain pinned archive hashes.
+The Arch package and package recipes are
 generated from the exact archives tested by the release workflow. A release is
 staged as a draft during upload and then published automatically; a failed build
 does not produce a public release. A failed channel update leaves the already
@@ -26,6 +29,11 @@ Prerelease tags, for example `v0.0.2-rc.1`, produce a GitHub prerelease without
 updating AUR or Homebrew. A manual run on a branch builds and tests artifacts
 without publishing. The tag name, rather than the development version recorded
 on that branch, is the version of every tagged build. Never move a published tag.
+
+Add `docs/releases/VERSION.md` for curated release notes. CI uses that document
+in preference to a generated commit changelog. The initial release introduces
+the product and its supported workflows; later versions can describe user-facing
+changes in their own documents or use the automatic changelog.
 
 ## Homebrew tap
 

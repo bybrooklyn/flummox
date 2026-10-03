@@ -18,6 +18,32 @@ def module(filename):
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_curated_notes_override_the_commit_changelog(self):
+        prepare = module('prepare-release.py')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            notes = root / 'docs/releases/0.0.1.md'
+            notes.parent.mkdir(parents=True)
+            notes.write_text('# Flummox 0.0.1\n\nFirst public release and installation guide.\n')
+            self.assertEqual(prepare.release_notes(root, '0.0.1', '', 'v0.0.1'), notes.read_text())
+
+    def test_later_release_notes_include_only_new_commits(self):
+        prepare = module('prepare-release.py')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            commands = [
+                ['git', 'init'],
+                ['git', '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.com', 'commit', '--allow-empty', '-m', 'Initial implementation'],
+                ['git', 'tag', 'v0.0.1'],
+                ['git', '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.com', 'commit', '--allow-empty', '-m', 'Add a useful feature'],
+            ]
+            for command in commands:
+                subprocess.run(command, cwd=root, check=True, capture_output=True)
+            notes = prepare.release_notes(root, '0.0.2', 'v0.0.1', 'v0.0.2')
+            self.assertIn('Add a useful feature', notes)
+            self.assertNotIn('Initial implementation', notes)
+            self.assertIn('/compare/v0.0.1...v0.0.2', notes)
+
     def test_tag_sets_manifest_and_lock_without_touching_dependencies(self):
         prepare = module('prepare-release.py')
         with tempfile.TemporaryDirectory() as temporary:
