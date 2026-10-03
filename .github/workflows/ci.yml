@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Install the toolchain
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install stable --profile minimal --component clippy
       - uses: taiki-e/install-action@v2.87.22
         with:
           tool: cargo-xwin
@@ -31,6 +31,8 @@ jobs:
           command -v clang-cl llvm-lib lld-link
       - name: Build the Windows CLI and GUI
         run: cargo xwin build --release --target x86_64-pc-windows-msvc --features gui --bins
+      - name: Lint Windows code and tests
+        run: cargo xwin clippy --locked --target x86_64-pc-windows-msvc --all-features --all-targets -- -D warnings
 
   macos:
     name: macOS portable shell

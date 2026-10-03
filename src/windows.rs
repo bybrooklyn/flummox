@@ -163,7 +163,7 @@ pub(crate) fn discover_steam() -> Vec<InstalledGame> {
             }
         }
     }
-    games.sort_by(|left, right| left.title.to_lowercase().cmp(&right.title.to_lowercase()));
+    games.sort_by_key(|game| game.title.to_lowercase());
     games
 }
 
@@ -259,6 +259,7 @@ fn decompress_file(path: &Path) -> Result<bool> {
         return Ok(true);
     }
     // A file without external backing is already restored.
+    // SAFETY: GetLastError reads this thread's Win32 error slot and takes no pointers.
     let error = unsafe { GetLastError() };
     if matches!(error, 1 | 50 | 4390) {
         return Ok(false);
