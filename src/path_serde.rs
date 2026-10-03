@@ -46,7 +46,7 @@ pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<PathBuf
     })
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub mod option {
     use super::*;
 

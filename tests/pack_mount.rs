@@ -1,4 +1,5 @@
 //! Kernel-backed checks for the experimental read-only store view.
+#![cfg(target_os = "linux")]
 #![cfg(feature = "pack-mount")]
 
 use flummox::{

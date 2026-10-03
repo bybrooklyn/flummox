@@ -66,7 +66,7 @@ operating system's WOF/LZX storage and does not need a filesystem driver.
 |---|---|
 | **Linux native compression outside btrfs** | Maximum Space works through a writable FUSE store, but these filesystems have no in-place native backend |
 | **Windows launcher parity** | Steam and manual folders work. Heroic, Xbox, GOG Galaxy, background maintenance, and Maximum Space are still Linux-only |
-| **macOS** | Deferred until there is user demand |
+| **macOS compression** | The desktop shell builds, but a macOS storage backend is not implemented |
 | **Bottles** | Discovery is planned |
 | **Flatpak build** | Not possible. The sandbox hides other processes, so Flummox could not tell whether a game was running, which is the check that keeps it from touching a game you are playing |
 

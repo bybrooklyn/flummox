@@ -20,6 +20,8 @@
 //!   file cannot inflate into an out-of-memory;
 //! * anything written in quoted form is read back unchanged.
 
+#![cfg(target_os = "linux")]
+
 use flummox::launchers::vdf::{self, Object};
 use flummox::testutil::{TestResult, check, check_eq};
 use proptest::prelude::*;

@@ -1,5 +1,7 @@
 //! Real coordinator/worker IPC against an isolated home and temporary games.
 
+#![cfg(target_os = "linux")]
+
 use flummox::{
     jobs::{Command as Request, Operation, Phase, Snapshot},
     model::{Game, GameId, InstallState, Launcher},
@@ -398,18 +400,10 @@ fn closing_clients_keeps_jobs_and_restart_preserves_results() -> TestResult {
         )?;
         std::thread::sleep(Duration::from_millis(50));
     };
-    let btrfs = flummox::fsprobe::probe(&game_path)
-        .ctx("fixture filesystem")?
-        .fstype
-        == "btrfs";
     check_eq(
         phase,
-        if btrfs {
-            Phase::Completed
-        } else {
-            Phase::Failed
-        },
-        "supported drives analyze; unsupported drives fail clearly",
+        Phase::Completed,
+        "read-only analysis works on native and other filesystems",
     )?;
     check_eq(
         std::fs::read(game_path.join("raw.dds")).ctx("payload after analysis")?,

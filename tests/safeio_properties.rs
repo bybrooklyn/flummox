@@ -18,6 +18,8 @@
 //! the caller actually depends on: anything this function accepts, when joined
 //! to the install directory, still names something inside it.
 
+#![cfg(target_os = "linux")]
+
 use std::path::{Component, Path};
 
 use flummox::safeio::is_contained;

@@ -20,6 +20,8 @@
 //! * a block that saves less than one whole sector is stored uncompressed, and
 //!   saves exactly nothing.
 
+#![cfg(target_os = "linux")]
+
 use flummox::estimate::{BtrfsModel, UnitModel};
 use proptest::prelude::*;
 

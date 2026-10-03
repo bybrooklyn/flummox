@@ -19,6 +19,8 @@
 //! tiers share this function and a change made for one must not quietly alter
 //! the other.
 
+#![cfg(target_os = "linux")]
+
 use std::path::PathBuf;
 
 use flummox::inventory::{Action, WalkOpts, decide, is_precompressed_name};

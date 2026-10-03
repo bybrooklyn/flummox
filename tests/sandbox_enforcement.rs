@@ -1,5 +1,7 @@
 //! Landlock enforcement in a fresh executable, without inheriting live FUSE locks.
 
+#![cfg(target_os = "linux")]
+
 use flummox::{
     sandbox::{SandboxPlan, restrict},
     testutil::{Ctx, TestResult, check},

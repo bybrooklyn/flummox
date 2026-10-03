@@ -483,7 +483,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod corpus_tests {
     use super::*;
     use crate::testutil::{Ctx, TestResult, check, check_eq, check_ne};
