@@ -18,7 +18,7 @@ use std::path::PathBuf;
 pub use service::{configured_libraries, request, state_dir};
 
 /// Protocol version. A mismatched installed worker is rejected before work.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 /// Which application palette the desktop shell follows.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +186,23 @@ impl PackTask {
     }
 }
 
+/// How a manually added location maps to games.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FolderKind {
+    #[default]
+    Game,
+    Collection,
+}
+
+impl std::fmt::Display for FolderKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Game => "Single game",
+            Self::Collection => "Games library",
+        })
+    }
+}
+
 /// Library policy. Enabling maintenance starts observing from that moment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Library {
@@ -193,6 +210,8 @@ pub struct Library {
     pub path: PathBuf,
     pub automatic: bool,
     pub custom: bool,
+    #[serde(default)]
+    pub folder_kind: FolderKind,
 }
 
 /// Snapshot returned to clients; no database handle crosses the boundary.
@@ -234,6 +253,7 @@ pub enum Command {
     Cancel(i64),
     Retry(i64),
     Library(Library),
+    RemoveLibrary(#[serde(with = "crate::path_serde")] PathBuf),
     Exclude {
         id: String,
         excluded: bool,
@@ -392,4 +412,66 @@ pub fn validate_folder(path: &std::path::Path) -> anyhow::Result<PathBuf> {
         );
     }
     Ok(path)
+}
+
+/// Resolves a typed location without invoking a shell or expanding variables.
+pub fn folder_path(input: &str, home: &std::path::Path) -> PathBuf {
+    let text = input.trim();
+    let text = text
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| text.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(text);
+    let expand = |text: &str| {
+        if text == "~" {
+            home.to_path_buf()
+        } else if let Some(relative) = text.strip_prefix("~/") {
+            home.join(relative)
+        } else {
+            PathBuf::from(text)
+        }
+    };
+    let raw = expand(text);
+    if raw.exists() {
+        raw
+    } else {
+        expand(&text.replace("\\ ", " "))
+    }
+}
+
+#[cfg(test)]
+mod folder_tests {
+    use super::*;
+    use crate::testutil::{Ctx, TestResult, check_eq};
+
+    #[test]
+    fn typed_locations_expand_home_spaces_and_preserve_literal_backslashes() -> TestResult {
+        let home = tempfile::tempdir().ctx("home")?;
+        let games = home.path().join("My Games");
+        std::fs::create_dir(&games).ctx("games")?;
+        for input in [
+            "~/My Games",
+            "~/My\\ Games",
+            "\"~/My Games\"",
+            "'~/My Games'",
+        ] {
+            check_eq(folder_path(input, home.path()), games.clone(), input)?;
+        }
+        let literal = home.path().join("My\\ Games");
+        std::fs::create_dir(&literal).ctx("literal backslash")?;
+        check_eq(
+            folder_path("~/My\\ Games", home.path()),
+            literal,
+            "existing literal path wins",
+        )?;
+        let legacy: Library = serde_json::from_value(serde_json::json!({
+            "path": games, "automatic": false, "custom": true
+        }))
+        .ctx("legacy location")?;
+        check_eq(
+            legacy.folder_kind,
+            FolderKind::Game,
+            "existing locations retain single-game behavior",
+        )
+    }
 }

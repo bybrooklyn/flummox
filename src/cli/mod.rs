@@ -155,6 +155,17 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum JobAction {
+    /// Register a folder whose immediate subfolders are games.
+    AddFolder {
+        path: String,
+        /// Treat the whole folder as one game instead.
+        #[arg(long)]
+        single_game: bool,
+    },
+    /// Forget a custom location without deleting its files.
+    RemoveFolder {
+        path: String,
+    },
     /// Restart the background worker when jobs and mounted installs are idle.
     Restart,
     Pause {
@@ -298,6 +309,21 @@ pub fn run() -> Result<()> {
             let command = match action {
                 None => JobCommand::Snapshot,
                 Some(JobAction::Restart) => JobCommand::Restart,
+                Some(JobAction::AddFolder { path, single_game }) => {
+                    JobCommand::Library(crate::jobs::Library {
+                        path: crate::jobs::folder_path(&path, &env.home),
+                        automatic: false,
+                        custom: true,
+                        folder_kind: if single_game {
+                            crate::jobs::FolderKind::Game
+                        } else {
+                            crate::jobs::FolderKind::Collection
+                        },
+                    })
+                }
+                Some(JobAction::RemoveFolder { path }) => {
+                    JobCommand::RemoveLibrary(crate::jobs::folder_path(&path, &env.home))
+                }
                 Some(JobAction::Pause { id }) => JobCommand::Pause { id, paused: true },
                 Some(JobAction::Resume { id }) => JobCommand::Pause { id, paused: false },
                 Some(JobAction::Cancel { id }) => JobCommand::Cancel(id),
@@ -658,7 +684,9 @@ fn cmd_scan(env: &Env, out: Output, tools: bool) -> Result<()> {
         .filter(|g| !g.ids().any(|id| hidden.contains(id)))
         .collect();
     if games.is_empty() && !out.json {
-        println!("No games found. Is Steam installed for this user?");
+        println!(
+            "No games found. Add a games location in the app or with flummox jobs add-folder."
+        );
         return Ok(());
     }
     let rows: Vec<ScanRow> = games

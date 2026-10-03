@@ -67,3 +67,12 @@ installs are restored. Installation instructions are in [install.md](install.md)
 Small-file grouping is a bounded sample reported separately from the overall
 prediction. It is not a full-store allocation estimate. Restore and reclaim
 transactions finish without pause/cancel once filesystem switching starts.
+
+## Custom games locations
+
+Drives & libraries supports both a collection of immediate game subfolders and
+one individual game. Home shortcuts and escaped spaces are accepted. Tests cover
+legacy registrations, collection discovery, hidden/symlink filtering, overlapping
+locations, persistent registration, and removal without deleting game files.
+The coordinator protocol is version 6; the version 5 restart command supports
+upgrading the previous coordinator.

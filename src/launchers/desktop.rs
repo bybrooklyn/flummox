@@ -184,21 +184,58 @@ pub(super) fn custom(scan: &mut Scan) {
     match crate::jobs::configured_libraries() {
         Ok(libraries) => {
             for library in libraries.into_iter().filter(|l| l.custom) {
-                let path = library.path;
-                let name = path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "Game folder".into());
-                let key = path.to_string_lossy().into_owned();
-                if let Some(game) = game(Launcher::Manual, key, name, path, None, None) {
-                    scan.games.push(game);
-                }
+                add_custom(scan, &library);
             }
         }
         Err(e) => scan.warnings.push(DetectError::new(
             "Reading custom folders",
             std::io::Error::other(e.to_string()),
         )),
+    }
+}
+
+fn add_custom(scan: &mut Scan, library: &crate::jobs::Library) {
+    let paths = if library.folder_kind == crate::jobs::FolderKind::Collection {
+        let entries = match std::fs::read_dir(&library.path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                scan.warnings.push(DetectError::new(
+                    format!("Reading {}", library.path.display()),
+                    error,
+                ));
+                return;
+            }
+        };
+        let mut paths = Vec::new();
+        for entry in entries {
+            let result = (|| -> std::io::Result<_> {
+                let entry = entry?;
+                let hidden = entry.file_name().to_string_lossy().starts_with('.');
+                Ok((!hidden && entry.file_type()?.is_dir()).then(|| entry.path()))
+            })();
+            match result {
+                Ok(Some(path)) => paths.push(path),
+                Ok(None) => {}
+                Err(error) => scan.warnings.push(DetectError::new(
+                    format!("Reading {}", library.path.display()),
+                    error,
+                )),
+            }
+        }
+        paths.sort();
+        paths
+    } else {
+        vec![library.path.clone()]
+    };
+    for path in paths {
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Game folder".into());
+        let key = path.to_string_lossy().into_owned();
+        if let Some(game) = game(Launcher::Manual, key, name, path, None, None) {
+            scan.games.push(game);
+        }
     }
 }
 
@@ -233,6 +270,73 @@ pub(super) fn merge(scan: &mut Scan) {
 mod tests {
     use super::*;
     use crate::testutil::{Ctx, TestResult, check, check_eq};
+    #[test]
+    fn custom_collections_list_direct_games_and_merge_duplicates() -> TestResult {
+        use crate::jobs::{FolderKind, Library};
+        let temp = tempfile::tempdir().ctx("custom collection")?;
+        let root = temp.path().join("My Games");
+        let first = root.join("A Game");
+        let second = root.join("Another Game");
+        for dir in [
+            &first,
+            &second,
+            &root.join(".flummox"),
+            &first.join("assets"),
+        ] {
+            std::fs::create_dir_all(dir).ctx("fixture folder")?;
+        }
+        std::fs::write(root.join("notes.txt"), b"leave untouched").ctx("non-game file")?;
+        std::os::unix::fs::symlink(&first, root.join("alias")).ctx("symlink")?;
+        let library = Library {
+            path: root,
+            automatic: false,
+            custom: true,
+            folder_kind: FolderKind::Collection,
+        };
+        let mut scan = Scan::default();
+        add_custom(&mut scan, &library);
+        check_eq(
+            scan.games.len(),
+            2,
+            "hidden folders, files, symlinks and nested assets excluded",
+        )?;
+        check_eq(
+            scan.games.first().ctx("first game")?.title.as_str(),
+            "A Game",
+            "folder names become titles",
+        )?;
+        add_custom(
+            &mut scan,
+            &Library {
+                path: first.clone(),
+                folder_kind: FolderKind::Game,
+                ..library
+            },
+        );
+        merge(&mut scan);
+        check_eq(
+            scan.games.len(),
+            2,
+            "overlapping locations do not duplicate games",
+        )?;
+        std::fs::create_dir(second.parent().ctx("collection")?.join("New Game"))
+            .ctx("new install")?;
+        let mut refreshed = Scan::default();
+        add_custom(
+            &mut refreshed,
+            &Library {
+                path: temp.path().join("My Games"),
+                automatic: false,
+                custom: true,
+                folder_kind: FolderKind::Collection,
+            },
+        );
+        check_eq(
+            refreshed.games.len(),
+            3,
+            "refresh discovers newly added games",
+        )
+    }
     #[test]
     fn reads_installed_manifests_and_preserves_unavailable_games() -> TestResult {
         let data = serde_json::json!({"a":{"title":"A game","install_path":"/unavailable/game","version":"2"},"bad":{"install_path":"relative"}});

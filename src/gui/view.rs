@@ -6,7 +6,9 @@ use super::{
 };
 use crate::{
     backend::Preset,
-    jobs::{Command, Job, Library, MotionPreference, Operation, Phase, ThemePreference},
+    jobs::{
+        Command, FolderKind, Job, Library, MotionPreference, Operation, Phase, ThemePreference,
+    },
 };
 use humansize::{DECIMAL, format_size};
 use iced::widget::{
@@ -1113,13 +1115,19 @@ fn updates(state: &State, compact: bool) -> Element<'_, Message> {
 fn drives(state: &State) -> Element<'_, Message> {
     let mut content = column![
         theme::page_title("Drives & libraries"),
-        theme::muted("Keep selected libraries compressed after updates"),
+        theme::muted("Add games from any location and choose which libraries to maintain"),
         panel(
             column![
-                text("Add a game folder").size(17),
+                text("Add a location").size(17),
+                pick_list([FolderKind::Collection, FolderKind::Game], Some(state.folder_kind), Message::FolderKind),
+                theme::muted(match state.folder_kind {
+                    FolderKind::Collection => "Each immediate subfolder appears as a game. New subfolders appear when you refresh.",
+                    FolderKind::Game => "Show this entire folder as one game."
+                }),
                 row![
-                    text_input("Folder path", &state.folder)
+                    text_input("~/My Games or /mnt/games", &state.folder)
                         .on_input(Message::Folder)
+                        .on_submit(Message::AddFolder)
                         .padding(10)
                         .width(Length::Fill),
                     secondary_maybe(
@@ -1144,7 +1152,7 @@ fn drives(state: &State) -> Element<'_, Message> {
         .snapshot
         .libraries
         .iter()
-        .map(|l| (l.path.clone(), l.custom))
+        .map(|l| (l.path.clone(), l.custom, l.folder_kind))
         .collect();
     for game in &state.games {
         let path = game
@@ -1153,26 +1161,48 @@ fn drives(state: &State) -> Element<'_, Message> {
             .parent()
             .unwrap_or(&game.game.install_dir)
             .to_path_buf();
-        if !paths.iter().any(|(p, _)| *p == path) {
-            paths.push((path, false));
+        if !paths.iter().any(|(p, _, _)| *p == path) {
+            paths.push((path, false, FolderKind::Game));
         }
     }
-    for (path, custom) in paths {
+    for (path, custom, folder_kind) in paths {
         let automatic = state
             .snapshot
             .libraries
             .iter()
             .any(|l| l.path == path && l.automatic);
         let label = path.display().to_string();
+        let remove_path = path.clone();
         content = content.push(panel(
             column![
-                text(label),
+                row![
+                    column![
+                        text(label),
+                        theme::muted(if custom {
+                            folder_kind.to_string()
+                        } else {
+                            "Detected library".into()
+                        })
+                    ]
+                    .spacing(4)
+                    .width(Length::Fill),
+                    if custom {
+                        secondary(
+                            "Remove location",
+                            Message::Send(Command::RemoveLibrary(remove_path)),
+                        )
+                    } else {
+                        Space::new().into()
+                    }
+                ]
+                .spacing(10),
                 checkbox(automatic)
                     .label("Maintain new installs and updates")
                     .on_toggle(move |enabled| Message::Send(Command::Library(Library {
                         path: path.clone(),
                         automatic: enabled,
-                        custom
+                        custom,
+                        folder_kind
                     })))
             ]
             .spacing(10),

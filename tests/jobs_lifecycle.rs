@@ -746,3 +746,86 @@ fn graceful_restart_preserves_settings_and_rejects_old_mutations() -> TestResult
         "replacement keeps durable settings",
     )
 }
+
+#[test]
+fn custom_locations_persist_discover_games_and_remove_without_deletion() -> TestResult {
+    use flummox::jobs::{FolderKind, Library};
+    let temp = tempfile::tempdir().ctx("custom locations")?;
+    let home = temp.path().join("home");
+    let root = home.join("My Games");
+    let game_path = root.join("Example Game");
+    std::fs::create_dir_all(&game_path).ctx("fixture game")?;
+    std::fs::write(game_path.join("save.dat"), b"keep this save").ctx("fixture save")?;
+    let mut service = start(&home)?;
+    let output = Command::new(env!("CARGO_BIN_EXE_flummox"))
+        .args(["jobs", "add-folder", "~/My\\ Games"])
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .output()
+        .ctx("add custom location")?;
+    check(
+        output.status.success(),
+        format!("add location: {}", String::from_utf8_lossy(&output.stderr)),
+    )?;
+    let snapshot = request(&home, Request::Snapshot)?;
+    check_eq(
+        snapshot
+            .libraries
+            .first()
+            .ctx("saved location")?
+            .folder_kind,
+        FolderKind::Collection,
+        "CLI registers a collection",
+    )?;
+    service.stop()?;
+    let _replacement = start(&home)?;
+    check_eq(
+        request(&home, Request::Snapshot)?.libraries.len(),
+        1,
+        "locations survive restart",
+    )?;
+    let scan = || -> Result<Vec<serde_json::Value>, String> {
+        let output = Command::new(env!("CARGO_BIN_EXE_flummox"))
+            .args(["--json", "scan"])
+            .env("HOME", &home)
+            .env("XDG_STATE_HOME", home.join("state"))
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .output()
+            .ctx("scan custom games")?;
+        check(output.status.success(), "scan succeeded")?;
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).ctx("scan JSON")?;
+        serde_json::from_value(result).ctx("games list")
+    };
+    check_eq(scan()?.len(), 1, "collection child appears as a game")?;
+    request(
+        &home,
+        Request::Library(Library {
+            path: game_path.clone(),
+            automatic: false,
+            custom: true,
+            folder_kind: FolderKind::Game,
+        }),
+    )?;
+    check_eq(
+        scan()?.len(),
+        1,
+        "overlapping single-game registration is deduplicated",
+    )?;
+    request(&home, Request::RemoveLibrary(root.clone()))?;
+    check_eq(
+        scan()?.len(),
+        1,
+        "removing collection preserves separately added games",
+    )?;
+    request(&home, Request::RemoveLibrary(game_path.clone()))?;
+    check(
+        scan()?.is_empty(),
+        "removed locations disappear from discovery",
+    )?;
+    check_eq(
+        std::fs::read(game_path.join("save.dat")).ctx("save after removal")?,
+        b"keep this save".to_vec(),
+        "removal preserves files",
+    )
+}

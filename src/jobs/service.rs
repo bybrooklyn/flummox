@@ -1017,6 +1017,37 @@ fn apply(
             snapshot.libraries.push(library);
             settings(db, snapshot)?;
         }
+        Command::RemoveLibrary(path) => {
+            let path = path.canonicalize().unwrap_or(path);
+            let library = snapshot
+                .libraries
+                .iter()
+                .find(|l| l.path == path && l.custom)
+                .context("This custom location is no longer registered")?
+                .clone();
+            ensure!(
+                !snapshot
+                    .jobs
+                    .iter()
+                    .any(|job| job.phase.active() && job.game.install_dir.starts_with(&path)),
+                "Finish or cancel jobs in this location before removing it."
+            );
+            ensure!(
+                !snapshot
+                    .packs
+                    .iter()
+                    .any(|install| install.game_path.starts_with(&path)),
+                "Restore Maximum Space games in this location before removing it."
+            );
+            if path.is_dir() {
+                update_live_compression(&Library {
+                    automatic: false,
+                    ..library
+                })?;
+            }
+            snapshot.libraries.retain(|l| l.path != path);
+            settings(db, snapshot)?;
+        }
         Command::Exclude { id, excluded } => {
             snapshot.excluded.retain(|i| i != &id);
             if excluded {
@@ -1715,6 +1746,7 @@ pub(super) fn run() -> Result<()> {
                     let startup_changed = matches!(
                         &message.command,
                         Command::Library(_)
+                            | Command::RemoveLibrary(_)
                             | Command::PackActivate { .. }
                             | Command::PackRollback { .. }
                     );
@@ -1998,6 +2030,7 @@ mod tests {
             path: temp.path().into(),
             automatic: false,
             custom: false,
+            folder_kind: FolderKind::Game,
         }];
         let on = vec![Library {
             automatic: true,

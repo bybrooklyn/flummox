@@ -36,7 +36,7 @@ pub fn choose(target: &Target) -> Result<Option<PathBuf>, String> {
     }
     let report = matches!(target, Target::Report);
     let title = match target {
-        Target::Game => "Choose an installed game folder",
+        Target::Game => "Choose a games location",
         Target::Storage(_) => "Choose where Maximum Space stores should live",
         Target::Report => "Import a compatibility report",
     };

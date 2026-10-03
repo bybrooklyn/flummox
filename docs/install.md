@@ -54,3 +54,29 @@ SHA-256 checksum in `dist/`. The Release workflow can also be run manually to
 produce downloadable workflow artifacts. A matching `v` tag runs the checks and
 creates Linux archive and Arch package downloads in a draft GitHub release; desktop acceptance remains required before
 publishing the draft.
+
+## Games in other locations
+
+Open **Drives & libraries**, choose **Games library**, and browse or enter a
+location such as `~/My Games` or `/mnt/other-drive/Games`. Each immediate
+subfolder appears as a separate game. Choose **Single game** when the folder
+itself contains one game's files. Spaces, quoted paths, and `~/My\ Games` are
+accepted; Flummox expands your home folder without executing shell commands.
+Hidden folders, files directly in the library root, and symlinked subfolders
+are excluded from collection discovery. Add a symlinked game directly if needed.
+Refresh to discover newly installed subfolders. Overlapping locations are merged
+with detected launcher games. Locations persist across app and coordinator
+restarts. **Remove location** forgets the registration and preserves every file;
+finish jobs and restore Maximum Space games in that location before removal.
+Automatic maintenance remains off until you enable it for the location.
+
+The CLI uses the same configuration:
+
+```sh
+flummox jobs add-folder '~/My Games'
+flummox jobs add-folder '/mnt/games/One Game' --single-game
+flummox jobs remove-folder '~/My Games'
+```
+
+The custom-location protocol is version 6. When upgrading a running version 5
+coordinator, use `flummox jobs restart` before adding locations.

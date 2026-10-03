@@ -5,7 +5,7 @@ use super::{
     theme, view,
 };
 use crate::{
-    jobs::{Job, Operation, PackTask, Phase},
+    jobs::{FolderKind, Job, Library, Operation, PackTask, Phase},
     launchers::Env,
     model::{Game, GameId, InstallState, Launcher},
     testutil::{Ctx, TestResult, check},
@@ -121,6 +121,13 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
         user_paused: false,
         pack: None,
         pack_interruptible: false,
+    });
+    state.folder = "~/My Games".into();
+    state.snapshot.libraries.push(Library {
+        path: "/home/player/My Games".into(),
+        automatic: false,
+        custom: true,
+        folder_kind: FolderKind::Collection,
     });
     for (page, name) in [
         (Page::Games, "games"),

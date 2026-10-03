@@ -4,8 +4,8 @@ use crate::{
     db::{Activity, Db, GameRecord},
     fsprobe,
     jobs::{
-        self, Command, Job, Library, MotionPreference, Operation, PackTask, Phase, Snapshot,
-        ThemePreference,
+        self, Command, FolderKind, Job, Library, MotionPreference, Operation, PackTask, Phase,
+        Snapshot, ThemePreference,
     },
     launchers::Env,
     model::Game,
@@ -214,6 +214,7 @@ pub struct State {
     pub scanning: bool,
     pub folder: String,
     pub folder_error: Option<String>,
+    pub folder_kind: FolderKind,
     pub picker_busy: bool,
     pub shown: usize,
     pub detail: Animation<bool>,
@@ -273,6 +274,7 @@ impl State {
             scanning: false,
             folder: String::new(),
             folder_error: None,
+            folder_kind: FolderKind::Collection,
             picker_busy: false,
             shown: 40,
             detail: Animation::new(false).duration(Duration::from_millis(200)),
@@ -608,6 +610,7 @@ pub enum Message {
     Send(Command),
     Folder(String),
     AddFolder,
+    FolderKind(FolderKind),
     Browse(super::dialog::Target),
     Chosen(super::dialog::Target, Result<Option<PathBuf>, String>),
     ReportImported(Result<crate::compatibility::Report, String>),
@@ -1152,8 +1155,13 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             state.folder = folder;
             state.folder_error = None;
         }
+        Message::FolderKind(kind) => state.folder_kind = kind,
         Message::AddFolder => {
-            let folder = PathBuf::from(state.folder.trim());
+            let Some(env) = Env::current() else {
+                state.folder_error = Some("Cannot locate your home folder.".into());
+                return Task::none();
+            };
+            let folder = jobs::folder_path(&state.folder, &env.home);
             if !folder.is_dir() || folder.parent().is_none() {
                 state.folder_error = Some("Choose an existing game folder.".into());
                 return Task::none();
@@ -1163,6 +1171,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 path: folder,
                 automatic: false,
                 custom: true,
+                folder_kind: state.folder_kind,
             }));
         }
         Message::Preset(id, preset) => {
