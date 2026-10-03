@@ -48,6 +48,7 @@ impl Algorithm {
 #[derive(Debug, Parser)]
 #[command(
     name = "flummox",
+    version,
     about = "Compress game folders and keep them playable"
 )]
 struct Args {
