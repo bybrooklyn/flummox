@@ -673,7 +673,7 @@ pub fn estimate_game_cancellable(
                     // Saturating, not wrapping: `remaining` was read before
                     // the file was sampled, so another thread may have spent
                     // the budget in between.
-                    let _spent = budget.fetch_update(
+                    let _spent = budget.try_update(
                         std::sync::atomic::Ordering::AcqRel,
                         std::sync::atomic::Ordering::Acquire,
                         |left| Some(left.saturating_sub(est.sampled)),
