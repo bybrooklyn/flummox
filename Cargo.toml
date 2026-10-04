@@ -1,7 +1,7 @@
 [package]
 name = "flummox"
 description = "Compress your game library and keep playing it"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 rust-version = "1.98"
 license = "AGPL-3.0-or-later"
@@ -68,6 +68,10 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_IO",
     "Win32_System_Ioctl",
 ] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.190"
+xattr = "1.6.1"
 
 [dev-dependencies]
 # The VDF parser reads files Steam writes, not files we write. Its robustness

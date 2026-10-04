@@ -63,6 +63,9 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
     ensure!(work.version == VERSION, "Worker version mismatch");
     let job = work.job;
     let _operation = super::operation_lock()?;
+    if let Some(plan) = &job.space_plan {
+        plan.recheck()?;
+    }
     let path = validate_folder(&job.game.install_dir)?;
     let fs = crate::fsprobe::probe(&path)?;
     let kind = crate::fsprobe::tier_for(&fs)
@@ -73,6 +76,11 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
         .context("Compression is not supported on this drive yet.")?;
     let backend =
         backend::for_kind(kind).context("Compression is not supported on this drive yet.")?;
+    if job.operation != Operation::Analyze {
+        let plan = crate::storage::native_plan(&path, job.operation == Operation::Decompress)?;
+        output.send(WorkerEvent::SpacePlan(plan.clone()));
+        plan.recheck()?;
+    }
     let mut db = Db::open(&Db::default_path().context("Cannot locate state database")?)?;
     for id in job.game.ids() {
         ensure!(

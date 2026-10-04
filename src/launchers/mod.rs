@@ -84,5 +84,23 @@ pub fn scan_all(env: &Env) -> Scan {
         desktop::custom(&mut scan);
     }
     desktop::merge(&mut scan);
+    if Env::current().is_some_and(|current| current.home == env.home) {
+        let libraries = crate::jobs::configured_libraries().unwrap_or_default();
+        let keep = |game: &Game| {
+            game.id.launcher != crate::model::Launcher::Manual
+                || libraries
+                    .iter()
+                    .any(|library| game.install_dir.starts_with(&library.path))
+        };
+        match crate::libraries::data_dir()
+            .and_then(|root| crate::libraries::remember(&root, scan.games.clone(), keep))
+        {
+            Ok(games) => scan.games = games,
+            Err(error) => scan.warnings.push(DetectError::new(
+                "Remembering offline libraries",
+                std::io::Error::other(error.to_string()),
+            )),
+        }
+    }
     scan
 }

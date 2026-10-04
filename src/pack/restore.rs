@@ -51,6 +51,16 @@ pub(super) fn copy_xattrs(source: &Path, destination: &Path) -> Result<()> {
 pub fn restore(store: &Path, destination: &Path, cancel: &AtomicBool) -> Result<Summary> {
     let reader = Reader::open(store)?;
     let (parent, target) = super::create::destination(destination)?;
+    let mut space = crate::storage::SpacePlan::default();
+    space.add(
+        crate::storage::volume(&parent)?,
+        reader
+            .summary()
+            .logical_bytes
+            .saturating_add(reader.summary().metadata_bytes.saturating_mul(8)),
+        "Ordinary restored files and metadata",
+    )?;
+    space.recheck()?;
     let staged = tempfile::Builder::new()
         .prefix(".flummox-restore-")
         .tempdir_in(&parent)?;

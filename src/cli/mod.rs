@@ -126,6 +126,14 @@ enum Command {
         #[command(subcommand)]
         action: ExcludeAction,
     },
+    /// Plan additional storage without changing installed files.
+    Plan {
+        folder: PathBuf,
+        #[arg(long)]
+        restore: bool,
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
     /// List the drives holding games, and how each one can be compressed.
     Drives,
     /// Check this machine for anything that would stop the tool working.
@@ -288,6 +296,28 @@ pub fn run() -> Result<()> {
             dry_run,
         } => cmd_watch(&env, action, &level, threads, dry_run, &cancel),
         Command::Exclude { action } => cmd_exclude(&env, out, action),
+        Command::Plan {
+            folder,
+            restore,
+            store,
+        } => {
+            let plan = if let Some(store) = store {
+                let mut plan = crate::storage::SpacePlan {
+                    retained_original: true,
+                    ..Default::default()
+                };
+                plan.add(
+                    crate::storage::volume(&store)?,
+                    crate::storage::pack_bound(&crate::storage::inventory(&folder)?)?,
+                    "Verified store; original retained",
+                )?;
+                plan
+            } else {
+                crate::storage::native_plan(&folder, restore)?
+            };
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+            plan.check()
+        }
         Command::Drives => cmd_drives(&env),
         Command::Doctor => cmd_doctor(&env),
         Command::Pack { action } => crate::pack::cli::run(action, cli.json, &cancel),

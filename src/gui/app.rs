@@ -22,15 +22,17 @@ pub enum Page {
     Updates,
     Drives,
     Activity,
+    Recovery,
     Settings,
 }
-pub const PAGES: [Page; 6] = [
+pub const PAGES: [Page; 7] = [
     Page::Overview,
     Page::Games,
     Page::Queue,
     Page::Updates,
     Page::Drives,
     Page::Activity,
+    Page::Recovery,
 ];
 impl Page {
     pub fn label(self) -> &'static str {
@@ -41,6 +43,7 @@ impl Page {
             Self::Updates => "Updates",
             Self::Drives => "Drives",
             Self::Activity => "Activity",
+            Self::Recovery => "Recovery",
             Self::Settings => "Settings",
         }
     }
@@ -81,6 +84,19 @@ impl GameRow {
                     })
                 })
         });
+        if matches!(&game.state, crate::model::InstallState::Broken { detail } if detail.starts_with("Library unavailable:"))
+        {
+            return Self {
+                game,
+                filesystem: "Offline".into(),
+                mountpoint: None,
+                supported: false,
+                native_supported: false,
+                pack_supported: false,
+                note: Some("Reconnect the original drive and refresh.".into()),
+                artwork,
+            };
+        }
         match fsprobe::probe(&game.install_dir) {
             Ok(fs) => {
                 let tier = fsprobe::tier_for(&fs);
@@ -197,6 +213,8 @@ pub struct State {
     pub status_reveal: Animation<bool>,
     pub status_deadline: Option<Instant>,
     pub snapshot: Snapshot,
+    pub planned: Option<(Command, crate::storage::SpacePlan)>,
+    pub qualification: Option<crate::qualification::Wizard>,
     pub nav: Vec<(Page, Animation<bool>)>,
     pub page_reveal: Animation<bool>,
     pub query: String,
@@ -245,6 +263,8 @@ impl State {
                 .easing(Easing::EaseOutCubic),
             status_deadline: None,
             snapshot: Snapshot::default(),
+            planned: None,
+            qualification: None,
             nav: PAGES
                 .into_iter()
                 .map(|page| {
@@ -595,12 +615,26 @@ pub enum Message {
     Refresh,
     Scanned(Result<ScanResult, String>),
     Snapshot(Result<Snapshot, String>),
+    Planned(Result<(Command, crate::storage::SpacePlan), String>),
+    StartPlanned,
+    CancelPlanned,
+    ExportDiagnostics,
+    Qualify(String),
+    QualificationReady(Result<crate::qualification::Wizard, String>),
+    QualificationField(crate::qualification::Field, String),
+    QualificationCheck(crate::qualification::Check, bool),
+    QualificationMode(crate::compatibility::StorageMode),
+    SaveQualification,
+    CloseQualification,
+    QualificationSaved(Result<PathBuf, String>),
+    DiagnosticsExported(Result<PathBuf, String>),
     AnalysisQueued(Result<Snapshot, String>),
     Dismiss,
     Tick,
     Query(String),
     Select(String, bool),
     Expand(String),
+    ReviewGame(String),
     Sort(Sort),
     Filter(Filter),
     ShowMore,
@@ -642,6 +676,28 @@ pub async fn background<T: Send + 'static>(
         .map_err(|_| "The background task stopped unexpectedly.".into())
 }
 fn send(command: Command) -> Task<Message> {
+    if matches!(
+        &command,
+        Command::Enqueue {
+            operation: Operation::Compress | Operation::Decompress,
+            ..
+        } | Command::EnqueuePack { .. }
+    ) {
+        return Task::perform(
+            background(move || {
+                let snapshot =
+                    jobs::request(Command::Snapshot).map_err(|error| error.to_string())?;
+                let plan =
+                    jobs::space_plan(&command, &snapshot).map_err(|error| error.to_string())?;
+                Ok((command, plan))
+            }),
+            |result| Message::Planned(result.and_then(|result| result)),
+        );
+    }
+    send_unchecked(command)
+}
+
+fn send_unchecked(command: Command) -> Task<Message> {
     Task::perform(
         background(move || jobs::request(command).map_err(|e| e.to_string())),
         |r| Message::Snapshot(r.and_then(|r| r)),
@@ -779,6 +835,116 @@ fn analyze_visible(state: &mut State) -> Task<Message> {
 
 pub fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
+        Message::Qualify(id) => {
+            if let Some(game) = state
+                .games
+                .iter()
+                .find(|row| row.game.id.to_string() == id && row.game.state.is_idle())
+                .map(|row| row.game.clone())
+            {
+                return Task::perform(
+                    background(move || {
+                        crate::qualification::baseline(&game)
+                            .map(|corpus| crate::qualification::Wizard::new(game, corpus))
+                            .map_err(|error| error.to_string())
+                    }),
+                    |result| Message::QualificationReady(result.and_then(|result| result)),
+                );
+            }
+        }
+        Message::QualificationReady(result) => match result {
+            Ok(wizard) => state.qualification = Some(wizard),
+            Err(error) => state.show_status(Status::error(error)),
+        },
+        Message::QualificationField(field, text) => {
+            if let Some(wizard) = &mut state.qualification {
+                wizard.field(field, text);
+            }
+        }
+        Message::QualificationCheck(check, value) => {
+            if let Some(wizard) = &mut state.qualification {
+                wizard.check(check, value);
+            }
+        }
+        Message::QualificationMode(mode) => {
+            if let Some(wizard) = &mut state.qualification {
+                wizard.mode = mode;
+            }
+        }
+        Message::SaveQualification => {
+            if let Some(wizard) = &state.qualification {
+                match wizard.report() {
+                    Ok(report) => {
+                        return Task::perform(
+                            background(move || {
+                                crate::compatibility::Store::local()
+                                    .and_then(|store| store.save(&report))
+                                    .map_err(|error| error.to_string())
+                            }),
+                            |result| Message::QualificationSaved(result.and_then(|result| result)),
+                        );
+                    }
+                    Err(error) => state.show_status(Status::error(error.to_string())),
+                }
+            }
+        }
+        Message::CloseQualification => state.qualification = None,
+        Message::QualificationSaved(result) => match result {
+            Ok(path) => {
+                state.qualification = None;
+                state.show_status(Status::info(format!(
+                    "Compatibility report saved to {}",
+                    path.display()
+                )));
+                return update(state, Message::Refresh);
+            }
+            Err(error) => state.show_status(Status::error(error)),
+        },
+        Message::Planned(result) => match result {
+            Ok(plan) => state.planned = Some(plan),
+            Err(error) => state.show_status(Status::error(error)),
+        },
+        Message::StartPlanned => {
+            if let Some((command, plan)) = state.planned.take() {
+                match plan.check() {
+                    Ok(()) => {
+                        return send_unchecked(Command::EnqueuePlanned {
+                            command: Box::new(command),
+                            plan,
+                        });
+                    }
+                    Err(error) => state.show_status(Status::error(error.to_string())),
+                }
+            }
+        }
+        Message::CancelPlanned => state.planned = None,
+        Message::ExportDiagnostics => {
+            let snapshot = state.snapshot.clone();
+            return Task::perform(
+                background(move || {
+                    let root = crate::libraries::data_dir().map_err(|error| error.to_string())?;
+                    crate::libraries::private_dir(&root).map_err(|error| error.to_string())?;
+                    let mut file = tempfile::NamedTempFile::new_in(&root)
+                        .map_err(|error| error.to_string())?;
+                    serde_json::to_writer_pretty(&mut file, &snapshot)
+                        .map_err(|error| error.to_string())?;
+                    file.as_file()
+                        .sync_all()
+                        .map_err(|error| error.to_string())?;
+                    let path = root.join("diagnostics.json");
+                    file.persist(&path).map_err(|error| error.to_string())?;
+                    Ok(path)
+                }),
+                |result| Message::DiagnosticsExported(result.and_then(|result| result)),
+            );
+        }
+        Message::DiagnosticsExported(result) => match result {
+            Ok(path) => state.show_status(Status::info(format!(
+                "Diagnostics saved to {}. They include local folder paths.",
+                path.display()
+            ))),
+            Err(error) => state.show_status(Status::error(error)),
+        },
         Message::GoTo(page) => {
             if state.page != page {
                 state.page = page;
@@ -847,6 +1013,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::Snapshot(result) => match result {
             Ok(snapshot) => {
                 let libraries_changed = state.snapshot.libraries != snapshot.libraries;
+                let discovery_changed = state.snapshot.discovered != snapshot.discovered;
                 let completed_work = snapshot.jobs.iter().any(|job| {
                     job.operation != Operation::Analyze
                         && !job.phase.active()
@@ -893,7 +1060,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                     state.show_status(Status::info("Library settings saved."));
                     return update(state, Message::Refresh);
                 }
-                if completed_work {
+                if completed_work || discovery_changed {
                     return update(state, Message::Refresh);
                 }
                 return analyze_visible(state);
@@ -919,6 +1086,10 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             } else {
                 state.selected.remove(&id);
             }
+        }
+        Message::ReviewGame(id) => {
+            let _navigation = update(state, Message::GoTo(Page::Games));
+            return update(state, Message::Expand(id));
         }
         Message::Expand(id) => {
             state.confirm_reclaim.clear();
@@ -1360,6 +1531,7 @@ mod tests {
             user_paused: false,
             pack: None,
             pack_interruptible: false,
+            space_plan: None,
         };
         state.snapshot.jobs.push(analysis.clone());
         check(state.estimate(&game).is_some(), "fresh analysis is shown")?;

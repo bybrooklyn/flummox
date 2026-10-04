@@ -583,6 +583,16 @@ pub fn create_observed(
     );
     let root = crate::jobs::validate_folder(root)?;
     let (parent, target) = destination(output)?;
+    let mut space = crate::storage::SpacePlan {
+        retained_original: true,
+        ..Default::default()
+    };
+    space.add(
+        crate::storage::volume(&parent)?,
+        crate::storage::pack_bound(&crate::storage::inventory(&root)?)?,
+        "Verified store; source retained",
+    )?;
+    space.recheck()?;
     ensure!(
         !target.starts_with(&root),
         "Keep the store outside its source folder"
@@ -754,6 +764,16 @@ pub fn create_shared_observed(
     );
     let root = crate::jobs::validate_folder(root)?;
     let (parent, target) = destination(output)?;
+    let mut space = crate::storage::SpacePlan {
+        retained_original: true,
+        ..Default::default()
+    };
+    space.add(
+        crate::storage::volume(&parent)?,
+        crate::storage::pack_bound(&crate::storage::inventory(&root)?)?,
+        "Verified store; source retained",
+    )?;
+    space.recheck()?;
     ensure!(
         !target.starts_with(&root),
         "Keep the store outside its source folder"

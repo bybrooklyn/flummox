@@ -71,7 +71,7 @@ package() {{
 
   url "{url}/{mac}"
   name "Flummox"
-  desc "Game compression desktop shell (macOS backend under development)"
+  desc "Compress installed games using native APFS storage"
   homepage "https://github.com/bybrooklyn/flummox"
 
   depends_on arch: :arm64

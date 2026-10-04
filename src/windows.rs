@@ -11,7 +11,7 @@ use std::{
     collections::BTreeSet,
     fs::OpenOptions,
     io::Read,
-    os::windows::io::AsRawHandle,
+    os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -64,6 +64,12 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Algorithm::Lzx)]
         algorithm: Algorithm,
     },
+    /// Inspect temporary-space requirements without changing files.
+    Analyze {
+        folder: PathBuf,
+        #[arg(long)]
+        restore: bool,
+    },
     /// Restore ordinary NTFS storage for a folder tree.
     Decompress { folder: PathBuf },
 }
@@ -72,6 +78,8 @@ enum Command {
 pub(crate) struct InstalledGame {
     pub title: String,
     pub path: PathBuf,
+    pub app_id: Option<u32>,
+    pub build: Option<String>,
 }
 
 fn bounded_text(path: &Path, limit: u64) -> Result<String> {
@@ -159,6 +167,8 @@ pub(crate) fn discover_steam() -> Vec<InstalledGame> {
                 games.push(InstalledGame {
                     title: title.to_owned(),
                     path,
+                    app_id: manifest.get_u32("appid"),
+                    build: manifest.get_str("buildid").map(str::to_owned),
                 });
             }
         }
@@ -185,6 +195,7 @@ fn file_handle(path: &Path) -> Result<std::fs::File> {
     OpenOptions::new()
         .read(true)
         .write(true)
+        .share_mode(0)
         .open(path)
         .with_context(|| format!("Opening {}", path.display()))
 }
@@ -271,9 +282,43 @@ fn decompress_file(path: &Path) -> Result<bool> {
     )
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Recovery {
+    #[serde(with = "crate::path_serde")]
+    pub root: PathBuf,
+    pub restore: bool,
+    pub volume: crate::storage::Volume,
+}
+
+fn journal_path() -> Result<PathBuf> {
+    Ok(crate::libraries::data_dir()?.join("windows-job.json"))
+}
+
+pub fn recovery() -> Result<Vec<Recovery>> {
+    match std::fs::read(journal_path()?) {
+        Ok(bytes) => Ok(vec![serde_json::from_slice(&bytes)?]),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn recover_folder(folder: &Path) -> Result<()> {
+    let record = recovery()?
+        .into_iter()
+        .find(|record| record.root == folder)
+        .context("No interrupted job for this folder")?;
+    ensure!(
+        crate::storage::volume(folder)?.identity == record.volume.identity,
+        "Reconnect the original drive"
+    );
+    restore_folder_with(folder, &AtomicBool::new(false), |_| {})?;
+    Ok(())
+}
+
 fn visit_with(
     root: &Path,
     cancel: &AtomicBool,
+    restore: bool,
     mut operation: impl FnMut(&Path) -> Result<bool>,
     mut report: impl FnMut(Progress),
 ) -> Result<Progress> {
@@ -281,6 +326,37 @@ fn visit_with(
         .canonicalize()
         .with_context(|| format!("Opening {}", root.display()))?;
     ensure!(root.is_dir(), "Choose an installed game folder");
+    let state = crate::libraries::data_dir()?;
+    crate::libraries::private_dir(&state)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(state.join("native.lock"))?;
+    ensure!(
+        lock.try_lock().is_ok(),
+        "Another Flummox process is working"
+    );
+    let volume = crate::storage::volume(&root)?;
+    for record in recovery()? {
+        ensure!(
+            record.root == root && record.volume.identity == volume.identity,
+            "Review the interrupted job before processing another game"
+        );
+    }
+    crate::storage::native_plan(&root, restore)?.recheck()?;
+    let mut journal = tempfile::NamedTempFile::new_in(&state)?;
+    serde_json::to_writer(
+        &mut journal,
+        &Recovery {
+            root: root.clone(),
+            restore,
+            volume,
+        },
+    )?;
+    journal.as_file().sync_all()?;
+    journal.persist(journal_path()?)?;
     let mut summary = Progress::default();
     for item in walkdir::WalkDir::new(&root).follow_links(false) {
         ensure!(!cancel.load(Ordering::Relaxed), "Operation stopped");
@@ -309,11 +385,16 @@ fn visit_with(
             .saturating_add(allocation_size(item.path())?);
         report(summary.clone());
     }
+    std::fs::remove_file(journal_path()?)?;
     Ok(summary)
 }
 
-fn visit(root: &Path, operation: impl FnMut(&Path) -> Result<bool>) -> Result<Progress> {
-    visit_with(root, &AtomicBool::new(false), operation, |_| {})
+fn visit(
+    root: &Path,
+    restore: bool,
+    operation: impl FnMut(&Path) -> Result<bool>,
+) -> Result<Progress> {
+    visit_with(root, &AtomicBool::new(false), restore, operation, |_| {})
 }
 
 fn describe(summary: &Progress) -> String {
@@ -353,6 +434,7 @@ pub(crate) fn optimize_folder_with(
     visit_with(
         folder,
         cancel,
+        false,
         |path| compress_file(path, Algorithm::Lzx),
         report,
     )
@@ -365,16 +447,23 @@ pub(crate) fn restore_folder_with(
     cancel: &AtomicBool,
     report: impl FnMut(Progress),
 ) -> Result<String> {
-    visit_with(folder, cancel, decompress_file, report).map(|summary| describe(&summary))
+    visit_with(folder, cancel, true, decompress_file, report).map(|summary| describe(&summary))
 }
 
 /// Runs the native Windows CLI.
 pub fn run() -> Result<()> {
     let summary = match Args::parse().command {
-        Command::Compress { folder, algorithm } => {
-            visit(&folder, |path| compress_file(path, algorithm))?
+        Command::Analyze { folder, restore } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&crate::storage::native_plan(&folder, restore)?)?
+            );
+            return Ok(());
         }
-        Command::Decompress { folder } => visit(&folder, decompress_file)?,
+        Command::Compress { folder, algorithm } => {
+            visit(&folder, false, |path| compress_file(path, algorithm))?
+        }
+        Command::Decompress { folder } => visit(&folder, true, decompress_file)?,
     };
     println!("{}", describe(&summary));
     Ok(())

@@ -161,6 +161,53 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         .height(Length::Fill)
         .style(theme::sidebar);
     let mut body = column![].spacing(0).width(Length::Fill);
+    if let Some(wizard) = &state.qualification {
+        body = body.push(panel(
+            scrollable(crate::qualification::view(
+                wizard,
+                Message::QualificationField,
+                Message::QualificationCheck,
+                Message::QualificationMode,
+                Message::SaveQualification,
+                Message::CloseQualification,
+            ))
+            .height(Length::Fixed(420.0)),
+        ));
+    }
+    if let Some((_, plan)) = &state.planned {
+        let mut review = column![theme::section_title("Storage plan")].spacing(8);
+        for requirement in &plan.requirements {
+            review = review.push(
+                text(format!(
+                    "{}: {} needed including headroom · {} available",
+                    requirement.volume.path.display(),
+                    size(requirement.additional.saturating_add(requirement.headroom)),
+                    size(requirement.volume.available)
+                ))
+                .size(13),
+            );
+            review = review.push(theme::muted(requirement.reasons.join(" · ")));
+        }
+        if plan.retained_original {
+            review = review.push(theme::muted(
+                "The original is retained until you explicitly reclaim it.",
+            ));
+        }
+        if let Err(error) = plan.check() {
+            review = review.push(text(error.to_string()).size(13));
+        }
+        review = review.push(
+            row![
+                action_maybe(
+                    "Start job",
+                    plan.check().is_ok().then_some(Message::StartPlanned)
+                ),
+                secondary("Cancel", Message::CancelPlanned)
+            ]
+            .spacing(8),
+        );
+        body = body.push(panel(review));
+    }
     let page = match state.page {
         Page::Overview => overview(state, compact),
         Page::Games => games(state, compact),
@@ -168,6 +215,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         Page::Updates => updates(state, compact),
         Page::Drives => drives(state),
         Page::Activity => activity(state),
+        Page::Recovery => recovery(state),
         Page::Settings => settings_page(state),
     };
     let page_reveal = if state.reduced_motion {
@@ -264,6 +312,7 @@ fn page_icon(page: Page) -> &'static str {
         Page::Updates => "↻",
         Page::Drives => "▰",
         Page::Activity => "⌁",
+        Page::Recovery => "⟲",
         Page::Settings => "⚙",
     }
 }
@@ -878,6 +927,13 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
         if let Some(note) = &item.note {
             details = details.push(theme::muted(note));
         }
+        details = details.push(secondary_maybe(
+            "Qualify compatibility",
+            item.game
+                .state
+                .is_idle()
+                .then(|| Message::Qualify(id.clone())),
+        ));
         details = details.push(secondary(
             "Exclude",
             Message::Send(Command::Exclude {
@@ -960,6 +1016,91 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
         ]);
     }
     panel(contents)
+}
+
+fn recovery(state: &State) -> Element<'_, Message> {
+    let mut content = column![
+        theme::page_title("Recovery"),
+        theme::muted("Review interrupted jobs and retained storage before retrying or restoring."),
+        secondary("Export local diagnostics", Message::ExportDiagnostics)
+    ]
+    .spacing(14);
+    let mut issues = 0;
+    for job in state.snapshot.jobs.iter().filter(|job| {
+        matches!(
+            job.phase,
+            Phase::Interrupted | Phase::Partial | Phase::Failed
+        )
+    }) {
+        issues += 1;
+        content = content.push(job_row(state, job));
+    }
+    for install in &state.snapshot.packs {
+        if install.phase == crate::pack::InstallPhase::Mounted
+            && install.backup_path.is_none()
+            && install.previous_store_path.is_none()
+        {
+            continue;
+        }
+        issues += 1;
+        let mut details = column![
+            text(install.game_path.display().to_string()).size(16),
+            theme::muted(install.phase.label()),
+            text(&install.message).size(13),
+            theme::muted(format!(
+                "Store: {} · Updates: {}",
+                install.store_path.display(),
+                install.writes_path.display()
+            ))
+        ]
+        .spacing(8);
+        if let Some(backup) = &install.backup_path {
+            details = details.push(theme::muted(format!(
+                "Retained original: {}",
+                backup.display()
+            )));
+        }
+        if let Some(previous) = &install.previous_store_path {
+            details = details.push(theme::muted(format!(
+                "Previous store retained: {}",
+                previous.display()
+            )));
+        }
+        let game = state
+            .games
+            .iter()
+            .find(|row| row.game.install_dir == install.game_path);
+        let pending = state
+            .snapshot
+            .jobs
+            .iter()
+            .any(|job| job.phase.active() && job.game.install_dir == install.game_path);
+        if let Some(row) = game {
+            if !pending
+                && row.game.state.is_idle()
+                && install.phase == crate::pack::InstallPhase::Mounted
+            {
+                details = details.push(secondary(
+                    "Restore ordinary files",
+                    Message::Send(Command::EnqueuePack {
+                        game: row.game.clone(),
+                        task: crate::jobs::PackTask::Restore,
+                    }),
+                ));
+            }
+            details = details.push(secondary(
+                "Review game and storage",
+                Message::ReviewGame(row.game.id.to_string()),
+            ));
+        }
+        content = content.push(panel(details));
+    }
+    if issues == 0 {
+        content = content.push(panel(theme::muted(
+            "No interrupted jobs or retained storage need review.",
+        )));
+    }
+    content.into()
 }
 
 fn progress<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {

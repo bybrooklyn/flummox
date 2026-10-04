@@ -8,7 +8,7 @@
 //! Only the text format lives here. `shortcuts.vdf` is binary and gets its own
 //! module when non-Steam shortcuts are supported.
 
-#![cfg_attr(windows, allow(dead_code))]
+#![cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
 
 use std::fmt;
 

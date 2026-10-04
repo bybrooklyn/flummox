@@ -41,6 +41,11 @@ jobs:
         env:
           TAG: ${{ steps.tag.outputs.tag }}
         run: python packaging/prepare-release.py --tag "$TAG"
+      - name: Require recorded game acceptance for tag publication
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: python packaging/check-acceptance.py --version "$VERSION"
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: release-notes
@@ -87,7 +92,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libxrandr-dev \
-            libxi-dev libxcursor-dev libgl1-mesa-dev libfontconfig1-dev desktop-file-utils
+            libxi-dev libxcursor-dev libgl1-mesa-dev libfontconfig1-dev desktop-file-utils minisign
       - name: Install Rust
         env:
           TARGET: ${{ matrix.target }}
@@ -180,6 +185,15 @@ jobs:
             dist/*.zip
             dist/*-setup.exe
             dist/*.sha256
+            dist/*-sizes.json
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7.0.1
+        if: matrix.platform == 'linux'
+        with:
+          name: debug-${{ matrix.platform }}-${{ matrix.arch }}
+          path: release-debug/
+          retention-days: 14
           if-no-files-found: error
 
   arch:
@@ -271,11 +285,53 @@ jobs:
           test ! -d /Applications/Flummox.app
           brew untap bybrooklyn/flummox-test
 
-  publish:
-    name: Publish tagged release
+  sign:
+    name: Sign and verify finalized downloads
     needs: [prepare, build, arch, homebrew-check]
     if: >-
-      always() && startsWith(github.ref, 'refs/tags/') &&
+      always() && needs.prepare.result == 'success' && needs.build.result == 'success' &&
+      (needs.arch.result == 'success' || needs.arch.result == 'skipped') &&
+      (needs.homebrew-check.result == 'success' || needs.homebrew-check.result == 'skipped')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: flummox-*
+          merge-multiple: true
+          path: dist
+      - run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Sign manifest
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import subprocess
+          import tempfile
+          secret = os.environ.pop('RELEASE_SIGNING_KEY')
+          if not secret:
+              raise SystemExit('RELEASE_SIGNING_KEY is missing')
+          with tempfile.NamedTemporaryFile(mode='w', prefix='flummox-signing-') as key:
+              key.write(secret)
+              key.flush()
+              subprocess.run(['python', 'packaging/release-manifest.py', 'sign', '--version', os.environ['VERSION'], '--commit', os.environ['GITHUB_SHA'], '--key', key.name], check=True)
+          PY
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: flummox-manifest
+          path: |
+            dist/*-manifest.json
+            dist/*-manifest.json.minisig
+          if-no-files-found: error
+
+  publish:
+    name: Publish tagged release
+    needs: [prepare, build, arch, homebrew-check, sign]
+    if: >-
+      always() && startsWith(github.ref, 'refs/tags/') && needs.sign.result == 'success' &&
       needs.prepare.result == 'success' && needs.build.result == 'success' &&
       (needs.arch.result == 'success' || needs.arch.result == 'skipped') &&
       (needs.homebrew-check.result == 'success' || needs.homebrew-check.result == 'skipped')
@@ -293,6 +349,21 @@ jobs:
         with:
           name: release-notes
           path: notes
+      - run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Verify signed downloads and include public key
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          python packaging/release-manifest.py verify --version "$VERSION" --commit "$GITHUB_SHA"
+          python - <<'PY'
+          from pathlib import Path
+          import os
+          notes = Path('notes/RELEASE-NOTES.md')
+          key = Path('packaging/minisign.pub').read_text().splitlines()[-1]
+          version = os.environ['VERSION']
+          with notes.open('a') as output:
+              output.write(f'\n## Verify downloads\n\nRelease public key: `{key}`\n\nVerify the manifest with `minisign -Vm flummox-{version}-manifest.json -P {key}`, then compare your download against its signed SHA-256 digest. The manifest authenticates all downloads.\n')
+          PY
       - name: Publish with changelog and download digests
         env:
           GH_TOKEN: ${{ github.token }}
@@ -302,7 +373,7 @@ jobs:
         run: |
           args=()
           if [ "$PRERELEASE" = true ]; then args+=(--prerelease --latest=false); fi
-          mapfile -t assets < <(find dist -maxdepth 1 -type f \( -name '*.tar.xz' -o -name '*.zip' -o -name '*-setup.exe' -o -name '*.pkg.tar.zst' \) | sort)
+          mapfile -t assets < <(find dist -maxdepth 1 -type f \( -name '*.tar.xz' -o -name '*.zip' -o -name '*-setup.exe' -o -name '*.pkg.tar.zst' -o -name '*-manifest.json' -o -name '*-manifest.json.minisig' \) | sort)
           # Create as draft so an interrupted upload never exposes a partial release.
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" --verify-tag --draft --title "Flummox $VERSION" --notes-file notes/RELEASE-NOTES.md
@@ -322,6 +393,11 @@ jobs:
           pattern: flummox-*
           merge-multiple: true
           path: dist
+      - run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Verify signed downloads before channel updates
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: python packaging/release-manifest.py verify --version "$VERSION" --commit "$GITHUB_SHA"
       - name: Generate pinned recipes
         env:
           VERSION: ${{ needs.prepare.outputs.version }}

@@ -35,7 +35,7 @@ def release_notes(root, version, start, tag):
     commits = subprocess.check_output(['git', 'log', '--format=- %s (%h)', f'{start}..HEAD' if start else 'HEAD'], cwd=root, text=True)
     notes = f'# Flummox {version}\n\n## Changes\n\n{commits}\n'
     notes += '## Downloads\n\nLinux: x86_64 and ARM64 archives. macOS: Apple Silicon app bundle. Windows: x64 installer and portable ZIP. GitHub displays a SHA-256 digest beside each download.\n\n'
-    notes += 'macOS currently provides the desktop shell; compression is not implemented. Linux archives require glibc 2.39 or newer. Unsigned macOS and Windows downloads can trigger operating-system security prompts.\n'
+    notes += 'macOS supports native APFS compression. Linux archives require glibc 2.39 or newer. Unsigned macOS and Windows downloads can trigger operating-system security prompts.\n'
     if start:
         notes += f'\n[Full changelog](https://github.com/bybrooklyn/flummox/compare/{start}...{tag or "HEAD"})\n'
     return notes

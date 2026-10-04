@@ -548,25 +548,10 @@ fn recover_packs(
     let mut recovered = Vec::with_capacity(snapshot.packs.len());
     for mut install in std::mem::take(&mut snapshot.packs) {
         if install.phase == crate::pack::InstallPhase::Restoring {
-            let completed = install
-                .backup_path
-                .as_ref()
-                .is_none_or(|backup| !backup.exists())
-                && install.game_path.is_dir()
-                && std::fs::read_dir(&install.game_path)
-                    .is_ok_and(|mut entries| entries.next().is_some());
-            if completed {
-                continue;
-            }
-            match crate::pack::rollback(&install, None, &std::sync::atomic::AtomicBool::new(false))
-            {
-                Ok(()) => continue,
-                Err(error) => {
-                    install.message = format!("Could not finish restoring files: {error}");
-                    recovered.push(install);
-                    continue;
-                }
-            }
+            install.phase = crate::pack::InstallPhase::Attention;
+            install.message = "Restoration was interrupted. Retained copies are unchanged; verify the ordinary folder before any cleanup.".into();
+            recovered.push(install);
+            continue;
         }
         if mounts
             .iter()
@@ -857,6 +842,7 @@ fn enqueue_job(
         user_paused: false,
         pack,
         pack_interruptible: true,
+        space_plan: None,
     };
     save(db, &job)?;
     snapshot.jobs.push(job);
@@ -903,6 +889,35 @@ fn apply(
     running_pack: Option<i64>,
 ) -> Result<()> {
     match command {
+        Command::EnqueuePlanned { command, plan } => {
+            ensure!(
+                matches!(
+                    &*command,
+                    Command::Enqueue {
+                        operation: Operation::Compress | Operation::Decompress,
+                        ..
+                    } | Command::EnqueuePack { .. }
+                ),
+                "Space plans apply only to storage jobs"
+            );
+            plan.recheck()?;
+            let path = match &*command {
+                Command::Enqueue { game, .. } | Command::EnqueuePack { game, .. } => {
+                    game.install_dir.clone()
+                }
+                _ => bail!("Storage command is missing"),
+            };
+            apply(*command, snapshot, db, active, mounts, running_pack)?;
+            if let Some(job) = snapshot
+                .jobs
+                .iter_mut()
+                .rev()
+                .find(|job| job.game.install_dir == path && job.phase.active())
+            {
+                job.space_plan = Some(plan);
+                save(db, job)?;
+            }
+        }
         Command::Snapshot | Command::Restart => {}
         Command::ReducedMotion(value) => {
             db.execute(
@@ -1175,6 +1190,7 @@ fn start(job: &Job, db: &Connection) -> Result<Active> {
 fn event(job: &mut Job, event: WorkerEvent, db: &Connection) -> Result<bool> {
     use crate::backend::Event;
     match event {
+        WorkerEvent::SpacePlan(plan) => job.space_plan = Some(plan),
         WorkerEvent::Estimate(estimate) => {
             job.estimate = Some(estimate);
         }
@@ -1349,6 +1365,7 @@ fn start_pack(
     database: &Path,
 ) -> Result<PackActive> {
     let task = job.pack.clone().context("Storage task is missing")?;
+    let expected_plan = job.space_plan.clone();
     let (send, events) = mpsc::sync_channel(128);
     let control = std::sync::Arc::new(PackControl {
         interruptible: std::sync::atomic::AtomicBool::new(true),
@@ -1369,6 +1386,9 @@ fn start_pack(
             let db = Connection::open(database)?;
             db.busy_timeout(Duration::from_secs(5))?;
             let _operation = super::operation_lock()?;
+            if let Some(plan) = expected_plan {
+                plan.recheck()?;
+            }
             run_pack_task(
                 &task,
                 &game,
@@ -1436,6 +1456,14 @@ fn run_pack_task(
 ) -> Result<()> {
     use crate::pack::Observer;
     control.checkpoint()?;
+    let plan = super::space_plan(
+        &Command::EnqueuePack {
+            game: game.clone(),
+            task: task.clone(),
+        },
+        snapshot,
+    )?;
+    plan.recheck()?;
     match task {
         PackTask::Create { store } => {
             let root = validate_folder(&game.install_dir)?;
@@ -1676,6 +1704,7 @@ pub(super) fn run() -> Result<()> {
             last_scan = Instant::now();
             if let Some(env) = crate::launchers::Env::current() {
                 games = crate::launchers::scan_all(&env).games;
+                snapshot.discovered = games.clone();
             }
             use crate::busy::ProcSource;
             let procs = crate::busy::ProcFs::new().processes();

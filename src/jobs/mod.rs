@@ -18,7 +18,7 @@ use std::path::PathBuf;
 pub use service::{configured_libraries, request, state_dir};
 
 /// Protocol version. A mismatched installed worker is rejected before work.
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 
 /// Which application palette the desktop shell follows.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +151,8 @@ pub struct Job {
     pub pack: Option<PackTask>,
     #[serde(default)]
     pub pack_interruptible: bool,
+    #[serde(default)]
+    pub space_plan: Option<crate::storage::SpacePlan>,
 }
 
 /// Durable work for Maximum Space. Paths survive client disconnection.
@@ -229,6 +231,8 @@ pub struct Snapshot {
     pub motion: MotionPreference,
     #[serde(default)]
     pub packs: Vec<crate::pack::Install>,
+    #[serde(default)]
+    pub discovered: Vec<Game>,
 }
 
 /// Client requests operate on ids, never shell command strings.
@@ -245,6 +249,10 @@ pub enum Command {
     EnqueuePack {
         game: Game,
         task: PackTask,
+    },
+    EnqueuePlanned {
+        command: Box<Command>,
+        plan: crate::storage::SpacePlan,
     },
     Pause {
         id: i64,
@@ -303,6 +311,7 @@ pub(crate) struct Response {
 pub(crate) enum WorkerEvent {
     Progress(Event),
     Estimate(Estimate),
+    SpacePlan(crate::storage::SpacePlan),
     Done {
         cancelled: bool,
         errors: Vec<String>,
@@ -436,6 +445,91 @@ pub fn folder_path(input: &str, home: &std::path::Path) -> PathBuf {
         raw
     } else {
         expand(&text.replace("\\ ", " "))
+    }
+}
+
+/// Builds a read-only preflight for an explicit client command.
+pub fn space_plan(
+    command: &Command,
+    snapshot: &Snapshot,
+) -> anyhow::Result<crate::storage::SpacePlan> {
+    use crate::storage::{self, SpacePlan};
+    use anyhow::Context;
+    match command {
+        Command::Enqueue {
+            game, operation, ..
+        } if *operation != Operation::Analyze => {
+            storage::native_plan(&game.install_dir, *operation == Operation::Decompress)
+        }
+        Command::EnqueuePack { game, task } => {
+            let mut plan = SpacePlan::default();
+            match task {
+                PackTask::Create { store }
+                | PackTask::Activate {
+                    store,
+                    create: true,
+                    ..
+                } if !store.exists() => {
+                    let footprint = storage::inventory(&game.install_dir)?;
+                    plan.retained_original = true;
+                    plan.add(
+                        storage::volume(store)?,
+                        storage::pack_bound(&footprint)?,
+                        "Verified store; original remains on the source drive",
+                    )?;
+                }
+                PackTask::Compact | PackTask::Restore => {
+                    let install = snapshot
+                        .packs
+                        .iter()
+                        .find(|install| install.game_path == game.install_dir)
+                        .context("This game has no activated store")?;
+                    let updates = storage::inventory(&install.writes_path)?;
+                    let summary = install.summary.clone().map(Ok).unwrap_or_else(|| {
+                        Ok::<_, anyhow::Error>(
+                            crate::pack::Reader::open(&install.store_path)?
+                                .summary()
+                                .clone(),
+                        )
+                    })?;
+                    if matches!(task, PackTask::Compact) {
+                        let footprint = storage::Footprint {
+                            files: summary.files.saturating_add(updates.files),
+                            bytes: summary.logical_bytes.saturating_add(updates.bytes),
+                            largest: 0,
+                            metadata_bytes: updates
+                                .metadata_bytes
+                                .saturating_add(summary.metadata_bytes.saturating_mul(8)),
+                        };
+                        plan.add(
+                            storage::volume(&install.store_path)?,
+                            storage::pack_bound(&footprint)?,
+                            "New compacted store; previous version retained",
+                        )?;
+                    } else {
+                        let bytes = if install.backup_path.is_some() {
+                            updates.bytes
+                        } else {
+                            summary.logical_bytes.saturating_add(updates.bytes)
+                        };
+                        // The FUSE launcher mount is not the destination filesystem.
+                        let destination = install
+                            .game_path
+                            .parent()
+                            .context("Game has no parent folder")?;
+                        plan.add(
+                            storage::volume(destination)?,
+                            bytes,
+                            "Ordinary files and writable updates",
+                        )?;
+                    }
+                    plan.retained_original = install.backup_path.is_some();
+                }
+                _ => {}
+            }
+            Ok(plan)
+        }
+        _ => Ok(SpacePlan::default()),
     }
 }
 

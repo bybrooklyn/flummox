@@ -11,11 +11,11 @@ mod dialog;
 #[cfg(all(test, target_os = "linux"))]
 mod preview;
 mod theme;
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod unsupported;
 #[cfg(target_os = "linux")]
 mod view;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod windows;
 
 use anyhow::Result;
@@ -109,12 +109,12 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub fn run() -> Result<()> {
     windows::run()
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn run() -> Result<()> {
     unsupported::run()
 }

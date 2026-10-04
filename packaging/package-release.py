@@ -10,8 +10,23 @@ import shutil
 import tarfile
 import tempfile
 import tomllib
+import json
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def split_debug(executable, debug_dir):
+    """Strip a staging copy, preserving matching symbols outside the download."""
+    tool = shutil.which('objcopy') or shutil.which('llvm-objcopy')
+    if not tool:
+        raise RuntimeError('Linux packaging requires objcopy or llvm-objcopy')
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    symbols = debug_dir / (executable.name + '.debug')
+    before = executable.stat().st_size
+    subprocess.run([tool, '--only-keep-debug', str(executable), str(symbols)], check=True)
+    subprocess.run([tool, '--strip-debug', str(executable)], check=True)
+    subprocess.run([tool, '--add-gnu-debuglink=' + str(symbols.resolve()), str(executable)], check=True)
+    return {'file': executable.name, 'before': before, 'after': executable.stat().st_size}
 
 
 def main():
@@ -20,6 +35,7 @@ def main():
     parser.add_argument('--binaries', type=Path, default=ROOT / 'target/release')
     parser.add_argument('--platform', choices=['linux', 'macos', 'windows'], default='linux')
     parser.add_argument('--arch', choices=['x86_64', 'aarch64'], default='x86_64')
+    parser.add_argument('--debug-output', type=Path, default=ROOT / 'release-debug')
     args = parser.parse_args()
     version = tomllib.loads((ROOT / 'Cargo.toml').read_text())['package']['version']
     name = f'flummox-{version}-{args.platform}-{args.arch}'
@@ -50,6 +66,7 @@ def main():
                 raise RuntimeError(f'Expected a Linux {args.arch} ELF executable: {source}')
     args.output.mkdir(parents=True, exist_ok=True)
     archive = args.output / f'{name}.tar.xz'
+    sizes = []
     with tempfile.TemporaryDirectory(prefix='flummox-release-') as temporary:
         stage = Path(temporary) / name
         for destination, source in files.items():
@@ -57,6 +74,11 @@ def main():
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
             target.chmod(0o755 if destination.startswith('bin/') else 0o644)
+            if destination.startswith('bin/'):
+                sizes.append(split_debug(target, args.debug_output / name))
+                result = subprocess.run([str(target), '--version'], check=True, capture_output=True, text=True)
+                if result.stdout.strip() != f'flummox {version}':
+                    raise RuntimeError(f'Unexpected packaged version: {target}')
         with tarfile.open(archive, 'w:xz') as bundle:
             for path in sorted(stage.rglob('*')):
                 info = bundle.gettarinfo(path, arcname=str(path.relative_to(stage.parent)))
@@ -68,6 +90,7 @@ def main():
                         bundle.addfile(info, content)
                 else:
                     bundle.addfile(info)
+    (args.output / f'{name}-sizes.json').write_text(json.dumps({'executables': sizes, 'archive': archive.stat().st_size}, indent=2) + '\n')
     with archive.open('rb') as content:
         digest = hashlib.file_digest(content, 'sha256').hexdigest()
     checksum = args.output / f'{archive.name}.sha256'
@@ -97,6 +120,11 @@ def package_desktop(args, version, name):
             (contents / 'Resources').mkdir()
             shutil.copy2(executable, contents / 'MacOS/flummox-gui')
             (contents / 'MacOS/flummox-gui').chmod(0o755)
+            cli = args.binaries / 'flummox'
+            if cli.read_bytes()[:8] != b'\xcf\xfa\xed\xfe\x0c\x00\x00\x01':
+                raise RuntimeError('Expected an Apple Silicon CLI executable')
+            shutil.copy2(cli, contents / 'MacOS/flummox')
+            (contents / 'MacOS/flummox').chmod(0o755)
             info = {'CFBundleName': 'Flummox', 'CFBundleDisplayName': 'Flummox',
                     'CFBundleIdentifier': 'dev.bybrooklyn.flummox',
                     'CFBundleExecutable': 'flummox-gui', 'CFBundlePackageType': 'APPL',

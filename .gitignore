@@ -6,3 +6,5 @@
 /packaging/*.pkg.tar.*
 /RELEASE-NOTES.md
 __pycache__/
+
+/release-debug

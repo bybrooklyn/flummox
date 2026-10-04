@@ -121,6 +121,7 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
         user_paused: false,
         pack: None,
         pack_interruptible: false,
+        space_plan: None,
     });
     state.folder = "~/My Games".into();
     state.snapshot.libraries.push(Library {
@@ -157,6 +158,7 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
         drive_change: None,
         user_paused: false,
         pack_interruptible: true,
+        space_plan: None,
     });
     state.page = Page::Queue;
     render(&state, 1100, 720, &output.join("queue.png"))?;

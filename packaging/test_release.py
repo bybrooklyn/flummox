@@ -88,9 +88,58 @@ class ReleaseTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('Expected a Linux x86_64 ELF', result.stderr)
             result = subprocess.run(['python3', str(HERE / 'package-release.py'), '--arch', 'aarch64', '--binaries', str(root), '--output', str(root / 'dist')], capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotEqual(result.returncode, 0)
             version = tomllib.loads((HERE.parent / 'Cargo.toml').read_text())['package']['version']
-            self.assertTrue((root / f'dist/flummox-{version}-linux-aarch64.tar.xz').is_file())
+            self.assertFalse((root / f'dist/flummox-{version}-linux-aarch64.tar.xz').is_file())
+
+    def test_linux_download_strips_debug_without_changing_build_outputs(self):
+        import shutil
+        import tarfile
+        if not shutil.which('cc') or not shutil.which('objcopy'):
+            self.skipTest('Native ELF compiler and objcopy are needed')
+        bundle = module('package-release.py')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'fixture.c'
+            source.write_text('int main(void) { return 0; }\n')
+            executable = root / 'fixture'
+            subprocess.run(['cc', '-g', str(source), '-o', str(executable)], check=True)
+            original = executable.read_bytes()
+            staged = root / 'staged'
+            shutil.copy2(executable, staged)
+            sizes = bundle.split_debug(staged, root / 'debug')
+            self.assertLess(sizes['after'], sizes['before'])
+            self.assertEqual(executable.read_bytes(), original)
+            self.assertTrue((root / 'debug/staged.debug').is_file())
+            subprocess.run([str(staged)], check=True)
+            sections = subprocess.run(['readelf', '-S', str(staged)], check=True, capture_output=True, text=True).stdout
+            self.assertNotIn('.debug_info', sections)
+            self.assertIn('.gnu_debuglink', sections)
+
+    def test_signed_manifest_rejects_modified_artifacts_and_wrong_keys(self):
+        import shutil
+        manifest = module('release-manifest.py')
+        if not shutil.which('minisign'):
+            self.skipTest('minisign is needed for signature tests')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in manifest.artifact_names('0.0.2'):
+                (root / name).write_bytes(b'artifact fixture')
+            pub = root / 'key.pub'
+            key = root / 'key.secret'
+            subprocess.run(['minisign', '-G', '-W', '-s', str(key), '-p', str(pub)], check=True, capture_output=True)
+            path = manifest.create(root, '0.0.2', 'a' * 40)
+            subprocess.run(['minisign', '-S', '-W', '-s', str(key), '-m', str(path)], check=True, capture_output=True)
+            manifest.verify(root, path, pub, '0.0.2', 'a' * 40)
+            with self.assertRaises(ValueError):
+                manifest.verify(root, path, pub, '0.0.3')
+            (root / manifest.artifact_names('0.0.2')[0]).write_bytes(b'modified')
+            with self.assertRaises(ValueError):
+                manifest.verify(root, path, pub, '0.0.2')
+            wrong_pub = root / 'wrong.pub'
+            subprocess.run(['minisign', '-G', '-W', '-s', str(root / 'wrong.secret'), '-p', str(wrong_pub)], check=True, capture_output=True)
+            with self.assertRaises(subprocess.CalledProcessError):
+                manifest.verify(root, path, wrong_pub, '0.0.2')
 
 
 if __name__ == '__main__':

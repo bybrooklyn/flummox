@@ -15,6 +15,18 @@ use std::{
 };
 
 use super::theme;
+#[cfg(target_os = "macos")]
+use crate::macos as backend;
+#[cfg(windows)]
+use crate::windows as backend;
+#[cfg(windows)]
+const PLATFORM: &str = "Windows · WOF/LZX";
+#[cfg(target_os = "macos")]
+const PLATFORM: &str = "macOS · APFS";
+#[cfg(windows)]
+const MODE: &str = "LZX";
+#[cfg(target_os = "macos")]
+const MODE: &str = "APFS";
 
 struct Status {
     error: bool,
@@ -22,14 +34,17 @@ struct Status {
 }
 
 struct State {
-    games: Vec<crate::windows::InstalledGame>,
+    games: Vec<crate::model::Game>,
     folder: String,
     status: Option<Status>,
     working: bool,
     scanning: bool,
-    progress: Option<crate::windows::Progress>,
+    progress: Option<backend::Progress>,
     cancel: Option<Arc<AtomicBool>>,
     system_theme: iced::theme::Mode,
+    planned: Option<(PathBuf, bool, crate::storage::SpacePlan)>,
+    recovery: Vec<backend::Recovery>,
+    qualification: Option<crate::qualification::Wizard>,
 }
 
 impl Default for State {
@@ -43,6 +58,9 @@ impl Default for State {
             progress: None,
             cancel: None,
             system_theme: iced::theme::Mode::Dark,
+            planned: None,
+            recovery: vec![],
+            qualification: None,
         }
     }
 }
@@ -52,11 +70,30 @@ enum Message {
     Folder(String),
     Select(PathBuf),
     Refresh,
-    Scanned(Vec<crate::windows::InstalledGame>),
+    Scanned(std::result::Result<Vec<crate::model::Game>, String>),
     Optimize,
+    Planned(
+        PathBuf,
+        bool,
+        std::result::Result<crate::storage::SpacePlan, String>,
+    ),
+    StartPlanned,
+    CancelPlanned,
+    Remember,
+    Qualify,
+    QualificationReady(std::result::Result<Box<crate::qualification::Wizard>, String>),
+    QualificationField(crate::qualification::Field, String),
+    QualificationCheck(crate::qualification::Check, bool),
+    QualificationMode(crate::compatibility::StorageMode),
+    SaveQualification,
+    CloseQualification,
+    QualificationSaved(std::result::Result<String, String>),
+    Remembered(std::result::Result<(), String>),
+    Recover(PathBuf),
+    RecoveryScanned(std::result::Result<Vec<backend::Recovery>, String>),
     Restore,
     Stop,
-    Progress(crate::windows::Progress),
+    Progress(backend::Progress),
     Finished(std::result::Result<String, String>),
     SystemTheme(iced::theme::Mode),
 }
@@ -73,11 +110,25 @@ async fn background<T: Send + 'static>(
         .map_err(|_| "The background operation stopped unexpectedly.".to_owned())?
 }
 
-fn start(state: &mut State, optimize: bool) -> Task<Message> {
+fn plan(state: &mut State, optimize: bool) -> Task<Message> {
     if state.working {
         return Task::none();
     }
     let folder = PathBuf::from(state.folder.trim());
+    state.working = true;
+    let planned_folder = folder.clone();
+    Task::perform(
+        background(move || {
+            crate::storage::native_plan(&folder, !optimize).map_err(|error| error.to_string())
+        }),
+        move |result| Message::Planned(planned_folder.clone(), optimize, result),
+    )
+}
+
+fn start(state: &mut State, folder: PathBuf, optimize: bool) -> Task<Message> {
+    if state.working {
+        return Task::none();
+    }
     if folder.as_os_str().is_empty() {
         state.status = Some(Status {
             error: true,
@@ -99,20 +150,20 @@ fn start(state: &mut State, optimize: bool) -> Task<Message> {
     state.status = Some(Status {
         error: false,
         text: if optimize {
-            "Compressing worthwhile files with Windows LZX…".into()
+            format!("Compressing worthwhile files with {MODE}…")
         } else {
-            "Restoring ordinary NTFS storage…".into()
+            "Restoring ordinary storage…".into()
         },
     });
     let stream = iced::stream::channel(32, async move |sender| {
         std::thread::spawn(move || {
             let mut progress_sender = sender.clone();
             let result = if optimize {
-                crate::windows::optimize_folder_with(&folder, &cancel, move |progress| {
+                backend::optimize_folder_with(&folder, &cancel, move |progress| {
                     let _sent = progress_sender.try_send(Message::Progress(progress));
                 })
             } else {
-                crate::windows::restore_folder_with(&folder, &cancel, move |progress| {
+                backend::restore_folder_with(&folder, &cancel, move |progress| {
                     let _sent = progress_sender.try_send(Message::Progress(progress));
                 })
             }
@@ -127,7 +178,87 @@ fn start(state: &mut State, optimize: bool) -> Task<Message> {
 
 fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
-        Message::Folder(folder) => state.folder = folder,
+        Message::Qualify => {
+            let path = PathBuf::from(state.folder.trim());
+            if let Some(game) = state
+                .games
+                .iter()
+                .find(|game| game.install_dir == path)
+                .cloned()
+            {
+                return Task::perform(
+                    background(move || {
+                        crate::qualification::baseline(&game)
+                            .map(|corpus| Box::new(crate::qualification::Wizard::new(game, corpus)))
+                            .map_err(|error| error.to_string())
+                    }),
+                    Message::QualificationReady,
+                );
+            }
+            state.status = Some(Status {
+                error: true,
+                text: "Remember or select the game folder first.".into(),
+            });
+        }
+        Message::QualificationReady(result) => match result {
+            Ok(wizard) => state.qualification = Some(*wizard),
+            Err(error) => {
+                state.status = Some(Status {
+                    error: true,
+                    text: error,
+                })
+            }
+        },
+        Message::QualificationField(field, text) => {
+            if let Some(wizard) = &mut state.qualification {
+                wizard.field(field, text);
+            }
+        }
+        Message::QualificationCheck(check, value) => {
+            if let Some(wizard) = &mut state.qualification {
+                wizard.check(check, value);
+            }
+        }
+        Message::QualificationMode(mode) => {
+            if let Some(wizard) = &mut state.qualification {
+                wizard.mode = mode;
+            }
+        }
+        Message::CloseQualification => state.qualification = None,
+        Message::SaveQualification => {
+            if let Some(wizard) = &state.qualification {
+                match wizard.report() {
+                    Ok(report) => {
+                        return Task::perform(
+                            background(move || {
+                                crate::compatibility::Store::local()
+                                    .and_then(|store| store.save(&report))
+                                    .map(|path| format!("Report saved to {}", path.display()))
+                                    .map_err(|error| error.to_string())
+                            }),
+                            Message::QualificationSaved,
+                        );
+                    }
+                    Err(error) => {
+                        state.status = Some(Status {
+                            error: true,
+                            text: error.to_string(),
+                        })
+                    }
+                }
+            }
+        }
+        Message::QualificationSaved(result) => {
+            state.qualification = None;
+            state.status = Some(match result {
+                Ok(text) => Status { error: false, text },
+                Err(text) => Status { error: true, text },
+            });
+        }
+        Message::Folder(folder) => {
+            state.folder = folder;
+            state.planned = None;
+        }
         Message::Select(folder) => {
             state.folder = folder.display().to_string();
             state.status = None;
@@ -138,20 +269,92 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             state.scanning = true;
             return Task::perform(
-                background(|| Ok(crate::windows::discover_steam())),
-                |result| Message::Scanned(result.unwrap_or_default()),
+                background(|| crate::native::discover().map_err(|error| error.to_string())),
+                Message::Scanned,
             );
         }
         Message::Scanned(games) => {
             state.scanning = false;
-            state.games = games;
+            match games {
+                Ok(games) => state.games = games,
+                Err(error) => {
+                    state.status = Some(Status {
+                        error: true,
+                        text: error,
+                    });
+                    return Task::none();
+                }
+            }
             state.status = Some(Status {
                 error: false,
                 text: format!("Found {} installed Steam games.", state.games.len()),
             });
         }
-        Message::Optimize => return start(state, true),
-        Message::Restore => return start(state, false),
+        Message::Optimize => return plan(state, true),
+        Message::Restore => return plan(state, false),
+        Message::Planned(folder, optimize, result) => {
+            state.working = false;
+            match result {
+                Ok(plan) => state.planned = Some((folder, optimize, plan)),
+                Err(error) => {
+                    state.status = Some(Status {
+                        error: true,
+                        text: error,
+                    })
+                }
+            }
+        }
+        Message::StartPlanned => {
+            if let Some((folder, optimize, plan)) = state.planned.take() {
+                if let Err(error) = plan.check() {
+                    state.status = Some(Status {
+                        error: true,
+                        text: error.to_string(),
+                    });
+                } else {
+                    return start(state, folder, optimize);
+                }
+            }
+        }
+        Message::CancelPlanned => state.planned = None,
+        Message::Remember => {
+            let folder = PathBuf::from(state.folder.trim());
+            return Task::perform(
+                background(move || {
+                    crate::native::add_folder(&folder).map_err(|error| error.to_string())
+                }),
+                Message::Remembered,
+            );
+        }
+        Message::Remembered(result) => match result {
+            Ok(()) => return update(state, Message::Refresh),
+            Err(error) => {
+                state.status = Some(Status {
+                    error: true,
+                    text: error,
+                })
+            }
+        },
+        Message::Recover(folder) => {
+            state.working = true;
+            return Task::perform(
+                background(move || {
+                    backend::recover_folder(&folder)
+                        .map(|()| "Recovery finished.".into())
+                        .map_err(|error| error.to_string())
+                }),
+                Message::Finished,
+            );
+        }
+        Message::RecoveryScanned(result) => match result {
+            Ok(records) => state.recovery = records,
+            Err(error) => {
+                state.status = Some(Status {
+                    error: true,
+                    text: error,
+                })
+            }
+        },
         Message::Stop => {
             if let Some(cancel) = &state.cancel {
                 cancel.store(true, Ordering::Relaxed);
@@ -176,6 +379,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 (false, Ok(text)) => Status { error: false, text },
                 (false, Err(text)) => Status { error: true, text },
             });
+            return Task::perform(
+                background(|| backend::recovery().map_err(|error| error.to_string())),
+                Message::RecoveryScanned,
+            );
         }
         Message::SystemTheme(theme) => state.system_theme = theme,
     }
@@ -189,11 +396,11 @@ fn view(state: &State) -> Element<'_, Message> {
 fn layout(state: &State, compact: bool) -> Element<'_, Message> {
     let hero = container(
         column![
-            text("Save space with LZX").size(28),
+            text(format!("Save space with {MODE}")).size(28),
             theme::muted("Games stay in place and launch normally"),
             row![
                 theme::stat(state.games.len().to_string(), "Games"),
-                theme::stat("LZX".into(), "Mode")
+                theme::stat(MODE.into(), "Mode")
             ]
             .spacing(32),
         ]
@@ -228,14 +435,16 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
             button(
                 column![
                     text(&game.title).size(14),
-                    text(game.path.display().to_string()).size(11),
+                    text(game.install_dir.display().to_string()).size(11),
+                    text(game.state.to_string()).size(11),
                 ]
                 .spacing(2),
             )
             .width(Length::Fill)
             .padding([9, 11])
             .on_press_maybe(
-                (!state.working && !state.scanning).then(|| Message::Select(game.path.clone())),
+                (!state.working && !state.scanning && game.state.is_idle())
+                    .then(|| Message::Select(game.install_dir.clone())),
             ),
         );
     }
@@ -274,10 +483,62 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
             .on_input(Message::Folder)
             .padding(12)
             .width(Length::Fill),
-        theme::muted("Optimize skips files LZX cannot shrink"),
+        theme::muted("Optimize skips files the filesystem cannot shrink"),
         controls,
+        button("Qualify compatibility")
+            .on_press_maybe((!state.working).then_some(Message::Qualify)),
+        button("Remember this folder")
+            .on_press_maybe((!state.working).then_some(Message::Remember)),
     ]
     .spacing(14);
+    if let Some(wizard) = &state.qualification {
+        action = action.push(crate::qualification::view(
+            wizard,
+            Message::QualificationField,
+            Message::QualificationCheck,
+            Message::QualificationMode,
+            Message::SaveQualification,
+            Message::CloseQualification,
+        ));
+    }
+    if let Some((_, _, plan)) = &state.planned {
+        action = action.push(theme::section_title("Storage plan"));
+        for row in &plan.requirements {
+            action = action.push(
+                text(format!(
+                    "{}: {} needed including headroom; {} available",
+                    row.volume.path.display(),
+                    humansize::format_size(
+                        row.additional.saturating_add(row.headroom),
+                        humansize::DECIMAL
+                    ),
+                    humansize::format_size(row.volume.available, humansize::DECIMAL)
+                ))
+                .size(13),
+            );
+        }
+        if let Err(error) = plan.check() {
+            action = action.push(text(error.to_string()).size(13));
+        }
+        action = action.push(
+            row![
+                button("Start job")
+                    .on_press_maybe(plan.check().is_ok().then_some(Message::StartPlanned)),
+                button("Cancel").on_press(Message::CancelPlanned)
+            ]
+            .spacing(10),
+        );
+    }
+    if !state.recovery.is_empty() {
+        action = action.push(theme::section_title("Recovery"));
+        for record in &state.recovery {
+            action = action.push(text(record.root.display().to_string()).size(13));
+            action =
+                action.push(button("Restore retained original").on_press_maybe(
+                    (!state.working).then(|| Message::Recover(record.root.clone())),
+                ));
+        }
+    }
     if let Some(progress) = &state.progress {
         let freed = progress
             .allocation_before
@@ -311,7 +572,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
                 .style(theme::banner(status.error)),
         );
     }
-    let action = container(action)
+    let action = container(scrollable(action))
         .padding(18)
         .width(if compact {
             Length::Fill
@@ -335,7 +596,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
             row![
                 theme::page_title("Flummox"),
                 Space::new().width(Length::Fill),
-                theme::muted(format!("Windows · WOF/LZX · {}", env!("CARGO_PKG_VERSION")))
+                theme::muted(format!("{PLATFORM} · {}", env!("CARGO_PKG_VERSION")))
             ]
             .spacing(10)
             .align_y(iced::Alignment::Center),
@@ -359,10 +620,14 @@ fn boot() -> (State, Task<Message>) {
     let state = State::default();
     let task = Task::batch([
         Task::perform(
-            background(|| Ok(crate::windows::discover_steam())),
-            |result| Message::Scanned(result.unwrap_or_default()),
+            background(|| crate::native::discover().map_err(|error| error.to_string())),
+            Message::Scanned,
         ),
         iced::system::theme().map(Message::SystemTheme),
+        Task::perform(
+            background(|| backend::recovery().map_err(|error| error.to_string())),
+            Message::RecoveryScanned,
+        ),
     ]);
     (state, task)
 }

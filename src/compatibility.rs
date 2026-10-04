@@ -45,12 +45,22 @@ pub enum StorageMode {
     MaximumSpace,
 }
 
+impl std::fmt::Display for StorageMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Native => "Native compression",
+            Self::MaximumSpace => "Maximum Space",
+        })
+    }
+}
+
 /// Platform family without host names, mount paths, or device identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Platform {
     Linux,
     Windows,
+    Macos,
     Other,
 }
 
@@ -60,6 +70,8 @@ impl Platform {
             Self::Linux
         } else if cfg!(windows) {
             Self::Windows
+        } else if cfg!(target_os = "macos") {
+            Self::Macos
         } else {
             Self::Other
         }
@@ -204,6 +216,11 @@ impl Store {
         let database = crate::db::Db::default_path().context("Cannot locate state folder")?;
         let parent = database.parent().context("Invalid state folder")?;
         Self::open(parent.join("compatibility"))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn local() -> Result<Self> {
+        Self::open(crate::libraries::data_dir()?.join("compatibility"))
     }
 
     pub fn save(&self, report: &Report) -> Result<PathBuf> {
@@ -447,7 +464,7 @@ mod tests {
         wrong_platform.platform = match Platform::current() {
             Platform::Linux => Platform::Windows,
             Platform::Windows => Platform::Linux,
-            Platform::Other => Platform::Linux,
+            Platform::Other | Platform::Macos => Platform::Linux,
         };
         check(
             !wrong_platform.qualifies(&installed, &"a".repeat(64), Policy::default()),

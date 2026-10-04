@@ -3,30 +3,30 @@
 //! Kept separate from [`crate::view`] so that page code reads as layout rather
 //! than as a list of colour values.
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use iced::widget::button;
 #[cfg(target_os = "linux")]
 use iced::widget::scrollable as scrollable_widget;
 use iced::widget::{container, text};
 use iced::{Background, Color, Font, Theme, color};
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use iced::{Border, Element, Shadow, Vector};
 
 #[derive(Clone, Copy)]
 struct Colors {
     accent: Color,
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     accent_dim: Color,
     text: Color,
     muted: Color,
     background: Color,
     #[cfg(target_os = "linux")]
     sidebar: Color,
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     panel: Color,
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     hero: Color,
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     border: Color,
     danger: Color,
     warning: Color,
@@ -36,18 +36,18 @@ fn colors(theme: &Theme) -> Colors {
     if theme.extended_palette().is_dark {
         Colors {
             accent: color!(0x55C887),
-            #[cfg(any(target_os = "linux", windows))]
+            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             accent_dim: color!(0x2D6E49),
             text: color!(0xE9ECEB),
             muted: color!(0x9AA4A0),
             background: color!(0x111517),
             #[cfg(target_os = "linux")]
             sidebar: color!(0x161B1E),
-            #[cfg(any(target_os = "linux", windows))]
+            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             panel: color!(0x191F22),
-            #[cfg(any(target_os = "linux", windows))]
+            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             hero: color!(0x182720),
-            #[cfg(any(target_os = "linux", windows))]
+            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             border: color!(0x293135),
             danger: color!(0xE26861),
             warning: color!(0xE6AE5C),
@@ -55,18 +55,18 @@ fn colors(theme: &Theme) -> Colors {
     } else {
         Colors {
             accent: color!(0x247A4B),
-            #[cfg(any(target_os = "linux", windows))]
+            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             accent_dim: color!(0xCDE8D8),
             text: color!(0x18201C),
             muted: color!(0x63706A),
             background: color!(0xF4F7F5),
             #[cfg(target_os = "linux")]
             sidebar: color!(0xECF1EE),
-            #[cfg(any(target_os = "linux", windows))]
+            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             panel: color!(0xFFFFFF),
-            #[cfg(any(target_os = "linux", windows))]
+            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             hero: color!(0xEAF5EE),
-            #[cfg(any(target_os = "linux", windows))]
+            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             border: color!(0xD7DFDA),
             danger: color!(0xB83D38),
             warning: color!(0x9A641D),
@@ -131,7 +131,7 @@ pub fn sidebar(theme: &Theme) -> container::Style {
 }
 
 /// A raised card holding one group of information.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub fn panel(theme: &Theme) -> container::Style {
     let colors = colors(theme);
     container::Style {
@@ -152,7 +152,7 @@ pub fn panel(theme: &Theme) -> container::Style {
 }
 
 /// The main recommendation on Overview.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub fn hero(theme: &Theme) -> container::Style {
     let colors = colors(theme);
     container::Style {
@@ -236,7 +236,7 @@ pub fn toast(is_error: bool, reveal: f32) -> impl Fn(&Theme) -> container::Style
 ///
 /// Animations interpolate a single number, and this turns that number into
 /// the colours a widget style needs.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn mix(from: Color, to: Color, t: f32) -> Color {
     let t = t.clamp(0.0, 1.0);
     Color::from_rgb(
@@ -292,7 +292,7 @@ pub fn nav_icon(highlight: f32) -> impl Fn(&Theme) -> text::Style {
 }
 
 /// The button for the main action on a page.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub fn action_button(theme: &Theme, status: button::Status) -> button::Style {
     let colors = colors(theme);
     let dark = theme.extended_palette().is_dark;
@@ -320,7 +320,7 @@ pub fn action_button(theme: &Theme, status: button::Status) -> button::Style {
 }
 
 /// A lower-emphasis action that still belongs to the shared surface system.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub fn secondary_button(theme: &Theme, status: button::Status) -> button::Style {
     let colors = colors(theme);
     let background = match status {
@@ -365,13 +365,13 @@ pub fn scrollable(theme: &Theme, status: scrollable_widget::Status) -> scrollabl
 }
 
 /// A page heading.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub fn page_title(label: &str) -> text::Text<'_> {
     text(label).size(26)
 }
 
 /// A heading inside a page.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub fn section_title(label: &str) -> text::Text<'_> {
     text(label).size(16)
 }
@@ -407,7 +407,7 @@ pub fn toast_mark(is_error: bool) -> impl Fn(&Theme) -> text::Style {
 }
 
 /// A number worth reading from across the room, with its label beneath.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub fn stat<'a, Message: 'a>(value: String, label: &'a str) -> Element<'a, Message> {
     iced::widget::column![
         text(value).size(30).style(|theme: &Theme| text::Style {

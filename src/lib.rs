@@ -37,16 +37,26 @@ pub mod inventory;
 pub mod jobs;
 #[cfg(target_os = "linux")]
 pub mod launchers;
+pub mod libraries;
+#[cfg(target_os = "macos")]
+pub mod macos;
 pub mod model;
+#[cfg(any(windows, target_os = "macos"))]
+pub mod native;
+#[cfg(target_os = "macos")]
+#[path = "launchers/vdf.rs"]
+mod native_vdf;
 #[cfg(target_os = "linux")]
 pub mod pack;
 mod path_serde;
+pub mod qualification;
 #[cfg(target_os = "linux")]
 pub mod recommendation;
 #[cfg(target_os = "linux")]
 pub mod safeio;
 #[cfg(target_os = "linux")]
 pub mod sandbox;
+pub mod storage;
 pub mod testutil;
 #[cfg(target_os = "linux")]
 pub mod watch;

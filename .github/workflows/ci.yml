@@ -35,7 +35,7 @@ jobs:
         run: cargo xwin clippy --locked --target x86_64-pc-windows-msvc --all-features --all-targets -- -D warnings
 
   macos:
-    name: macOS portable shell
+    name: macOS native APFS app
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7.0.1
@@ -66,7 +66,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libxrandr-dev \
-            libxi-dev libxcursor-dev libgl1-mesa-dev libfontconfig1-dev
+            libxi-dev libxcursor-dev libgl1-mesa-dev libfontconfig1-dev minisign
 
       # CI runs the same recipes the pre-push hook runs. While CI called cargo
       # directly the two drifted, and a licence failure reached main because

@@ -13,7 +13,12 @@ fn main() -> anyhow::Result<()> {
     flummox::windows::run()
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(target_os = "macos")]
+fn main() -> anyhow::Result<()> {
+    flummox::macos::run()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn main() -> anyhow::Result<()> {
     let _matches = clap::Command::new("flummox")
         .version(env!("CARGO_PKG_VERSION"))
