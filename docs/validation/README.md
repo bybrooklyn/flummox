@@ -4,6 +4,12 @@ Version 0.0.2 stays pending until these checks have evidence. A manual Release
 workflow builds downloadable candidates without publishing a tag. Automated
 fixtures must never operate on an existing game library.
 
+The [Linux real-engine smoke record](2026-10-04-linux-smoke.md) establishes
+Factorio deterministic simulation and Super Meat Boy Proton startup across
+mounted reads, writable state, remount, and restoration on disposable copies.
+The record lists the remaining checks. Follow the interactive procedure below
+before qualifying the release.
+
 Use a disposable installation or copy with its own launcher metadata. Keep your
 ordinary installation and save files outside the test location. Do not point
 fixture tests at your Steam library.

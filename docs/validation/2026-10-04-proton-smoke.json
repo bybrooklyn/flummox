@@ -1,0 +1,136 @@
+{
+  "schema": 1,
+  "scope": "proton-startup-smoke",
+  "qualification": "incomplete",
+  "date_utc": "2026-10-04",
+  "game": "Super Meat Boy",
+  "steam_app_id": "40800",
+  "steam_build": "3241924",
+  "platform": "linux-proton",
+  "runtime": "1785139158 proton-10.0-4b",
+  "flummox_version": "0.0.2",
+  "candidate_commit": "233f2973f235e20b8b0fbabb1d93ccd7b114eeff",
+  "candidate_run": "https://github.com/bybrooklyn/flummox/actions/runs/37173463103",
+  "filesystem": "btrfs",
+  "profile": {
+    "level": 9,
+    "comparison_levels": [
+      15,
+      19,
+      22
+    ]
+  },
+  "store": {
+    "files": 46,
+    "logical_bytes": 519530692,
+    "archive_bytes": 369884508,
+    "metadata_bytes": 50897,
+    "raw_bytes": 3075307,
+    "compressed_input_bytes": 499836308,
+    "compressed_bytes": 366758304,
+    "zero_bytes": 0,
+    "shared_bytes": 0,
+    "unique_chunks": 223,
+    "duplicate_bytes": 16619077
+  },
+  "creation_elapsed_ms": 94761,
+  "allocated_game_bytes": null,
+  "cold_game_load_times": null,
+  "ordinary_baseline": {
+    "exit_code": -15,
+    "timed_out": true,
+    "elapsed_ms": 40002
+  },
+  "checks": [
+    {
+      "phase": "proton-verify",
+      "exit_code": 0
+    },
+    {
+      "phase": "proton-activate",
+      "exit_code": 0
+    },
+    {
+      "phase": "proton-initial-mounted-metadata",
+      "passed": true,
+      "entries": 54,
+      "changed": []
+    },
+    {
+      "phase": "proton-mounted",
+      "elapsed_ms": 40217,
+      "exit_code": -15,
+      "stopped_by_harness": true,
+      "fresh_wine_trace": true,
+      "menu_and_cutscene_assets_loaded": true,
+      "passed": true
+    },
+    {
+      "phase": "proton-immutable-mounted",
+      "passed": true,
+      "entries": 50,
+      "changed": []
+    },
+    {
+      "phase": "proton-remount",
+      "exit_code": 0
+    },
+    {
+      "phase": "proton-state-after-remount",
+      "passed": true,
+      "entries": 54,
+      "changed": []
+    },
+    {
+      "phase": "proton-remounted",
+      "elapsed_ms": 40222,
+      "exit_code": -15,
+      "stopped_by_harness": true,
+      "fresh_wine_trace": true,
+      "menu_and_cutscene_assets_loaded": true,
+      "passed": true
+    },
+    {
+      "phase": "proton-immutable-remounted",
+      "passed": true,
+      "entries": 50,
+      "changed": []
+    },
+    {
+      "phase": "proton-rollback",
+      "exit_code": 0
+    },
+    {
+      "phase": "proton-state-after-restore",
+      "passed": true,
+      "entries": 54,
+      "changed": []
+    },
+    {
+      "phase": "proton-restored",
+      "elapsed_ms": 40221,
+      "exit_code": -15,
+      "stopped_by_harness": true,
+      "fresh_wine_trace": true,
+      "menu_and_cutscene_assets_loaded": true,
+      "passed": true
+    },
+    {
+      "phase": "proton-immutable-restored",
+      "passed": true,
+      "entries": 50,
+      "changed": []
+    }
+  ],
+  "method": "Private copied runtime and prefix, isolated save/configuration state, network/IPC/PID namespaces, read-only host filesystem with only the disposable workspace writable. Startup readiness requires a fresh per-run Wine trace recording menu texture loads and completed cutscenes. The harness stops each run after forty seconds.",
+  "busy_guard": "Activation refused while a private display process held the copied game folder; activation succeeded after that namespace was stopped.",
+  "remaining": [
+    "Interactive gameplay and representative level streaming",
+    "Actual launcher update and verification",
+    "Normal game exit and progress-save checks",
+    "OS reboot and login remount",
+    "Physical allocated-byte measurements",
+    "Representative load-time measurements",
+    "Anti-cheat checks where applicable"
+  ]
+}

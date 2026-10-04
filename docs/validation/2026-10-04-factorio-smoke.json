@@ -1,0 +1,153 @@
+{
+  "schema": 1,
+  "scope": "headless-smoke",
+  "qualification": "incomplete",
+  "date_utc": "2026-10-04",
+  "game": "Factorio",
+  "game_version": "2.0.77",
+  "engine_build": "84539",
+  "steam_build": "23347942",
+  "flummox_version": "0.0.2",
+  "candidate_commit": "233f2973f235e20b8b0fbabb1d93ccd7b114eeff",
+  "candidate_run": "https://github.com/bybrooklyn/flummox/actions/runs/37173463103",
+  "platform": "native-linux",
+  "filesystem": "btrfs",
+  "copy_method": "buffered reads and writes, with symlinks and file metadata preserved",
+  "profile": {
+    "level": 9,
+    "comparison_levels": [
+      15,
+      19,
+      22
+    ]
+  },
+  "store": {
+    "files": 11837,
+    "logical_bytes": 2047685348,
+    "archive_bytes": 1464552386,
+    "metadata_bytes": 3056106,
+    "raw_bytes": 261648831,
+    "compressed_input_bytes": 1783718413,
+    "compressed_bytes": 1199847449,
+    "zero_bytes": 0,
+    "shared_bytes": 0,
+    "unique_chunks": 2813,
+    "duplicate_bytes": 2318104
+  },
+  "creation_elapsed_ms": 480536,
+  "allocated_game_bytes": null,
+  "cold_game_load_times": null,
+  "simulation": {
+    "world_seed": 424242,
+    "ticks_per_run": 1200,
+    "runs_per_phase": 3
+  },
+  "baseline": {
+    "phase": "baseline",
+    "exit_code": 0,
+    "elapsed_ms": 515
+  },
+  "checks": [
+    {
+      "phase": "verify-store",
+      "exit_code": 0,
+      "elapsed_ms": 615
+    },
+    {
+      "phase": "activate",
+      "exit_code": 0,
+      "elapsed_ms": 1867
+    },
+    {
+      "phase": "mounted-bytes-and-metadata",
+      "passed": true,
+      "entries": 13614,
+      "changed": []
+    },
+    {
+      "phase": "mounted",
+      "exit_code": 0,
+      "elapsed_ms": 514
+    },
+    {
+      "phase": "mounted-checksums",
+      "passed": true,
+      "checksums": [
+        "911970612",
+        "3108547700",
+        "3108547700",
+        "3108547700"
+      ]
+    },
+    {
+      "phase": "remount-snapshot",
+      "exit_code": 0,
+      "elapsed_ms": 64
+    },
+    {
+      "phase": "remounted-updates",
+      "passed": true,
+      "entries": 13615,
+      "changed": []
+    },
+    {
+      "phase": "remounted",
+      "exit_code": 0,
+      "elapsed_ms": 464
+    },
+    {
+      "phase": "remounted-checksums",
+      "passed": true,
+      "checksums": [
+        "911970612",
+        "3108547700",
+        "3108547700",
+        "3108547700"
+      ]
+    },
+    {
+      "phase": "rollback",
+      "exit_code": 0,
+      "elapsed_ms": 164
+    },
+    {
+      "phase": "restored-bytes-and-metadata",
+      "passed": true,
+      "entries": 13615,
+      "changed": []
+    },
+    {
+      "phase": "restored",
+      "exit_code": 0,
+      "elapsed_ms": 464
+    },
+    {
+      "phase": "restored-checksums",
+      "passed": true,
+      "checksums": [
+        "911970612",
+        "3108547700",
+        "3108547700",
+        "3108547700"
+      ]
+    }
+  ],
+  "synthetic_update": "Append to copied documentation and add one copied-root file; preserve both across coordinator restart and restoration.",
+  "remaining": [
+    "Graphical launch and interactive gameplay",
+    "Real launcher update and verification",
+    "OS reboot and login remount",
+    "Physical allocated-byte measurements",
+    "Representative load and streaming measurements",
+    "Anti-cheat checks where applicable"
+  ],
+  "graphics_baseline": {
+    "outcome": "incomplete",
+    "detail": "The isolated Steam build requested a Steam restart; the private headless compositor exited with status 139. No compressed graphical run was attempted."
+  },
+  "proton_baseline": {
+    "outcome": "separate-record",
+    "report": "2026-10-04-proton-smoke.json",
+    "detail": "Terraria Linux assembly was not a valid Windows-client candidate. An isolated Super Meat Boy Windows build subsequently completed startup checks across the storage lifecycle."
+  }
+}

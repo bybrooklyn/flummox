@@ -2,6 +2,10 @@
 
 ## Release acceptance
 
+Native Factorio simulation and Super Meat Boy Proton startup passed disposable
+storage-cycle smoke checks. See [the evidence](validation/2026-10-04-linux-smoke.md)
+for measured results and the remaining limits.
+
 These checks remain necessary before calling the release fully validated:
 
 - Qualify real native Linux and Proton games for Maximum Space. Check launch,
