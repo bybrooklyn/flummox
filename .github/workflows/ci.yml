@@ -13,26 +13,21 @@ env:
 jobs:
   windows:
     name: Windows native app
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Install the toolchain
         run: rustup toolchain install stable --profile minimal --component clippy
-      - uses: taiki-e/install-action@v2.87.22
-        with:
-          tool: cargo-xwin
       - uses: Swatinem/rust-cache@v2.9.2
-      - name: Install the Windows Rust target
-        run: rustup target add --toolchain stable x86_64-pc-windows-msvc
-      - name: Install Windows cross-build tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang llvm lld
-          command -v clang-cl llvm-lib lld-link
-      - name: Build the Windows CLI and GUI
-        run: cargo xwin build --release --target x86_64-pc-windows-msvc --features gui --bins
       - name: Lint Windows code and tests
-        run: cargo xwin clippy --locked --target x86_64-pc-windows-msvc --all-features --all-targets -- -D warnings
+        run: cargo clippy --locked --all-features --all-targets -- -D warnings
+      - name: Test on Windows
+        run: cargo test --locked --all-features
+      - name: Build the Windows CLI and GUI
+        run: cargo build --locked --release --all-features --bins
 
   macos:
     name: macOS native APFS app
