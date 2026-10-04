@@ -1541,6 +1541,21 @@ fn run_pack_task(
             control.transaction("Restoring files; this step must finish before stopping")?;
             pack_rollback(snapshot, db, mounts, &game.install_dir)
         }
+        PackTask::VerifyRestored => {
+            let position = snapshot
+                .packs
+                .iter()
+                .position(|install| install.game_path == game.install_dir)
+                .context("Install record is missing")?;
+            let install = snapshot
+                .packs
+                .get(position)
+                .context("Install record is missing")?;
+            crate::pack::verify_restored(install, &control.cancel, control)?;
+            // Verification closes only the record. Store, update layer, and backups remain.
+            snapshot.packs.remove(position);
+            save_packs(db, snapshot)
+        }
         PackTask::Reclaim => {
             control.transaction("Reclaiming the retained original; this step must finish")?;
             pack_reclaim(snapshot, db, &game.install_dir)

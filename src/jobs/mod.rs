@@ -170,6 +170,7 @@ pub enum PackTask {
     },
     Compact,
     Restore,
+    VerifyRestored,
     Reclaim,
     Prune,
 }
@@ -182,6 +183,7 @@ impl PackTask {
             Self::Activate { .. } => "Activate Maximum Space",
             Self::Compact => "Compact updates",
             Self::Restore => "Restore ordinary files",
+            Self::VerifyRestored => "Verify restored files",
             Self::Reclaim => "Reclaim original",
             Self::Prune => "Reclaim previous version",
         }
@@ -478,7 +480,7 @@ pub fn space_plan(
                         "Verified store; original remains on the source drive",
                     )?;
                 }
-                PackTask::Compact | PackTask::Restore => {
+                PackTask::Compact | PackTask::Restore | PackTask::VerifyRestored => {
                     let install = snapshot
                         .packs
                         .iter()
@@ -507,7 +509,9 @@ pub fn space_plan(
                             "New compacted store; previous version retained",
                         )?;
                     } else {
-                        let bytes = if install.backup_path.is_some() {
+                        let bytes = if install.backup_path.is_some()
+                            && !matches!(task, PackTask::VerifyRestored)
+                        {
                             updates.bytes
                         } else {
                             summary.logical_bytes.saturating_add(updates.bytes)

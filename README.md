@@ -71,7 +71,7 @@ operating system's WOF/LZX storage and does not need a filesystem driver.
 |---|---|
 | **Linux native compression outside btrfs** | Maximum Space works through a writable FUSE store, but these filesystems have no in-place native backend |
 | **Windows launcher parity** | Steam and manual folders work. Heroic, Xbox, GOG Galaxy, background maintenance, and Maximum Space are still Linux-only |
-| **macOS compression** | The desktop shell builds, but a macOS storage backend is not implemented |
+| **macOS compression** | Native APFS compression, verified restoration, and replacement recovery in the next release |
 | **Bottles** | Discovery is planned |
 | **Flatpak build** | Not possible. The sandbox hides other processes, so Flummox could not tell whether a game was running, which is the check that keeps it from touching a game you are playing |
 
@@ -94,8 +94,8 @@ same files at the same paths.
 
 The window theme and responsive layout are shared across targets. Linux-only
 storage controls appear only when their backend and FUSE support are available.
-Other desktop targets build the shared shell with compression disabled until a
-safe storage backend exists.
+Mac uses built-in APFS compression with staged verification and durable replacement
+journals. Unsupported desktop targets retain the informational shell.
 
 Queue supports pause, resume, cancel, and retry for native jobs and Maximum Space preparation. Store creation and compaction report measured progress; verification reports checked items. File switches, restoration, and reclaim finish without interruption, with controls hidden during those phases. Closing the window leaves jobs
 with the background coordinator; reopening reconnects. Analysis and compression
@@ -333,14 +333,36 @@ Installation, coordinator upgrades, and release builds are described in
 [GitHub Releases](https://github.com/bybrooklyn/flummox/releases) provides Linux
 x86_64/ARM64 archives, an Apple Silicon macOS app, and a Windows x64 installer
 and portable ZIP. Each release shows its version and changelog, with SHA-256
-digests displayed beside each download. macOS currently provides the desktop shell only.
+digests displayed beside each download. The published v0.0.1 Mac app is a shell;
+the development version adds native APFS storage.
 
 On Arch, install `flummox-bin` from the AUR. On Apple Silicon, run
 `brew tap bybrooklyn/flummox` and `brew install --cask flummox`.
 Windows users can run the setup executable for Start menu integration, upgrades,
 and an uninstaller in Installed apps.
 
-Commit your changes, tag that commit with `git tag v0.0.1`, and push the tag with
-`git push origin v0.0.1`. CI builds the tag version and publishes after native
+Commit the completed acceptance records, tag that commit with `git tag v0.0.2`,
+and push the tag with `git push origin v0.0.2`. CI builds the tag version and publishes after native
 build and installation checks pass. See [installation](docs/install.md) and
 [release automation](docs/release-automation.md) for details.
+
+## Next release: storage planning and recovery
+
+The development version shows per-volume storage plans before individual jobs,
+combines simultaneous allocations, and rechecks free space and volume identity
+in workers. Linux CLI users can run `flummox plan FOLDER --store STORE` or
+`flummox plan FOLDER --restore` without writing game files.
+
+Recovery groups interrupted jobs and retained Maximum Space storage. Its
+verification action reconstructs a temporary expected installation before
+closing an interrupted restoration record. Diagnostics are local and include
+folder paths; exporting them does not upload them.
+
+Disconnected libraries retain their last discovered games. A different volume
+mounted at the same location stays unavailable. In a game's details, choose
+**Qualify compatibility** to record measurements and save a local report.
+
+The next tag requires [real-game acceptance](docs/validation/README.md). A manual
+Release workflow produces candidates without publishing. Linux debug symbols
+stay in internal CI artifacts, and public downloads are covered by one
+[Minisign manifest](docs/release-automation.md#release-signatures).

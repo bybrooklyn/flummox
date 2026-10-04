@@ -114,16 +114,68 @@ pub fn recovery() -> Result<Vec<Recovery>> {
     Ok(records)
 }
 
+fn directory(path: &Path) -> Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let mut current = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open("/")?;
+    for part in path.components() {
+        let std::path::Component::Normal(name) = part else {
+            ensure!(
+                matches!(part, std::path::Component::RootDir),
+                "Recovery path must be absolute without parent steps"
+            );
+            continue;
+        };
+        let name = CString::new(name.as_bytes())?;
+        // SAFETY: current owns the parent descriptor and name is terminated.
+        let descriptor = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        ensure!(
+            descriptor >= 0,
+            "Directory changed or is unavailable: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: openat returned a new owned descriptor and no other File owns it.
+        current = unsafe { File::from_raw_fd(descriptor) };
+    }
+    Ok(current)
+}
+
 fn swap(first: &Path, second: &Path) -> Result<()> {
-    let first = CString::new(first.as_os_str().as_bytes())?;
-    let second = CString::new(second.as_os_str().as_bytes())?;
-    // SAFETY: both paths are terminated; RENAME_SWAP keeps both directory entries present.
-    let result = unsafe { libc::renamex_np(first.as_ptr(), second.as_ptr(), libc::RENAME_SWAP) };
+    use std::os::fd::AsRawFd;
+    let first_parent = directory(first.parent().context("File has no parent")?)?;
+    let second_parent = directory(second.parent().context("Staging file has no parent")?)?;
+    let first = CString::new(first.file_name().context("File has no name")?.as_bytes())?;
+    let second = CString::new(
+        second
+            .file_name()
+            .context("Staging file has no name")?
+            .as_bytes(),
+    )?;
+    // SAFETY: owned directory descriptors anchor both terminated leaf names.
+    let result = unsafe {
+        libc::renameatx_np(
+            first_parent.as_raw_fd(),
+            first.as_ptr(),
+            second_parent.as_raw_fd(),
+            second.as_ptr(),
+            libc::RENAME_SWAP,
+        )
+    };
     ensure!(
         result == 0,
         "Atomic replacement failed: {}",
         std::io::Error::last_os_error()
     );
+    first_parent.sync_all()?;
+    second_parent.sync_all()?;
     Ok(())
 }
 

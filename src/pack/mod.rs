@@ -9,6 +9,8 @@ mod install;
 pub mod mount;
 #[cfg(feature = "pack-mount")]
 mod overlay;
+#[cfg(feature = "pack-mount")]
+mod recovery;
 mod restore;
 
 pub use create::{
@@ -17,6 +19,8 @@ pub use create::{
 };
 pub use format::{CHUNK_BYTES, Entry, Kind, Reader, Summary};
 pub use install::{Install, InstallPhase};
+#[cfg(feature = "pack-mount")]
+pub use recovery::verify_restored;
 pub use restore::restore;
 
 #[cfg(feature = "pack-mount")]

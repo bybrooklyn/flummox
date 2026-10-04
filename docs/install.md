@@ -63,8 +63,10 @@ Alternatively, download `flummox-VERSION-macos-aarch64.zip`, verify its SHA-256,
 and drag `Flummox.app` into Applications. macOS 14 or newer is required. The app
 is ad hoc signed; Apple Developer ID signing and notarization are not configured.
 macOS can require approval in System Settings > Privacy & Security when opening
-the downloaded app. Compression is not implemented on macOS yet; this download
-provides the desktop shell and displays its version.
+the downloaded app. The published v0.0.1 Mac download is an informational shell. The development
+version adds APFS compression, restoration, and recovery. Native Mac jobs finish
+the current file when stopped; interrupted replacements keep their originals
+for explicit recovery. Mac FUSE support is not required.
 
 ## Windows (64-bit)
 
@@ -153,3 +155,11 @@ flummox jobs remove-folder '~/My Games'
 
 The custom-location protocol is version 6. When upgrading a running version 5
 coordinator, use `flummox jobs restart` before adding locations.
+
+## Verify release signatures
+
+Starting with v0.0.2, download the release manifest and its `.minisig` signature.
+Install Minisign and verify with the stable public key shown in the notes and
+committed in `packaging/minisign.pub`. Pin that known key for later releases.
+Compare the signed manifest's filename, size, and SHA-256 with your download.
+Publisher signing and notarization remain separate from these signatures.

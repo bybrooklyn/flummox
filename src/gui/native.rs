@@ -1,4 +1,4 @@
-//! Native Windows shell over the WOF backend.
+//! Native Mac and Windows desktop workflows over their filesystem backends.
 
 use anyhow::Result;
 use iced::futures::SinkExt;
@@ -27,6 +27,10 @@ const PLATFORM: &str = "macOS · APFS";
 const MODE: &str = "LZX";
 #[cfg(target_os = "macos")]
 const MODE: &str = "APFS";
+#[cfg(windows)]
+const RECOVERY_ACTION: &str = "Restore ordinary storage";
+#[cfg(target_os = "macos")]
+const RECOVERY_ACTION: &str = "Restore retained original";
 
 struct Status {
     error: bool,
@@ -534,7 +538,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         for record in &state.recovery {
             action = action.push(text(record.root.display().to_string()).size(13));
             action =
-                action.push(button("Restore retained original").on_press_maybe(
+                action.push(button(RECOVERY_ACTION).on_press_maybe(
                     (!state.working).then(|| Message::Recover(record.root.clone())),
                 ));
         }
@@ -632,7 +636,7 @@ fn boot() -> (State, Task<Message>) {
     (state, task)
 }
 
-/// Runs the Windows desktop app.
+/// Runs the native desktop app.
 pub fn run() -> Result<()> {
     iced::application(boot, update, view)
         .title("Flummox")

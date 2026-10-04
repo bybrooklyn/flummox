@@ -1,6 +1,7 @@
 # Release automation
 
-Push a SemVer tag such as `v0.0.1` after committing the intended changes. The
+Push a SemVer tag such as `v0.0.2` after committing the intended changes and
+passing the recorded [real-game acceptance](validation/README.md). The
 Release workflow builds that exact commit, applies the tag version to its
 temporary Cargo.toml and Cargo.lock, generates release notes from git history,
 and publishes the release after every required check passes. Versions appear in
@@ -82,3 +83,29 @@ Run `just ci` for the code, packaging tests, dependency policy, and prose checks
 checksum generation, and mislabeled architecture rejection using temporary
 fixtures. Native installer and Homebrew acceptance run on GitHub's respective
 platform runners. No release check touches a real game library.
+
+## Release signatures
+
+`RELEASE_SIGNING_KEY` holds the stable Minisign secret key. Its public key is
+committed in `packaging/minisign.pub` and appended to every release's notes.
+The signing job runs after finalized archives, installers, and the Arch package
+have passed their checks. It signs a versioned JSON manifest containing the tag,
+commit, exact download set, lengths, and SHA-256 digests. Publication and package
+channel updates verify the signature and all local downloads first.
+
+A local private backup is kept outside the repository in the owner's application
+state. Keep that key private and back it up securely. Rotation requires a new
+public key and an announcement signed with the previous key; do not regenerate
+keys for each tag. User verification should pin the previously trusted public
+key, since replacing a release's key and signature together does not prove
+continuity with earlier releases.
+
+Linux packaging uses native objcopy to extract debug symbols, strip only debug
+information from staging copies, and attach debug links. Matching symbols are
+internal CI artifacts retained for 14 days. Archive size reports are CI
+artifacts too. Download packaging leaves developer build outputs unchanged.
+
+`docs/validation/VERSION.json` must contain passed Linux native, Proton, Windows,
+and Mac runs with local compatibility reports before a tag build can publish.
+Workflow dispatch remains available for candidate builds while those interactive
+checks are pending. This gate does not replace native automated validation.

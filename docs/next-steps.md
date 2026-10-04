@@ -22,45 +22,25 @@ Linux x86_64/ARM64, Apple Silicon macOS, and Windows x64 downloads are available
 macOS is currently a shell without a compression backend. This replaces the
 previous draft-release and cross-build-only acceptance items.
 
-## Recommended next release
+## Version 0.0.2 implementation
 
-Prioritize temporary-space planning and recovery alongside real-game acceptance.
-Creating a store while retaining the original requires additional space, and
-users need to understand where it is needed before a job starts. Validate launch,
-patching, interruption, and restoration against ordinary installs before making
-broader compatibility or performance claims.
+The next-release branch implements per-volume space planning, worker rechecks,
+Recovery with explicit restoration verification, remembered offline games,
+guided local compatibility reports, native APFS compression, and signed release
+manifests. Linux downloads omit embedded debug data and retain internal symbols.
 
-After those core workflows, make the macOS download useful with a storage backend,
-and configure Windows publisher signing and Apple Developer ID/notarization.
-Choose the macOS backend through experiments with temporary game fixtures and
-verified restoration before exposing it as a supported storage mode. Credentials
-for trusted signing are separate from the currently configured release keys.
+Real-game acceptance remains pending in `validation/0.0.2.json`. Native build,
+fixture, installation, and visual checks must also finish before publication.
+User-run Windows and Mac launch/gameplay/update/restore evidence is required;
+Linux native and Proton evidence is required too. See the
+[acceptance procedure](validation/README.md).
 
-## Product improvements
+## Later work
 
-1. **Plan temporary space before storage jobs.** Show the source, store, retained
-   original, and restoration requirements on the relevant drives. Check available
-   space before starting and explain what users need to free. Distinguish sample
-   predictions from verified store sizes.
-2. **Guide Maximum Space qualification in the app.** Start from a selected game,
-   capture its build and corpus, lead the user through launch/update/restore
-   checks, record baseline and compressed performance, and save the local report.
-   Reports currently have to be produced separately and imported.
-3. **Put recovery actions in one place.** Present interrupted jobs and affected
-   installs together, explain which original/store/update layer is retained, and
-   provide the appropriate retry or restore action. Add a user-controlled export
-   of diagnostics for troubleshooting.
-4. **Remember disconnected custom libraries.** Keep the last discovered games
-   visible with an unavailable-drive state, explain why their jobs are paused,
-   and rediscover them when the drive returns. Collection discovery currently
-   reports a warning and cannot list children of an unavailable location.
-5. **Finish desktop accessibility and navigation.** Exercise focus order, keyboard
-   folder entry, button labels, contrast, and reduced motion in real sessions.
-   Preserve the current sidebar and theme while improving these interactions.
-
-Items above are proposed improvements. Windows launcher and maintenance parity,
-scheduling, Bottles integration, and community report sharing can follow the core
-storage workflows.
+Mac FUSE support, Windows launcher and maintenance parity, scheduling, Bottles
+integration, and community report sharing remain deferred. Apple Developer ID,
+notarization, and Windows Authenticode require publisher credentials; current
+release authentication uses a separate stable Minisign key.
 
 ## Dependency update (2026-10-03)
 

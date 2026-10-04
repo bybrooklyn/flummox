@@ -84,8 +84,13 @@ fn volume_existing(path: &Path) -> Result<Volume> {
                     .then(|| entry.file_name().to_string_lossy().into_owned())
             })
         });
+    let fallback = format!(
+        "{}:{:?}",
+        fs.source,
+        nix::sys::statfs::statfs(path)?.filesystem_id()
+    );
     Ok(Volume {
-        identity: format!("{}:{}", fs.fstype, uuid.unwrap_or(fs.source)),
+        identity: format!("{}:{}", fs.fstype, uuid.unwrap_or(fallback)),
         path: fs.mountpoint,
         available: crate::backend::free_bytes(path)?,
     })

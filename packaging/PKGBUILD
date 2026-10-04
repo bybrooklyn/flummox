@@ -3,12 +3,11 @@
 # Arch/CachyOS package. Build from a checkout with:
 #   cd packaging && makepkg -si
 #
-# There is no AUR submission yet; when there is, `source` should point at a
-# release tarball with a checksum rather than at the working tree, and
-# `pkgver()` should read the tag.
+# This recipe builds the working tree. The published flummox-bin AUR recipe
+# is generated from verified release archives by distributions.py.
 
 pkgname=flummox
-pkgver=0.1.0
+pkgver=0.0.2
 pkgrel=1
 pkgdesc="Compress installed games with zstd on Linux, and keep playing them"
 arch=('x86_64')

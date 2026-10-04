@@ -1088,6 +1088,18 @@ fn recovery(state: &State) -> Element<'_, Message> {
                     }),
                 ));
             }
+            if !pending
+                && row.game.state.is_idle()
+                && install.phase == crate::pack::InstallPhase::Attention
+            {
+                details = details.push(secondary(
+                    "Verify restored files",
+                    Message::Send(Command::EnqueuePack {
+                        game: row.game.clone(),
+                        task: crate::jobs::PackTask::VerifyRestored,
+                    }),
+                ));
+            }
             details = details.push(secondary(
                 "Review game and storage",
                 Message::ReviewGame(row.game.id.to_string()),

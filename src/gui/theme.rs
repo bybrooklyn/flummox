@@ -176,7 +176,7 @@ pub fn hero(theme: &Theme) -> container::Style {
 ///
 /// `is_error` picks the colour, rather than the wording being sniffed for
 /// words like "failed". The wording of a message does not reliably say what kind it is.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub fn banner(is_error: bool) -> impl Fn(&Theme) -> container::Style {
     move |theme| {
         let colors = colors(theme);

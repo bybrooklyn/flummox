@@ -8,6 +8,8 @@
 mod app;
 #[cfg(target_os = "linux")]
 mod dialog;
+#[cfg(any(windows, target_os = "macos"))]
+mod native;
 #[cfg(all(test, target_os = "linux"))]
 mod preview;
 mod theme;
@@ -15,8 +17,6 @@ mod theme;
 mod unsupported;
 #[cfg(target_os = "linux")]
 mod view;
-#[cfg(any(windows, target_os = "macos"))]
-mod windows;
 
 use anyhow::Result;
 
@@ -111,7 +111,7 @@ pub fn run() -> Result<()> {
 
 #[cfg(any(windows, target_os = "macos"))]
 pub fn run() -> Result<()> {
-    windows::run()
+    native::run()
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
