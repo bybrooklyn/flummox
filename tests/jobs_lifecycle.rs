@@ -110,6 +110,7 @@ fn managed_pack_remounts_after_coordinator_restart_and_keeps_updates() -> TestRe
     std::fs::create_dir(&home).ctx("home")?;
     std::fs::create_dir(&game).ctx("game")?;
     std::fs::write(game.join("data"), b"base").ctx("source")?;
+    let source_volume = flummox::storage::volume(&game).ctx("source volume")?;
     flummox::pack::create_shared(
         &game,
         &store,
@@ -129,6 +130,13 @@ fn managed_pack_remounts_after_coordinator_restart_and_keeps_updates() -> TestRe
         },
     )?;
     check_eq(snapshot.packs.len(), 1, "activation is durable")?;
+    check_eq(
+        flummox::storage::volume(&game)
+            .ctx("mounted volume")?
+            .identity,
+        source_volume.identity.clone(),
+        "managed mount keeps the underlying library drive identity",
+    )?;
     check(
         request(&home, Request::Restart).is_err(),
         "restart refuses to interrupt mounted game reads",
@@ -138,6 +146,13 @@ fn managed_pack_remounts_after_coordinator_restart_and_keeps_updates() -> TestRe
 
     let mut restarted = start(&home)?;
     let snapshot = request(&home, Request::Snapshot)?;
+    check_eq(
+        flummox::storage::volume(&game)
+            .ctx("remounted volume")?
+            .identity,
+        source_volume.identity,
+        "library drive identity survives remounting",
+    )?;
     check_eq(
         snapshot.packs.len(),
         1,

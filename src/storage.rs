@@ -74,6 +74,15 @@ pub fn volume(path: &Path) -> Result<Volume> {
 #[cfg(target_os = "linux")]
 fn volume_existing(path: &Path) -> Result<Volume> {
     let fs = crate::fsprobe::probe(path)?;
+    if fs.magic == crate::fsprobe::magic::FUSE && fs.source == "flummox-pack" {
+        // Managed mounts receive a new filesystem ID after each remount.
+        // Library identity and capacity belong to the underlying drive.
+        let parent = fs
+            .mountpoint
+            .parent()
+            .context("Managed game mount has no parent folder")?;
+        return volume_existing(parent);
+    }
     ensure!(!fs.read_only, "Storage volume is read-only");
     let source = Path::new(&fs.source).canonicalize().ok();
     let uuid = std::fs::read_dir("/dev/disk/by-uuid")

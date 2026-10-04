@@ -29,8 +29,9 @@ Recovery with explicit restoration verification, remembered offline games,
 guided local compatibility reports, native APFS compression, and signed release
 manifests. Linux downloads omit embedded debug data and retain internal symbols.
 
-Real-game acceptance remains pending in `validation/0.0.2.json`. Native build,
-fixture, installation, and visual checks must also finish before publication.
+Real-game acceptance remains pending in `validation/0.0.2.json`. Native builds,
+APFS fixtures, Windows installer checks, Arch and Homebrew installation,
+signed-manifest verification, and offscreen GUI checks have passed.
 User-run Windows and Mac launch/gameplay/update/restore evidence is required;
 Linux native and Proton evidence is required too. See the
 [acceptance procedure](validation/README.md).

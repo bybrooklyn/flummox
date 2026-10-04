@@ -479,6 +479,27 @@ pub fn space_plan(
                         storage::pack_bound(&footprint)?,
                         "Verified store; original remains on the source drive",
                     )?;
+                    if matches!(task, PackTask::Activate { .. }) {
+                        plan.add(
+                            storage::volume(&game.install_dir)?,
+                            0,
+                            "Original retained; activation metadata",
+                        )?;
+                    }
+                }
+                PackTask::Activate { store, .. } => {
+                    anyhow::ensure!(store.exists(), "Verified store is unavailable");
+                    plan.retained_original = true;
+                    plan.add(
+                        storage::volume(store)?,
+                        0,
+                        "Existing verified store and writable updates",
+                    )?;
+                    plan.add(
+                        storage::volume(&game.install_dir)?,
+                        0,
+                        "Original retained; activation metadata",
+                    )?;
                 }
                 PackTask::Compact | PackTask::Restore | PackTask::VerifyRestored => {
                     let install = snapshot
