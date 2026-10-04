@@ -65,6 +65,35 @@ termination; the repeated checks used per-run Wine traces. These checks do not
 establish interactive gameplay, normal exit, progress saves, or cold load times.
 See [the Proton smoke record](2026-10-04-proton-smoke.json).
 
+## Graphical folder controls
+
+The candidate GUI ran in a private headless Xwayland display using Iced's
+software renderer. Its home, configuration, database, runtime, and disposable
+collection were isolated from the ordinary desktop session. Captured windows
+were inspected after actual mouse and keyboard input.
+
+Entering `~/Missing Games` produced the existing-folder validation error.
+Entering `~/My Games` expanded the isolated home path, saved the collection,
+and displayed its immediate `Example Game` subfolder on the Games page. A
+read-only database query confirmed the collection was persisted with automatic
+maintenance disabled. After the private display session restarted, the saved
+collection still appeared. Renaming the collection out of the way and refreshing
+retained its game as unavailable with compression disabled; restoring the path
+and refreshing enabled it again. This simulates an unavailable location, not a
+physical drive disconnect. Removing the location cleared the registered
+libraries in the database while leaving the disposable game bytes intact.
+Private screenshots and harness scripts remain local.
+The headless compositor exited with status 139 during harness teardown; normal
+app shutdown was not assessed. Path-free results are in
+[the GUI smoke record](2026-10-04-gui-smoke.json).
+This checks the typed-path flow; native KDE and other desktop dialogs remain
+unverified.
+
+A separate Proton window-close probe captured a rendered Super Meat Boy intro.
+The game did not terminate within twenty seconds of the window-close request.
+The private harness stopped it afterward. Normal game exit and progress-save
+flushing remain unverified; this probe adds no completed compatibility run.
+
 ## Incomplete checks
 
 A private graphical Factorio baseline requested a Steam restart, and the

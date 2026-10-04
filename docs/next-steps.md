@@ -4,7 +4,9 @@
 
 Native Factorio simulation and Super Meat Boy Proton startup passed disposable
 storage-cycle smoke checks. See [the evidence](validation/2026-10-04-linux-smoke.md)
-for measured results and the remaining limits.
+for measured results and the remaining limits. The typed-path GUI flow also
+passed an isolated graphical check with a spaced collection path and an invalid
+path control. Native desktop picker integration remains pending.
 
 These checks remain necessary before calling the release fully validated:
 
@@ -28,7 +30,7 @@ previous draft-release and cross-build-only acceptance items.
 
 ## Version 0.0.2 implementation
 
-The next-release branch implements per-volume space planning, worker rechecks,
+The main branch implements per-volume space planning, worker rechecks,
 Recovery with explicit restoration verification, remembered offline games,
 guided local compatibility reports, native APFS compression, and signed release
 manifests. Linux downloads omit embedded debug data and retain internal symbols.

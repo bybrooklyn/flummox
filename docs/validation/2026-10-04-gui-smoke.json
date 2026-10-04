@@ -1,0 +1,29 @@
+{
+  "date": "2026-10-04",
+  "scope": "isolated graphical folder workflow",
+  "qualification": "incomplete",
+  "candidate_commit": "233f2973f235e20b8b0fbabb1d93ccd7b114eeff",
+  "version": "0.0.2",
+  "display": "headless gamescope Xwayland",
+  "renderer": "tiny-skia",
+  "input": "xdotool mouse and keyboard",
+  "evidence": "visually inspected window captures and read-only settings database queries",
+  "checks": {
+    "invalid_path_rejected": true,
+    "tilde_and_spaces_accepted": true,
+    "collection_saved": true,
+    "immediate_game_discovered": true,
+    "collection_persisted_across_display_restart": true,
+    "missing_location_retained_and_compression_disabled": true,
+    "restored_location_enabled_after_refresh": true,
+    "removed_location_absent_from_database": true,
+    "removal_preserved_game_content": true
+  },
+  "limitations": [
+    "Missing path simulated by rename; no physical drive was disconnected",
+    "Native folder and report dialogs on KDE and another desktop remain unverified",
+    "Harness terminated GUI; normal application exit unverified",
+    "Headless compositor teardown exited with status 139",
+    "GPU-rendered X11 window capture was black; software renderer used"
+  ]
+}
