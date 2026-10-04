@@ -13,6 +13,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub fn folder_path(input: &str) -> PathBuf {
+    let text = input.trim().trim_matches(['\"', '\'']);
+    let text = text.replace("\\ ", " ");
+    if let Some(relative) = text.strip_prefix("~/")
+        && let Some(home) = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+    {
+        return PathBuf::from(home).join(relative);
+    }
+    PathBuf::from(text)
+}
+
 fn folders() -> Result<Vec<PathBuf>> {
     let path = libraries::data_dir()?.join("folders.json");
     match std::fs::read(path) {

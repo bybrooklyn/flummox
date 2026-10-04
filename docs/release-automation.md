@@ -105,7 +105,8 @@ information from staging copies, and attach debug links. Matching symbols are
 internal CI artifacts retained for 14 days. Archive size reports are CI
 artifacts too. Download packaging leaves developer build outputs unchanged.
 
-`docs/validation/VERSION.json` must contain passed Linux native, Proton, Windows,
-and Mac runs with local compatibility reports before a tag build can publish.
+`docs/validation/0.0.2.json` must contain passed Linux native, Proton, Windows,
+and Mac runs with local compatibility reports before the 0.0.2 tag can publish.
+Later versions keep the usual tag-triggered release flow.
 Workflow dispatch remains available for candidate builds while those interactive
 checks are pending. This gate does not replace native automated validation.

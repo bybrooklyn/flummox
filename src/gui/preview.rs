@@ -139,6 +139,45 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
         render(&state, 1100, 900, &output.join(format!("{name}.png")))?;
         render(&state, 720, 900, &output.join(format!("{name}-narrow.png")))?;
     }
+    state.planned = Some((
+        crate::jobs::Command::Enqueue {
+            game: game.clone(),
+            operation: Operation::Compress,
+            options: Default::default(),
+        },
+        crate::storage::SpacePlan {
+            retained_original: true,
+            requirements: vec![crate::storage::Requirement {
+                volume: crate::storage::Volume {
+                    identity: "fixture".into(),
+                    path: "/Games".into(),
+                    available: 10_000_000_000,
+                },
+                additional: 4_000_000_000,
+                headroom: 200_000_000,
+                reasons: vec!["Verified store; original retained".into()],
+            }],
+        },
+    ));
+    render(&state, 1100, 900, &output.join("space-plan.png"))?;
+    state.planned = None;
+    state.page = Page::Recovery;
+    if let Some(job) = state.snapshot.jobs.first_mut() {
+        job.phase = Phase::Interrupted;
+        job.message = "Worker stopped; original retained".into();
+    }
+    render(&state, 1100, 720, &output.join("recovery.png"))?;
+    state.page = Page::Games;
+    state.qualification = Some(crate::qualification::Wizard::new(
+        game.clone(),
+        crate::compatibility::Corpus {
+            sha256: "a".repeat(64),
+            files: 140,
+            bytes: 4_000_000_000,
+        },
+    ));
+    render(&state, 720, 900, &output.join("qualification.png"))?;
+    state.qualification = None;
     state.snapshot.jobs.push(Job {
         id: 2,
         game,

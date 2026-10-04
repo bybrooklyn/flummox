@@ -1601,6 +1601,15 @@ fn poll_pack(
         for update in running.events.try_iter() {
             let _finished = event(job, WorkerEvent::Progress(update), db)?;
         }
+        if paused && job.pack_interruptible && job.phase != Phase::Cancelling {
+            job.message = if job.user_paused {
+                "Paused by you".into()
+            } else if let Some(game) = &snapshot.gaming {
+                format!("Paused while you play {game}")
+            } else {
+                "Waiting for the original drive or launcher activity to finish".into()
+            };
+        }
         job.elapsed = running.started.elapsed().as_secs();
         save(db, job)?;
     }
@@ -1900,6 +1909,15 @@ pub(super) fn run() -> Result<()> {
                     finished = true;
                     break;
                 }
+            }
+            if a.paused && job.phase != Phase::Cancelling {
+                job.message = if job.user_paused {
+                    "Paused by you".into()
+                } else if let Some(game) = &snapshot.gaming {
+                    format!("Paused while you play {game}")
+                } else {
+                    "Waiting for the original drive or launcher activity to finish".into()
+                };
             }
             job.elapsed = a.started.elapsed().as_secs();
             if last_save.elapsed() >= Duration::from_secs(1) {

@@ -77,6 +77,7 @@ package() {{
   depends_on arch: :arm64
   depends_on macos: ">= :sonoma"
   app "Flummox.app"
+  binary "#{{appdir}}/Flummox.app/Contents/MacOS/flummox"
 end
 ''')
 

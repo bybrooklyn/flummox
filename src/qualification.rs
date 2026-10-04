@@ -278,3 +278,50 @@ pub fn view<'a, Message: Clone + 'a>(
     )
     .into()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        model::{GameId, InstallState, Launcher},
+        testutil::{Ctx, TestResult, check, check_eq},
+    };
+    #[test]
+    fn incomplete_measurements_cannot_be_saved_and_failed_checks_stay_failed() -> TestResult {
+        let game = Game {
+            id: GameId::new(Launcher::Steam, "fixture"),
+            also: vec![],
+            title: "Fixture".into(),
+            install_dir: "/fixture".into(),
+            build: Some("1".into()),
+            size_hint: None,
+            state: InstallState::Idle,
+            is_tool: false,
+        };
+        let mut wizard = Wizard::new(
+            game.clone(),
+            Corpus {
+                sha256: "a".repeat(64),
+                files: 1,
+                bytes: 4096,
+            },
+        );
+        check(wizard.report().is_err(), "missing measurements must fail")?;
+        wizard.field(Field::BaselineLoad, "1000".into());
+        wizard.field(Field::CandidateLoad, "1500".into());
+        wizard.field(Field::AllocationBefore, "4096".into());
+        wizard.field(Field::AllocationAfter, "2048".into());
+        wizard.mode = StorageMode::MaximumSpace;
+        wizard.check(Check::Gameplay, true);
+        let report = wizard.report().ctx("measured report")?;
+        check_eq(report.checks.baseline_load_ms, 1000, "baseline preserved")?;
+        check(
+            report.checks.gameplay_issue && !report.checks.launched,
+            "failures are not replaced by optimistic defaults",
+        )?;
+        check(
+            !report.qualifies(&game, &"a".repeat(64), compatibility::Policy::default()),
+            "incomplete or regressed evidence must not qualify",
+        )
+    }
+}

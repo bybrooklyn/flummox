@@ -111,3 +111,52 @@ pub fn verify_restored(
     );
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{Ctx, TestResult, check};
+    #[test]
+    fn restore_verification_requires_matching_bytes_and_retains_storage() -> TestResult {
+        let fixture = tempfile::tempdir().ctx("fixture")?;
+        let source = fixture.path().join("source");
+        std::fs::create_dir(&source).ctx("source")?;
+        std::fs::write(source.join("data"), b"base bytes").ctx("base")?;
+        let store = fixture.path().join("store");
+        let cancel = AtomicBool::new(false);
+        let summary =
+            super::super::create(&source, &store, super::super::Options::default(), &cancel)
+                .ctx("store")?;
+        let restored = fixture.path().join("restored");
+        super::super::restore(&store, &restored, &cancel).ctx("restore")?;
+        let writes = fixture.path().join("writes");
+        let overlay = super::super::overlay::Overlay::open(&writes).ctx("updates")?;
+        drop(overlay);
+        let install = Install {
+            game_path: restored.clone(),
+            store_path: store.clone(),
+            writes_path: writes.clone(),
+            backup_path: None,
+            previous_store_path: None,
+            previous_writes_path: None,
+            summary: Some(summary),
+            phase: super::super::InstallPhase::Attention,
+            message: "interrupted".into(),
+        };
+        verify_restored(&install, &cancel, &super::super::NoObserver)
+            .ctx("verify completed restoration")?;
+        check(
+            store.exists() && writes.exists(),
+            "verification must retain store and updates",
+        )?;
+        std::fs::write(restored.join("data"), b"changed bytes").ctx("change")?;
+        check(
+            verify_restored(&install, &cancel, &super::super::NoObserver).is_err(),
+            "unexpected bytes must require review",
+        )?;
+        check(
+            store.exists() && writes.exists(),
+            "failed verification must retain all storage",
+        )
+    }
+}

@@ -128,34 +128,48 @@ fn volume_existing(path: &Path) -> Result<Volume> {
         .collect();
     use std::os::unix::ffi::OsStringExt;
     let mount = PathBuf::from(std::ffi::OsString::from_vec(mount));
-    let output = std::process::Command::new("/usr/sbin/diskutil")
-        .args(["info", "-plist"])
-        .arg(&mount)
-        .output()?;
+    let mount_c = CString::new(mount.as_os_str().as_bytes())?;
+    let mut attributes = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: 0,
+        volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_UUID,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    #[repr(C)]
+    struct VolumeUuid {
+        length: u32,
+        bytes: [u8; 16],
+    }
+    let mut uuid = VolumeUuid {
+        length: 0,
+        bytes: [0; 16],
+    };
+    // SAFETY: mount_c is terminated, attributes describes the fixed UUID output,
+    // and uuid has room for the returned length prefix and 16-byte UUID.
+    let result = unsafe {
+        libc::getattrlist(
+            mount_c.as_ptr(),
+            std::ptr::from_mut(&mut attributes).cast(),
+            std::ptr::from_mut(&mut uuid).cast(),
+            std::mem::size_of::<VolumeUuid>(),
+            0,
+        )
+    };
     ensure!(
-        output.status.success(),
-        "Cannot identify the storage volume"
+        result == 0 && uuid.length as usize == std::mem::size_of::<VolumeUuid>(),
+        "Cannot identify the storage volume: {}",
+        std::io::Error::last_os_error()
     );
-    let converted = std::process::Command::new("/usr/bin/plutil")
-        .args(["-extract", "VolumeUUID", "raw", "-o", "-", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()?;
-    let mut child = converted;
-    use std::io::Write;
-    child
-        .stdin
-        .take()
-        .context("Volume identity input is unavailable")?
-        .write_all(&output.stdout)?;
-    let uuid = child.wait_with_output()?;
-    ensure!(uuid.status.success(), "Volume has no stable identity");
+    let uuid: String = uuid
+        .bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     Ok(Volume {
-        identity: format!(
-            "{}:{}",
-            String::from_utf8(kind)?,
-            String::from_utf8(uuid.stdout)?.trim()
-        ),
+        identity: format!("{}:{}", String::from_utf8(kind)?, uuid),
         path: mount,
         available: stat.f_bavail.saturating_mul(stat.f_bsize as u64),
     })
@@ -294,18 +308,18 @@ impl SpacePlan {
 pub fn native_plan(root: &Path, restore: bool) -> Result<SpacePlan> {
     let footprint = inventory(root)?;
     let mut plan = SpacePlan::default();
-    // Restoration can expand every file; sequential compression stages one file.
+    // Snapshots and shared extents can pin old blocks throughout a rewrite.
+    let additional = footprint
+        .bytes
+        .checked_add(footprint.largest)
+        .context("Native space requirement overflow")?;
     plan.add(
         volume(root)?,
+        additional,
         if restore {
-            footprint.bytes
+            "Ordinary expansion and temporary file; old blocks may remain pinned"
         } else {
-            footprint.largest.saturating_mul(2)
-        },
-        if restore {
-            "Expansion to ordinary files"
-        } else {
-            "Temporary file and replacement"
+            "Worst-case native rewrite with snapshots or shared extents retaining old blocks"
         },
     )?;
     Ok(plan)

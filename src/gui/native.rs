@@ -25,6 +25,10 @@ const PLATFORM: &str = "Windows · WOF/LZX";
 const PLATFORM: &str = "macOS · APFS";
 #[cfg(windows)]
 const MODE: &str = "LZX";
+#[cfg(windows)]
+const FOLDER_HINT: &str = "C:\\Games\\Your game";
+#[cfg(target_os = "macos")]
+const FOLDER_HINT: &str = "~/My Games/Your game";
 #[cfg(target_os = "macos")]
 const MODE: &str = "APFS";
 #[cfg(windows)]
@@ -47,6 +51,7 @@ struct State {
     cancel: Option<Arc<AtomicBool>>,
     system_theme: iced::theme::Mode,
     planned: Option<(PathBuf, bool, crate::storage::SpacePlan)>,
+    refreshing: bool,
     recovery: Vec<backend::Recovery>,
     qualification: Option<crate::qualification::Wizard>,
 }
@@ -63,6 +68,7 @@ impl Default for State {
             cancel: None,
             system_theme: iced::theme::Mode::Dark,
             planned: None,
+            refreshing: false,
             recovery: vec![],
             qualification: None,
         }
@@ -74,6 +80,8 @@ enum Message {
     Folder(String),
     Select(PathBuf),
     Refresh,
+    Poll,
+    Key(iced::keyboard::Event),
     Scanned(std::result::Result<Vec<crate::model::Game>, String>),
     Optimize,
     Planned(
@@ -118,8 +126,9 @@ fn plan(state: &mut State, optimize: bool) -> Task<Message> {
     if state.working {
         return Task::none();
     }
-    let folder = PathBuf::from(state.folder.trim());
+    let folder = crate::native::folder_path(&state.folder);
     state.working = true;
+    state.planned = None;
     let planned_folder = folder.clone();
     Task::perform(
         background(move || {
@@ -183,7 +192,7 @@ fn start(state: &mut State, folder: PathBuf, optimize: bool) -> Task<Message> {
 fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
         Message::Qualify => {
-            let path = PathBuf::from(state.folder.trim());
+            let path = crate::native::folder_path(&state.folder);
             if let Some(game) = state
                 .games
                 .iter()
@@ -265,7 +274,32 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::Select(folder) => {
             state.folder = folder.display().to_string();
+            state.planned = None;
             state.status = None;
+        }
+        Message::Key(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+            if key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab) {
+                return if modifiers.shift() {
+                    iced::widget::operation::focus_previous()
+                } else {
+                    iced::widget::operation::focus_next()
+                };
+            }
+            if key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) {
+                state.planned = None;
+                state.qualification = None;
+            }
+        }
+        Message::Key(_) => {}
+        Message::Poll => {
+            if !state.working
+                && !state.scanning
+                && state.planned.is_none()
+                && state.qualification.is_none()
+            {
+                state.refreshing = true;
+                return update(state, Message::Refresh);
+            }
         }
         Message::Refresh => {
             if state.scanning || state.working {
@@ -289,10 +323,13 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     return Task::none();
                 }
             }
-            state.status = Some(Status {
-                error: false,
-                text: format!("Found {} installed Steam games.", state.games.len()),
-            });
+            if !state.refreshing {
+                state.status = Some(Status {
+                    error: false,
+                    text: format!("Found {} remembered games.", state.games.len()),
+                });
+            }
+            state.refreshing = false;
         }
         Message::Optimize => return plan(state, true),
         Message::Restore => return plan(state, false),
@@ -310,7 +347,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::StartPlanned => {
             if let Some((folder, optimize, plan)) = state.planned.take() {
-                if let Err(error) = plan.check() {
+                if let Err(error) = plan.recheck() {
                     state.status = Some(Status {
                         error: true,
                         text: error.to_string(),
@@ -322,7 +359,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::CancelPlanned => state.planned = None,
         Message::Remember => {
-            let folder = PathBuf::from(state.folder.trim());
+            let folder = crate::native::folder_path(&state.folder);
             return Task::perform(
                 background(move || {
                     crate::native::add_folder(&folder).map_err(|error| error.to_string())
@@ -416,7 +453,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
 
     let mut game_list = column![
         row![
-            text(format!("Steam library · {} games", state.games.len())).size(16),
+            text(format!("Library · {} games", state.games.len())).size(16),
             button(if state.scanning {
                 "Refreshing…"
             } else {
@@ -478,13 +515,13 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         button("Stop")
             .padding([11, 18])
             .style(theme::secondary_button)
-            .on_press_maybe(state.working.then_some(Message::Stop)),
+            .on_press_maybe(state.cancel.is_some().then_some(Message::Stop)),
     ]
     .spacing(10);
     let mut action = column![
         theme::section_title("Selected folder"),
-        text_input("C:\\Games\\Your game", &state.folder)
-            .on_input(Message::Folder)
+        text_input(FOLDER_HINT, &state.folder)
+            .on_input_maybe((!state.working).then_some(Message::Folder))
             .padding(12)
             .width(Length::Fill),
         theme::muted("Optimize skips files the filesystem cannot shrink"),
@@ -636,12 +673,29 @@ fn boot() -> (State, Task<Message>) {
     (state, task)
 }
 
+fn polls() -> impl iced::futures::Stream<Item = Message> {
+    iced::futures::stream::unfold((), |()| async {
+        let _waited = background(|| {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            Ok(())
+        })
+        .await;
+        Some((Message::Poll, ()))
+    })
+}
+
 /// Runs the native desktop app.
 pub fn run() -> Result<()> {
     iced::application(boot, update, view)
         .title("Flummox")
         .theme(theme)
-        .subscription(|_| iced::system::theme_changes().map(Message::SystemTheme))
+        .subscription(|_| {
+            iced::Subscription::batch([
+                iced::system::theme_changes().map(Message::SystemTheme),
+                iced::Subscription::run(polls),
+                iced::keyboard::listen().map(Message::Key),
+            ])
+        })
         .default_font(theme::BODY_FONT)
         .window_size((900.0, 620.0))
         .run()?;

@@ -62,7 +62,8 @@ installs are restored. Installation instructions are in [install.md](install.md)
   checks, Homebrew installation, and Arch install/upgrade/GUI startup. AUR and
   Homebrew updates also passed. See release-automation.md for the pipeline.
 - Windows launcher/maintenance parity, real NTFS game tests, and direct
-  WOF/Game Compressor comparisons remain separate work. The macOS compression backend, Bottles, and community report sharing remain deferred.
+  WOF/Game Compressor comparisons remain separate work. Native APFS compression is implemented for 0.0.2 and has native fixture evidence.
+  Real-game acceptance is pending. Mac FUSE, Bottles, and community report sharing remain deferred.
 
 Small-file grouping is a bounded sample reported separately from the overall
 prediction. It is not a full-store allocation estimate. Restore and reclaim
@@ -74,7 +75,7 @@ Drives & libraries supports both a collection of immediate game subfolders and
 one individual game. Home shortcuts and escaped spaces are accepted. Tests cover
 legacy registrations, collection discovery, hidden/symlink filtering, overlapping
 locations, persistent registration, and removal without deleting game files.
-The coordinator protocol is version 6; the version 5 restart command supports
+The coordinator protocol is version 7; the version 6 restart command supports
 upgrading the previous coordinator.
 
 Prioritized acceptance work and proposed product improvements are tracked in
