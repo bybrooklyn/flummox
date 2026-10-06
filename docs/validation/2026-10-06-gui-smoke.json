@@ -1,0 +1,35 @@
+{
+  "date": "2026-10-06",
+  "candidate_commit": "be099676c1f7b5651a6e76f6e12fa4c5aaf5a320",
+  "version": "0.0.2",
+  "scope": "isolated Linux desktop acceptance",
+  "display": "headless gamescope Xwayland",
+  "renderer": "tiny-skia, optimized application build",
+  "fixture_games": 250,
+  "input": "xdotool mouse and keyboard",
+  "checks": {
+    "overview_games_settings_navigation": true,
+    "settings_jump_links": true,
+    "wheel_movement_and_stop": true,
+    "per_page_scroll_restoration": true,
+    "keyboard_home": true,
+    "search_shortcut_and_retained_query": true,
+    "custom_collection_discovery": true,
+    "disposable_file_analysis": true,
+    "needs_attention_job_retained_on_page_return": true,
+    "dark_and_light_layouts": true,
+    "reduced_motion": true,
+    "narrow_layout": true,
+    "native_folder_picker_open_and_cancel": true,
+    "missing_folder_remembered_after_refresh": true,
+    "restored_folder_visible_after_refresh": true,
+    "normal_gui_exit_code": 0
+  },
+  "limitations": [
+    "Synthetic X11 input does not establish physical trackpad behavior.",
+    "A renamed fixture simulates disconnection; physical unplugging was not tested.",
+    "The unsupported fixture mount produces a needs-attention storage job; real compression is covered separately by integration tests.",
+    "Running, paused and completed storage-job GUI states still require native acceptance.",
+    "This record does not qualify real games or Windows and Mac interactive behavior."
+  ]
+}

@@ -100,34 +100,56 @@ parsing passed. The selected
 [narrow Settings](desktop-polish/settings-narrow.png) fixtures accompany this
 record. They are not screenshots of a running desktop session.
 
+## Live Linux acceptance
+
+An optimized build from `be09967` ran in an isolated headless Gamescope/Xwayland
+session with a temporary home, 250 fake Steam games and a custom collection.
+Ordinary game libraries were hidden. Mouse and keyboard input verified:
+
+- Overview/Games/Settings navigation, Settings jumps and direct Home scrolling.
+- Wheel movement reaching its endpoint without momentum and retained per-page
+  offsets. Modifier notifications no longer cancel easing.
+- Search across page changes. A needs-attention storage job stayed
+  visible after returning to Settings, with no connection/loading placeholder.
+- Light/dark, reduced motion, wide/narrow layouts and fixed missing-art slots.
+- A collection containing a disposable game, file analysis, remembered missing
+  folders after refresh and restored folders after reconnecting the fixture.
+- Native folder picker open/cancel and normal GUI closure with exit code zero.
+
+The [path-free check record](2026-10-06-gui-smoke.json) states the scope and
+limitations. Selected live window captures are checked in:
+[dark Overview](desktop-polish/live/overview-live.png),
+[light Overview](desktop-polish/live/overview-light-live.png),
+[dark Games](desktop-polish/live/games-live.png),
+[narrow light Games](desktop-polish/live/games-narrow-live.png),
+[dark Jobs](desktop-polish/live/jobs-dark-return-live.png),
+[light Jobs](desktop-polish/live/jobs-retained-live.png),
+[Locations](desktop-polish/live/locations-live.png), and
+[disconnected fixture](desktop-polish/live/offline-game-live.png).
+These are screenshots of the running app with fixtures.
+
 ## Required follow-up
 
-Complete the remaining acceptance checks for wheel/trackpad input,
-rapid navigation, scroll restoration, jump links, keyboard input, native dialogs,
-large libraries, offline locations and reduced motion. The isolated live Linux window discovers custom collections and analyzes
-disposable files. Optimized Settings jump links settle within a 350 ms capture.
-X11 modifier notifications no longer cancel wheel easing; a regression exercises
-this sequence and direct keyboard scrolling. Native physical trackpad input and
-all job states still need interactive acceptance.
+Physical wheel/trackpad behavior, all job phases, real external-drive removal,
+Windows/Mac dialogs, tray, startup and real-game qualification remain required.
+The Linux disconnection check used a rename. Storage on the isolated fixture
+mount is unsupported and produces an attention row; it does not establish
+compression there. Real btrfs and FUSE behavior was verified separately.
 
-The added fixtures execute in native CI and export previews. Mac CI passes.
-Windows native tests pass; the installer smoke check is being rerun after its
-release-notes repair. Verify
+The [native CI run](https://github.com/bybrooklyn/flummox/actions/runs/37531175295)
+passes every job for `be09967`: Linux policy/tests, btrfs matrix, required FUSE,
+Mac native tests/builds and Windows native tests/builds plus installer lifecycle.
+Windows and Mac export native previews. Verify
 tray/Explorer restart, startup ownership, dialogs, actual game/updater deferral,
 recovery and upgrades during work on disposable native installations.
 
-Git metadata is now writable. The continuation was committed and pushed as
-`a573904`. Its Linux CI, btrfs matrix and real FUSE integration passed. Native
-Mac and Windows Clippy and previews passed, but tests exposed canonical-path
-alias handling and a Windows pipe reply race. Follow-up fixes resolve location
-aliases, retain pipe buffers until client acknowledgement and join the listener
-on shutdown. Explicit animation redraw requests also remove dependence on the
-one-second worker poll. The complete local CI gate passes after these fixes.
-The follow-up `a9ac255` passed Windows native tests by distinguishing temporary
-empty pipe buffers from disconnections. A new native delayed-reply regression
-checks that a client waits for the server. Final-frame redraws and direct
-keyboard scrolling cover the shared desktop surface. Blurred shadows were
-removed after they rendered artifacts and delayed software-renderer frames.
+Git metadata is now writable. The continuation and its repairs are committed and
+pushed through `be09967`. Native validation covers canonical location aliases,
+acknowledged pipe replies, joined shutdown listeners and temporary empty pipe
+buffers. Explicit animation redraws, final scroll frames and direct keyboard
+scrolling cover the shared surface. Flat cards avoid the software-renderer blur
+artifacts seen during live checks. The complete local CI gate passes.
 No new tag or release was made.
-Native Mac runtime and all real-game qualification records remain pending.
+Interactive Mac and Windows acceptance and all real-game qualification records
+remain pending.
 Version 0.0.2 must remain unpublished until its acceptance records pass.

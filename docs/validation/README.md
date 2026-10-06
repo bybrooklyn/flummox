@@ -48,3 +48,25 @@ corpus hash, matching logical-byte counts, and positive allocated-byte and
 load-time measurements. Linux native and Proton runs must exercise Maximum
 Space; Windows and Mac runs must exercise native compression. Measurements must
 be integers, and restart and launcher verification must be JSON `true`.
+
+## Desktop checks before game qualification
+
+Use candidate artifacts from the Actions release workflow without creating a
+tag. Keep location maintenance off until the disposable locations are added.
+
+On Windows, install the candidate, add a temporary collection, and check the
+initial baseline before creating a new child game directory. Enable maintenance
+for that collection, create a disposable payload, and verify one automatic job.
+Check exclusions, pause/resume, a running executable inside the fixture,
+reopening the window, retained jobs after worker restart and unavailable drives.
+Opt into login startup separately; reboot and check the tray. Restart Explorer
+and check that its icon returns. Upgrade and uninstall while a disposable job
+runs, then verify bytes and any retained recovery files. Confirm that another
+installation's startup entry is preserved.
+
+On Mac, use a temporary APFS game folder. Check discovery, dialogs, native
+compression/restore, recovery, theme/motion persistence and closing during work.
+On both platforms, inspect wide/narrow and light/dark layouts, wheel/trackpad
+movement, rapid navigation, scroll restoration, missing/corrupt local artwork
+and Running/Waiting/Needs attention/History rows. These checks supplement native
+CI; they do not replace the real-game reports required for publication.
