@@ -2,7 +2,7 @@
 #![allow(unsafe_code)]
 use anyhow::{Context, Result, ensure};
 use std::{
-    io::{Read, Write},
+    io::Write,
     os::windows::{
         fs::OpenOptionsExt,
         io::{AsRawHandle, FromRawHandle},
@@ -189,7 +189,26 @@ fn read_exact_wait(
 ) -> Result<()> {
     while !bytes.is_empty() {
         ensure!(Instant::now() < deadline, "Coordinator response timed out");
-        match file.read(bytes) {
+        let mut count = 0;
+        // SAFETY: file owns a synchronous handle; bytes is writable for its stated
+        // length, count is a live output slot, and no OVERLAPPED pointer is used.
+        let read = unsafe {
+            ReadFile(
+                file.as_raw_handle().cast(),
+                bytes.as_mut_ptr(),
+                u32::try_from(bytes.len())?,
+                &mut count,
+                std::ptr::null_mut(),
+            )
+        };
+        let result = if read != 0 {
+            Ok(usize::try_from(count)?)
+        } else {
+            Err(std::io::Error::last_os_error())
+        };
+        // std::fs::File maps ERROR_NO_DATA to EOF. A nonblocking pipe needs to
+        // distinguish that temporary empty buffer from ERROR_BROKEN_PIPE.
+        match result {
             Ok(0) => anyhow::bail!("Coordinator connection closed"),
             Ok(count) => bytes = bytes.get_mut(count..).context("Pipe read bounds")?,
             Err(error) if matches!(error.raw_os_error(), Some(232 | 536)) => {
