@@ -61,6 +61,8 @@ fn call_file(command: Command, mut file: std::fs::File) -> Result<Snapshot> {
         },
     )?;
     let response: Response = crate::windows_ipc::receive(&mut file)?;
+    // The server retains its buffers until the client has read the complete reply.
+    crate::windows_ipc::send(&mut file, &true)?;
     ensure!(
         response.version == VERSION,
         "Worker protocol changed. Restart Flummox."
@@ -166,10 +168,16 @@ impl Drop for Active {
         }
     }
 }
-struct ListenerStop(Arc<AtomicBool>);
+struct ListenerStop {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
 impl Drop for ListenerStop {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _joined = thread.join();
+        }
     }
 }
 enum Event {
@@ -232,11 +240,10 @@ fn run() -> Result<()> {
     let mut pipe = crate::windows_ipc::listener()?;
     let (requests, receive) = mpsc::channel::<(Request, mpsc::Sender<Response>)>();
     let stopped = Arc::new(AtomicBool::new(false));
-    let _listener_lifetime = ListenerStop(stopped.clone());
     let listener_stop = stopped.clone();
     let listener_failed = Arc::new(AtomicBool::new(false));
     let pipe_failed = listener_failed.clone();
-    std::thread::spawn(move || {
+    let listener_thread = std::thread::spawn(move || {
         while !listener_stop.load(Ordering::Relaxed) {
             match crate::windows_ipc::accept(&pipe) {
                 Ok(true) => {
@@ -244,8 +251,9 @@ fn run() -> Result<()> {
                         let (send, reply) = mpsc::channel();
                         if requests.send((request, send)).is_ok()
                             && let Ok(response) = reply.recv_timeout(Duration::from_secs(3))
+                            && crate::windows_ipc::send(&mut pipe, &response).is_ok()
                         {
-                            let _sent = crate::windows_ipc::send(&mut pipe, &response);
+                            let _acknowledged = crate::windows_ipc::receive::<bool>(&mut pipe);
                         }
                     }
                     crate::windows_ipc::disconnect(&pipe);
@@ -259,6 +267,10 @@ fn run() -> Result<()> {
             }
         }
     });
+    let _listener_lifetime = ListenerStop {
+        stop: stopped.clone(),
+        thread: Some(listener_thread),
+    };
     let mut snapshot = Snapshot {
         epoch: u64::try_from(
             std::time::SystemTime::now()
@@ -803,10 +815,19 @@ mod tests {
         let mut child = launch(temp.path(), &catalog_path, &suffix)?;
         let deadline = Instant::now() + Duration::from_secs(10);
         let snapshot = loop {
-            if let Ok(snapshot) = fixture_call(&suffix, Command::Snapshot) {
-                break snapshot;
+            match fixture_call(&suffix, Command::Snapshot) {
+                Ok(snapshot) => break snapshot,
+                Err(error) => {
+                    check(
+                        Instant::now() < deadline,
+                        format!("isolated pipe starts: {error:#}"),
+                    )?;
+                    check(
+                        child.0.try_wait().ctx("fixture worker status")?.is_none(),
+                        "fixture worker stays alive during startup",
+                    )?;
+                }
             }
-            check(Instant::now() < deadline, "isolated pipe starts")?;
             std::thread::sleep(Duration::from_millis(20));
         };
         check(
@@ -825,6 +846,7 @@ mod tests {
         .ctx("bad version request")?;
         let response: Response =
             crate::windows_ipc::receive(&mut pipe).ctx("bad version response")?;
+        crate::windows_ipc::send(&mut pipe, &true).ctx("rejected request acknowledgement")?;
         check(
             response.error.is_some(),
             "old or unknown protocol is rejected",

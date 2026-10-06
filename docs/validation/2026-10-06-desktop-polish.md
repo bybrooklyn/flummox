@@ -76,7 +76,8 @@ Native runtime and release acceptance remain pending.
   including a fresh dependency-policy check and all packaging tests.
 - The six remaining integration targets were run separately: 21 tests passed.
   The single doctest passed. Filesystem-dependent tests retain their existing
-  capability guards; passing does not establish FUSE or sandbox enforcement here.
+  capability guards. A separate required-FUSE run passed all ten pack-mount and
+  coordinator tests without skips, including a real btrfs worker round trip.
 - `python3 packaging/test_release.py`: eight tests passed, including the existing
   acceptance-check changes. The temporary test signer was used.
 - Windows x64 GUI cross-compilation and Clippy over all targets passed with
@@ -113,7 +114,13 @@ cannot execute them here. Mac compilation has not been checked locally. Verify
 tray/Explorer restart, startup ownership, dialogs, actual game/updater deferral,
 recovery and upgrades during work on disposable native installations.
 
-Git metadata is now writable. The continuation passes the complete local CI
-gate and is ready for native remote CI. No new tag or release was made.
+Git metadata is now writable. The continuation was committed and pushed as
+`a573904`. Its Linux CI, btrfs matrix and real FUSE integration passed. Native
+Mac and Windows Clippy and previews passed, but tests exposed canonical-path
+alias handling and a Windows pipe reply race. Follow-up fixes resolve location
+aliases, retain pipe buffers until client acknowledgement and join the listener
+on shutdown. Explicit animation redraw requests also remove dependence on the
+one-second worker poll. The complete local CI gate passes after these fixes.
+No new tag or release was made.
 Native Mac runtime and all real-game qualification records remain pending.
 Version 0.0.2 must remain unpublished until its acceptance records pass.

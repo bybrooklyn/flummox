@@ -46,24 +46,30 @@ fn theme_of(state: &app::State) -> iced::Theme {
     theme::theme(dark)
 }
 
+#[cfg(target_os = "linux")]
+fn animation_pending(state: &app::State) -> bool {
+    let now = std::time::Instant::now();
+    !state.reduced_motion
+        && (state
+            .nav
+            .iter()
+            .any(|(_, animation)| animation.is_animating(now))
+            || state.page_reveal.is_animating(now)
+            || state.status_reveal.is_animating(now)
+            || state.detail.is_animating(now)
+            || state
+                .progress
+                .values()
+                .any(|animation| animation.is_animating(now)))
+}
+
 /// Frames, but only while something is moving.
 ///
 /// Subscribing unconditionally would redraw at the display's rate forever,
 /// which costs power for a window that is usually still.
 #[cfg(target_os = "linux")]
 fn animation_frames(state: &app::State) -> iced::Subscription<app::Message> {
-    let moving = !state.reduced_motion
-        && (state
-            .nav
-            .iter()
-            .any(|(_, a)| a.is_animating(std::time::Instant::now()))
-            || state.page_reveal.is_animating(std::time::Instant::now())
-            || state.status_reveal.is_animating(std::time::Instant::now())
-            || state.detail.is_animating(std::time::Instant::now())
-            || state
-                .progress
-                .values()
-                .any(|p| p.is_animating(std::time::Instant::now())));
+    let moving = animation_pending(state);
     let frames = if moving || state.status_deadline.is_some() {
         iced::window::frames().map(|_| app::Message::Tick)
     } else {

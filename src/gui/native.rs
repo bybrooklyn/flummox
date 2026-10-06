@@ -974,7 +974,11 @@ fn filtered_games(state: &State) -> Vec<&crate::model::Game> {
     games
 }
 fn view(state: &State) -> Element<'_, Message> {
-    responsive(move |size| layout(state, size.width < 760.0)).into()
+    super::surface::animate(
+        responsive(move |size| layout(state, size.width < 760.0)),
+        state.preferences.motion != MotionChoice::Reduced
+            && state.reveal.is_animating(Instant::now()),
+    )
 }
 
 fn layout(state: &State, compact: bool) -> Element<'_, Message> {

@@ -162,7 +162,8 @@ pub fn accept(file: &std::fs::File) -> Result<bool> {
     // SAFETY: file owns a live non-overlapped pipe handle.
     let result = unsafe { ConnectNamedPipe(file.as_raw_handle().cast(), std::ptr::null_mut()) };
     if result != 0 {
-        return Ok(true);
+        // In PIPE_NOWAIT mode this only makes the instance available to clients.
+        return Ok(false);
     }
     // SAFETY: GetLastError takes no pointers and reads this thread's error slot.
     match unsafe { GetLastError() } {

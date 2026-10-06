@@ -162,7 +162,9 @@ impl Preferences {
         Ok(())
     }
     pub fn remove(&mut self, path: &Path) {
-        self.locations.retain(|location| location.path != path);
+        let resolved = resolved_path(path);
+        self.locations
+            .retain(|location| resolved_path(&location.path) != resolved);
     }
     pub fn custom_games(&self) -> (Vec<crate::model::Game>, Vec<String>) {
         let mut games = vec![];
@@ -217,13 +219,29 @@ impl Preferences {
     }
     pub fn keeps(&self, game: &crate::model::Game) -> bool {
         game.id.launcher != crate::model::Launcher::Manual
-            || self.locations.iter().any(|location| match location.kind {
-                LocationKind::Game => game.install_dir == location.path,
-                LocationKind::Collection => {
-                    game.install_dir.parent() == Some(location.path.as_path())
+            || self.locations.iter().any(|location| {
+                let path = resolved_path(&location.path);
+                let game_path = resolved_path(&game.install_dir);
+                match location.kind {
+                    LocationKind::Game => game_path == path,
+                    LocationKind::Collection => game_path.parent() == Some(path.as_path()),
                 }
             })
     }
+}
+/// Resolves existing ancestors so offline paths retain their directory aliases.
+fn resolved_path(path: &Path) -> PathBuf {
+    path.ancestors()
+        .find(|ancestor| ancestor.exists())
+        .and_then(|ancestor| {
+            Some(
+                ancestor
+                    .canonicalize()
+                    .ok()?
+                    .join(path.strip_prefix(ancestor).ok()?),
+            )
+        })
+        .unwrap_or_else(|| path.to_path_buf())
 }
 pub fn manual_game(title: String, path: PathBuf) -> crate::model::Game {
     crate::model::Game {

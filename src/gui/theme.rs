@@ -163,11 +163,6 @@ pub fn hero(theme: &Theme) -> container::Style {
             color: colors.accent_dim,
         },
         text_color: Some(colors.text),
-        shadow: Shadow {
-            color: Color::from_rgba(0.0, 0.0, 0.0, 0.24),
-            offset: Vector::new(0.0, 5.0),
-            blur_radius: 18.0,
-        },
         ..container::Style::default()
     }
 }

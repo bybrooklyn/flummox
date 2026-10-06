@@ -59,7 +59,10 @@ fn hero<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
 }
 
 pub fn view(state: &State) -> Element<'_, Message> {
-    responsive(move |size| layout(state, size.width < 880.0)).into()
+    super::surface::animate(
+        responsive(move |size| layout(state, size.width < 880.0)),
+        super::animation_pending(state) || state.status_deadline.is_some(),
+    )
 }
 
 fn layout(state: &State, compact: bool) -> Element<'_, Message> {

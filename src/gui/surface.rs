@@ -15,6 +15,20 @@ pub fn surface<'a, Message: 'a>(
         offset,
         smooth,
         key,
+        animating: false,
+    })
+}
+/// Requests future redraws while application animations are active.
+pub fn animate<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    animating: bool,
+) -> Element<'a, Message> {
+    Element::new(Surface {
+        content: content.into(),
+        offset: 0.0,
+        smooth: false,
+        key: "animation-driver",
+        animating,
     })
 }
 struct Surface<'a, Message> {
@@ -22,6 +36,7 @@ struct Surface<'a, Message> {
     offset: f32,
     smooth: bool,
     key: &'static str,
+    animating: bool,
 }
 #[derive(Default)]
 struct Motion {
@@ -142,6 +157,11 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if self.animating
+            && let Event::Window(iced::window::Event::RedrawRequested(now)) = event
+        {
+            shell.request_redraw_at(*now + Duration::from_millis(16));
+        }
         let Some(child) = tree.children.first_mut() else {
             return;
         };
