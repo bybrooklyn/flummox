@@ -31,5 +31,16 @@
     "The unsupported fixture mount produces a needs-attention storage job; real compression is covered separately by integration tests.",
     "Running, paused and completed storage-job GUI states still require native acceptance.",
     "This record does not qualify real games or Windows and Mac interactive behavior."
-  ]
+  ],
+  "additional_btrfs_fixture": {
+    "fixture_games": 60,
+    "files_changed_during_decompression": 2,
+    "files_changed_during_recompression": 2,
+    "bytes_processed": 262357952,
+    "large_file_sha256_verified": true,
+    "completed_history_retained_after_page_return": true,
+    "selection_retained_after_page_return": true,
+    "normal_gui_exit_code": 0,
+    "running_and_paused_gui_states": "unverified; work completed before capture"
+  }
 }
