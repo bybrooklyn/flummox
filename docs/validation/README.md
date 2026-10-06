@@ -42,3 +42,9 @@ A tag build checks these records before publication. Build/install CI and native
 APFS fixtures establish those particular behaviors; they do not establish
 real-game compatibility. Windows and Mac interactive acceptance is performed
 on the user's machines. Linux native and Proton evidence also remains required.
+
+The publication check requires schema-version-1 reports with a game build and
+corpus hash, matching logical-byte counts, and positive allocated-byte and
+load-time measurements. Linux native and Proton runs must exercise Maximum
+Space; Windows and Mac runs must exercise native compression. Measurements must
+be integers, and restart and launcher verification must be JSON `true`.

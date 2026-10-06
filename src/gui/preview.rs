@@ -23,7 +23,7 @@ fn render(state: &State, width: u32, height: u32, path: &std::path::Path) -> Tes
     ));
     let size = Size::new(width as f32, height as f32);
     let node = widget.layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, size));
-    let palette = theme::theme(true);
+    let palette = super::theme_of(state);
     widget.draw(
         &tree,
         &mut renderer,
@@ -58,6 +58,11 @@ fn render(state: &State, width: u32, height: u32, path: &std::path::Path) -> Tes
             .any(|pixel| pixel.first().is_some_and(|value| *value > 40)),
         "desktop widgets render visible content",
     )?;
+    // Iced renders BGRA for its desktop surface; PNG requires RGBA.
+    for pixel in pixels.data_mut().as_chunks_mut::<4>().0 {
+        let [blue, _, red, _] = pixel;
+        std::mem::swap(blue, red);
+    }
     image::save_buffer(path, pixels.data(), width, height, image::ColorType::Rgba8)
         .ctx("save headless preview")
 }
@@ -90,6 +95,7 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
         pack_supported: true,
         note: None,
         artwork: None,
+        cover: None,
     });
     state.expanded = Some(game.id.to_string());
     state.detail = iced::Animation::new(true);
@@ -131,6 +137,7 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
         folder_kind: FolderKind::Collection,
     });
     for (page, name) in [
+        (Page::Overview, "overview"),
         (Page::Games, "games"),
         (Page::Drives, "drives"),
         (Page::Settings, "settings"),
@@ -138,6 +145,9 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
         state.page = page;
         render(&state, 1100, 900, &output.join(format!("{name}.png")))?;
         render(&state, 720, 900, &output.join(format!("{name}-narrow.png")))?;
+        state.theme = crate::jobs::ThemePreference::Light;
+        render(&state, 1100, 900, &output.join(format!("{name}-light.png")))?;
+        state.theme = crate::jobs::ThemePreference::Dark;
     }
     state.planned = Some((
         crate::jobs::Command::Enqueue {

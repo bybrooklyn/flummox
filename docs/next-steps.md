@@ -1,5 +1,12 @@
 # Next steps
 
+## Desktop polish priority
+
+The [desktop implementation plan](plans/desktop-polish.md) defines navigation,
+motion, stable jobs, asynchronous discovery and local artwork. UI acceptance
+precedes Windows expansion. The [desktop delivery record](validation/2026-10-06-desktop-polish.md)
+separates implemented changes from graphical and platform acceptance still needed.
+
 ## Release acceptance
 
 Native Factorio simulation and Super Meat Boy Proton startup passed disposable
@@ -41,6 +48,14 @@ signed-manifest verification, and offscreen GUI checks have passed.
 User-run Windows and Mac launch/gameplay/update/restore evidence is required;
 Linux native and Proton evidence is required too. See the
 [acceptance procedure](validation/README.md).
+
+## Adoption backlog
+
+After desktop polish, simplify first use equally on Windows, Linux and Mac.
+Compare discovery, savings, batch jobs, update handling and restoration against
+[Game Compressor on Steam](https://store.steampowered.com/app/4339880/Game_Compressor/).
+Test existing WOF/LZX recognition and migration on disposable copies. A new user
+should install, compress a supported game, and find Restore without documentation.
 
 ## Later work
 

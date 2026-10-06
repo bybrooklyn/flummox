@@ -7,6 +7,7 @@ pub enum Target {
     Game,
     Storage(String),
     Report,
+    Artwork(String),
 }
 
 fn selected(code: Option<i32>, bytes: &[u8]) -> Result<Option<PathBuf>, String> {
@@ -35,10 +36,12 @@ pub fn choose(target: &Target) -> Result<Option<PathBuf>, String> {
         );
     }
     let report = matches!(target, Target::Report);
+    let artwork = matches!(target, Target::Artwork(_));
     let title = match target {
         Target::Game => "Choose a games location",
         Target::Storage(_) => "Choose where Maximum Space stores should live",
         Target::Report => "Import a compatibility report",
+        Target::Artwork(_) => "Choose local game artwork",
     };
     let kde = std::env::var("XDG_CURRENT_DESKTOP")
         .unwrap_or_default()
@@ -53,14 +56,18 @@ pub fn choose(target: &Target) -> Result<Option<PathBuf>, String> {
         let mut command = Command::new(program);
         if program == "kdialog" {
             command.arg("--title").arg(title);
-            if report {
+            if artwork {
+                command.args(["--getopenfilename", ".", "*.png *.jpg *.jpeg"]);
+            } else if report {
                 command.args(["--getopenfilename", ".", "*.json"]);
             } else {
                 command.args(["--getexistingdirectory", "."]);
             }
         } else {
             command.arg("--file-selection").arg("--title").arg(title);
-            if report {
+            if artwork {
+                command.arg("--file-filter=Images | *.png *.jpg *.jpeg");
+            } else if report {
                 command.arg("--file-filter=JSON reports | *.json");
             } else {
                 command.arg("--directory");

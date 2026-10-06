@@ -5,6 +5,7 @@
 //! reads launcher metadata, so a scan is always safe to run.
 
 mod desktop;
+pub(crate) mod scan_job;
 pub mod steam;
 pub mod vdf;
 
@@ -73,17 +74,43 @@ pub struct Scan {
 
 /// Runs every detector.
 pub fn scan_all(env: &Env) -> Scan {
+    scan_with(env, &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap_or_default()
+}
+
+pub(crate) fn scan_with(
+    env: &Env,
+    cancel: &std::sync::atomic::AtomicBool,
+    mut emit: impl FnMut(scan_job::Event),
+) -> Option<Scan> {
+    use std::sync::atomic::Ordering;
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    emit(scan_job::Event::Source("Steam"));
     let mut scan = Scan::default();
     match steam::discover(env) {
         Ok(mut games) => scan.games.append(&mut games),
         Err(e) => scan.warnings.push(e),
     }
+    emit(scan_job::Event::Batch(scan.games.clone()));
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    emit(scan_job::Event::Source("Heroic and Lutris"));
     desktop::discover(env, &mut scan);
+    emit(scan_job::Event::Batch(scan.games.clone()));
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    emit(scan_job::Event::Source("Custom locations"));
     // Fixture environments must never read the real user's custom libraries.
     if Env::current().is_some_and(|current| current.home == env.home) {
         desktop::custom(&mut scan);
     }
     desktop::merge(&mut scan);
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
     if Env::current().is_some_and(|current| current.home == env.home) {
         let libraries = crate::jobs::configured_libraries().unwrap_or_default();
         let keep = |game: &Game| {
@@ -102,5 +129,5 @@ pub fn scan_all(env: &Env) -> Scan {
             )),
         }
     }
-    scan
+    Some(scan)
 }

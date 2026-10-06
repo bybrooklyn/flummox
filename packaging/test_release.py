@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Check tag versions, checksums, and release architecture validation."""
 import importlib.util
+import copy
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -18,6 +20,95 @@ def module(filename):
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_acceptance_requires_complete_evidence_for_each_backend(self):
+        acceptance = module('check-acceptance.py')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / 'docs/validation'
+            directory.mkdir(parents=True)
+            runs = []
+            reports = {}
+            for kind in sorted(acceptance.REQUIRED):
+                linux = kind in {'native-linux', 'proton'}
+                reports[kind] = {
+                    'version': 1,
+                    'game': {'launcher': 'manual', 'key': 'fixture', 'build': '1'},
+                    'corpus': {'sha256': 'a' * 64, 'files': 1, 'bytes': 1024},
+                    'platform': 'linux' if linux else kind,
+                    'mode': 'maximum-space' if linux else 'native',
+                    'flummox_version': '0.0.2',
+                    'storage': {'logical_bytes': 1024, 'allocated_before': 4096, 'allocated_after': 2048, 'random_read_p95_ns': None},
+                    'checks': {
+                        'bytes_verified': True, 'metadata_verified': True,
+                        'writable_update_verified': True, 'rollback_verified': True,
+                        'launched': True, 'anti_cheat_issue': False, 'gameplay_issue': False,
+                        'baseline_load_ms': 1000, 'candidate_load_ms': 1050,
+                    },
+                }
+                runs.append({'kind': kind, 'game': 'Fixture', 'tester': 'Fixture', 'date': '2026-10-05', 'report': f'{kind}.json', 'restart_verified': True, 'launcher_verification_passed': True})
+            manifest = {'version': '0.0.2', 'status': 'passed', 'runs': runs}
+
+            def write_evidence(data, evidence):
+                (directory / '0.0.2.json').write_text(json.dumps(data))
+                for kind, report in evidence.items():
+                    (directory / f'{kind}.json').write_text(json.dumps(report))
+
+            write_evidence(manifest, reports)
+            acceptance.check(root, '0.0.2')
+            invalid_reports = [
+                (['version'], True), (['version'], 2),
+                (['mode'], 'native'), (['mode'], None), (['platform'], 'windows'),
+                (['flummox_version'], '0.0.1'), (['game', 'build'], ''),
+                (['game', 'key'], ''), (['corpus', 'sha256'], 'invalid'),
+                (['corpus', 'files'], 0), (['corpus', 'bytes'], True),
+                (['storage'], None), (['storage'], {}), (['storage', 'logical_bytes'], 2048),
+                (['storage', 'allocated_before'], 0), (['storage', 'allocated_after'], True),
+                (['checks', 'baseline_load_ms'], True), (['checks', 'baseline_load_ms'], 0),
+                (['checks', 'candidate_load_ms'], 2**64),
+                (['checks', 'metadata_verified'], False), (['checks', 'gameplay_issue'], True),
+            ]
+            for path, value in invalid_reports:
+                with self.subTest(path=path, value=value):
+                    changed = copy.deepcopy(reports)
+                    target = changed['proton']
+                    for key in path[:-1]:
+                        target = target[key]
+                    target[path[-1]] = value
+                    write_evidence(manifest, changed)
+                    with self.assertRaises(ValueError):
+                        acceptance.check(root, '0.0.2')
+            for field, value in [('restart_verified', 'yes'), ('launcher_verification_passed', 1)]:
+                with self.subTest(field=field):
+                    changed = copy.deepcopy(manifest)
+                    changed['runs'][0][field] = value
+                    write_evidence(changed, reports)
+                    with self.assertRaises(ValueError):
+                        acceptance.check(root, '0.0.2')
+            for status in ['pending', 'failed']:
+                changed = copy.deepcopy(manifest)
+                changed['status'] = status
+                write_evidence(changed, reports)
+                with self.assertRaises(ValueError):
+                    acceptance.check(root, '0.0.2')
+            for kind in ['windows', 'macos']:
+                changed = copy.deepcopy(reports)
+                changed[kind]['mode'] = 'maximum-space'
+                write_evidence(manifest, changed)
+                with self.assertRaises(ValueError):
+                    acceptance.check(root, '0.0.2')
+            for changed_runs in [runs[:-1], runs[:-1] + [runs[0]]]:
+                changed = copy.deepcopy(manifest)
+                changed['runs'] = changed_runs
+                write_evidence(changed, reports)
+                with self.assertRaises(ValueError):
+                    acceptance.check(root, '0.0.2')
+            changed = copy.deepcopy(manifest)
+            changed['runs'][0]['report'] = '../outside.json'
+            (root / 'docs/outside.json').write_text(json.dumps(reports['macos']))
+            write_evidence(changed, reports)
+            with self.assertRaisesRegex(ValueError, 'escaped'):
+                acceptance.check(root, '0.0.2')
+
     def test_curated_notes_override_the_commit_changelog(self):
         prepare = module('prepare-release.py')
         with tempfile.TemporaryDirectory() as temporary:

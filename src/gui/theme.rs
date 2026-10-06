@@ -40,15 +40,15 @@ fn colors(theme: &Theme) -> Colors {
             accent_dim: color!(0x2D6E49),
             text: color!(0xE9ECEB),
             muted: color!(0x9AA4A0),
-            background: color!(0x111517),
+            background: color!(0x141618),
             #[cfg(target_os = "linux")]
-            sidebar: color!(0x161B1E),
+            sidebar: color!(0x191C1F),
             #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-            panel: color!(0x191F22),
+            panel: color!(0x1E2225),
             #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-            hero: color!(0x182720),
+            hero: color!(0x1E2225),
             #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-            border: color!(0x293135),
+            border: color!(0x30363B),
             danger: color!(0xE26861),
             warning: color!(0xE6AE5C),
         }
@@ -59,13 +59,13 @@ fn colors(theme: &Theme) -> Colors {
             accent_dim: color!(0xCDE8D8),
             text: color!(0x18201C),
             muted: color!(0x63706A),
-            background: color!(0xF4F7F5),
+            background: color!(0xF5F6F7),
             #[cfg(target_os = "linux")]
             sidebar: color!(0xECF1EE),
             #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             panel: color!(0xFFFFFF),
             #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-            hero: color!(0xEAF5EE),
+            hero: color!(0xFFFFFF),
             #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             border: color!(0xD7DFDA),
             danger: color!(0xB83D38),

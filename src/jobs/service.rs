@@ -918,7 +918,10 @@ fn apply(
                 save(db, job)?;
             }
         }
-        Command::Snapshot | Command::Restart => {}
+        Command::Snapshot
+        | Command::Restart
+        | Command::RefreshDiscovery
+        | Command::CancelDiscovery => {}
         Command::ReducedMotion(value) => {
             db.execute(
                 "INSERT OR REPLACE INTO settings(id,data) VALUES(3,?1)",
@@ -1705,6 +1708,15 @@ pub(super) fn run() -> Result<()> {
     let mut active: Option<Active> = None;
     let mut pack_active: Option<PackActive> = None;
     let mut last_scan = Instant::now() - Duration::from_secs(60);
+    let mut last_busy = Instant::now() - Duration::from_secs(60);
+    snapshot.worker_epoch = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos(),
+    )?;
+    snapshot.revision = 0;
+    let mut discovery: Option<crate::launchers::scan_job::Worker> = None;
+    let mut refresh_requested = false;
     let mut known: Observations = db
         .query_row("SELECT data FROM settings WHERE id=2", [], |r| {
             r.get::<_, String>(0)
@@ -1724,27 +1736,96 @@ pub(super) fn run() -> Result<()> {
         } else {
             30
         };
-        if last_scan.elapsed() >= Duration::from_secs(scan_interval) {
+        if discovery.is_none()
+            && (refresh_requested || last_scan.elapsed() >= Duration::from_secs(scan_interval))
+        {
             last_scan = Instant::now();
+            refresh_requested = false;
             if let Some(env) = crate::launchers::Env::current() {
-                games = crate::launchers::scan_all(&env).games;
-                snapshot.discovered = games.clone();
+                snapshot.scan_generation = snapshot.scan_generation.saturating_add(1);
+                snapshot.scan_source = Some("Starting discovery".into());
+                discovery = Some(crate::launchers::scan_job::Worker::start(env));
             }
+        }
+        let events = discovery
+            .as_ref()
+            .map(|worker| worker.events())
+            .unwrap_or_default();
+        let mut completed_scan = false;
+        for event in events {
+            let cancelled = discovery.as_ref().is_some_and(|worker| worker.cancelled());
+            match event {
+                crate::launchers::scan_job::Event::Source(source) if !cancelled => {
+                    snapshot.scan_source = Some(source.into())
+                }
+                crate::launchers::scan_job::Event::Batch(batch) if !cancelled => {
+                    for game in batch {
+                        if let Some(previous) =
+                            snapshot.discovered.iter_mut().find(|old| old.id == game.id)
+                        {
+                            *previous = game;
+                        } else {
+                            snapshot.discovered.push(game);
+                        }
+                    }
+                }
+                crate::launchers::scan_job::Event::Finished(result) => {
+                    if !cancelled && result.is_none() {
+                        snapshot.scan_warnings.push(
+                            "Discovery stopped unexpectedly; showing the previous library".into(),
+                        );
+                    }
+                    if !cancelled && let Some(scan) = result {
+                        snapshot.scan_warnings =
+                            scan.warnings.iter().map(ToString::to_string).collect();
+                        games = scan.games;
+                        if !snapshot.scan_warnings.is_empty() {
+                            for old in &snapshot.discovered {
+                                if !games.iter().any(|game| game.id == old.id) {
+                                    games.push(old.clone());
+                                }
+                            }
+                        }
+                        snapshot.discovered = games.clone();
+                        completed_scan = true;
+                    }
+                    snapshot.scan_source = None;
+                    last_scan = Instant::now();
+                    discovery = None;
+                }
+                _ => {}
+            }
+        }
+        if completed_scan || last_busy.elapsed() >= Duration::from_secs(3) {
+            last_busy = Instant::now();
             use crate::busy::ProcSource;
             let procs = crate::busy::ProcFs::new().processes();
-            snapshot.gaming = games.iter().filter(|g| !g.is_tool).find_map(|g| {
-                procs
-                    .iter()
-                    .find(|p| {
-                        p.pid != std::process::id() as i32
-                            && active.as_ref().is_none_or(|a| p.pid != a.child.id() as i32)
-                            && p.uses_dir(&g.install_dir)
-                    })
-                    .map(|_| g.title.clone())
-            });
+            snapshot.gaming = snapshot
+                .discovered
+                .iter()
+                .chain(
+                    snapshot
+                        .jobs
+                        .iter()
+                        .filter(|job| job.phase.active())
+                        .map(|job| &job.game),
+                )
+                .filter(|g| !g.is_tool)
+                .find_map(|g| {
+                    procs
+                        .iter()
+                        .find(|p| {
+                            p.pid != std::process::id() as i32
+                                && active.as_ref().is_none_or(|a| p.pid != a.child.id() as i32)
+                                && p.uses_dir(&g.install_dir)
+                        })
+                        .map(|_| g.title.clone())
+                });
             if std::fs::read_dir("/proc/self/fd").is_err() {
                 snapshot.gaming = Some("process information is unavailable".into());
             }
+        }
+        if completed_scan {
             let before = serde_json::to_string(&known)?;
             for game in &games {
                 if known.observe(game, &snapshot.libraries, initialized) {
@@ -1803,6 +1884,17 @@ pub(super) fn run() -> Result<()> {
                             | Command::PackActivate { .. }
                             | Command::PackRollback { .. }
                     );
+                    match &message.command {
+                        Command::RefreshDiscovery => refresh_requested = true,
+                        Command::CancelDiscovery => {
+                            if let Some(worker) = &discovery {
+                                worker.cancel();
+                            }
+                            snapshot.scan_source = None;
+                            refresh_requested = false;
+                        }
+                        _ => {}
+                    }
                     let exclusion = match &message.command {
                         Command::Exclude { id, excluded } => Some((
                             crate::db::parse_game_id(id).context("Unrecognized game id")?,
@@ -1863,6 +1955,7 @@ pub(super) fn run() -> Result<()> {
                     Ok(())
                 })();
                 let restart = restart && result.is_ok();
+                snapshot.revision = snapshot.revision.saturating_add(1);
                 let response = Response {
                     version: VERSION,
                     snapshot: result.as_ref().ok().map(|_| snapshot.clone()),

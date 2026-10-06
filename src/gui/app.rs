@@ -19,30 +19,41 @@ pub enum Page {
     Overview,
     Games,
     Queue,
-    Updates,
     Drives,
-    Activity,
     Recovery,
     Settings,
 }
-pub const PAGES: [Page; 7] = [
-    Page::Overview,
-    Page::Games,
-    Page::Queue,
-    Page::Updates,
-    Page::Drives,
-    Page::Activity,
-    Page::Recovery,
-];
+pub const PAGES: [Page; 2] = [Page::Overview, Page::Games];
+impl Page {
+    pub fn main(self) -> Self {
+        match self {
+            Self::Overview | Self::Games => self,
+            _ => Self::Settings,
+        }
+    }
+    pub fn rank(self) -> u8 {
+        match self.main() {
+            Self::Overview => 0,
+            Self::Games => 1,
+            _ => 2,
+        }
+    }
+    pub fn section(self) -> Option<&'static str> {
+        match self {
+            Self::Queue => Some("settings-jobs"),
+            Self::Drives => Some("settings-locations"),
+            Self::Recovery => Some("settings-recovery"),
+            _ => None,
+        }
+    }
+}
 impl Page {
     pub fn label(self) -> &'static str {
         match self {
             Self::Overview => "Overview",
             Self::Games => "Games",
             Self::Queue => "Queue",
-            Self::Updates => "Updates",
             Self::Drives => "Drives",
-            Self::Activity => "Activity",
             Self::Recovery => "Recovery",
             Self::Settings => "Settings",
         }
@@ -58,32 +69,15 @@ pub struct GameRow {
     pub native_supported: bool,
     pub pack_supported: bool,
     pub note: Option<String>,
-    pub artwork: Option<PathBuf>,
+    pub artwork: Option<super::artwork::Source>,
+    pub cover: Option<super::artwork::Source>,
 }
 impl GameRow {
-    fn probe(game: Game, env: &Env) -> Self {
-        let artwork = game.id.steam_appid().and_then(|id| {
-            crate::launchers::steam::roots(env)
-                .into_iter()
-                .find_map(|root| {
-                    let cache = root.join("appcache/librarycache");
-                    [
-                        format!("{id}_icon.jpg"),
-                        format!("{id}_header.jpg"),
-                        format!("{id}_library_600x900.jpg"),
-                    ]
-                    .iter()
-                    .map(|name| cache.join(name))
-                    .find(|p| p.is_file())
-                    .or_else(|| {
-                        std::fs::read_dir(cache.join(id.to_string()))
-                            .ok()?
-                            .flatten()
-                            .map(|e| e.path())
-                            .find(|p| p.extension().is_some_and(|e| e == "jpg" || e == "png"))
-                    })
-                })
-        });
+    fn probe(
+        game: Game,
+        artwork: Option<super::artwork::Source>,
+        cover: Option<super::artwork::Source>,
+    ) -> Self {
         if matches!(&game.state, crate::model::InstallState::Broken { detail } if detail.starts_with("Library unavailable:"))
         {
             return Self {
@@ -95,6 +89,7 @@ impl GameRow {
                 pack_supported: false,
                 note: Some("Reconnect the original drive and refresh.".into()),
                 artwork,
+                cover,
             };
         }
         match fsprobe::probe(&game.install_dir) {
@@ -118,6 +113,7 @@ impl GameRow {
                     note: (!supported)
                         .then(|| "Compression isn't supported on this drive yet.".into()),
                     artwork,
+                    cover,
                 }
             }
             Err(_) => Self {
@@ -129,6 +125,7 @@ impl GameRow {
                 pack_supported: false,
                 note: Some("Reconnect this drive to continue.".into()),
                 artwork,
+                cover,
             },
         }
     }
@@ -141,6 +138,9 @@ pub struct Drive {
 }
 #[derive(Debug, Clone)]
 pub struct ScanResult {
+    pub worker_epoch: u64,
+    pub generation: u64,
+    pub discovered: Vec<Game>,
     pub reports: Vec<crate::compatibility::Report>,
     pub games: Vec<GameRow>,
     pub drives: Vec<Drive>,
@@ -188,6 +188,7 @@ pub enum Filter {
     Ready,
     Compressed,
     Attention,
+    Updated,
 }
 impl Filter {
     pub fn label(self) -> &'static str {
@@ -196,6 +197,7 @@ impl Filter {
             Self::Ready => "Ready",
             Self::Compressed => "Compressed",
             Self::Attention => "Needs attention",
+            Self::Updated => "Updated games",
         }
     }
 }
@@ -205,6 +207,7 @@ pub struct State {
     pub reports: Vec<crate::compatibility::Report>,
     pub page: Page,
     pub games: Vec<GameRow>,
+    pub artwork_cache: super::artwork::Cache,
     pub drives: Vec<Drive>,
     pub records: Vec<GameRecord>,
     pub activity: Vec<Activity>,
@@ -217,6 +220,10 @@ pub struct State {
     pub qualification: Option<crate::qualification::Wizard>,
     pub nav: Vec<(Page, Animation<bool>)>,
     pub page_reveal: Animation<bool>,
+    pub page_direction: f32,
+    pub scroll_positions: std::collections::HashMap<String, f32>,
+    pub snapshot_loaded: bool,
+    pub connection_error: Option<String>,
     pub query: String,
     pub selected: std::collections::HashSet<String>,
     pub expanded: Option<String>,
@@ -253,6 +260,7 @@ impl State {
             reports: vec![],
             page: Page::Overview,
             games: vec![],
+            artwork_cache: Default::default(),
             drives: vec![],
             records: vec![],
             activity: vec![],
@@ -267,6 +275,7 @@ impl State {
             qualification: None,
             nav: PAGES
                 .into_iter()
+                .chain(std::iter::once(Page::Settings))
                 .map(|page| {
                     (
                         page,
@@ -279,6 +288,10 @@ impl State {
             page_reveal: Animation::new(true)
                 .duration(Duration::from_millis(240))
                 .easing(Easing::EaseOutCubic),
+            page_direction: 1.0,
+            scroll_positions: Default::default(),
+            snapshot_loaded: false,
+            connection_error: None,
             query: String::new(),
             selected: Default::default(),
             expanded: None,
@@ -298,7 +311,7 @@ impl State {
             picker_busy: false,
             shown: 40,
             detail: Animation::new(false).duration(Duration::from_millis(200)),
-            polling: false,
+            polling: true,
             progress: Default::default(),
             pack_paths: Default::default(),
             confirm_reclaim: Default::default(),
@@ -328,7 +341,7 @@ impl State {
 
     fn motion_easing(&self) -> Easing {
         match self.motion {
-            MotionPreference::Expressive => Easing::EaseOutBack,
+            MotionPreference::Expressive => Easing::EaseOutCubic,
             MotionPreference::Subtle | MotionPreference::Reduced => Easing::EaseOutCubic,
         }
     }
@@ -554,6 +567,9 @@ impl State {
                         .is_none_or(|l| row.game.id.launcher.label() == l)
                     && match self.filter {
                         Filter::All => true,
+                        Filter::Updated => self.records.iter().any(|record| {
+                            record.id == row.game.id && record.build != row.game.build
+                        }),
                         Filter::Ready => {
                             row.supported && row.game.state.is_idle() && !self.compressed(&row.game)
                         }
@@ -612,7 +628,14 @@ impl State {
 #[derive(Debug, Clone)]
 pub enum Message {
     GoTo(Page),
+    Jump(&'static str),
+    JumpOffset(f32),
+    Scrolled(Page, f32),
+    ArtworkVisible(super::artwork::Source),
+    ArtworkLoaded(super::artwork::Source, Option<iced::widget::image::Handle>),
+    ArtworkSaved(Result<(), String>),
     Refresh,
+    Rescan,
     Scanned(Result<ScanResult, String>),
     Snapshot(Result<Snapshot, String>),
     Planned(Result<(Command, crate::storage::SpacePlan), String>),
@@ -735,18 +758,29 @@ fn pack_activate(state: &mut State, id: &str, create: bool) -> Task<Message> {
             qualification: None,
         },
     };
-    let _navigation = update(state, Message::GoTo(Page::Queue));
-    send(command)
+    let navigation = update(state, Message::GoTo(Page::Queue));
+    Task::batch([navigation, send(command)])
 }
 
-fn scan(env: Env) -> ScanResult {
-    let scan = crate::launchers::scan_all(&env);
-    let mut warnings: Vec<_> = scan.warnings.iter().map(ToString::to_string).collect();
-    let games: Vec<_> = scan
-        .games
+fn scan(env: Env) -> Result<ScanResult, String> {
+    let snapshot = jobs::request(Command::Snapshot).map_err(|error| error.to_string())?;
+    let worker_epoch = snapshot.worker_epoch;
+    let generation = snapshot.scan_generation;
+    let discovered = snapshot.discovered;
+    let scanned_discovery = discovered.clone();
+    let mut warnings = snapshot.scan_warnings;
+    let artwork = super::artwork::Index::new(crate::launchers::steam::roots(&env));
+    if let Err(error) = &artwork {
+        warnings.push(format!("Artwork preferences unavailable: {error}"));
+    }
+    let games: Vec<_> = discovered
         .into_iter()
         .filter(|g| !g.is_tool)
-        .map(|g| GameRow::probe(g, &env))
+        .map(|g| {
+            let source = artwork.as_ref().ok().and_then(|index| index.source(&g));
+            let cover = artwork.as_ref().ok().and_then(|index| index.cover(&g));
+            GameRow::probe(g, source, cover)
+        })
         .collect();
     let mut drives: Vec<Drive> = vec![];
     for row in &games {
@@ -782,14 +816,17 @@ fn scan(env: Env) -> ScanResult {
             vec![]
         }
     };
-    ScanResult {
+    Ok(ScanResult {
+        worker_epoch,
+        generation,
+        discovered: scanned_discovery,
         reports,
         games,
         drives,
         records,
         activity,
         warnings,
-    }
+    })
 }
 
 /// Queues only newly visible games. Existing results and failures are kept
@@ -945,11 +982,42 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             ))),
             Err(error) => state.show_status(Status::error(error)),
         },
-        Message::GoTo(page) => {
-            if state.page != page {
+        Message::ArtworkVisible(source) => state.artwork_cache.request(source),
+        Message::ArtworkLoaded(source, image) => state.artwork_cache.loaded(source, image),
+        Message::ArtworkSaved(result) => match result {
+            Ok(()) => return update(state, Message::Refresh),
+            Err(error) => state.show_status(Status::error(error)),
+        },
+        Message::Scrolled(page, offset) => {
+            state
+                .scroll_positions
+                .insert(page.main().label().into(), offset);
+        }
+        Message::Jump(section) => {
+            let _navigation = update(state, Message::GoTo(Page::Settings));
+            return super::surface::jump(section, Message::JumpOffset);
+        }
+        Message::JumpOffset(offset) => {
+            return iced::widget::operation::scroll_to(
+                "Settings",
+                iced::widget::operation::AbsoluteOffset {
+                    x: None,
+                    y: Some(offset),
+                },
+            );
+        }
+        Message::GoTo(destination) => {
+            let page = destination.main();
+            let changed = state.page.main() != page;
+            if changed {
+                state.page_direction = if page.rank() < state.page.rank() {
+                    -1.0
+                } else {
+                    1.0
+                };
                 state.page = page;
                 state.page_reveal = Animation::new(false)
-                    .duration(state.motion_duration(280, 160))
+                    .duration(state.motion_duration(180, 120))
                     .easing(state.motion_easing())
                     .go(true, Instant::now());
             }
@@ -958,19 +1026,47 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             for (target, animation) in &mut state.nav {
                 animation.go_mut(*target == page, Instant::now());
             }
+            if let Some(section) = destination.section() {
+                return super::surface::jump(section, Message::JumpOffset);
+            }
+            if changed {
+                let offset = state
+                    .scroll_positions
+                    .get(page.label())
+                    .copied()
+                    .unwrap_or_default();
+                return iced::widget::operation::scroll_to(
+                    page.label(),
+                    iced::widget::operation::AbsoluteOffset {
+                        x: None,
+                        y: Some(offset),
+                    },
+                );
+            }
         }
+        Message::Rescan => return send(Command::RefreshDiscovery),
         Message::Refresh => {
             if state.scanning {
                 return Task::none();
             }
             state.scanning = true;
             let env = state.env.clone();
-            return Task::perform(background(move || scan(env)), Message::Scanned);
+            return Task::perform(background(move || scan(env)), |result| {
+                Message::Scanned(result.and_then(|result| result))
+            });
         }
         Message::Scanned(result) => {
             state.scanning = false;
             match result {
                 Ok(scan) => {
+                    if scan.worker_epoch > 0
+                        && state.snapshot_loaded
+                        && (scan.worker_epoch != state.snapshot.worker_epoch
+                            || scan.generation != state.snapshot.scan_generation
+                            || scan.discovered != state.snapshot.discovered)
+                    {
+                        return update(state, Message::Refresh);
+                    }
                     state.games = scan.games;
                     state.reports = scan.reports;
                     state.drives = scan.drives;
@@ -1012,6 +1108,16 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
 
         Message::Snapshot(result) => match result {
             Ok(snapshot) => {
+                if snapshot.worker_epoch > 0
+                    && state.snapshot.worker_epoch > 0
+                    && (snapshot.worker_epoch < state.snapshot.worker_epoch
+                        || (snapshot.worker_epoch == state.snapshot.worker_epoch
+                            && snapshot.revision <= state.snapshot.revision))
+                {
+                    return Task::none();
+                }
+                state.snapshot_loaded = true;
+                state.connection_error = None;
                 let libraries_changed = state.snapshot.libraries != snapshot.libraries;
                 let discovery_changed = state.snapshot.discovered != snapshot.discovered;
                 let completed_work = snapshot.jobs.iter().any(|job| {
@@ -1066,7 +1172,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 return analyze_visible(state);
             }
             Err(e) => {
-                state.polling = false;
+                state.connection_error = Some(e.clone());
+                state.polling = true;
                 state.show_status(Status::error(e));
             }
         },
@@ -1088,8 +1195,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::ReviewGame(id) => {
-            let _navigation = update(state, Message::GoTo(Page::Games));
-            return update(state, Message::Expand(id));
+            let navigation = update(state, Message::GoTo(Page::Games));
+            return Task::batch([navigation, update(state, Message::Expand(id))]);
         }
         Message::Expand(id) => {
             state.confirm_reclaim.clear();
@@ -1132,8 +1239,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 if operation == Operation::Compress {
                     match state.optimize_command(game) {
                         Ok(command) => {
-                            let _navigation = update(state, Message::GoTo(Page::Queue));
-                            return send(command);
+                            let navigation = update(state, Message::GoTo(Page::Queue));
+                            return Task::batch([navigation, send(command)]);
                         }
                         Err(error) => {
                             state.show_status(Status::error(error));
@@ -1145,14 +1252,19 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                     preset: state.preset_for(&id),
                     ..Default::default()
                 };
-                if operation != Operation::Analyze {
-                    let _navigation = update(state, Message::GoTo(Page::Queue));
-                }
-                return send(Command::Enqueue {
-                    game,
-                    operation,
-                    options,
-                });
+                let navigation = if operation != Operation::Analyze {
+                    update(state, Message::GoTo(Page::Queue))
+                } else {
+                    Task::none()
+                };
+                return Task::batch([
+                    navigation,
+                    send(Command::Enqueue {
+                        game,
+                        operation,
+                        options,
+                    }),
+                ]);
             }
         }
         Message::Queue(operation) => {
@@ -1181,8 +1293,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                     return Task::none();
                 }
             };
-            let _navigation = update(state, Message::GoTo(Page::Queue));
-            return send_many(commands);
+            let navigation = update(state, Message::GoTo(Page::Queue));
+            return Task::batch([navigation, send_many(commands)]);
         }
         Message::OptimizeLibrary => {
             let commands: Result<Vec<_>, _> = state
@@ -1200,8 +1312,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 .collect();
             match commands {
                 Ok(commands) if !commands.is_empty() => {
-                    let _navigation = update(state, Message::GoTo(Page::Queue));
-                    return send_many(commands);
+                    let navigation = update(state, Message::GoTo(Page::Queue));
+                    return Task::batch([navigation, send_many(commands)]);
                 }
                 Ok(_) => state.show_status(Status::info(
                     "Analysis has not found a worthwhile compression job yet.",
@@ -1224,8 +1336,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                     .find(|row| row.game.install_dir == *path)
                     .map(|row| row.game.clone())
                 {
-                    let _navigation = update(state, Message::GoTo(Page::Queue));
-                    return send(Command::EnqueuePack { game, task });
+                    let navigation = update(state, Message::GoTo(Page::Queue));
+                    return Task::batch([navigation, send(Command::EnqueuePack { game, task })]);
                 }
                 state.show_status(Status::error("The selected game is no longer installed."));
                 return Task::none();
@@ -1275,6 +1387,15 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                         } else {
                             state.show_status(Status::error("This path cannot be shown in the storage field. Choose another folder."));
                         }
+                    }
+                    super::dialog::Target::Artwork(game) => {
+                        return Task::perform(
+                            background(move || {
+                                super::artwork::save_override(game, path)
+                                    .map_err(|error| error.to_string())
+                            }),
+                            |result| Message::ArtworkSaved(result.and_then(|result| result)),
+                        );
                     }
                     super::dialog::Target::Report => {
                         return Task::perform(
@@ -1381,11 +1502,14 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 .map(|row| row.game.clone())
             {
                 let store = state.store_path(&game);
-                let _navigation = update(state, Message::GoTo(Page::Queue));
-                return send(Command::EnqueuePack {
-                    game,
-                    task: PackTask::Create { store },
-                });
+                let navigation = update(state, Message::GoTo(Page::Queue));
+                return Task::batch([
+                    navigation,
+                    send(Command::EnqueuePack {
+                        game,
+                        task: PackTask::Create { store },
+                    }),
+                ]);
             }
         }
         Message::PackReclaimPrompt(id) => {
@@ -1433,18 +1557,33 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                     state.selected.clear();
                 }
                 Key::Character(key) if modifiers.command() && key.as_str() == "f" => {
-                    let _navigation = update(state, Message::GoTo(Page::Games));
-                    return iced::widget::operation::focus(iced::widget::Id::new("game-search"));
+                    let navigation = update(state, Message::GoTo(Page::Games));
+                    return Task::batch([
+                        navigation,
+                        iced::widget::operation::focus(iced::widget::Id::new("game-search")),
+                    ]);
                 }
                 Key::Character(key) if modifiers.command() && key.as_str() == "r" => {
-                    return update(state, Message::Refresh);
+                    return update(state, Message::Rescan);
                 }
                 _ => {}
             }
         }
         Message::Keyboard(_) => {}
     }
-    Task::none()
+    artwork_tasks(state)
+}
+
+fn artwork_tasks(state: &mut State) -> Task<Message> {
+    let mut tasks = vec![];
+    while let Some(source) = state.artwork_cache.next() {
+        let key = source.clone();
+        tasks.push(Task::perform(
+            background(move || source.decode().ok()),
+            move |result| Message::ArtworkLoaded(key.clone(), result.ok().flatten()),
+        ));
+    }
+    Task::batch(tasks)
 }
 
 pub fn polls() -> impl iced::futures::Stream<Item = Message> {
@@ -1474,7 +1613,7 @@ mod tests {
     use super::*;
     use crate::{
         model::{GameId, InstallState, Launcher},
-        testutil::{TestResult, check, check_eq},
+        testutil::{Ctx, TestResult, check, check_eq},
     };
 
     fn game() -> Game {
@@ -1500,7 +1639,109 @@ mod tests {
             pack_supported: false,
             note: (!supported).then(|| "Unavailable".into()),
             artwork: None,
+            cover: None,
         }
+    }
+
+    #[test]
+    fn navigation_and_stale_responses_preserve_jobs_and_context() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        state.games.push(row(true));
+        state.query = "Fixture".into();
+        state.selected.insert(game().id.to_string());
+        state.snapshot = Snapshot {
+            worker_epoch: 10,
+            revision: 5,
+            jobs: vec![Job {
+                id: 42,
+                game: game(),
+                operation: Operation::Compress,
+                options: Default::default(),
+                phase: Phase::Running,
+                files_done: 1,
+                bytes_done: 10,
+                files_total: 10,
+                bytes_total: 100,
+                estimate: None,
+                message: "Compressing".into(),
+                errors: vec![],
+                created: 0,
+                elapsed: 1,
+                drive_change: None,
+                user_paused: false,
+                pack: None,
+                pack_interruptible: false,
+                space_plan: None,
+            }],
+            discovered: vec![game()],
+            ..Default::default()
+        };
+        let _task = update(&mut state, Message::GoTo(Page::Games));
+        check_eq(
+            state.page_direction,
+            1.0,
+            "later page moves upward into view",
+        )?;
+        let _task = update(&mut state, Message::GoTo(Page::Overview));
+        check_eq(
+            state.page_direction,
+            -1.0,
+            "earlier page moves downward into view",
+        )?;
+        let _task = update(&mut state, Message::GoTo(Page::Queue));
+        check_eq(state.page, Page::Settings, "jobs live in Settings")?;
+        let _task = update(&mut state, Message::Snapshot(Err("offline".into())));
+        check(
+            state.connection_error.is_some(),
+            "connection failure is visible",
+        )?;
+        let _task = update(
+            &mut state,
+            Message::Snapshot(Ok(Snapshot {
+                worker_epoch: 10,
+                revision: 4,
+                ..Default::default()
+            })),
+        );
+        check_eq(
+            state.snapshot.revision,
+            5,
+            "late response cannot overwrite current jobs",
+        )?;
+        check_eq(
+            state.snapshot.discovered.len(),
+            1,
+            "late empty response does not clear content",
+        )?;
+        let _task = update(
+            &mut state,
+            Message::Snapshot(Ok(Snapshot {
+                worker_epoch: 9,
+                revision: 100,
+                ..Default::default()
+            })),
+        );
+        check_eq(
+            state.snapshot.worker_epoch,
+            10,
+            "previous worker response is discarded",
+        )?;
+        check_eq(
+            state.snapshot.jobs.first().ctx("retained job")?.phase,
+            Phase::Running,
+            "running job survives navigation, disconnect and old responses",
+        )?;
+        let _task = update(&mut state, Message::Scanned(Err("scan failed".into())));
+        check_eq(state.games.len(), 1, "failed scan retains current games")?;
+        check_eq(
+            state.query.as_str(),
+            "Fixture",
+            "navigation preserves search",
+        )?;
+        check(
+            state.selected.contains(&game().id.to_string()),
+            "navigation preserves selection",
+        )
     }
 
     #[test]
@@ -1592,6 +1833,9 @@ mod tests {
         let _task = update(
             &mut state,
             Message::Scanned(Ok(ScanResult {
+                worker_epoch: 0,
+                generation: 0,
+                discovered: vec![],
                 reports: vec![],
                 games: vec![],
                 drives: vec![],

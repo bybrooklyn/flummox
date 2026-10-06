@@ -18,7 +18,7 @@ use std::path::PathBuf;
 pub use service::{configured_libraries, request, state_dir};
 
 /// Protocol version. A mismatched installed worker is rejected before work.
-pub const VERSION: u32 = 7;
+pub const VERSION: u32 = 8;
 
 /// Which application palette the desktop shell follows.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +221,10 @@ pub struct Library {
 /// Snapshot returned to clients; no database handle crosses the boundary.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub worker_epoch: u64,
+    #[serde(default)]
+    pub revision: u64,
     pub jobs: Vec<Job>,
     pub libraries: Vec<Library>,
     pub excluded: Vec<String>,
@@ -235,12 +239,20 @@ pub struct Snapshot {
     pub packs: Vec<crate::pack::Install>,
     #[serde(default)]
     pub discovered: Vec<Game>,
+    #[serde(default)]
+    pub scan_source: Option<String>,
+    #[serde(default)]
+    pub scan_generation: u64,
+    #[serde(default)]
+    pub scan_warnings: Vec<String>,
 }
 
 /// Client requests operate on ids, never shell command strings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
     Snapshot,
+    RefreshDiscovery,
+    CancelDiscovery,
     /// Restart an idle coordinator after replacing the executable.
     Restart,
     Enqueue {

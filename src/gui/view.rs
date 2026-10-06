@@ -161,6 +161,23 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         .height(Length::Fill)
         .style(theme::sidebar);
     let mut body = column![].spacing(0).width(Length::Fill);
+    if let Some(source) = &state.snapshot.scan_source {
+        body = body.push(
+            container(
+                row![
+                    theme::muted(format!(
+                        "Scanning {source} · {} games found",
+                        state.snapshot.discovered.len()
+                    )),
+                    Space::new().width(Length::Fill),
+                    secondary("Cancel scan", Message::Send(Command::CancelDiscovery))
+                ]
+                .spacing(12),
+            )
+            .padding([8, 24]),
+        );
+    }
+
     if let Some(wizard) = &state.qualification {
         body = body.push(panel(
             scrollable(crate::qualification::view(
@@ -212,9 +229,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         Page::Overview => overview(state, compact),
         Page::Games => games(state, compact),
         Page::Queue => queue(state),
-        Page::Updates => updates(state, compact),
         Page::Drives => drives(state),
-        Page::Activity => activity(state),
         Page::Recovery => recovery(state),
         Page::Settings => settings_page(state),
     };
@@ -225,20 +240,27 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
             .page_reveal
             .interpolate(0.0, 1.0, std::time::Instant::now())
     };
-    body = body.push(
-        column![
-            Space::new().height(Length::Fixed(12.0 * (1.0 - page_reveal))),
-            scrollable(
-                container(page)
-                    .padding(if compact { 16 } else { 24 })
-                    .width(Length::Fill)
-            )
-            .id(iced::widget::Id::new(state.page.label()))
-            .style(theme::scrollable)
-            .height(Length::Fill)
-        ]
+    let page_key = state.page.main();
+    let distance = if state.motion == MotionPreference::Subtle {
+        6.0
+    } else {
+        12.0
+    };
+    let offset = state.page_direction * distance * (1.0 - page_reveal);
+    body = body.push(super::surface::surface(
+        scrollable(
+            container(page)
+                .padding(if compact { 16 } else { 24 })
+                .width(Length::Fill),
+        )
+        .id(iced::widget::Id::new(page_key.label()))
+        .on_scroll(move |viewport| Message::Scrolled(page_key, viewport.absolute_offset().y))
+        .style(theme::scrollable)
         .height(Length::Fill),
-    );
+        offset,
+        !state.reduced_motion && state.motion != MotionPreference::Reduced,
+        page_key.label(),
+    ));
     if let Some(job) = state.active() {
         body = body.push(
             container(panel(
@@ -309,9 +331,7 @@ fn page_icon(page: Page) -> &'static str {
         Page::Overview => "⌂",
         Page::Games => "◈",
         Page::Queue => "☷",
-        Page::Updates => "↻",
         Page::Drives => "▰",
-        Page::Activity => "⌁",
         Page::Recovery => "⟲",
         Page::Settings => "⚙",
     }
@@ -348,7 +368,7 @@ fn overview(state: &State, compact: bool) -> Element<'_, Message> {
                 } else {
                     "Refresh"
                 },
-                Message::Refresh
+                Message::Rescan
             )
         ]
         .align_y(Alignment::Center),
@@ -390,7 +410,7 @@ fn overview(state: &State, compact: bool) -> Element<'_, Message> {
                         } else if state.scanning || state.analysis_queuing() {
                             None
                         } else {
-                            Some(Message::Refresh)
+                            Some(Message::Rescan)
                         }
                     ),
                     secondary("Games", Message::GoTo(Page::Games))
@@ -495,7 +515,8 @@ fn games(state: &State, compact: bool) -> Element<'_, Message> {
                         Filter::All,
                         Filter::Ready,
                         Filter::Compressed,
-                        Filter::Attention
+                        Filter::Attention,
+                        Filter::Updated
                     ],
                     Some(state.filter),
                     Message::Filter
@@ -522,7 +543,8 @@ fn games(state: &State, compact: bool) -> Element<'_, Message> {
                     Filter::All,
                     Filter::Ready,
                     Filter::Compressed,
-                    Filter::Attention
+                    Filter::Attention,
+                    Filter::Updated
                 ],
                 Some(state.filter),
                 Message::Filter
@@ -546,7 +568,7 @@ fn games(state: &State, compact: bool) -> Element<'_, Message> {
                 } else {
                     "Refresh"
                 },
-                Message::Refresh
+                Message::Rescan
             )
         ]
         .align_y(Alignment::Center),
@@ -612,9 +634,15 @@ fn games(state: &State, compact: bool) -> Element<'_, Message> {
             ))
             .into();
     }
-    for game in filtered.iter().take(state.shown) {
-        content = content.push(game_row(state, game, compact));
-    }
+    content = content.push(
+        iced::widget::keyed_column(filtered.iter().take(state.shown).map(|game| {
+            (
+                *blake3::hash(game.game.id.to_string().as_bytes()).as_bytes(),
+                game_row(state, game, compact),
+            )
+        }))
+        .spacing(12),
+    );
     if filtered.len() > state.shown {
         content = content.push(secondary(
             format!("Show more · {} games", filtered.len()),
@@ -629,17 +657,33 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
     let id = game.id.to_string();
     let compressed = state.compressed(game);
     let artwork_size = if compact { 44 } else { 52 };
-    let icon: Element<'a, Message> = match &item.artwork {
-        Some(path) => image(path.clone())
-            .width(artwork_size)
-            .height(artwork_size)
-            .content_fit(iced::ContentFit::Cover)
-            .into(),
-        None => container(text(game.title.chars().next().unwrap_or('F').to_string()).size(23))
+    let fallback = || {
+        container(text(game.title.chars().next().unwrap_or('F').to_string()).size(23))
             .center(artwork_size)
             .style(theme::panel)
-            .into(),
     };
+    let icon: Element<'_, Message> = match &item.artwork {
+        Some(source) => {
+            let tile: Element<'_, Message> = match state.artwork_cache.get(source) {
+                Some(handle) => image(handle.clone())
+                    .width(artwork_size)
+                    .height(artwork_size)
+                    .content_fit(iced::ContentFit::Cover)
+                    .into(),
+                None => fallback().into(),
+            };
+            let source = source.clone();
+            iced::widget::sensor(tile)
+                .key(source.clone())
+                .on_show(move |_| Message::ArtworkVisible(source.clone()))
+                .into()
+        }
+        None => fallback().into(),
+    };
+    let icon = button(icon).style(button::text).padding(0).on_press_maybe(
+        (!state.picker_busy).then(|| Message::Browse(super::dialog::Target::Artwork(id.clone()))),
+    );
+    let icon = tooltip(icon, "Choose local artwork", tooltip::Position::Bottom);
     let status = item.note.clone().unwrap_or_else(|| {
         if let Some(job) = state.latest(game)
             && (job.phase.active()
@@ -726,6 +770,25 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
             game.install_dir.display()
         ))]
         .spacing(10);
+        if let Some(source) = &item.cover {
+            let cover: Element<'_, Message> = match state.artwork_cache.get(source) {
+                Some(handle) => image(handle.clone())
+                    .width(128)
+                    .height(192)
+                    .content_fit(iced::ContentFit::Contain)
+                    .into(),
+                None => container(theme::muted("Local artwork"))
+                    .center_x(128)
+                    .center_y(192)
+                    .into(),
+            };
+            let source = source.clone();
+            details = details.push(
+                iced::widget::sensor(cover)
+                    .key(source.clone())
+                    .on_show(move |_| Message::ArtworkVisible(source.clone())),
+            );
+        }
         let preset_id = id.clone();
         if item.supported {
             details = details
@@ -1010,10 +1073,12 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                 .detail
                 .interpolate(0.0, 1.0, std::time::Instant::now())
         };
-        contents = contents.push(column![
-            Space::new().height(Length::Fixed(10.0 * (1.0 - reveal))),
-            container(details)
-        ]);
+        contents = contents.push(super::surface::surface(
+            container(details),
+            6.0 * (1.0 - reveal),
+            false,
+            "game-details",
+        ));
     }
     panel(contents)
 }
@@ -1152,7 +1217,7 @@ fn job_row<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
             ))
             .push(secondary("Cancel", Message::Send(Command::Cancel(job.id))));
     } else if !job.phase.active() && job.phase != Phase::Completed {
-        controls = controls.push(secondary("Resume", Message::Send(Command::Retry(job.id))));
+        controls = controls.push(secondary("Retry", Message::Send(Command::Retry(job.id))));
     }
     let kind = match job.operation {
         Operation::Analyze => "Analysis",
@@ -1205,63 +1270,73 @@ fn job_row<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
 }
 fn queue(state: &State) -> Element<'_, Message> {
     let mut content = column![
-        theme::page_title("Queue"),
-        theme::muted("Jobs keep running when Flummox closes")
+        theme::page_title("Jobs"),
+        theme::muted("Track running work, waiting games, and recent results")
     ]
     .spacing(14);
+    if let Some(error) = &state.connection_error {
+        content = content.push(panel(
+            column![
+                text("Worker connection interrupted"),
+                theme::muted(error),
+                theme::muted("Showing the last received jobs. Reconnecting…")
+            ]
+            .spacing(6),
+        ));
+    }
+    if !state.snapshot_loaded && state.snapshot.jobs.is_empty() {
+        content = content.push(theme::muted("Connecting to the background worker…"));
+    }
     if let Some(game) = &state.snapshot.gaming {
         content = content.push(panel(text(format!("Paused while you play {game}"))));
     }
-    let jobs: Vec<_> = state
-        .snapshot
-        .jobs
-        .iter()
-        .filter(|j| j.operation != Operation::Analyze && j.phase.active())
-        .collect();
-    if jobs.is_empty() {
-        content = content.push(panel(
-            column![
-                text("Nothing waiting"),
-                theme::muted("Choose games to start"),
-                action("Choose games", Message::GoTo(Page::Games))
-            ]
-            .spacing(10),
-        ));
-    }
-    for job in jobs {
-        content = content.push(job_row(state, job));
-    }
-    for job in state
-        .snapshot
-        .jobs
-        .iter()
-        .rev()
-        .filter(|j| j.operation != Operation::Analyze && !j.phase.active())
-        .take(20)
-    {
-        content = content.push(job_row(state, job));
-    }
-    content.into()
-}
-fn updates(state: &State, compact: bool) -> Element<'_, Message> {
-    let mut content = column![
-        theme::page_title("Updates"),
-        theme::muted("Changed files appear here")
-    ]
-    .spacing(14);
-    let mut count = 0;
-    for game in &state.games {
-        if state
-            .records
+    for (title, group) in [
+        ("Running", 0),
+        ("Waiting", 1),
+        ("Needs attention", 2),
+        ("History", 3),
+    ] {
+        let jobs: Vec<_> = state
+            .snapshot
+            .jobs
             .iter()
-            .any(|r| r.id == game.game.id && r.build != game.game.build)
-        {
-            count += 1;
-            content = content.push(game_row(state, game, compact));
+            .filter(|job| {
+                job.operation != Operation::Analyze
+                    && match group {
+                        0 => job.phase.active() && job.phase != Phase::Queued,
+                        1 => job.phase == Phase::Queued,
+                        2 => matches!(
+                            job.phase,
+                            Phase::Failed | Phase::Partial | Phase::Interrupted
+                        ),
+                        _ => matches!(job.phase, Phase::Completed | Phase::Cancelled),
+                    }
+            })
+            .collect();
+        content = content.push(text(format!("{title} · {}", jobs.len())).size(17));
+        if jobs.is_empty() {
+            content = content.push(theme::muted(match group {
+                0 => "No jobs running",
+                1 => "No games waiting",
+                2 => "No jobs need attention",
+                _ => "Finished jobs will appear here",
+            }));
         }
+        let rows: Vec<_> = if group == 3 {
+            jobs.into_iter()
+                .rev()
+                .take(20)
+                .map(|job| (job.id, completed_job_row(job)))
+                .collect()
+        } else {
+            jobs.into_iter()
+                .map(|job| (job.id, job_row(state, job)))
+                .collect()
+        };
+        content = content.push(iced::widget::keyed_column(rows).spacing(12));
     }
-    if count == 0 {
-        content = content.push(panel(text("No updates found")));
+    for entry in &state.activity {
+        content = content.push(theme::muted(&entry.message));
     }
     content.into()
 }
@@ -1377,6 +1452,42 @@ fn drives(state: &State) -> Element<'_, Message> {
 }
 
 fn settings_page(state: &State) -> Element<'_, Message> {
+    let links = iced::widget::Row::with_children(
+        [
+            ("Jobs", "settings-jobs"),
+            ("Locations", "settings-locations"),
+            ("Recovery", "settings-recovery"),
+            ("Maintenance", "settings-maintenance"),
+            ("Appearance", "settings-appearance"),
+            ("Reports", "settings-reports"),
+            ("About", "settings-about"),
+        ]
+        .into_iter()
+        .map(|(label, section)| {
+            secondary(
+                label,
+                if section == "settings-recovery" {
+                    Message::GoTo(Page::Recovery)
+                } else {
+                    Message::Jump(section)
+                },
+            )
+        }),
+    )
+    .spacing(8)
+    .wrap();
+    column![
+        theme::page_title("Settings"),
+        links,
+        container(queue(state)).id("settings-jobs"),
+        container(drives(state)).id("settings-locations"),
+        container(recovery(state)).id("settings-recovery"),
+        preferences(state),
+    ]
+    .spacing(28)
+    .into()
+}
+fn preferences(state: &State) -> Element<'_, Message> {
     let maintained = state
         .snapshot
         .libraries
@@ -1384,13 +1495,33 @@ fn settings_page(state: &State) -> Element<'_, Message> {
         .filter(|library| library.automatic)
         .count();
     column![
-        theme::page_title("Settings"),
         panel(column![
             text("Background worker").size(17),
             theme::muted("After an upgrade, restart when the queue is empty and Maximum Space games have been restored."),
             secondary("Restart worker", Message::Send(Command::Restart))
         ].spacing(10)),
-        panel(
+        container(panel(
+            row![
+                column![
+                    text("Automatic maintenance").size(17),
+                    theme::muted(if maintained == 0 {
+                        "Off".into()
+                    } else {
+                        format!(
+                            "{} librar{} maintained",
+                            maintained,
+                            if maintained == 1 { "y is" } else { "ies are" }
+                        )
+                    })
+                ]
+                .spacing(4)
+                .width(Length::Fill),
+                secondary("Libraries", Message::GoTo(Page::Drives))
+            ]
+            .spacing(16)
+            .align_y(Alignment::Center)
+        )).id("settings-maintenance"),
+        container(panel(
             column![
                 text("Appearance").size(17),
                 row![
@@ -1438,42 +1569,21 @@ fn settings_page(state: &State) -> Element<'_, Message> {
                 .align_y(Alignment::Center)
             ]
             .spacing(18)
-        ),
-        panel(
-            row![
-                column![
-                    text("Automatic maintenance").size(17),
-                    theme::muted(if maintained == 0 {
-                        "Off".into()
-                    } else {
-                        format!(
-                            "{} librar{} maintained",
-                            maintained,
-                            if maintained == 1 { "y is" } else { "ies are" }
-                        )
-                    })
-                ]
-                .spacing(4)
-                .width(Length::Fill),
-                secondary("Libraries", Message::GoTo(Page::Drives))
-            ]
-            .spacing(16)
-            .align_y(Alignment::Center)
-        ),
-        panel(
+        )).id("settings-appearance"),
+        container(panel(
             column![
                 text("Maximum Space compatibility").size(17),
                 theme::muted(format!("{} local reports. Analysis checks the exact build and installed files before enabling automatic activation.", state.reports.len())),
                 secondary_maybe("Import report…", (!state.picker_busy).then_some(Message::Browse(super::dialog::Target::Report)))
             ].spacing(8)
-        ),
-        panel(
+        )).id("settings-reports"),
+        container(panel(
             column![
                 text("About Flummox").size(17),
                 theme::muted(format!("Version {}", env!("CARGO_PKG_VERSION")))
             ]
             .spacing(5)
-        )
+        )).id("settings-about")
     ]
     .spacing(16)
     .into()
@@ -1492,7 +1602,12 @@ fn completed_job_row(job: &Job) -> Element<'_, Message> {
     };
     panel(
         row![
-            text("✓").size(18),
+            text(if job.phase == Phase::Completed {
+                "✓"
+            } else {
+                "○"
+            })
+            .size(18),
             column![
                 text(&job.game.title).size(15),
                 theme::muted(format!(
@@ -1505,65 +1620,14 @@ fn completed_job_row(job: &Job) -> Element<'_, Message> {
             ]
             .spacing(3)
             .width(Length::Fill),
-            theme::muted("Completed")
+            theme::muted(job.phase.label()),
+            if job.phase == Phase::Cancelled {
+                secondary("Retry", Message::Send(Command::Retry(job.id)))
+            } else {
+                Space::new().width(0).into()
+            }
         ]
         .spacing(12)
         .align_y(Alignment::Center),
     )
-}
-
-fn activity(state: &State) -> Element<'_, Message> {
-    let mut content = column![theme::page_title("Activity")].spacing(14);
-    let active: Vec<_> = state
-        .snapshot
-        .jobs
-        .iter()
-        .filter(|job| job.operation != Operation::Analyze && job.phase.active())
-        .collect();
-    if !active.is_empty() {
-        content = content.push(theme::section_title("In progress"));
-        for job in active {
-            content = content.push(job_row(state, job));
-        }
-    }
-    let attention: Vec<_> = state
-        .snapshot
-        .jobs
-        .iter()
-        .rev()
-        .filter(|job| {
-            job.operation != Operation::Analyze
-                && matches!(
-                    job.phase,
-                    Phase::Failed | Phase::Partial | Phase::Interrupted
-                )
-        })
-        .collect();
-    if !attention.is_empty() {
-        content = content.push(theme::section_title("Needs attention"));
-        for job in attention {
-            content = content.push(job_row(state, job));
-        }
-    }
-    let completed: Vec<_> = state
-        .snapshot
-        .jobs
-        .iter()
-        .rev()
-        .filter(|job| job.operation != Operation::Analyze && job.phase == Phase::Completed)
-        .take(50)
-        .collect();
-    if !completed.is_empty() {
-        content = content.push(theme::section_title("Recent results"));
-        for job in completed {
-            content = content.push(completed_job_row(job));
-        }
-    }
-    for entry in &state.activity {
-        content = content.push(panel(text(&entry.message)));
-    }
-    if state.snapshot.jobs.is_empty() && state.activity.is_empty() {
-        content = content.push(panel(text("Your results will appear here.")));
-    }
-    content.into()
 }

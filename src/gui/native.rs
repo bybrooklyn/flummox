@@ -5,7 +5,8 @@ use iced::futures::SinkExt;
 use iced::widget::{
     Space, button, column, container, responsive, row, scrollable, text, text_input,
 };
-use iced::{Element, Length, Task, Theme};
+use iced::{Animation, Element, Length, Task, Theme, animation::Easing};
+use std::time::{Duration, Instant};
 use std::{
     path::PathBuf,
     sync::{
@@ -41,7 +42,33 @@ struct Status {
     text: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Overview,
+    Games,
+    Settings,
+}
+impl Page {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::Games => "Games",
+            Self::Settings => "Settings",
+        }
+    }
+    fn rank(self) -> u8 {
+        match self {
+            Self::Overview => 0,
+            Self::Games => 1,
+            Self::Settings => 2,
+        }
+    }
+}
 struct State {
+    page: Page,
+    reveal: Animation<bool>,
+    direction: f32,
+    scroll_positions: std::collections::HashMap<&'static str, f32>,
     games: Vec<crate::model::Game>,
     folder: String,
     status: Option<Status>,
@@ -59,6 +86,12 @@ struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            page: Page::Overview,
+            reveal: Animation::new(true)
+                .duration(Duration::from_millis(180))
+                .easing(Easing::EaseOutCubic),
+            direction: 1.0,
+            scroll_positions: Default::default(),
             games: Vec::new(),
             folder: String::new(),
             status: None,
@@ -77,6 +110,9 @@ impl Default for State {
 
 #[derive(Debug, Clone)]
 enum Message {
+    GoTo(Page),
+    Scrolled(Page, f32),
+    Tick,
     Folder(String),
     Select(PathBuf),
     Refresh,
@@ -191,6 +227,38 @@ fn start(state: &mut State, folder: PathBuf, optimize: bool) -> Task<Message> {
 
 fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
+        Message::GoTo(page) => {
+            if state.page != page {
+                state.direction = if page.rank() < state.page.rank() {
+                    -1.0
+                } else {
+                    1.0
+                };
+                state.page = page;
+                state.reveal = Animation::new(false)
+                    .duration(Duration::from_millis(180))
+                    .easing(Easing::EaseOutCubic)
+                    .go(true, Instant::now());
+                return iced::widget::operation::scroll_to(
+                    page.label(),
+                    iced::widget::operation::AbsoluteOffset {
+                        x: None,
+                        y: Some(
+                            state
+                                .scroll_positions
+                                .get(page.label())
+                                .copied()
+                                .unwrap_or_default(),
+                        ),
+                    },
+                );
+            }
+        }
+        Message::Scrolled(page, offset) => {
+            state.scroll_positions.insert(page.label(), offset);
+        }
+        Message::Tick => {}
+
         Message::Qualify => {
             let path = crate::native::folder_path(&state.folder);
             if let Some(game) = state
@@ -273,9 +341,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.planned = None;
         }
         Message::Select(folder) => {
+            let navigation = update(state, Message::GoTo(Page::Games));
             state.folder = folder.display().to_string();
             state.planned = None;
             state.status = None;
+            return navigation;
         }
         Message::Key(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
             if key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab) {
@@ -489,17 +559,12 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
             ),
         );
     }
-    let library = container(scrollable(game_list).height(Length::Fill))
+    let library = container(game_list)
         .padding(16)
         .width(if compact {
             Length::Fill
         } else {
             Length::FillPortion(5)
-        })
-        .height(if compact {
-            Length::Fixed(250.0)
-        } else {
-            Length::Fill
         })
         .style(theme::panel);
 
@@ -613,40 +678,79 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
                 .style(theme::banner(status.error)),
         );
     }
-    let action = container(scrollable(action))
-        .padding(18)
-        .width(if compact {
-            Length::Fill
-        } else {
-            Length::FillPortion(6)
-        })
-        .height(Length::Fill)
-        .style(theme::panel);
-
-    let workspace: Element<'_, Message> = if compact {
-        column![library, action].spacing(16).into()
-    } else {
-        row![library, action]
-            .spacing(16)
-            .height(Length::Fill)
-            .into()
-    };
-
-    container(
-        column![
-            row![
-                theme::page_title("Flummox"),
-                Space::new().width(Length::Fill),
-                theme::muted(format!("{PLATFORM} · {}", env!("CARGO_PKG_VERSION")))
-            ]
-            .spacing(10)
-            .align_y(iced::Alignment::Center),
+    let page = state.page;
+    let content: Element<'_, Message> = match page {
+        Page::Overview => column![
+            theme::page_title("Overview"),
             hero,
-            workspace,
+            theme::section_title("Running now"),
+            theme::muted(if state.working {
+                "A storage operation is running"
+            } else {
+                "No jobs running"
+            }),
+            button("View jobs and recovery").on_press(Message::GoTo(Page::Settings)),
+            button("Choose games").on_press(Message::GoTo(Page::Games)),
         ]
-        .spacing(16),
+        .spacing(16)
+        .into(),
+        Page::Games => {
+            if compact {
+                column![theme::page_title("Games"), library, action]
+                    .spacing(16)
+                    .into()
+            } else {
+                column![
+                    theme::page_title("Games"),
+                    row![library, action].spacing(16)
+                ]
+                .spacing(16)
+                .into()
+            }
+        }
+        Page::Settings => column![
+            theme::page_title("Settings"),
+            theme::section_title("Jobs, locations and recovery"),
+            action,
+            theme::section_title("About"),
+            theme::muted(format!("{PLATFORM} · {}", env!("CARGO_PKG_VERSION"))),
+        ]
+        .spacing(16)
+        .into(),
+    };
+    let reveal = state.reveal.interpolate(0.0, 1.0, Instant::now());
+    let body = super::surface::surface(
+        scrollable(container(content).padding(24).width(Length::Fill))
+            .id(page.label())
+            .on_scroll(move |viewport| Message::Scrolled(page, viewport.absolute_offset().y))
+            .height(Length::Fill),
+        state.direction * 12.0 * (1.0 - reveal),
+        true,
+        page.label(),
+    );
+    let mut navigation = column![text("Flummox").size(23), Space::new().height(16)]
+        .spacing(10)
+        .padding(16);
+    for destination in [Page::Overview, Page::Games, Page::Settings] {
+        navigation = navigation.push(
+            button(destination.label())
+                .style(if destination == page {
+                    theme::action_button
+                } else {
+                    theme::secondary_button
+                })
+                .width(Length::Fill)
+                .padding(12)
+                .on_press(Message::GoTo(destination)),
+        );
+    }
+    container(
+        row![
+            container(navigation).width(if compact { 130 } else { 190 }),
+            body
+        ]
+        .height(Length::Fill),
     )
-    .padding(24)
     .width(Length::Fill)
     .height(Length::Fill)
     .style(theme::app_background)
@@ -689,8 +793,13 @@ pub fn run() -> Result<()> {
     iced::application(boot, update, view)
         .title("Flummox")
         .theme(theme)
-        .subscription(|_| {
+        .subscription(|state: &State| {
             iced::Subscription::batch([
+                if state.reveal.is_animating(Instant::now()) {
+                    iced::window::frames().map(|_| Message::Tick)
+                } else {
+                    iced::Subscription::none()
+                },
                 iced::system::theme_changes().map(Message::SystemTheme),
                 iced::Subscription::run(polls),
                 iced::keyboard::listen().map(Message::Key),
