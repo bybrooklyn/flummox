@@ -279,6 +279,8 @@ fn native_worker_reuses_receipts_and_reprocesses_a_changed_file() -> TestResult 
         0,
         "the baseline must be uncompressed before comparing",
     )?;
+    // A retained directory handle would make the test itself look like a running game.
+    drop(anchor);
     let _service = start(&home)?;
     let game = Game {
         id: GameId::new(Launcher::Manual, "fixture"),
@@ -295,7 +297,8 @@ fn native_worker_reuses_receipts_and_reprocesses_a_changed_file() -> TestResult 
             data.push(b'B');
             std::fs::write(&payload, &data).ctx("game update")?;
             flummox::backend::btrfs::decompress_fd(
-                &anchor
+                &flummox::safeio::Anchor::open(&path)
+                    .ctx("updated anchor")?
                     .open_file(Path::new("stored.zip"))
                     .ctx("updated file")?,
             )

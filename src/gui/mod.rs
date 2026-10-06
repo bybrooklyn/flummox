@@ -6,7 +6,7 @@
 
 #[cfg(target_os = "linux")]
 mod app;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod artwork;
 #[cfg(target_os = "linux")]
 mod dialog;
@@ -14,6 +14,8 @@ mod dialog;
 mod native;
 #[cfg(all(test, target_os = "linux"))]
 mod preview;
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
+mod preview_renderer;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod surface;
 mod theme;

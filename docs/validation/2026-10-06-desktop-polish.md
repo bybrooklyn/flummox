@@ -1,9 +1,9 @@
 # Desktop polish implementation, 2026-10-06
 
 The [implementation plan](../plans/desktop-polish.md) remains the delivery contract.
-This change implements the Linux desktop phase and brings the native front end
-onto the shared three-page navigation and scrolling wrapper. It is not full
-Windows parity or release acceptance.
+The baseline Linux desktop phase is committed as `596b21e`. The continuation
+adds native UI parity and the Windows coordinator/maintenance implementation.
+Native runtime and release acceptance remain pending.
 
 ## Delivered changes
 
@@ -28,13 +28,52 @@ Windows parity or release acceptance.
   fixed dimensions and corrupt images do not remove games. Clicking a row image
   opens a local-file override picker. Metadata and artwork require no network.
 
+## Native continuation
+
+- Native Settings now includes Jobs, Locations, Recovery, Maintenance, Appearance,
+  compatibility reports and About, with shared scroll jumps. Theme/motion persist;
+  collections preserve legacy folder identities; local artwork uses the shared
+  bounded decode cache. Search, sorting and Updated/Needs attention filters stay
+  selected through navigation and refresh.
+- Windows discovery reads Steam registry/library manifests, Epic item manifests,
+  GOG installed-game registry and Heroic local metadata. Individual malformed
+  manifests produce warnings. Resolved directories merge launcher aliases;
+  remembered missing games remain visible and cannot start work.
+- Windows jobs run through one current-user coordinator. Its named pipe uses a
+  current-user-only DACL, rejects remote clients, bounds frames, checks protocol
+  versions and refuses a duplicate server instance. Client windows can close
+  while jobs run. The durable queue preserves job IDs and drive identities;
+  interrupted work requires review. Retry cannot duplicate a game's active job.
+- Maintenance is opt-in by location. The first healthy scan establishes a whole
+  batch baseline, including empty libraries. Paused, busy, offline or failed
+  discovery does not consume pending updates. Exclusions and opt-out cancel
+  automatic jobs; recovery blocks new automatic compression. Restoration remains
+  available for excluded games. File metadata stamps detect custom-folder changes.
+- Process checks defer work for running games, known updater tools and unknown
+  activity. Original-drive checks pause work after disconnection or replacement.
+  Existing WOF/LZX files are queried before opening a write handle, so unchanged
+  compressed files are skipped. See Microsoft's
+  [WOF query contract](https://learn.microsoft.com/en-us/windows/win32/api/wofapi/nf-wofapi-wofisexternalfile).
+- Tray actions open Flummox, pause/resume and exit after the current file. The
+  icon is restored after Explorer restarts. Login startup is separately opt-in.
+  Upgrade/uninstall asks the owned coordinator to stop before replacing files;
+  uninstall removes only this installation's startup entry.
+- CI now exports native wide/narrow light/dark fixture previews and runs the
+  Windows installer compilation/install/upgrade/uninstall smoke checks. Windows
+  tests use isolated data roots, catalogs, pipe names and disposable payloads.
+  They cover rejected protocol versions, pipe ACLs, client closure, persistence,
+  actual WOF compression and unchanged-file skips. They have only been compiled
+  in this session.
+
 ## Validation
 
 - `just lint`: passed, all Linux features and targets, warnings denied.
-- `just test`: 136 library tests passed, including offscreen previews and motion,
-  artwork, discovery cancellation and snapshot-ordering regressions. Six
-  coordinator lifecycle tests failed because this sandbox rejects Unix socket
-  creation with `Operation not permitted`. The complete test gate is not green.
+- `just test`: 144 library tests passed, including offscreen previews and motion,
+  artwork, discovery cancellation and snapshot-ordering regressions. With the
+  session restrictions removed, all eight coordinator lifecycle tests pass. The
+  btrfs fixture now closes its own directory handle before queueing work, so busy
+  detection does not classify the fixture as a running game. `just ci` passes,
+  including a fresh dependency-policy check and all packaging tests.
 - The six remaining integration targets were run separately: 21 tests passed.
   The single doctest passed. Filesystem-dependent tests retain their existing
   capability guards; passing does not establish FUSE or sandbox enforcement here.
@@ -43,12 +82,15 @@ Windows parity or release acceptance.
 - Windows x64 GUI cross-compilation and Clippy over all targets passed with
   warnings denied. This is compilation evidence, not a Windows runtime test.
 - `cargo deny --offline check`: passed using the cached advisory database;
-  no claim of fresh advisory coverage. Prose and whitespace checks passed.
+  the continuation also passes the normal policy check with the updated advisory
+  database. Prose and whitespace checks passed.
 - Fixture screenshots were rendered without a display and inspected in wide,
   narrow, dark and light layouts. The preview exporter now converts Iced's BGRA
   desktop pixels to RGBA before saving PNGs.
 
-Logs and previews from this run are under `/tmp/flummox-polish-*`. The selected
+Baseline logs and previews are under `/tmp/flummox-polish-*`. Continuation logs
+are under `/tmp/flummox-next-*`. Workflow checks passed with `actionlint`; YAML
+parsing passed. The selected
 [dark Overview](desktop-polish/overview.png),
 [light Overview](desktop-polish/overview-light.png),
 [dark Games](desktop-polish/games.png),
@@ -59,17 +101,19 @@ record. They are not screenshots of a running desktop session.
 
 ## Required follow-up
 
-Run `just ci` in an environment allowing coordinator sockets. Reproduce the
+Reproduce the
 reported queue disappearance in a real window and verify wheel/trackpad input,
 rapid navigation, scroll restoration, jump links, keyboard input, native dialogs,
 large libraries, offline locations and reduced motion. The code addresses stale
 responses and widget identity; live reproduction has not been established here.
 
-The native Mac/Windows front end still needs the full Settings sections, stored
-appearance/motion controls and artwork integration. Windows Epic/GOG/Heroic
-providers, collections, persistent secured coordinator, tray, maintenance,
-login startup and installer lifecycle remain the later Windows phase.
+Run the added native fixtures on Windows and Mac CI and inspect their exported
+previews. Windows cross-target Clippy proves compilation, including tests; it
+cannot execute them here. Mac compilation has not been checked locally. Verify
+tray/Explorer restart, startup ownership, dialogs, actual game/updater deferral,
+recovery and upgrades during work on disposable native installations.
 
-No commit, push, tag or release was made: this workspace exposes `.git` read-only.
+Git metadata is now writable. The continuation passes the complete local CI
+gate and is ready for native remote CI. No new tag or release was made.
 Native Mac runtime and all real-game qualification records remain pending.
 Version 0.0.2 must remain unpublished until its acceptance records pass.

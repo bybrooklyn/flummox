@@ -901,6 +901,8 @@ fn migrate(conn: &Connection) -> Result<()> {
 fn launcher_from_slug(slug: &str) -> Option<Launcher> {
     [
         Launcher::Steam,
+        Launcher::Epic,
+        Launcher::Gog,
         Launcher::HeroicLegendary,
         Launcher::HeroicGog,
         Launcher::HeroicNile,

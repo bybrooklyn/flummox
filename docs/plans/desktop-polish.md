@@ -121,17 +121,31 @@ online metadata and publisher signing remain deferred.
 
 ## Implementation status
 
-- Implemented Linux navigation, continuous Settings, jobs grouping, directional
-  motion, wheel easing, ordered snapshots, background discovery and local artwork.
-  Shared native navigation and wheel handling compile on Windows x64.
-- Verified library, motion, discovery and art fixtures, offscreen wide/narrow
-  dark/light previews, Linux lint, Windows cross-target lint, packaging, cached
-  dependency policy and prose checks. See the
+- Implemented Linux navigation, continuous Settings, grouped stable jobs,
+  directional motion, wheel easing, ordered snapshots, background discovery and
+  local artwork. The baseline UI change is committed as `596b21e`.
+- Implemented the native Settings sections, persisted theme/motion, collections,
+  local artwork, search, sorting and Updated/Needs attention filters. Native
+  snapshot/discovery ordering retains the library through refresh failures.
+- Implemented Windows Steam registry, Epic, GOG and Heroic discovery; a per-user
+  restricted versioned pipe coordinator; durable jobs and drive identities;
+  opt-in maintenance baselines/exclusions; tray controls; separate login startup;
+  and installer shutdown handling. Jobs show current deferral reasons. Recovery
+  blocks automatic maintenance, and restoration remains available for exclusions.
+- Verified Linux lint, 144 library tests, remaining portable integration targets,
+  packaging, workflow syntax, cached dependency policy and Windows x64
+  cross-target lint. Windows runtime fixtures and native UI previews compile;
+  CI runs them and exports preview images. See the
   [delivery and validation record](../validation/2026-10-06-desktop-polish.md).
-- Pending graphical acceptance: actual queue disappearance, menu/anchor scrolling,
-  native dialogs and input. Coordinator lifecycle tests are blocked by the current
-  sandbox's Unix socket restriction. The full test gate is not green.
-- Pending native UI parity: full Settings sections, stored appearance/motion and
-  artwork. Windows discovery/background phase remains after graphical acceptance.
-- Pending release acceptance, native Mac runtime, real-game qualification,
-  writable Git checkout, push/CI and publication. No new release was published.
+- Pending graphical acceptance: actual queue disappearance, wheel/trackpad and
+  anchor scrolling, keyboard navigation, native dialogs and image layouts on
+  each desktop. The complete Linux `just ci` gate now passes, including all eight
+  coordinator lifecycle tests and a real btrfs worker round trip. Native
+  Windows/Mac runtime CI has not run for this change.
+- Pending Windows manual lifecycle acceptance: tray/Explorer restart, login,
+  busy/updating games, unplugged/replaced drives, recovery and upgrades while a
+  worker is finishing a file. Installer smoke checks and isolated coordinator
+  tests are wired into CI, not claimed as locally executed.
+- Pending release acceptance, Mac compilation/runtime, real-game qualification,
+  remote CI and publication. Git metadata is now writable in this session.
+  No new release was published. Game Compressor adoption work remains deferred.

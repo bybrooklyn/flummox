@@ -67,6 +67,17 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    "Win32_System_Registry",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_System_SystemServices",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_Graphics_Gdi",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -77,6 +88,11 @@ xattr = "1.6.1"
 # The VDF parser reads files Steam writes, not files we write. Its robustness
 # against arbitrary input is a property, not a list of examples.
 proptest = "1.11.0"
+
+# Render the real desktop widgets without a display server for SSH review.
+iced_tiny_skia = { version = "0.14.1", features = ["image"] }
+# Iced 0.14 uses tiny-skia 0.11 types in its offscreen renderer.
+tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -114,9 +130,3 @@ debug = "line-tables-only"
 # real data.
 [profile.dev.package.zstd-sys]
 opt-level = 3
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-# Render the real desktop widgets without a display server for SSH review.
-iced_tiny_skia = { version = "0.14.1", features = ["image"] }
-# Iced 0.14 uses tiny-skia 0.11 types in its offscreen renderer.
-tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }

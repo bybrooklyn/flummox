@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 pub enum Launcher {
     /// Valve's Steam client.
     Steam,
+    /// Epic Games Launcher.
+    Epic,
+    /// GOG Galaxy or offline GOG installers.
+    Gog,
     /// Heroic, Epic games (via legendary).
     HeroicLegendary,
     /// Heroic, GOG games.
@@ -33,6 +37,8 @@ impl Launcher {
     pub fn slug(self) -> &'static str {
         match self {
             Self::Steam => "steam",
+            Self::Epic => "epic",
+            Self::Gog => "gog",
             Self::HeroicLegendary => "heroic-epic",
             Self::HeroicGog => "heroic-gog",
             Self::HeroicNile => "heroic-amazon",
@@ -47,6 +53,8 @@ impl Launcher {
     pub fn label(self) -> &'static str {
         match self {
             Self::Steam => "Steam",
+            Self::Epic => "Epic Games",
+            Self::Gog => "GOG",
             Self::HeroicLegendary => "Heroic (Epic)",
             Self::HeroicGog => "Heroic (GOG)",
             Self::HeroicNile => "Heroic (Amazon)",

@@ -8,10 +8,8 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::{
-    collections::BTreeSet,
     fs::OpenOptions,
-    io::Read,
-    os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
+    os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -21,7 +19,7 @@ use windows_sys::Win32::{
         FILE_PROVIDER_COMPRESSION_LZX, FILE_PROVIDER_COMPRESSION_XPRESS4K,
         FILE_PROVIDER_COMPRESSION_XPRESS8K, FILE_PROVIDER_COMPRESSION_XPRESS16K,
         FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx,
-        WOF_FILE_COMPRESSION_INFO_V1, WOF_PROVIDER_FILE, WofSetFileDataLocation,
+        WOF_FILE_COMPRESSION_INFO_V1, WOF_PROVIDER_FILE, WofIsExternalFile, WofSetFileDataLocation,
     },
     System::{IO::DeviceIoControl, Ioctl::FSCTL_DELETE_EXTERNAL_BACKING},
 };
@@ -74,109 +72,6 @@ enum Command {
     Decompress { folder: PathBuf },
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct InstalledGame {
-    pub title: String,
-    pub path: PathBuf,
-    pub app_id: Option<u32>,
-    pub build: Option<String>,
-}
-
-fn bounded_text(path: &Path, limit: u64) -> Result<String> {
-    let file = std::fs::File::open(path)?;
-    ensure!(
-        file.metadata()?.len() <= limit,
-        "Launcher manifest is too large"
-    );
-    let mut text = String::new();
-    file.take(limit.saturating_add(1))
-        .read_to_string(&mut text)?;
-    ensure!(text.len() as u64 <= limit, "Launcher manifest is too large");
-    Ok(text)
-}
-
-fn default_steamapps() -> BTreeSet<PathBuf> {
-    [
-        std::env::var_os("ProgramFiles(x86)"),
-        std::env::var_os("ProgramFiles"),
-    ]
-    .into_iter()
-    .flatten()
-    .map(PathBuf::from)
-    .map(|root| root.join("Steam").join("steamapps"))
-    .filter(|path| path.is_dir())
-    .collect()
-}
-
-/// Finds installed Steam games without contacting Steam or the network.
-pub(crate) fn discover_steam() -> Vec<InstalledGame> {
-    let mut libraries = default_steamapps();
-    let roots: Vec<_> = libraries.iter().cloned().collect();
-    for steamapps in roots {
-        let Ok(text) = bounded_text(&steamapps.join("libraryfolders.vdf"), 16 * 1024 * 1024) else {
-            continue;
-        };
-        let Ok(document) = crate::windows_vdf::parse(&text) else {
-            continue;
-        };
-        for (_, value) in document.entries() {
-            let library = match value {
-                crate::windows_vdf::Value::Str(path) => Some(path.as_str()),
-                crate::windows_vdf::Value::Obj(object) => object.get_str("path"),
-            };
-            if let Some(path) = library {
-                let steamapps = PathBuf::from(path).join("steamapps");
-                if steamapps.is_dir() {
-                    libraries.insert(steamapps);
-                }
-            }
-        }
-    }
-    let mut games = Vec::new();
-    let mut seen = BTreeSet::new();
-    for library in libraries {
-        let Ok(entries) = std::fs::read_dir(&library) else {
-            continue;
-        };
-        for item in entries.flatten() {
-            let name = item.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if !name.starts_with("appmanifest_") || !name.ends_with(".acf") {
-                continue;
-            }
-            let Ok(text) = bounded_text(&item.path(), 4 * 1024 * 1024) else {
-                continue;
-            };
-            let Ok(manifest) = crate::windows_vdf::parse(&text) else {
-                continue;
-            };
-            let (Some(title), Some(folder)) =
-                (manifest.get_str("name"), manifest.get_str("installdir"))
-            else {
-                continue;
-            };
-            let common = library.join("common");
-            let path = common.join(folder);
-            let Ok(path) = path.canonicalize() else {
-                continue;
-            };
-            let Ok(common) = common.canonicalize() else {
-                continue;
-            };
-            if path.is_dir() && path.starts_with(common) && seen.insert(path.clone()) {
-                games.push(InstalledGame {
-                    title: title.to_owned(),
-                    path,
-                    app_id: manifest.get_u32("appid"),
-                    build: manifest.get_str("buildid").map(str::to_owned),
-                });
-            }
-        }
-    }
-    games.sort_by_key(|game| game.title.to_lowercase());
-    games
-}
-
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Progress {
     pub files: u64,
@@ -221,6 +116,38 @@ fn allocation_size(path: &Path) -> Result<u64> {
 }
 
 fn compress_file(path: &Path, algorithm: Algorithm) -> Result<bool> {
+    let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut external = 0;
+    let mut provider = 0;
+    let mut existing = WOF_FILE_COMPRESSION_INFO_V1 {
+        Algorithm: 0,
+        Flags: 0,
+    };
+    let mut size = u32::try_from(std::mem::size_of_val(&existing))?;
+    // SAFETY: name is terminated and all output buffers have their exact writable sizes.
+    let query = unsafe {
+        WofIsExternalFile(
+            name.as_ptr(),
+            &mut external,
+            &mut provider,
+            std::ptr::from_mut(&mut existing).cast(),
+            &mut size,
+        )
+    };
+    ensure!(
+        query >= 0,
+        "Windows could not query existing compression for {}",
+        path.display()
+    );
+    ensure!(
+        external == 0
+            || provider != WOF_PROVIDER_FILE
+            || size == u32::try_from(std::mem::size_of_val(&existing))?,
+        "Windows returned unfamiliar compression metadata"
+    );
+    if external != 0 && provider == WOF_PROVIDER_FILE && existing.Algorithm == algorithm.code() {
+        return Ok(false);
+    }
     let file = file_handle(path)?;
     let info = WOF_FILE_COMPRESSION_INFO_V1 {
         Algorithm: algorithm.code(),
@@ -425,22 +352,6 @@ fn describe(summary: &Progress) -> String {
     )
 }
 
-/// Applies LZX while reporting measured allocation changes and observing stop.
-pub(crate) fn optimize_folder_with(
-    folder: &Path,
-    cancel: &AtomicBool,
-    report: impl FnMut(Progress),
-) -> Result<String> {
-    visit_with(
-        folder,
-        cancel,
-        false,
-        |path| compress_file(path, Algorithm::Lzx),
-        report,
-    )
-    .map(|summary| describe(&summary))
-}
-
 /// Restores ordinary files while reporting progress and observing stop.
 pub(crate) fn restore_folder_with(
     folder: &Path,
@@ -467,4 +378,32 @@ pub fn run() -> Result<()> {
     };
     println!("{}", describe(&summary));
     Ok(())
+}
+
+pub(crate) fn folder_controlled(
+    folder: &Path,
+    restore: bool,
+    cancel: &AtomicBool,
+    pause: &AtomicBool,
+    report: impl FnMut(Progress),
+) -> Result<String> {
+    visit_with(
+        folder,
+        cancel,
+        restore,
+        |path| {
+            while pause.load(Ordering::Relaxed) {
+                ensure!(!cancel.load(Ordering::Relaxed), "Operation stopped");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            ensure!(!cancel.load(Ordering::Relaxed), "Operation stopped");
+            if restore {
+                decompress_file(path)
+            } else {
+                compress_file(path, Algorithm::Lzx)
+            }
+        },
+        report,
+    )
+    .map(|summary| describe(&summary))
 }

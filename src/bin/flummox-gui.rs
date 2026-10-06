@@ -9,5 +9,9 @@ fn main() -> anyhow::Result<()> {
     if flummox::jobs::entrypoint()? {
         return Ok(());
     }
+    #[cfg(windows)]
+    if flummox::windows_coordinator::entrypoint()? {
+        return Ok(());
+    }
     flummox::gui::run()
 }

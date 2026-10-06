@@ -25,9 +25,40 @@ jobs:
       - name: Lint Windows code and tests
         run: cargo clippy --locked --all-features --all-targets -- -D warnings
       - name: Test on Windows
+        env:
+          FLUMMOX_NATIVE_PREVIEW_DIR: ${{ runner.temp }}/flummox-previews
         run: cargo test --locked --all-features
+      - uses: actions/upload-artifact@v7.0.1
+        if: always()
+        with:
+          name: windows-desktop-previews
+          path: ${{ runner.temp }}/flummox-previews
+          if-no-files-found: warn
       - name: Build the Windows CLI and GUI
         run: cargo build --locked --release --all-features --bins
+
+      - name: Compile and smoke-test the Windows installer
+        shell: pwsh
+        run: |
+          choco install innosetup --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'Inno Setup installation failed' }
+          $version = (cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ($LASTEXITCODE -ne 0) { throw 'Package metadata failed' }
+          $compiler = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*\ISCC.exe" | Select-Object -First 1
+          if (!$compiler) { throw 'ISCC.exe is missing' }
+          & $compiler.FullName "/DAppVersion=$version" "/DAppNumericVersion=$($version.Split('-')[0])" "/DSourceDir=$env:GITHUB_WORKSPACE\target\release" packaging/windows/flummox.iss
+          if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed' }
+          $installer = (Resolve-Path "dist/flummox-$version-windows-x86_64-setup.exe").Path
+          $destination = "$env:RUNNER_TEMP\Flummox installation"
+          $env:LOCALAPPDATA = "$env:RUNNER_TEMP\Flummox installer state"
+          1..2 | ForEach-Object {
+            $process = Start-Process -FilePath $installer -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$destination`"") -Wait -PassThru
+            if ($process.ExitCode -ne 0) { throw "Install failed: $($process.ExitCode)" }
+            $actual = & "$destination\flummox.exe" --version
+            if ($LASTEXITCODE -ne 0 -or $actual -ne "flummox $version") { throw "Unexpected installed version: $actual" }
+          }
+          $process = Start-Process -FilePath "$destination\unins000.exe" -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
+          if ($process.ExitCode -ne 0 -or (Test-Path "$destination\flummox.exe")) { throw 'Uninstall failed' }
 
   macos:
     name: macOS native APFS app
@@ -40,7 +71,15 @@ jobs:
       - name: Check every target with warnings denied
         run: cargo clippy --locked --all-features --all-targets -- -D warnings
       - name: Test portable modules
+        env:
+          FLUMMOX_NATIVE_PREVIEW_DIR: ${{ runner.temp }}/flummox-previews
         run: cargo test --locked --all-features
+      - uses: actions/upload-artifact@v7.0.1
+        if: always()
+        with:
+          name: macos-desktop-previews
+          path: ${{ runner.temp }}/flummox-previews
+          if-no-files-found: warn
       - name: Build CLI and GUI
         run: cargo build --locked --release --all-features --bins
 

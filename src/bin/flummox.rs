@@ -10,6 +10,9 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {
+    if flummox::windows_coordinator::entrypoint()? {
+        return Ok(());
+    }
     flummox::windows::run()
 }
 

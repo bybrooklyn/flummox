@@ -276,7 +276,6 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
     }
 }
 
-#[cfg(target_os = "linux")]
 pub fn jump<Message: Send + 'static>(
     section: &'static str,
     message: impl Fn(f32) -> Message + Send + 'static,

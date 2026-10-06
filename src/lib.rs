@@ -25,6 +25,10 @@ pub mod cli;
 pub mod compatibility;
 #[cfg(target_os = "linux")]
 pub mod db;
+pub mod desktop;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+pub mod desktop_discovery;
+pub mod desktop_jobs;
 #[cfg(target_os = "linux")]
 pub mod estimate;
 #[cfg(target_os = "linux")]
@@ -62,6 +66,16 @@ pub mod testutil;
 pub mod watch;
 #[cfg(windows)]
 pub mod windows;
+#[cfg(windows)]
+mod windows_activity;
+#[cfg(windows)]
+pub mod windows_coordinator;
+#[cfg(windows)]
+mod windows_ipc;
+#[cfg(windows)]
+mod windows_launchers;
+#[cfg(windows)]
+mod windows_tray;
 #[cfg(windows)]
 #[path = "launchers/vdf.rs"]
 mod windows_vdf;

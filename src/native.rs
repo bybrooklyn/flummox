@@ -1,17 +1,9 @@
 //! Library preferences shared by native Mac and Windows front ends.
+use crate::{libraries, model::Game};
 #[cfg(target_os = "macos")]
-use crate::macos as backend;
-#[cfg(windows)]
-use crate::windows as backend;
-use crate::{
-    libraries,
-    model::{Game, GameId, InstallState, Launcher},
-};
-use anyhow::{Context, Result, ensure};
-use std::{
-    io::Write,
-    path::{Path, PathBuf},
-};
+use anyhow::Context;
+use anyhow::Result;
+use std::path::{Path, PathBuf};
 
 pub fn folder_path(input: &str) -> PathBuf {
     let text = input.trim().trim_matches(['\"', '\'']);
@@ -24,73 +16,68 @@ pub fn folder_path(input: &str) -> PathBuf {
     PathBuf::from(text)
 }
 
-fn folders() -> Result<Vec<PathBuf>> {
-    let path = libraries::data_dir()?.join("folders.json");
-    match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).context("Reading custom folders"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
-        Err(error) => Err(error.into()),
-    }
-}
 pub fn add_folder(path: &Path) -> Result<()> {
-    let path = path.canonicalize()?;
-    ensure!(
-        path.is_dir() && path.parent().is_some(),
-        "Choose an installed game folder"
-    );
-    let mut folders = folders()?;
-    if !folders.contains(&path) {
-        folders.push(path);
-    }
     let root = libraries::data_dir()?;
-    libraries::private_dir(&root)?;
-    let mut file = tempfile::NamedTempFile::new_in(&root)?;
-    serde_json::to_writer(&mut file, &folders)?;
-    file.flush()?;
-    file.as_file().sync_all()?;
-    file.persist(root.join("folders.json"))?;
-    Ok(())
+    let mut preferences = crate::desktop::Preferences::load(&root)?;
+    preferences.add(path, crate::desktop::LocationKind::Game)?;
+    preferences.save(&root)
 }
-
+pub fn discover_catalog() -> Result<crate::desktop_discovery::Catalog> {
+    #[cfg(windows)]
+    let mut catalog = crate::windows_launchers::discover();
+    #[cfg(target_os = "macos")]
+    let mut catalog = {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .context("HOME is not set")?;
+        let mut catalog = crate::desktop_discovery::Catalog::default();
+        catalog.steam(vec![home.join("Library/Application Support/Steam")]);
+        catalog.heroic(&home.join("Library/Application Support/heroic"));
+        catalog
+    };
+    let root = libraries::data_dir()?;
+    let preferences = crate::desktop::Preferences::load(&root)?;
+    let (custom, warnings) = preferences.custom_games();
+    catalog.games.extend(custom);
+    catalog.warnings.extend(warnings);
+    catalog = catalog.finish();
+    catalog.games = libraries::remember(&root, catalog.games, |game| preferences.keeps(game))?;
+    Ok(catalog)
+}
 pub fn discover() -> Result<Vec<Game>> {
-    let mut games: Vec<_> = backend::discover_steam()
-        .into_iter()
-        .map(|game| {
-            let mut model = game_model(game.title, game.path, Launcher::Steam);
-            if let Some(id) = game.app_id {
-                model.id.key = id.to_string();
-            }
-            model.build = game.build;
-            model
-        })
-        .collect();
-    for path in folders()? {
-        if !path.is_dir() {
-            continue;
-        }
-        let title = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Custom game".into());
-        games.push(game_model(title, path, Launcher::Manual));
-    }
-    libraries::remember(&libraries::data_dir()?, games, |_| true)
+    Ok(discover_catalog()?.games)
 }
 
-fn game_model(title: String, path: PathBuf, launcher: Launcher) -> Game {
-    Game {
-        id: GameId::new(
-            launcher,
-            blake3::hash(path.as_os_str().as_encoded_bytes())
-                .to_hex()
-                .to_string(),
-        ),
-        also: vec![],
-        title,
-        install_dir: path,
-        build: None,
-        size_hint: None,
-        state: InstallState::Idle,
-        is_tool: false,
+/// Opens a platform picker without interpolating paths into scripts.
+pub fn pick(artwork: bool) -> Result<Option<PathBuf>> {
+    #[cfg(windows)]
+    let output = {
+        let picker = if artwork {
+            "$d=New-Object System.Windows.Forms.OpenFileDialog; $d.Filter='Images|*.png;*.jpg;*.jpeg'; if($d.ShowDialog() -eq 'OK'){[Console]::WriteLine($d.FileName)}"
+        } else {
+            "$d=New-Object System.Windows.Forms.FolderBrowserDialog; if($d.ShowDialog() -eq 'OK'){[Console]::WriteLine($d.SelectedPath)}"
+        };
+        std::process::Command::new("powershell.exe").args(["-NoProfile", "-STA", "-Command"]).arg(format!("[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); Add-Type -AssemblyName System.Windows.Forms; {picker}")).output()?
+    };
+    #[cfg(target_os = "macos")]
+    let output = std::process::Command::new("osascript")
+        .args([
+            "-e",
+            if artwork {
+                "POSIX path of (choose file of type {\"public.png\", \"public.jpeg\"})"
+            } else {
+                "POSIX path of (choose folder)"
+            },
+        ])
+        .output()?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr);
+        if error.contains("(-128)") {
+            return Ok(None);
+        }
+        anyhow::bail!("The file picker could not open: {error}");
     }
+    let text = String::from_utf8(output.stdout)?;
+    let text = text.trim_end_matches(['\r', '\n']);
+    Ok((!text.is_empty()).then(|| PathBuf::from(text)))
 }
