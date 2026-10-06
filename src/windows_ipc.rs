@@ -274,6 +274,52 @@ mod tests {
     use crate::testutil::{Ctx, TestResult, check};
     use std::io::{Seek, SeekFrom};
     #[test]
+    fn an_empty_pipe_waits_for_a_delayed_reply() -> TestResult {
+        let temp = tempfile::tempdir().ctx("delayed pipe fixture")?;
+        let suffix = temp
+            .path()
+            .file_name()
+            .ctx("pipe suffix")?
+            .to_string_lossy();
+        let name = format!("\\\\.\\pipe\\flummox-delayed-{suffix}");
+        let mut server = listener_named(&name).ctx("delayed pipe listener")?;
+        let client = std::thread::spawn(move || -> Result<bool> {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut file = loop {
+                match connect_named(&name) {
+                    Ok(file) => break file,
+                    Err(error) if Instant::now() >= deadline => return Err(error),
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            };
+            send(&mut file, &true)?;
+            let reply: bool = receive(&mut file)?;
+            send(&mut file, &true)?;
+            Ok(reply)
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !accept(&server).ctx("accept delayed pipe")? {
+            check(Instant::now() < deadline, "delayed client connects")?;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        check(
+            receive::<bool>(&mut server).ctx("request")?,
+            "request received",
+        )?;
+        std::thread::sleep(Duration::from_millis(100));
+        send(&mut server, &true).ctx("delayed reply")?;
+        check(
+            receive::<bool>(&mut server).ctx("acknowledgement")?,
+            "reply read",
+        )?;
+        disconnect(&server);
+        let reply = client
+            .join()
+            .map_err(|_| "pipe client thread stopped".to_owned())?
+            .ctx("client reads delayed reply")?;
+        check(reply, "empty pipe waits instead of reporting EOF")
+    }
+    #[test]
     fn frames_reject_truncation_and_excessive_lengths() -> TestResult {
         let mut file = tempfile::tempfile().ctx("frame fixture")?;
         file.write_all(&u32::MAX.to_le_bytes())

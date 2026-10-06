@@ -220,6 +220,7 @@ pub struct State {
     pub qualification: Option<crate::qualification::Wizard>,
     pub nav: Vec<(Page, Animation<bool>)>,
     pub page_reveal: Animation<bool>,
+    pub scroll_redraw_until: Option<Instant>,
     pub page_direction: f32,
     pub scroll_positions: std::collections::HashMap<String, f32>,
     pub snapshot_loaded: bool,
@@ -285,6 +286,7 @@ impl State {
                     )
                 })
                 .collect(),
+            scroll_redraw_until: None,
             page_reveal: Animation::new(true)
                 .duration(Duration::from_millis(240))
                 .easing(Easing::EaseOutCubic),
@@ -998,13 +1000,15 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             return super::surface::jump(section, Message::JumpOffset);
         }
         Message::JumpOffset(offset) => {
+            state.scroll_redraw_until = Some(Instant::now() + Duration::from_millis(150));
             return iced::widget::operation::scroll_to(
                 "Settings",
                 iced::widget::operation::AbsoluteOffset {
                     x: None,
                     y: Some(offset),
                 },
-            );
+            )
+            .chain(Task::done(Message::Tick));
         }
         Message::GoTo(destination) => {
             let page = destination.main();
@@ -1041,7 +1045,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                         x: None,
                         y: Some(offset),
                     },
-                );
+                )
+                .chain(Task::done(Message::Tick));
             }
         }
         Message::Rescan => return send(Command::RefreshDiscovery),

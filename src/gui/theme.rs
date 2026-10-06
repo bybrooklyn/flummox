@@ -10,7 +10,7 @@ use iced::widget::scrollable as scrollable_widget;
 use iced::widget::{container, text};
 use iced::{Background, Color, Font, Theme, color};
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-use iced::{Border, Element, Shadow, Vector};
+use iced::{Border, Element};
 
 #[derive(Clone, Copy)]
 struct Colors {
@@ -142,11 +142,6 @@ pub fn panel(theme: &Theme) -> container::Style {
             color: colors.border,
         },
         text_color: Some(colors.text),
-        shadow: Shadow {
-            color: Color::from_rgba(0.0, 0.0, 0.0, 0.10),
-            offset: Vector::new(0.0, 1.0),
-            blur_radius: 5.0,
-        },
         ..container::Style::default()
     }
 }
@@ -217,11 +212,6 @@ pub fn toast(is_error: bool, reveal: f32) -> impl Fn(&Theme) -> container::Style
                 color: edge.scale_alpha(reveal),
             },
             text_color: Some(colors.text.scale_alpha(reveal)),
-            shadow: Shadow {
-                color: Color::from_rgba(0.0, 0.0, 0.0, 0.38 * reveal),
-                offset: Vector::new(0.0, 8.0 * reveal),
-                blur_radius: 24.0 * reveal,
-            },
             ..container::Style::default()
         }
     }

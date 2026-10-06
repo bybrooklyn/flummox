@@ -172,6 +172,7 @@ struct State {
     artwork_cache: super::artwork::Cache,
     page: Page,
     reveal: Animation<bool>,
+    scroll_redraw_until: Option<Instant>,
     direction: f32,
     scroll_positions: std::collections::HashMap<&'static str, f32>,
     games: Vec<crate::model::Game>,
@@ -214,6 +215,7 @@ impl Default for State {
             covers: HashMap::new(),
             artwork_cache: super::artwork::Cache::default(),
             page: Page::Overview,
+            scroll_redraw_until: None,
             reveal: Animation::new(true)
                 .duration(Duration::from_millis(180))
                 .easing(Easing::EaseOutCubic),
@@ -602,13 +604,15 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             return super::surface::jump(section, Message::JumpOffset);
         }
         Message::JumpOffset(offset) => {
+            state.scroll_redraw_until = Some(Instant::now() + Duration::from_millis(150));
             return iced::widget::operation::scroll_to(
                 "Settings",
                 iced::widget::operation::AbsoluteOffset {
                     x: None,
                     y: Some(offset),
                 },
-            );
+            )
+            .chain(Task::done(Message::Tick));
         }
         Message::GoTo(page) => {
             if state.page != page {
@@ -634,7 +638,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                                 .unwrap_or_default(),
                         ),
                     },
-                );
+                )
+                .chain(Task::done(Message::Tick));
             }
         }
         Message::Scrolled(page, offset) => {
@@ -976,8 +981,11 @@ fn filtered_games(state: &State) -> Vec<&crate::model::Game> {
 fn view(state: &State) -> Element<'_, Message> {
     super::surface::animate(
         responsive(move |size| layout(state, size.width < 760.0)),
-        state.preferences.motion != MotionChoice::Reduced
-            && state.reveal.is_animating(Instant::now()),
+        (state.preferences.motion != MotionChoice::Reduced
+            && state.reveal.is_animating(Instant::now()))
+            || state
+                .scroll_redraw_until
+                .is_some_and(|until| Instant::now() < until),
     )
 }
 
@@ -1324,8 +1332,11 @@ pub fn run() -> Result<()> {
         .theme(theme)
         .subscription(|state: &State| {
             iced::Subscription::batch([
-                if state.preferences.motion != MotionChoice::Reduced
-                    && state.reveal.is_animating(Instant::now())
+                if (state.preferences.motion != MotionChoice::Reduced
+                    && state.reveal.is_animating(Instant::now()))
+                    || state
+                        .scroll_redraw_until
+                        .is_some_and(|until| Instant::now() < until)
                 {
                     iced::window::frames().map(|_| Message::Tick)
                 } else {

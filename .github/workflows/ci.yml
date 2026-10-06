@@ -37,6 +37,8 @@ jobs:
       - name: Build the Windows CLI and GUI
         run: cargo build --locked --release --all-features --bins
 
+      - name: Prepare installer release notes
+        run: python packaging/prepare-release.py
       - name: Compile and smoke-test the Windows installer
         shell: pwsh
         run: |

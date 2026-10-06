@@ -70,6 +70,7 @@ impl Motion {
 struct Position {
     current: f32,
     maximum: f32,
+    viewport: f32,
     found: bool,
 }
 impl Operation for Position {
@@ -90,6 +91,7 @@ impl Operation for Position {
         self.found = true;
         self.current = translation.y;
         self.maximum = (content.height - bounds.height).max(0.0);
+        self.viewport = bounds.height;
     }
 }
 impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Message> {
@@ -202,7 +204,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
             Event::Mouse(mouse::Event::WheelScrolled {
                 delta: mouse::ScrollDelta::Pixels { .. }
             }) | Event::Mouse(mouse::Event::ButtonPressed(_))
-                | Event::Keyboard(_)
+                | Event::Keyboard(iced::keyboard::Event::KeyPressed { .. })
         ) {
             motion.start = None;
         }
@@ -231,6 +233,9 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
                 shell,
                 viewport,
             );
+            // The synthetic wheel changes widget state during a redraw event.
+            // Request another frame even when the easing reaches its endpoint.
+            shell.request_redraw();
             if now.saturating_duration_since(start) >= Duration::from_millis(100) {
                 motion.start = None;
             } else {
@@ -240,6 +245,47 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
         self.content.as_widget_mut().update(
             child, event, bounds, cursor, renderer, clipboard, shell, viewport,
         );
+        // Inputs and open menus get first refusal, so Home/End still edit text.
+        if self.key != "animation-driver"
+            && !shell.is_event_captured()
+            && let Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(key),
+                modifiers,
+                ..
+            }) = event
+            && !modifiers.command()
+            && !modifiers.alt()
+        {
+            use iced::keyboard::key::Named;
+            let mut position = Position::default();
+            self.content
+                .as_widget_mut()
+                .operate(child, bounds, renderer, &mut position);
+            let target = match key {
+                Named::PageUp => Some(position.current - position.viewport * 0.9),
+                Named::PageDown => Some(position.current + position.viewport * 0.9),
+                Named::Home => Some(0.0),
+                Named::End => Some(position.maximum),
+                _ => None,
+            };
+            if let Some(target) = target
+                && position.maximum > 0.0
+            {
+                let mut scroll = widget::operation::scrollable::scroll_to::<()>(
+                    widget::Id::new(self.key),
+                    widget::operation::scrollable::AbsoluteOffset {
+                        x: None,
+                        y: Some(target.clamp(0.0, position.maximum)),
+                    },
+                );
+                self.content
+                    .as_widget_mut()
+                    .operate(child, bounds, renderer, &mut scroll);
+                motion.start = None;
+                shell.capture_event();
+                shell.request_redraw();
+            }
+        }
     }
     fn draw(
         &self,
@@ -349,6 +395,7 @@ mod tests {
     fn wheel_events_scroll_content_and_pixels_remain_direct() -> TestResult {
         let mut element: Element<'_, ()> = surface(
             iced::widget::scrollable(iced::widget::Space::new().height(1000).width(200))
+                .id("fixture")
                 .height(200)
                 .width(200),
             0.0,
@@ -389,6 +436,14 @@ mod tests {
                 delta: mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
             }),
         );
+        // X11 emits modifier notifications alongside wheel input even when no
+        // key was pressed. They must not cancel the pending wheel movement.
+        dispatch(
+            &mut tree,
+            Event::Keyboard(iced::keyboard::Event::ModifiersChanged(
+                iced::keyboard::Modifiers::default(),
+            )),
+        );
         let mut position = Position::default();
         // No immediate jump on a wheel step.
         let motion = tree.state.downcast_ref::<Motion>();
@@ -404,6 +459,7 @@ mod tests {
                 delta: mouse::ScrollDelta::Pixels { x: 0.0, y: -17.0 },
             }),
         );
+        drop(dispatch);
         widget.operate(&mut tree, bounds, &renderer, &mut position);
         check_eq(
             position.current,
@@ -413,7 +469,42 @@ mod tests {
         check(
             tree.state.downcast_ref::<Motion>().start.is_none(),
             "no momentum after the movement ends",
-        )
+        )?;
+        for (key, expected) in [
+            (iced::keyboard::key::Named::PageDown, 257.0),
+            (iced::keyboard::key::Named::End, 800.0),
+            (iced::keyboard::key::Named::Home, 0.0),
+        ] {
+            let key = iced::keyboard::Key::Named(key);
+            widget.update(
+                &mut tree,
+                &Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: key.clone(),
+                    modified_key: key,
+                    physical_key: iced::keyboard::key::Physical::Code(
+                        iced::keyboard::key::Code::PageDown,
+                    ),
+                    location: iced::keyboard::Location::Standard,
+                    modifiers: iced::keyboard::Modifiers::default(),
+                    text: None,
+                    repeat: false,
+                }),
+                bounds,
+                cursor,
+                &renderer,
+                &mut clipboard,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            let mut position = Position::default();
+            widget.operate(&mut tree, bounds, &renderer, &mut position);
+            check_eq(
+                position.current,
+                expected,
+                "keyboard scrolling stays direct",
+            )?;
+        }
+        Ok(())
     }
     #[test]
     fn wheel_retargets_reverses_and_stops_at_its_clamped_target() -> TestResult {

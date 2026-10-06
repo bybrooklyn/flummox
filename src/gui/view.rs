@@ -61,7 +61,11 @@ fn hero<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
 pub fn view(state: &State) -> Element<'_, Message> {
     super::surface::animate(
         responsive(move |size| layout(state, size.width < 880.0)),
-        super::animation_pending(state) || state.status_deadline.is_some(),
+        super::animation_pending(state)
+            || state.status_deadline.is_some()
+            || state
+                .scroll_redraw_until
+                .is_some_and(|until| std::time::Instant::now() < until),
     )
 }
 

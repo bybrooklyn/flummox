@@ -69,7 +69,10 @@ fn animation_pending(state: &app::State) -> bool {
 /// which costs power for a window that is usually still.
 #[cfg(target_os = "linux")]
 fn animation_frames(state: &app::State) -> iced::Subscription<app::Message> {
-    let moving = animation_pending(state);
+    let moving = animation_pending(state)
+        || state
+            .scroll_redraw_until
+            .is_some_and(|until| std::time::Instant::now() < until);
     let frames = if moving || state.status_deadline.is_some() {
         iced::window::frames().map(|_| app::Message::Tick)
     } else {

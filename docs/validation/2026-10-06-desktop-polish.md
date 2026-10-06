@@ -3,7 +3,7 @@
 The [implementation plan](../plans/desktop-polish.md) remains the delivery contract.
 The baseline Linux desktop phase is committed as `596b21e`. The continuation
 adds native UI parity and the Windows coordinator/maintenance implementation.
-Native runtime and release acceptance remain pending.
+Native CI and release acceptance are recorded separately below.
 
 ## Delivered changes
 
@@ -102,15 +102,17 @@ record. They are not screenshots of a running desktop session.
 
 ## Required follow-up
 
-Reproduce the
-reported queue disappearance in a real window and verify wheel/trackpad input,
+Complete the remaining acceptance checks for wheel/trackpad input,
 rapid navigation, scroll restoration, jump links, keyboard input, native dialogs,
-large libraries, offline locations and reduced motion. The code addresses stale
-responses and widget identity; live reproduction has not been established here.
+large libraries, offline locations and reduced motion. The isolated live Linux window discovers custom collections and analyzes
+disposable files. Optimized Settings jump links settle within a 350 ms capture.
+X11 modifier notifications no longer cancel wheel easing; a regression exercises
+this sequence and direct keyboard scrolling. Native physical trackpad input and
+all job states still need interactive acceptance.
 
-Run the added native fixtures on Windows and Mac CI and inspect their exported
-previews. Windows cross-target Clippy proves compilation, including tests; it
-cannot execute them here. Mac compilation has not been checked locally. Verify
+The added fixtures execute in native CI and export previews. Mac CI passes.
+Windows native tests pass; the installer smoke check is being rerun after its
+release-notes repair. Verify
 tray/Explorer restart, startup ownership, dialogs, actual game/updater deferral,
 recovery and upgrades during work on disposable native installations.
 
@@ -121,6 +123,11 @@ alias handling and a Windows pipe reply race. Follow-up fixes resolve location
 aliases, retain pipe buffers until client acknowledgement and join the listener
 on shutdown. Explicit animation redraw requests also remove dependence on the
 one-second worker poll. The complete local CI gate passes after these fixes.
+The follow-up `a9ac255` passed Windows native tests by distinguishing temporary
+empty pipe buffers from disconnections. A new native delayed-reply regression
+checks that a client waits for the server. Final-frame redraws and direct
+keyboard scrolling cover the shared desktop surface. Blurred shadows were
+removed after they rendered artifacts and delayed software-renderer frames.
 No new tag or release was made.
 Native Mac runtime and all real-game qualification records remain pending.
 Version 0.0.2 must remain unpublished until its acceptance records pass.
