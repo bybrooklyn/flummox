@@ -70,7 +70,7 @@ Native CI and release acceptance are recorded separately below.
 - `just lint`: passed, all Linux features and targets, warnings denied.
 - `just test`: 144 library tests passed, including offscreen previews and motion,
   artwork, discovery cancellation and snapshot-ordering regressions. With the
-  session restrictions removed, all eight coordinator lifecycle tests pass. The
+  session restrictions removed, all nine coordinator lifecycle tests pass. The
   btrfs fixture now closes its own directory handle before queueing work, so busy
   detection does not classify the fixture as a running game. `just ci` passes,
   including a fresh dependency-policy check and all packaging tests.
@@ -86,8 +86,12 @@ Native CI and release acceptance are recorded separately below.
   the continuation also passes the normal policy check with the updated advisory
   database. Prose and whitespace checks passed.
 - Fixture screenshots were rendered without a display and inspected in wide,
-  narrow, dark and light layouts. The preview exporter now converts Iced's BGRA
-  desktop pixels to RGBA before saving PNGs.
+  narrow, dark and light layouts. The preview fixture also renders Running,
+  Paused, Waiting, Needs attention and History rows together, plus retained
+  rows under a disconnected-worker warning, at wide and narrow widths. These
+  synthetic views do not establish the corresponding live job transitions.
+  The preview exporter converts Iced's BGRA desktop pixels to RGBA before
+  saving PNGs.
 
 Baseline logs and previews are under `/tmp/flummox-polish-*`. Continuation logs
 are under `/tmp/flummox-next-*`. Workflow checks passed with `actionlint`; YAML

@@ -61,9 +61,12 @@ installs are restored. Installation instructions are in [install.md](install.md)
   native Linux x64/ARM64, macOS ARM64, and Windows x64 builds, Windows installer
   checks, Homebrew installation, and Arch install/upgrade/GUI startup. AUR and
   Homebrew updates also passed. See release-automation.md for the pipeline.
-- Windows launcher/maintenance parity, real NTFS game tests, and direct
-  WOF/Game Compressor comparisons remain separate work. Native APFS compression is implemented for 0.0.2 and has native fixture evidence.
-  Real-game acceptance is pending. Mac FUSE, Bottles, and community report sharing remain deferred.
+- Windows Steam, Epic, GOG and Heroic discovery, opt-in maintenance and the
+  coordinator are implemented for 0.0.2; manual lifecycle and real NTFS game
+  tests remain. Native APFS compression has native fixture evidence, but Mac
+  interactive and real-game acceptance is pending. Direct WOF/Game Compressor
+  comparisons, Mac FUSE, Bottles and community report sharing remain separate
+  work.
 
 Small-file grouping is a bounded sample reported separately from the overall
 prediction. It is not a full-store allocation estimate. Restore and reclaim

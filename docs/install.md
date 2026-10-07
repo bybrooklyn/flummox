@@ -132,8 +132,8 @@ retries, and signing.
 
 ## Games in other locations
 
-Open **Drives & libraries**, choose **Games library**, and browse or enter a
-location such as `~/My Games` or `/mnt/other-drive/Games`. Each immediate
+Open **Settings > Locations**, choose **Games library**, and browse or enter
+a location such as `~/My Games` or `/mnt/other-drive/Games`. Each immediate
 subfolder appears as a separate game. Choose **Single game** when the folder
 itself contains one game's files. Spaces, quoted paths, and `~/My\ Games` are
 accepted; Flummox expands your home folder without executing shell commands.
@@ -153,8 +153,9 @@ flummox jobs add-folder '/mnt/games/One Game' --single-game
 flummox jobs remove-folder '~/My Games'
 ```
 
-The custom-location protocol is version 6. When upgrading a running version 5
-coordinator, use `flummox jobs restart` before adding locations.
+The development coordinator protocol is version 8. After upgrading a running
+older coordinator, follow [the restart or logout procedure](#upgrade-a-running-installation)
+once it is idle and no managed games are mounted, before adding locations.
 
 ## Verify release signatures
 

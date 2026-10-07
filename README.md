@@ -21,9 +21,10 @@ are shown separately.
 
 Download the app from [GitHub Releases](https://github.com/bybrooklyn/flummox/releases).
 Windows has a per-user installer and portable ZIP; Linux has x86_64 and ARM64
-archives. Arch/CachyOS users can install `flummox-bin` from the AUR. The Apple
-Silicon Homebrew cask provides the macOS shell; compression is not implemented
-on macOS yet. See [installation instructions](docs/install.md).
+archives. Arch/CachyOS users can install `flummox-bin` from the AUR. The
+published v0.0.1 Apple Silicon Homebrew cask provides an informational macOS
+shell. The unreleased 0.0.2 source adds native APFS compression. See
+[installation instructions](docs/install.md).
 
 To build from source:
 
@@ -52,28 +53,34 @@ On Windows with the Rust MSVC toolchain:
 cargo build --release --features gui
 ```
 
-The same `flummox-gui` application builds on Linux and Windows. Rust selects
-the storage implementation for the target at compile time. Windows uses the
-operating system's WOF/LZX storage and does not need a filesystem driver.
+The same `flummox-gui` application builds on Linux, Windows and Mac. Rust
+selects the storage implementation for the target at compile time. Windows
+uses the operating system's WOF/LZX storage and does not need a filesystem
+driver.
 
-## What works today
+## Development build (unreleased 0.0.2)
+
+These capabilities describe the current source, not the published v0.0.1
+download. Real-game release acceptance is
+[still pending](docs/validation/README.md).
 
 | | |
 |---|---|
 | **Linux games** | Steam (native, Flatpak and snap), Heroic installed manifests, Lutris, and custom game folders |
 | **Linux storage** | Native btrfs compression; verified writable Maximum Space stores on ext4, XFS, F2FS, ZFS, and btrfs with FUSE |
-| **Windows** | Local Steam discovery and custom folders on NTFS using transparent WOF/LZX compression |
-| **Desktop** | Wayland and X11 on Linux; native window on Windows |
+| **Windows** | Local Steam, Epic, GOG and Heroic discovery, plus custom folders on NTFS; WOF/LZX compression, durable background jobs and opt-in maintenance |
+| **macOS** | Local Steam and Heroic discovery, custom folders, native APFS compression and replacement recovery; jobs run in the app, without a durable Mac coordinator |
+| **Desktop** | Wayland and X11 on Linux; native windows on Windows and macOS; Overview, Games and Settings navigation |
 
 ## What does not work yet
 
 | | |
 |---|---|
 | **Linux native compression outside btrfs** | Maximum Space works through a writable FUSE store, but these filesystems have no in-place native backend |
-| **Windows launcher parity** | Steam and manual folders work. Heroic, Xbox, GOG Galaxy, background maintenance, and Maximum Space are still Linux-only |
-| **macOS compression** | Native APFS compression, verified restoration, and replacement recovery in the next release |
+| **Windows Maximum Space and Xbox discovery** | Windows currently offers native WOF/LZX compression; protected Xbox installs need separate feasibility and safety work |
+| **macOS Maximum Space and durable background jobs** | Native APFS compression is implemented; FUSE stores and a persistent Mac coordinator are not |
 | **Bottles** | Discovery is planned |
-| **Flatpak build** | Not possible. The sandbox hides other processes, so Flummox could not tell whether a game was running, which is the check that keeps it from touching a game you are playing |
+| **Flatpak build** | Not available. The sandbox hides other processes, so Flummox could not tell whether a game was running, which is the check that keeps it from touching a game you are playing |
 
 ## Use the window
 
@@ -86,36 +93,43 @@ available; a missing dialog helper leaves the path field usable. Maximum compare
 levels 9, 15, 19, and 22 per unique chunk and keeps the smallest result;
 ties use the cheaper level. Balanced remains the quicker native default.
 
-On Windows, choose a detected Steam game or paste another installed-game
-folder, then press **Optimize**. Flummox reports files processed and actual
-allocated bytes freed while Windows works. **Stop** finishes the current file
-and keeps completed work valid. **Restore** removes WOF backing and leaves the
-same files at the same paths.
+On Windows, choose a locally detected Steam, Epic, GOG or Heroic game, or add
+another installed-game folder, then press **Optimize**. Flummox reports files
+processed and allocated bytes freed while Windows works. **Stop** finishes the
+current file and keeps completed work valid. **Restore** removes WOF backing
+and leaves the same files at the same paths.
 
 The window theme and responsive layout are shared across targets. Linux-only
 storage controls appear only when their backend and FUSE support are available.
 Mac uses built-in APFS compression with staged verification and durable replacement
 journals. Unsupported desktop targets retain the informational shell.
 
-Queue supports pause, resume, cancel, and retry for native jobs and Maximum Space preparation. Store creation and compaction report measured progress; verification reports checked items. File switches, restoration, and reclaim finish without interruption, with controls hidden during those phases. Closing the window leaves jobs
-with the background coordinator; reopening reconnects. Analysis and compression
-pause when a detected game is running. Current filesystem operations finish
-before workers stop at 16 MiB range boundaries, including inside large files.
+Settings > Jobs groups running, waiting, attention and completed work. Linux
+jobs support pause, resume, cancel and retry for native work and Maximum Space
+preparation. Store creation and compaction report measured progress; verification
+reports checked items. File switches, restoration and reclaim finish without
+interruption, with controls hidden during those phases. Linux and Windows jobs
+survive closing the window because their coordinators keep running. Mac jobs
+currently run inside the app. Analysis and compression pause when a detected
+game is running. Current Linux filesystem operations finish before workers stop
+at 16 MiB range boundaries, including inside large files.
 
-Drives lets you add a game folder and opt each library into maintenance. An
-opt-in starts observing from that point, so existing installs are not all
-compressed immediately. Subsequent installations and completed updates queue
-work. The coordinator stays running after the window closes and starts at
-desktop login while any library has maintenance enabled. Disabling the last
-library removes Flummox's startup entry.
+Settings > Locations lets you add game folders. On Linux and Windows,
+Settings > Maintenance opts libraries into background work. Opting in
+establishes a baseline, so existing installs are not all compressed
+immediately. Subsequent installations and
+completed updates can queue work. Linux maintains a login entry while an opted-in
+library or mounted install needs its coordinator. Windows login startup is a
+separate opt-in.
 
 `Ctrl+F` focuses game search, `Ctrl+R` refreshes, and `Escape` clears selection
 and closes details. Tab and Shift+Tab move focus. Reduce motion is saved in
-Drives. Artwork comes from Steam's local cache; no artwork or telemetry is sent
-to a server.
+Settings > Appearance. Artwork comes from local launcher caches; no artwork or
+telemetry is sent to a server.
 
-The command line shares ordinary compression and decompression jobs with the
-window. Interrupting the CLI disconnects the client and leaves its job running:
+On Linux, the command line shares ordinary compression and decompression jobs
+with the window. Interrupting the CLI disconnects the client and leaves its
+job running:
 
 ```sh
 flummox jobs

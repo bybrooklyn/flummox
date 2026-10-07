@@ -1,9 +1,12 @@
 # Jobs and compression
 
-The GUI and ordinary CLI compression/decompression commands send versioned
-JSON requests to a per-user coordinator. The coordinator owns a single active
-worker and a durable SQLite queue. Closing a client leaves the worker running.
-Advanced CLI overrides use the same filesystem-operation lock.
+On Linux, the GUI and ordinary CLI compression/decompression commands send
+versioned JSON requests to a per-user coordinator. The coordinator owns a
+single active worker and a durable SQLite queue. Closing a client leaves the
+worker running. Advanced CLI overrides use the same filesystem-operation lock.
+On Windows, GUI jobs use a separate per-user coordinator and durable queue;
+the CLI still operates directly. Mac native jobs run in the app or CLI without
+a durable coordinator.
 
 ```mermaid
 stateDiagram-v2
@@ -117,14 +120,15 @@ WOF/LZX measurement.
 
 ## Current boundaries
 
-Native writes support Linux btrfs and Windows WOF/LZX. The
-[pack store](pack-store.md) adds verified larger chunks, within-store and
-cross-game sharing, restoration, and FUSE mounts with persistent copy-on-write
-data. Windows background maintenance and pack mounting, Bottles discovery,
-and opt-in community data remain separate implementation work. Heroic and
-Lutris adapters depend on their installed metadata; missing or malformed
-sources produce warnings. The GUI's custom-folder control accepts a path;
-native selection uses an installed KDialog or Zenity helper.
+Native writes support Linux btrfs, Windows WOF/LZX and macOS APFS in the
+unreleased 0.0.2 source. The [pack store](pack-store.md) adds verified larger
+chunks, within-store and cross-game sharing, restoration, and Linux FUSE
+mounts with persistent copy-on-write data. Windows background maintenance is
+implemented; Windows and Mac pack mounting, Bottles discovery, and opt-in
+community data remain separate work. Heroic and Lutris adapters depend on
+their installed metadata; missing or malformed sources produce warnings.
+The Linux GUI's custom-folder control accepts a path; native selection uses
+an installed KDialog or Zenity helper.
 
 `just ci` checks code, tests, dependency policy, and prose. The IPC tests use
 temporary homes and games. The native lifecycle test checks compression,

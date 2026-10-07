@@ -137,15 +137,18 @@ online metadata and publisher signing remain deferred.
   cross-target lint. Windows runtime fixtures and native UI previews compile;
   CI runs them and exports preview images. See the
   [delivery and validation record](../validation/2026-10-06-desktop-polish.md).
-- Pending graphical acceptance: actual queue disappearance, wheel/trackpad and
-  anchor scrolling, keyboard navigation, native dialogs and image layouts on
-  each desktop. The complete Linux `just ci` gate now passes, including all eight
-  coordinator lifecycle tests and a real btrfs worker round trip. Native
-  Windows/Mac runtime CI has not run for this change.
-- Pending Windows manual lifecycle acceptance: tray/Explorer restart, login,
-  busy/updating games, unplugged/replaced drives, recovery and upgrades while a
-  worker is finishing a file. Installer smoke checks and isolated coordinator
-  tests are wired into CI, not claimed as locally executed.
-- Pending release acceptance, Mac compilation/runtime, real-game qualification,
-  remote CI and publication. Git metadata is now writable in this session.
-  No new release was published. Game Compressor adoption work remains deferred.
+- An isolated live Linux window check covered wheel input, jump links, scroll
+  restoration, keyboard navigation, missing-art layouts, picker cancellation and
+  an attention job retained across navigation. A disposable btrfs run retained
+  completed history and selection. Physical trackpads, running/paused GUI
+  states, KDE and second-session dialogs and real drive disconnection remain
+  unverified. The complete Linux `just ci` gate passes, including coordinator
+  lifecycle tests and a btrfs worker round trip.
+- Native Windows/Mac CI passes at `be09967` and the latest `848eda3` CI run also
+  passes. Windows installer lifecycle and isolated coordinator fixtures ran in
+  CI, but manual tray/Explorer restart, login, busy/updating games, unplugged
+  drives, recovery and upgrades while a worker finishes a file remain pending.
+- Pending release acceptance: real-game qualification on Linux native, Proton,
+  Windows and Mac, native interactive checks and publication. Source changes
+  are pushed; no new release was published. Game Compressor adoption work
+  remains deferred.

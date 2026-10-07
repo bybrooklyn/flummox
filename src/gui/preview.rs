@@ -173,5 +173,59 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
         job.bytes_total = 0;
         job.message = "Switching stores; this step finishes before stopping".into();
     }
-    render(&state, 720, 720, &output.join("queue-switching.png"))
+    render(&state, 720, 720, &output.join("queue-switching.png"))?;
+
+    state.page = Page::Settings;
+    state.snapshot_loaded = true;
+    let mut job = state
+        .snapshot
+        .jobs
+        .last()
+        .ctx("fixture storage job")?
+        .clone();
+    state.snapshot.jobs.clear();
+    job.operation = Operation::Compress;
+    job.pack = None;
+    job.pack_interruptible = false;
+    job.files_total = 140;
+    job.bytes_total = 4_000_000_000;
+    for (id, title, phase, paused, message) in [
+        (3, "Adventure", Phase::Running, false, "Compressing files"),
+        (4, "Puzzle", Phase::Paused, true, "Paused by the user"),
+        (5, "Racing", Phase::Queued, false, "Waiting for another job"),
+        (
+            6,
+            "Strategy",
+            Phase::Partial,
+            false,
+            "One file needs review",
+        ),
+        (7, "Arcade", Phase::Completed, false, "Compression complete"),
+    ] {
+        let done = if phase == Phase::Queued {
+            0
+        } else if phase == Phase::Completed {
+            140
+        } else {
+            10
+        };
+        state.snapshot.jobs.push(Job {
+            id,
+            game: Game {
+                id: GameId::new(Launcher::Manual, format!("fixture-{id}")),
+                title: title.into(),
+                ..job.game.clone()
+            },
+            phase,
+            files_done: done,
+            bytes_done: done * 25_000_000,
+            user_paused: paused,
+            message: message.into(),
+            ..job.clone()
+        });
+    }
+    render(&state, 1100, 1800, &output.join("jobs-phases.png"))?;
+    render(&state, 720, 1800, &output.join("jobs-phases-narrow.png"))?;
+    state.connection_error = Some("Worker disconnected; reconnecting".into());
+    render(&state, 1100, 1800, &output.join("jobs-disconnected.png"))
 }

@@ -3,17 +3,20 @@
 ## Desktop polish priority
 
 The [desktop implementation plan](plans/desktop-polish.md) defines navigation,
-motion, stable jobs, asynchronous discovery and local artwork. UI acceptance
-precedes Windows expansion. The [desktop delivery record](validation/2026-10-06-desktop-polish.md)
-separates implemented changes from graphical and platform acceptance still needed.
+motion, stable jobs, asynchronous discovery, local artwork and Windows expansion.
+Those changes are implemented in the 0.0.2 source. The
+[desktop delivery record](validation/2026-10-06-desktop-polish.md) separates
+fixture and live Linux evidence from the graphical and platform acceptance
+still needed.
 
 ## Release acceptance
 
 Native Factorio simulation and Super Meat Boy Proton startup passed disposable
 storage-cycle smoke checks. See [the evidence](validation/2026-10-04-linux-smoke.md)
-for measured results and the remaining limits. The typed-path GUI flow also
-passed an isolated graphical check with a spaced collection path and an invalid
-path control. Native desktop picker integration remains pending.
+for measured results and the remaining limits. The typed-path GUI flow passed an isolated graphical check with a spaced
+collection path and an invalid path control. A later live Linux check opened
+and cancelled the native picker; KDE and a second desktop session still need
+interactive selection and cancellation checks.
 
 These checks remain necessary before calling the release fully validated:
 
@@ -59,8 +62,10 @@ should install, compress a supported game, and find Restore without documentatio
 
 ## Later work
 
-Mac FUSE support, Windows launcher and maintenance parity, scheduling, Bottles
-integration, and community report sharing remain deferred. Apple Developer ID,
+Windows Steam, Epic, GOG and Heroic discovery and opt-in maintenance are
+implemented in the 0.0.2 source. Xbox discovery, Windows pack mounting, Mac
+FUSE stores and durable Mac background jobs, scheduling, Bottles integration,
+and community report sharing remain separate work. Apple Developer ID,
 notarization, and Windows Authenticode require publisher credentials; current
 release authentication uses a separate stable Minisign key.
 

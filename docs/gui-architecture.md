@@ -1,13 +1,15 @@
 # Desktop architecture
 
 `flummox-gui` has one entrypoint and one public `gui::run` function. The GUI
-feature compiles the shared theme and desktop shell on every target. Linux and
-Windows select their storage integration with `cfg(target_os)`, so runtime code
-does not guess which operating system it is using.
+feature compiles the shared theme and desktop shell on every target. Linux,
+Windows and Mac select their storage integration with `cfg(target_os)`, so
+runtime code does not guess which operating system it is using.
 
-Linux owns btrfs, FUSE stores, process detection and the durable coordinator.
-Windows owns NTFS WOF calls and Windows launcher discovery. Targets without a
-safe backend show the shared shell with compression disabled. Linux system
+Linux owns btrfs, FUSE stores, process detection and its durable coordinator.
+Windows owns NTFS WOF calls, launcher discovery, a separate durable coordinator
+and opt-in maintenance. Mac owns native APFS compression and recovery; Mac GUI
+jobs currently run in the app instead of a durable coordinator. Targets without
+a safe backend show the shared shell with compression disabled. Linux system
 dependencies use `cfg(target_os = "linux")`, not the broader `cfg(unix)`, since
 Landlock, `/proc` and btrfs are Linux interfaces.
 

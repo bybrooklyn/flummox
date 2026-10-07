@@ -372,6 +372,111 @@ fn native_worker_reuses_receipts_and_reprocesses_a_changed_file() -> TestResult 
 }
 
 #[test]
+fn user_pause_holds_a_queued_job_and_resume_completes_it() -> TestResult {
+    let temp = tempfile::TempDir::new_in(std::env::current_dir().ctx("cwd")?).ctx("fixture")?;
+    if flummox::fsprobe::probe(temp.path())
+        .ctx("filesystem")?
+        .fstype
+        != "btrfs"
+    {
+        eprintln!("skipped: pause round trip requires btrfs");
+        return Ok(());
+    }
+    let home = temp.path().join("home");
+    let path = temp.path().join("game");
+    std::fs::create_dir_all(&home).ctx("fixture home")?;
+    std::fs::create_dir_all(&path).ctx("fixture game")?;
+    // Enough compressible data that pausing lands before the worker finishes:
+    // small fixtures rewrite in milliseconds on this filesystem.
+    let chunk = b"pause fixture payload line for compression testing\n".repeat(150_000);
+    let mut names = Vec::new();
+    for index in 0..64 {
+        let name = format!("payload-{index}.bin");
+        std::fs::write(path.join(&name), &chunk).ctx("fixture payload")?;
+        names.push(name);
+    }
+    // New files may land compressed under the mount default, leaving the
+    // worker nothing to rewrite. Undo that first so the job takes real work.
+    let anchor = flummox::safeio::Anchor::open(&path).ctx("anchor")?;
+    for name in &names {
+        flummox::backend::btrfs::decompress_fd(
+            &anchor.open_file(Path::new(name)).ctx("fixture file")?,
+        )
+        .ctx("raw baseline")?;
+    }
+    let (compressed, mapped) =
+        flummox::backend::btrfs::compressed_bytes(&path.join(names.first().ctx("fixture name")?))
+            .ctx("baseline extents")?;
+    check(mapped > 0, "baseline maps actual extents")?;
+    check_eq(compressed, 0, "the baseline must be uncompressed")?;
+    // A retained directory handle would make the test itself look like a running game.
+    drop(anchor);
+    let _service = start(&home)?;
+    let game = Game {
+        id: GameId::new(Launcher::Manual, "pause-fixture"),
+        also: vec![],
+        title: "Pause Fixture".into(),
+        install_dir: path.clone(),
+        build: None,
+        size_hint: None,
+        state: InstallState::Idle,
+        is_tool: false,
+    };
+    let snapshot = request(
+        &home,
+        Request::Enqueue {
+            game,
+            operation: Operation::Compress,
+            options: Default::default(),
+        },
+    )?;
+    let id = snapshot.jobs.last().ctx("job queued")?.id;
+    request(&home, Request::Pause { id, paused: true }).ctx("pause job")?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let snapshot = request(&home, Request::Snapshot)?;
+        let job = snapshot
+            .jobs
+            .iter()
+            .find(|j| j.id == id)
+            .ctx("paused job")?;
+        if job.phase == Phase::Paused {
+            check(job.user_paused, "pause records the user request")?;
+            break;
+        }
+        check(
+            Instant::now() < deadline,
+            format!("job never paused: {job:?}"),
+        )?;
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let snapshot = request(&home, Request::Snapshot)?;
+    let held = snapshot.jobs.iter().find(|j| j.id == id).ctx("held job")?;
+    check_eq(held.phase, Phase::Paused, "paused work stays paused")?;
+    request(&home, Request::Pause { id, paused: false }).ctx("resume job")?;
+    let job = finished(&home, id)?;
+    check_eq(
+        job.phase,
+        Phase::Completed,
+        format!("resumed result: {job:?}"),
+    )?;
+    check_eq(
+        job.files_done,
+        names.len() as u64,
+        "resuming rewrites every fixture file",
+    )?;
+    for name in &names {
+        check_eq(
+            std::fs::read(path.join(name)).ctx("verify payload")?,
+            chunk.clone(),
+            "paused and resumed work preserves every byte",
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
 fn closing_clients_keeps_jobs_and_restart_preserves_results() -> TestResult {
     let temp = tempfile::TempDir::new_in(std::env::current_dir().ctx("cwd")?).ctx("fixture")?;
     let home = temp.path().join("home");
