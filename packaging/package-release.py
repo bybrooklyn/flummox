@@ -29,6 +29,35 @@ def split_debug(executable, debug_dir):
     return {'file': executable.name, 'before': before, 'after': executable.stat().st_size}
 
 
+NOTICES = 'THIRD-PARTY-LICENSES.txt'
+
+
+def notices_input(path, required):
+    """The generated third-party licence file, or None when it is absent and optional."""
+    if path.is_file():
+        return path
+    if required:
+        raise RuntimeError(f'Release build requires the third-party licence notices, missing: {path}')
+    return None
+
+
+def linux_inputs(binaries, notices):
+    files = {
+        'bin/flummox': binaries / 'flummox',
+        'bin/flummox-gui': binaries / 'flummox-gui',
+        'share/applications/flummox.desktop': ROOT / 'packaging/flummox.desktop',
+        'lib/systemd/user/flummox-watch.service': ROOT / 'packaging/flummox-watch.service',
+        'share/doc/flummox/README.md': ROOT / 'README.md',
+        'share/doc/flummox/usage.md': ROOT / 'docs/usage.md',
+        'share/doc/flummox/status.md': ROOT / 'docs/status.md',
+        'share/doc/flummox/install.md': ROOT / 'docs/install.md',
+        'share/licenses/flummox/LICENSE': ROOT / 'LICENSE',
+    }
+    if notices:
+        files['share/licenses/flummox/' + NOTICES] = notices
+    return files
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=ROOT / 'dist')
@@ -36,23 +65,16 @@ def main():
     parser.add_argument('--platform', choices=['linux', 'macos', 'windows'], default='linux')
     parser.add_argument('--arch', choices=['x86_64', 'aarch64'], default='x86_64')
     parser.add_argument('--debug-output', type=Path, default=ROOT / 'release-debug')
+    parser.add_argument('--notices', type=Path, default=ROOT / NOTICES)
+    parser.add_argument('--require-notices', action='store_true', help='fail when the notices file is absent')
     args = parser.parse_args()
+    notices = notices_input(args.notices, args.require_notices)
     version = tomllib.loads((ROOT / 'Cargo.toml').read_text())['package']['version']
     name = f'flummox-{version}-{args.platform}-{args.arch}'
     if args.platform != 'linux':
-        package_desktop(args, version, name)
+        package_desktop(args, version, name, notices)
         return
-    files = {
-        'bin/flummox': args.binaries / 'flummox',
-        'bin/flummox-gui': args.binaries / 'flummox-gui',
-        'share/applications/flummox.desktop': ROOT / 'packaging/flummox.desktop',
-        'lib/systemd/user/flummox-watch.service': ROOT / 'packaging/flummox-watch.service',
-        'share/doc/flummox/README.md': ROOT / 'README.md',
-        'share/doc/flummox/release-readiness.md': ROOT / 'docs/release-readiness.md',
-        'share/doc/flummox/install.md': ROOT / 'docs/install.md',
-        'share/doc/flummox/next-steps.md': ROOT / 'docs/next-steps.md',
-        'share/licenses/flummox/LICENSE': ROOT / 'LICENSE',
-    }
+    files = linux_inputs(args.binaries, notices)
     if (ROOT / 'RELEASE-NOTES.md').is_file():
         files['share/doc/flummox/CHANGELOG.md'] = ROOT / 'RELEASE-NOTES.md'
     for destination, source in files.items():
@@ -106,7 +128,7 @@ def checksum(artifact):
     artifact.with_name(artifact.name + '.sha256').write_text(f'{digest}  {artifact.name}\n')
 
 
-def package_desktop(args, version, name):
+def package_desktop(args, version, name, notices):
     args.output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='flummox-release-') as temporary:
         stage = Path(temporary)
@@ -134,6 +156,8 @@ def package_desktop(args, version, name):
             (contents / 'Info.plist').write_bytes(plistlib.dumps(info))
             for filepath in ['LICENSE', 'RELEASE-NOTES.md']:
                 shutil.copy2(ROOT / filepath, contents / 'Resources' / filepath)
+            if notices:
+                shutil.copy2(notices, contents / 'Resources' / NOTICES)
             subprocess.run(['codesign', '--force', '--deep', '--sign', '-', str(contents.parent)], check=True)
             subprocess.run(['codesign', '--verify', '--deep', '--strict', str(contents.parent)], check=True)
             artifact = args.output / f'{name}.zip'
@@ -156,6 +180,8 @@ def package_desktop(args, version, name):
                     bundle.write(executable, filename)
                 for filename in ['LICENSE', 'RELEASE-NOTES.md']:
                     bundle.write(ROOT / filename, filename)
+                if notices:
+                    bundle.write(notices, NOTICES)
             installer = args.output / f'{name}-setup.exe'
             if not installer.is_file():
                 raise RuntimeError(f'Missing Windows installer: {installer}')

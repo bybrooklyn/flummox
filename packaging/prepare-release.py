@@ -10,6 +10,15 @@ import tomllib
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def check_tag_against_source(root, version, current):
+    """The tag must name the version the source declares, and a stable tag needs curated notes."""
+    base = version.split('-')[0]
+    if base != current.split('-')[0]:
+        raise ValueError(f'Tag version {version} does not match Cargo.toml version {current}; bump Cargo.toml in the tagged commit')
+    if '-' not in version and not (root / 'docs/releases' / f'{version}.md').is_file():
+        raise ValueError(f'A stable release needs docs/releases/{version}.md')
+
+
 def prepare(root, tag):
     manifest = root / 'Cargo.toml'
     current = tomllib.loads(manifest.read_text())['package']['version']
@@ -18,6 +27,8 @@ def prepare(root, tag):
         raise ValueError('Use a SemVer tag such as v0.0.1 or v0.0.1-rc.1')
     if tag and tag != f'v{version}':
         raise ValueError('Release tags must start with v')
+    if tag:
+        check_tag_against_source(root, version, current)
     manifest.write_text(re.sub(r'^version = "[^"]+"$', f'version = "{version}"', manifest.read_text(), count=1, flags=re.M))
     lock = root / 'Cargo.lock'
     pattern = r'(\[\[package\]\]\nname = "flummox"\nversion = ")[^"]+("\n)'
