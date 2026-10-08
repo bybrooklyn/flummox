@@ -31,6 +31,8 @@ version has no download yet. [Full notes](docs/releases/0.0.2.md).
 - A compress job reports its progress once and in order. The bar used to fill
   during sampling, empty, and fill again.
 - Linux downloads no longer carry debug data.
+- Building a Maximum Space store uses every processor core. A 4 GB game that
+  took 26 minutes takes about 4, and the store comes out byte for byte the same.
 
 ### Security
 

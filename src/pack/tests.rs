@@ -884,3 +884,59 @@ fn a_recreated_or_replaced_folder_shows_only_its_own_files() -> TestResult {
         "the recreated folder is still empty after reopening",
     )
 }
+
+// Chunks are encoded in parallel batches. The store must not depend on how
+// many threads did that, or on a chunk repeating inside one batch.
+#[test]
+fn a_store_is_the_same_whatever_the_thread_count() -> TestResult {
+    let temp = tempfile::tempdir().ctx("fixture")?;
+    let source = temp.path().join("game");
+    fs::create_dir(&source).ctx("source")?;
+    let unique = noise(9 * 1024 * 1024);
+    fs::write(source.join("a-unique.bin"), &unique).ctx("unique")?;
+    fs::write(
+        source.join("b-repeat.bin"),
+        [unique.as_slice(), unique.as_slice()].concat(),
+    )
+    .ctx("repeated")?;
+    fs::write(
+        source.join("c-text.bin"),
+        b"compressible line\n".repeat(400_000),
+    )
+    .ctx("text")?;
+    fs::write(source.join("d-zero.bin"), vec![0u8; 6 * 1024 * 1024]).ctx("zeros")?;
+    let build = |threads: usize, name: &str| -> Result<Vec<u8>, String> {
+        let store = temp.path().join(name);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .ctx("pool")?;
+        pool.install(|| create(&source, &store, Options::maximum(), &AtomicBool::new(false)))
+            .ctx("create")?;
+        fs::read(&store).ctx("store bytes")
+    };
+    let one = build(1, "one.flumpack")?;
+    let many = build(6, "many.flumpack")?;
+    check(
+        one == many,
+        "one thread and six threads wrote different stores",
+    )?;
+    let restored = temp.path().join("restored");
+    restore(
+        &temp.path().join("many.flumpack"),
+        &restored,
+        &AtomicBool::new(false),
+    )
+    .ctx("restore")?;
+    check_eq(
+        fs::read(restored.join("b-repeat.bin"))
+            .ctx("restored")?
+            .len(),
+        2 * unique.len(),
+        "the repeated file restores at full length",
+    )?;
+    check(
+        fs::read(restored.join("a-unique.bin")).ctx("restored unique")? == unique,
+        "restored bytes match the source",
+    )
+}
