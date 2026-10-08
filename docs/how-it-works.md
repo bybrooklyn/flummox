@@ -40,8 +40,8 @@ about 20 KB of nested braces would overflow the stack and abort the process.
 
 **Checks.** `just ci` runs clippy at deny-warnings, the full test suite, and
 `cargo deny check` for advisories, licences, duplicate versions and sources.
-A pre-push hook runs the same thing, so CI is a second opinion rather than the
-first one. `unwrap`, `expect`, `panic` and indexing are banned throughout,
+The pre-push hook in `.githooks/`, installed with `just hooks`, runs the same
+thing, so CI is a second opinion after the first. `unwrap`, `expect`, `panic` and indexing are banned throughout,
 including in tests.
 
 See [the job and compression design](jobs-and-compression.md) for state

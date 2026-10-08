@@ -6,7 +6,8 @@ Every release, newest first. Full notes for each version are in
 ## 0.0.2 (unreleased)
 
 Real-game acceptance is [still pending](docs/validation/README.md), so this
-version has no download yet. [Full notes](docs/releases/0.0.2.md).
+version has no stable download yet. Release candidates are published as
+prereleases. [Full notes](docs/releases/0.0.2.md).
 
 ### Added
 

@@ -2,9 +2,9 @@
 
 Your games take up less space and they still work after! Flummox is named for the reaction to how much storage you end up saving. (which in *my* personal experience, is a lot)
 
-Basically, Flummox beats your filesystem into compressing your game files (or whatever else you add to Flummox!) The files are not moved, they are just told to be stored in a different way.
+Basically, Flummox beats your filesystem into compressing your game files (or whatever else you add to Flummox!) With Standard compression the files stay where they are and are just told to be stored in a different way. Maximum Space runs the game from a compressed store mounted at its usual path, and keeps the original aside until you confirm the game works.
 
-Savings you get back very much depend on what is being compressed. Stuff that is already squeezed, like music, video and those bigfile things, you know them? those can't really be compressed again, so the gains would be very small and not worth the CPU. (nothing ever gets *bigger* though, the filesystem just leaves those parts alone.) Raw textures and plain game data are where the space comes back: one 240 MB Firewatch asset file went down to 162 MB on my drive.
+Savings you get back very much depend on what is being compressed. Stuff that is already squeezed, like music, video and those bigfile things, you know them? those can't really be compressed again, so the gains would be very small and not worth the CPU. (compression itself never makes a file bigger, the filesystem just leaves those parts alone, though snapshots can push drive usage up, see below.) Raw textures and plain game data are where the space comes back: Flummox estimated that one 240 MB Firewatch asset file went down to about 162 MB on my drive. That is an estimate, because btrfs only reports real per-file savings to a privileged tool (`compsize`) that Flummox does not ask to run.
 
 ## Get Flummox
 
@@ -33,7 +33,7 @@ git clone https://github.com/bybrooklyn/flummox
 cd flummox/packaging && makepkg -si
 ```
 
-Or if you prefer other distros (and have Rust and FUSE dev files):
+Or if you prefer other distros (and have Rust 1.98 or newer, plus the development headers the window needs: xkbcommon, xkbcommon-x11, Wayland, X11, Xrandr, Xi, Xcursor, GL and fontconfig. On Debian and Ubuntu that is `libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libxcursor-dev libgl1-mesa-dev libfontconfig1-dev`. Maximum Space needs `fuse3` at run time, not to build):
 
 ```sh
 git clone https://github.com/bybrooklyn/flummox
@@ -64,19 +64,19 @@ expire. Flummox checks and warns before it starts.
 
 ## Everything past this point is the smart AI nonsense
 
-- [Using Flummox](docs/usage.md): the window, the command line, and compressing new downloads automatically
-- [Status](docs/status.md): what works on each platform, what does not yet, and what the next release adds
-- [How it works](docs/how-it-works.md): the mechanism, and benchmarks against other approaches
-- [Installation](docs/install.md): packages, upgrades and release builds
-- [Jobs and compression design](docs/jobs-and-compression.md): state transitions, recovery and sampling
-- [Maximum Space stores](docs/pack-store.md): store commands and format
-- [Release acceptance](docs/validation/README.md): what must pass before a tag
-- [Security audit](docs/security/2026-10-08-audit.md): what was reviewed, what was fixed, and what is still open
-- [Changelog](CHANGELOG.md): what each version changed
+- [Using Flummox](https://github.com/bybrooklyn/flummox/blob/main/docs/usage.md): the window, the command line, and compressing new downloads automatically
+- [Status](https://github.com/bybrooklyn/flummox/blob/main/docs/status.md): what works on each platform, what does not yet, and what the next release adds
+- [How it works](https://github.com/bybrooklyn/flummox/blob/main/docs/how-it-works.md): the mechanism, and benchmarks against other approaches
+- [Installation](https://github.com/bybrooklyn/flummox/blob/main/docs/install.md): packages, upgrades and release builds
+- [Jobs and compression design](https://github.com/bybrooklyn/flummox/blob/main/docs/jobs-and-compression.md): state transitions, recovery and sampling
+- [Maximum Space stores](https://github.com/bybrooklyn/flummox/blob/main/docs/pack-store.md): store commands and format
+- [Release acceptance](https://github.com/bybrooklyn/flummox/blob/main/docs/validation/README.md): what must pass before a tag
+- [Security audit](https://github.com/bybrooklyn/flummox/blob/main/docs/security/2026-10-08-audit.md): what was reviewed, what was fixed, and what is still open
+- [Changelog](https://github.com/bybrooklyn/flummox/blob/main/CHANGELOG.md): what each version changed
 
 ## Licence
 
-AGPL-3.0-or-later. See [LICENSE](LICENSE).
+AGPL-3.0-or-later. See [LICENSE](https://github.com/bybrooklyn/flummox/blob/main/LICENSE).
 
 ## AI disclosure
 

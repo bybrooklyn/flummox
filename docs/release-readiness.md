@@ -13,7 +13,7 @@ the current sidebar, theme, and game-card structure.
 - Fixture coordinator tests cover queued creation, rejection of a mismatched
   qualification, activation, compaction, previous-version pruning, original
   reclaim, and restoration with launcher updates preserved.
-- Headless previews render the real Games, Drives, Settings, and Queue widgets
+- Headless previews render the real Overview, Games, Jobs and Settings pages
   at wide and narrow sizes. They use synthetic state and never scan a library.
 
 To retain preview PNGs:
@@ -74,7 +74,7 @@ transactions finish without pause/cancel once filesystem switching starts.
 
 ## Custom games locations
 
-Drives & libraries supports both a collection of immediate game subfolders and
+Settings > Locations supports both a collection of immediate game subfolders and
 one individual game. Home shortcuts and escaped spaces are accepted. Tests cover
 legacy registrations, collection discovery, hidden/symlink filtering, overlapping
 locations, persistent registration, and removal without deleting game files.

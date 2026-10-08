@@ -7,7 +7,7 @@ what the next release adds.
 
 These capabilities describe the current source, not the published v0.0.1
 download. Real-game release acceptance is
-[still pending](validation/README.md).
+[still pending](https://github.com/bybrooklyn/flummox/blob/main/docs/validation/README.md).
 
 | | |
 |---|---|
@@ -15,7 +15,7 @@ download. Real-game release acceptance is
 | **Linux storage** | Native btrfs compression; verified writable Maximum Space stores on ext4, XFS, F2FS, ZFS, and btrfs with FUSE |
 | **Windows** | Local Steam, Epic, GOG and Heroic discovery, plus custom folders on NTFS; WOF/LZX compression, durable background jobs and opt-in maintenance |
 | **macOS** | Local Steam and Heroic discovery, custom folders, native APFS compression and replacement recovery; jobs run in the app, without a durable Mac coordinator |
-| **Desktop** | Wayland and X11 on Linux; native windows on Windows and macOS; Overview, Games and Settings navigation |
+| **Desktop** | Wayland and X11 on Linux; native windows on Windows and macOS; the Linux sidebar lists Overview, Games and Jobs, with Settings below |
 
 ## What does not work yet
 
@@ -43,10 +43,11 @@ Disconnected libraries retain their last discovered games. A different volume
 mounted at the same location stays unavailable. In a game's details, choose
 **Qualify compatibility** to record measurements and save a local report.
 
-The next tag requires [real-game acceptance](validation/README.md). A manual
-Release workflow produces candidates without publishing. Linux debug symbols
-stay in internal CI artifacts, and public downloads are covered by one
-[Minisign manifest](release-automation.md#release-signatures).
+Every stable tag requires [real-game acceptance](https://github.com/bybrooklyn/flummox/blob/main/docs/validation/README.md).
+A manual Release workflow produces candidates without publishing. Linux debug
+symbols stay in internal CI artifacts for 90 days, and public downloads are
+covered by one
+[Minisign manifest](https://github.com/bybrooklyn/flummox/blob/main/docs/release-automation.md#release-signatures).
 
 ## Downloads and release tags
 
@@ -64,4 +65,4 @@ and an uninstaller in Installed apps.
 Commit the completed acceptance records, tag that commit with `git tag v0.0.2`,
 and push the tag with `git push origin v0.0.2`. CI builds the tag version and publishes after native
 build and installation checks pass. See [installation](install.md) and
-[release automation](release-automation.md) for details.
+[release automation](https://github.com/bybrooklyn/flummox/blob/main/docs/release-automation.md) for details.
