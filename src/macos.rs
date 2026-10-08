@@ -1178,4 +1178,121 @@ mod tests {
             "successful recovery clears its journal",
         )
     }
+    #[test]
+    fn kernel_managed_attributes_are_left_out_of_the_comparison() -> TestResult {
+        for name in [
+            "com.apple.provenance",
+            "com.apple.decmpfs",
+            "com.apple.ResourceFork",
+        ] {
+            check(
+                kernel_managed(std::ffi::OsStr::new(name)),
+                format!("{name} is kernel-managed"),
+            )?;
+        }
+        check(
+            !kernel_managed(std::ffi::OsStr::new("com.apple.quarantine")),
+            "quarantine is compared",
+        )?;
+        check(
+            !kernel_managed(std::ffi::OsStr::new("user.flummox-fixture")),
+            "user attributes are compared",
+        )
+    }
+    #[test]
+    fn too_broad_refuses_mount_points_and_state_ancestors() -> TestResult {
+        let mount = Path::new("/Volumes/Games");
+        let state = Path::new("/Users/a/Library/Application Support/flummox");
+        check(
+            too_broad(mount, mount, state).is_some(),
+            "a mount point is refused",
+        )?;
+        check(
+            too_broad(Path::new("/Users/a/Library"), mount, state).is_some(),
+            "an ancestor of the state directory is refused",
+        )?;
+        check(
+            too_broad(Path::new("/Volumes/Games/Portal"), mount, state).is_none(),
+            "a game folder on the volume is accepted",
+        )
+    }
+    #[test]
+    fn work_directories_stay_outside_application_bundles() -> TestResult {
+        check_eq(
+            work_parent(Path::new("/g/Game/data/file.bin")),
+            Some(PathBuf::from("/g/Game/data")),
+            "an ordinary file stages beside itself",
+        )?;
+        check_eq(
+            work_parent(Path::new("/g/Game/Foo.app/Contents/MacOS/foo")),
+            Some(PathBuf::from("/g/Game")),
+            "a bundle file stages beside the bundle",
+        )?;
+        check_eq(
+            work_parent(Path::new(
+                "/g/Foo.app/Contents/Frameworks/Bar.app/Contents/x",
+            )),
+            Some(PathBuf::from("/g")),
+            "a nested bundle stages beside the outermost one",
+        )
+    }
+    #[test]
+    fn staging_locations_accept_both_layouts_and_nothing_else() -> TestResult {
+        let root = Path::new("/g/Game");
+        let bundle_file = Path::new("/g/Game/Foo.app/Contents/MacOS/foo");
+        check(
+            staging_expected(
+                root,
+                bundle_file,
+                Path::new("/g/Game/.flummox-work-a/candidate"),
+            ),
+            "current layout beside the bundle",
+        )?;
+        check(
+            staging_expected(
+                root,
+                bundle_file,
+                Path::new("/g/Game/Foo.app/Contents/MacOS/.flummox-work-a/candidate"),
+            ),
+            "older layout beside the file",
+        )?;
+        check(
+            !staging_expected(
+                root,
+                bundle_file,
+                Path::new("/elsewhere/.flummox-work-a/candidate"),
+            ),
+            "a location outside the root is refused",
+        )
+    }
+    #[test]
+    fn orphaned_work_directories_are_removed_and_other_folders_kept() -> TestResult {
+        let fixture = tempfile::tempdir().ctx("fixture")?;
+        let orphan = fixture.path().join(".flummox-work-orphan");
+        let other = fixture.path().join("saves");
+        std::fs::create_dir(&orphan).ctx("orphan")?;
+        std::fs::write(orphan.join("candidate"), b"partial").ctx("partial copy")?;
+        std::fs::create_dir(&other).ctx("other")?;
+        let removed =
+            remove_orphans(&[orphan.clone(), other.clone()], &[]).ctx("remove orphans")?;
+        check_eq(removed, 1, "one directory removed")?;
+        check(!orphan.exists(), "the orphan is gone")?;
+        check(other.exists(), "a folder without the prefix is kept")
+    }
+    #[test]
+    fn survey_lists_files_and_work_directories_separately() -> TestResult {
+        let fixture = tempfile::tempdir().ctx("fixture")?;
+        let work = fixture.path().join(".flummox-work-a");
+        std::fs::create_dir(&work).ctx("work")?;
+        std::fs::write(work.join("candidate"), b"partial").ctx("partial copy")?;
+        std::fs::write(fixture.path().join("game.bin"), b"data").ctx("game file")?;
+        let found = survey(fixture.path());
+        check_eq(
+            found.files,
+            vec![fixture.path().join("game.bin")],
+            "only the game file is listed",
+        )?;
+        check_eq(found.work_dirs, vec![work], "the work directory is listed")?;
+        check_eq(found.unreadable, 0, "nothing was unreadable")
+    }
 }
