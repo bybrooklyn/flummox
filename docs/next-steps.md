@@ -82,6 +82,26 @@ exact for each codec, and what it costs per read, is unmeasured. The other
 repacker features considered on 2026-10-08 (dropping language packs, an
 on-demand verify button, a low-impact mode) are not planned.
 
+A first probe on 2026-10-08 sampled 96 MiB from the eight largest files of
+five installed games and looked for zlib streams that inflate. It is a rough
+lower bound: a stream cut by a sample edge is missed.
+
+| Game | Size | Sampled bytes inside zlib streams | Entropy, bits per byte |
+|---|---|---|---|
+| Just Cause 3 | 89.5 GB | 0% | 7.89 |
+| Need for Speed Heat | 37.0 GB | 0% | 7.87 |
+| Detroit: Become Human | 65.7 GB | 20%, inflating 2.4 times | 7.47 |
+| Escape the Backrooms | 28.0 GB | 11%, inflating 2.2 times | 7.58 |
+| Firewatch (control) | 4.3 GB | 0% | 5.87 |
+
+Firewatch is the control for the method: its data is not compressed, and plain
+zlib level 1 took the samples to 58%. Two of the four large games show nothing
+an open codec can unpack, so their data is either encrypted or packed with a
+proprietary codec such as Oodle. The other two hold zlib in a tenth to a fifth
+of the sampled bytes. Re-encoding only those streams would move each game by a
+few percent at best, and it needs an exact deflate rebuild on every read. On
+this evidence precompression does not rescue the large games.
+
 ## Dependency update (2026-10-03)
 
 The manifest now requires current stable direct releases and the lockfile updates
