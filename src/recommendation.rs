@@ -162,8 +162,13 @@ pub fn choose(
                 );
             }
         }
-        StorageMode::MaximumSpace => reasons.push(
+        StorageMode::MaximumSpace if maximum_worthwhile => reasons.push(
             "The verified pack projection saves at least five percentage points beyond native compression."
+                .into(),
+        ),
+        // Chosen because this drive has no native compression to compare with.
+        StorageMode::MaximumSpace => reasons.push(
+            "This drive has no native compression, and the verified pack projection provides a worthwhile saving."
                 .into(),
         ),
     }

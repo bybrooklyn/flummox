@@ -55,6 +55,13 @@ open items are listed there.
 
 ### Fixed
 
+- Windows: the background worker no longer crashes when it starts within a
+  minute of boot, and Restore no longer stops at a file that was never
+  compressed. Neither fix has been run on Windows yet.
+- A job you paused before it started is still paused after the background
+  worker restarts. It used to come back as interrupted.
+- Excluding a game during a storage step that must finish waits for that step.
+
 - Estimates cover the whole game. They used to total only the files that were
   sampled, which on a game with thousands of files showed a fraction of what a
   pass frees.

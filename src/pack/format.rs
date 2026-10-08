@@ -241,6 +241,13 @@ impl Index {
                 entry.mode & !mode_mask == 0 && entry.modified_nanos < 1_000_000_000,
                 "Invalid file metadata"
             );
+            // Restoring would create a file that runs with the restoring
+            // user's identity, from an index anyone could have written.
+            ensure!(
+                entry.mode & 0o6000 == 0
+                    || !matches!(entry.kind, Kind::File { .. } | Kind::SlicedFile { .. }),
+                "The store holds a setuid or setgid file"
+            );
             ensure!(
                 extended_metadata || (entry.xattrs.is_empty() && entry.hardlink_to.is_none()),
                 "Extended metadata requires a newer store version"
