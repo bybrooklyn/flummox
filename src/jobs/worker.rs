@@ -335,6 +335,7 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
                         maximum_opts: &EstimateOpts {
                             level: 19,
                             mount_level: None,
+                            floor: None,
                         },
                         byte_cap: sample_cap,
                     },

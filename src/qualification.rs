@@ -87,7 +87,21 @@ impl Wizard {
     }
     /// Hashes the game and measures its folder as the uncompressed baseline.
     pub fn start(game: Game) -> Result<Self> {
-        let corpus = baseline(&game)?;
+        Self::start_cancellable(
+            game,
+            &std::sync::atomic::AtomicBool::new(false),
+            &crate::pack::NoObserver,
+        )
+    }
+
+    /// [`Wizard::start`] that stops with an error once `cancel` is set, and
+    /// reports hashing progress to `observer`.
+    pub fn start_cancellable(
+        game: Game,
+        cancel: &std::sync::atomic::AtomicBool,
+        observer: &dyn crate::pack::Observer,
+    ) -> Result<Self> {
+        let corpus = baseline_cancellable(&game, cancel, observer)?;
         let before = crate::allocation::measure(std::slice::from_ref(&game.install_dir));
         let mut wizard = Self::new(game, corpus);
         match before {
@@ -144,11 +158,7 @@ impl Wizard {
             integer(&self.candidate_load, "compressed load time in milliseconds")?;
         let report = Report {
             version: compatibility::VERSION,
-            game: GameBuild {
-                launcher: self.game.id.launcher,
-                key: self.game.id.key.clone(),
-                build: self.build.trim().into(),
-            },
+            game: GameBuild::new(&self.game.id, &self.build),
             corpus: self.corpus.clone(),
             platform: Platform::current(),
             mode: self.mode,
@@ -174,12 +184,22 @@ impl Wizard {
 /// `compatibility::corpus`. Other platforms walk the folder here and fail
 /// if a file changes size or modification time while it is read.
 pub fn baseline(game: &Game) -> Result<Corpus> {
-    #[cfg(target_os = "linux")]
-    return compatibility::corpus(
-        &game.install_dir,
+    baseline_cancellable(
+        game,
         &std::sync::atomic::AtomicBool::new(false),
         &crate::pack::NoObserver,
-    );
+    )
+}
+
+/// [`baseline`] that stops with an error once `cancel` is set, and reports
+/// progress to `observer`.
+pub fn baseline_cancellable(
+    game: &Game,
+    cancel: &std::sync::atomic::AtomicBool,
+    observer: &dyn crate::pack::Observer,
+) -> Result<Corpus> {
+    #[cfg(target_os = "linux")]
+    return compatibility::corpus(&game.install_dir, cancel, observer);
     #[cfg(not(target_os = "linux"))]
     {
         use sha2::{Digest, Sha256};
@@ -197,6 +217,11 @@ pub fn baseline(game: &Game) -> Result<Corpus> {
         let mut hash = Sha256::new();
         let mut total = 0u64;
         for path in &files {
+            observer.checkpoint()?;
+            ensure!(
+                !cancel.load(std::sync::atomic::Ordering::Relaxed),
+                "Compatibility verification stopped"
+            );
             ensure!(
                 path.canonicalize()?.starts_with(&root),
                 "File escaped the selected game"
@@ -214,6 +239,10 @@ pub fn baseline(game: &Game) -> Result<Corpus> {
                 if length == 0 {
                     break;
                 }
+                ensure!(
+                    !cancel.load(std::sync::atomic::Ordering::Relaxed),
+                    "Compatibility verification stopped"
+                );
                 hash.update(buffer.get(..length).context("Invalid read length")?);
             }
             let after = file.metadata()?;
@@ -395,6 +424,32 @@ mod tests {
         check(
             !report.qualifies(&game, &"a".repeat(64), compatibility::Policy::default()),
             "incomplete or regressed evidence must not qualify",
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cancelled_wizard_start_stops_before_it_finishes() -> TestResult {
+        let dir = tempfile::tempdir().ctx("install folder")?;
+        std::fs::write(dir.path().join("data.bin"), vec![7u8; 4096]).ctx("write data.bin")?;
+        let game = Game {
+            id: GameId::new(Launcher::Manual, "fixture"),
+            also: vec![],
+            title: "Fixture".into(),
+            install_dir: dir.path().to_path_buf(),
+            build: Some("1".into()),
+            size_hint: None,
+            state: InstallState::Idle,
+            is_tool: false,
+        };
+        let running = std::sync::atomic::AtomicBool::new(false);
+        let wizard = Wizard::start_cancellable(game.clone(), &running, &crate::pack::NoObserver)
+            .ctx("control: an uncancelled start hashes the folder")?;
+        check_eq(wizard.corpus.files, 1, "control: the file was hashed")?;
+        let stopped = std::sync::atomic::AtomicBool::new(true);
+        check(
+            Wizard::start_cancellable(game, &stopped, &crate::pack::NoObserver).is_err(),
+            "a start cancelled up front returns an error",
         )
     }
 }
