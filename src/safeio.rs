@@ -189,9 +189,15 @@ mod tests {
                 "openat2 must refuse a symlinked parent component",
             )
         } else {
-            // Without openat2 only the last component is policed, so this is
-            // documented as the weaker guarantee rather than asserted away.
-            check(true, "no openat2 on this kernel")
+            // Without openat2 only the last component is policed, so the
+            // symlinked parent is let through. That is the weaker guarantee,
+            // and the final component must still be refused.
+            std::os::unix::fs::symlink(tmp.path().join("outside.dat"), game.join("last.dat"))
+                .ctx("plant a final-component symlink")?;
+            check(
+                anchor.open_file(Path::new("last.dat")).is_err(),
+                "the fallback still refuses a symlink as the last component",
+            )
         }
     }
 

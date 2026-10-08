@@ -44,10 +44,10 @@ fn an_update_that_finishes_while_another_game_is_handled_is_not_lost() -> TestRe
         let (library, cancel) = (tmp.path().to_path_buf(), &cancel);
         let watcher = scope.spawn(move || {
             watch::run(&[library], cancel, |app| {
-                let _ = ready_tx.send(app.appid);
+                ready_tx.send(app.appid).ok();
                 if app.appid == 100 {
                     // Stands for a compress job that takes a while.
-                    let _ = release_rx.recv_timeout(WAIT);
+                    release_rx.recv_timeout(WAIT).ok();
                 }
             })
         });
@@ -88,7 +88,7 @@ fn the_watcher_fails_when_every_watched_folder_goes_away() -> TestResult {
     std::thread::scope(|scope| -> TestResult {
         scope.spawn(|| {
             let result = watch::run(&[tmp.path().to_path_buf()], &cancel, |_| {});
-            let _ = done_tx.send(result);
+            done_tx.send(result).ok();
         });
         std::thread::sleep(Duration::from_millis(300));
         std::fs::remove_dir_all(tmp.path().join("steamapps")).ctx("remove steamapps")?;

@@ -1,11 +1,27 @@
 //! Landlock enforcement in a fresh executable, without inheriting live FUSE locks.
 
 #![cfg(target_os = "linux")]
+// One test calls a raw syscall to see whether the seccomp filter refuses it.
+#![allow(unsafe_code)]
 
 use flummox::{
     sandbox::{SandboxPlan, deny_sockets, restrict},
-    testutil::{Ctx, TestResult, check, check_eq},
+    testutil::{Ctx, TestResult, check, check_eq, check_ne},
 };
+
+/// The errno of `io_uring_setup(0, NULL)`: EPERM from the filter, otherwise
+/// whatever the kernel says about the bad arguments.
+fn io_uring_setup_errno() -> i32 {
+    // SAFETY: a zero entry count makes the kernel reject the call with EINVAL
+    // before it reads the null parameter pointer, so nothing is dereferenced.
+    let result =
+        unsafe { libc::syscall(libc::SYS_io_uring_setup, 0u32, std::ptr::null_mut::<u8>()) };
+    if result == -1 {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    } else {
+        0
+    }
+}
 
 /// A skip, or a failure on a machine that is supposed to have Landlock.
 fn skipped(why: &str) -> TestResult {
@@ -46,6 +62,14 @@ fn enforcement_blocks_paths_outside_the_game() -> TestResult {
             "sandbox permits the game",
         )?;
         check(
+            nix::unistd::mkfifo(
+                &game.join("after.fifo"),
+                nix::sys::stat::Mode::from_bits_truncate(0o600),
+            )
+            .is_err(),
+            "the game folder cannot be given a FIFO",
+        )?;
+        check(
             std::fs::read(root.join("secret.dat")).is_err(),
             "sandbox refuses unrelated files",
         )?;
@@ -56,6 +80,12 @@ fn enforcement_blocks_paths_outside_the_game() -> TestResult {
     std::fs::create_dir(&game).ctx("game")?;
     std::fs::write(game.join("inside.dat"), b"game data").ctx("game bytes")?;
     std::fs::write(temp.path().join("secret.dat"), b"private data").ctx("outside bytes")?;
+    // Control: before restriction a FIFO can be made in the game folder.
+    nix::unistd::mkfifo(
+        &game.join("control.fifo"),
+        nix::sys::stat::Mode::from_bits_truncate(0o600),
+    )
+    .ctx("control FIFO")?;
     let result = std::process::Command::new(std::env::current_exe().ctx("test executable")?)
         .args([
             "--exact",
@@ -159,7 +189,17 @@ fn a_worker_cannot_reach_a_socket_by_path() -> TestResult {
             UnixStream::connect(&socket).is_ok(),
             "control: the socket accepts a connection before the filter",
         )?;
+        check_ne(
+            io_uring_setup_errno(),
+            libc::EPERM,
+            "control: io_uring_setup is not refused before the filter",
+        )?;
         deny_sockets().ctx("socket filter")?;
+        check_eq(
+            io_uring_setup_errno(),
+            libc::EPERM,
+            "io_uring_setup is refused after the filter",
+        )?;
         let refused = UnixStream::connect(&socket);
         check(
             refused

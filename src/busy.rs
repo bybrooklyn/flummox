@@ -293,8 +293,10 @@ impl BackgroundScan {
 impl Drop for BackgroundScan {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            tracing::error!("the busy scanner thread panicked");
         }
     }
 }
