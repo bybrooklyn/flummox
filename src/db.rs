@@ -401,17 +401,18 @@ impl Db {
 
     /// Applies the connection settings, then brings the schema up to date.
     fn prepare(conn: Connection) -> Result<Self> {
+        // SQLite's default busy timeout is zero, so a second instance gets
+        // SQLITE_BUSY the instant the first holds the write lock. That happens
+        // whenever the window is open while a job finishes: the pass goes
+        // unrecorded, and the next run recompresses a library that was already
+        // done. Five seconds is far longer than any write here takes. It is
+        // set before the journal mode, because switching to WAL takes a lock.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // WAL lets the UI read the log while a job is writing to it. An
         // in-memory database cannot do WAL and answers "memory" instead, so
         // the reply is recorded rather than checked.
         let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         tracing::debug!(journal_mode = %mode, "state database journal mode");
-        // SQLite's default busy timeout is zero, so a second instance gets
-        // SQLITE_BUSY the instant the first holds the write lock. That happens
-        // whenever the window is open while a job finishes: the pass goes
-        // unrecorded, and the next run recompresses a library that was already
-        // done. Five seconds is far longer than any write here takes.
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // Off by default in SQLite, and the files table depends on it to keep
         // fingerprints from outliving the game row they belong to.
         conn.pragma_update(None, "foreign_keys", true)?;
@@ -645,6 +646,22 @@ impl Db {
     /// A game that was never recorded has no fingerprints, so every file comes
     /// back, which is the right answer for a first pass.
     pub fn changed_since(&self, id: &GameId, inv: &Inventory) -> Result<Vec<FileEntry>> {
+        self.changed_since_floor(id, inv, NOT_ATTEMPTED + 1)
+    }
+
+    /// [`Db::changed_since`] for a pass that wants every file at `floor` or
+    /// above.
+    ///
+    /// A file to be compressed is also returned when its recorded level is
+    /// below `floor`, so a file an earlier, cheaper pass compressed at level 3
+    /// is picked up by a later level-15 pass. Pass the plan's floor, not its
+    /// ceiling, for a plan that picks a level per file.
+    pub fn changed_since_floor(
+        &self,
+        id: &GameId,
+        inv: &Inventory,
+        floor: i32,
+    ) -> Result<Vec<FileEntry>> {
         let stored = self.fingerprints(id)?;
         Ok(inv
             .files
@@ -652,7 +669,8 @@ impl Db {
             .filter(|entry| {
                 stored.get(&entry.rel).is_none_or(|fp| {
                     !fp.matches(entry)
-                        || (entry.action.is_compress() && fp.level_applied == NOT_ATTEMPTED)
+                        || (entry.action.is_compress()
+                            && (fp.level_applied == NOT_ATTEMPTED || fp.level_applied < floor))
                 })
             })
             .cloned()
@@ -1095,6 +1113,82 @@ mod tests {
             db.changed_since(&game.id, &changed).ctx("after update")?,
             vec![replaced],
             "a changed fingerprint is eligible again",
+        )
+    }
+
+    #[test]
+    fn a_lower_level_file_is_picked_up_by_a_later_higher_pass() -> TestResult {
+        let mut db = Db::open_in_memory().ctx("database")?;
+        let file = entry("data.bin", 1_000_000);
+        let inv = inventory(vec![file.clone()]);
+        let game = record(&celeste());
+        db.record_outcome(&game, &inv, &[(file.clone(), 3)])
+            .ctx("a level-3 pass")?;
+        check(
+            db.changed_since(&game.id, &inv).ctx("plain")?.is_empty(),
+            "control: with no floor the level-3 file counts as done",
+        )?;
+        check_eq(
+            db.changed_since_floor(&game.id, &inv, 15)
+                .ctx("floor 15")?
+                .len(),
+            1,
+            "a level-15 pass wants the level-3 file",
+        )?;
+        check(
+            db.changed_since_floor(&game.id, &inv, 3)
+                .ctx("floor 3")?
+                .is_empty(),
+            "a level-3 pass does not",
+        )
+    }
+
+    #[test]
+    fn a_version_one_database_upgrades_and_keeps_its_rows() -> TestResult {
+        let dir = tempfile::tempdir().ctx("temporary folder")?;
+        let path = dir.path().join("state.sqlite");
+        {
+            let conn = Connection::open(&path).ctx("create a database")?;
+            conn.execute_batch(SCHEMA_V1)
+                .ctx("apply the first schema")?;
+            conn.execute(
+                "INSERT INTO hidden(id, title, added_at) VALUES('steam:220', 'Half-Life 2', 1)",
+                [],
+            )
+            .ctx("hide a game in the old file")?;
+            conn.pragma_update(None, "user_version", 1)
+                .ctx("mark it version 1")?;
+            let version: i32 = conn
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .ctx("read user_version")?;
+            check_eq(version, 1, "control: the file starts at version 1")?;
+        }
+        let db = Db::open(&path).ctx("open the old database")?;
+        let version: i32 = db
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .ctx("read user_version")?;
+        check_eq(version, SCHEMA_VERSION, "the version was bumped")?;
+        check(
+            db.is_excluded(&GameId::new(Launcher::Steam, "220"))
+                .ctx("read the exclusion")?,
+            "a row written under version 1 survives the upgrade",
+        )
+    }
+
+    #[test]
+    fn a_version_zero_database_gets_every_table() -> TestResult {
+        let dir = tempfile::tempdir().ctx("temporary folder")?;
+        let path = dir.path().join("state.sqlite");
+        drop(Connection::open(&path).ctx("create an empty database")?);
+        let mut db = Db::open(&path).ctx("open the empty database")?;
+        let file = entry("data.bin", 100);
+        db.record_compression(&record(&celeste()), &inventory(vec![file]))
+            .ctx("write to a fresh schema")?;
+        check_eq(
+            db.fingerprints(&celeste()).ctx("read back")?.len(),
+            1,
+            "the fresh schema stores fingerprints",
         )
     }
 
