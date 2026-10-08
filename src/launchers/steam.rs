@@ -144,11 +144,8 @@ pub fn read_app_manifest(path: &Path, library: &Path) -> Result<App, DetectError
         .ok_or_else(|| DetectError::new(ctx(), "no installdir"))?;
     // A manifest on a shared or removable library must not name a folder
     // outside it, such as `../../..` or an absolute path.
-    if install_name.is_empty()
-        || !Path::new(install_name)
-            .components()
-            .all(|part| matches!(part, std::path::Component::Normal(_)))
-    {
+    let mut parts = Path::new(install_name).components();
+    if !(matches!(parts.next(), Some(std::path::Component::Normal(_))) && parts.next().is_none()) {
         return Err(DetectError::new(ctx(), "installdir leaves the library"));
     }
     Ok(App {
@@ -203,17 +200,17 @@ fn apps_in_library_noting(
 
 /// The appid Steam currently reports as running, from `registry.vdf`.
 ///
-/// The key only exists while a game is up, so `None` is the normal state.
-pub fn running_app_id(root: &Path) -> Option<u32> {
-    // The registry lives next to the root, not inside it.
+/// Steam writes the file under `~/.steam`, or the same folder inside the
+/// Flatpak and snap homes, never inside the install root. The key only exists
+/// while a game is up, so `None` is the normal state.
+pub fn running_app_id(home: &Path) -> Option<u32> {
     let candidates = [
-        root.join("registry.vdf"),
-        root.parent()
-            .map(|p| p.join("registry.vdf"))
-            .unwrap_or_default(),
+        home.join(".steam/registry.vdf"),
+        home.join(".var/app/com.valvesoftware.Steam/.steam/registry.vdf"),
+        home.join("snap/steam/common/.steam/registry.vdf"),
     ];
     for path in candidates {
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(text) = read_manifest_text(&path) else {
             continue;
         };
         let Ok(obj) = vdf::parse(&text) else { continue };
@@ -253,9 +250,8 @@ pub fn discover(env: &Env) -> Result<Vec<Game>, DetectError> {
 /// manifest reached only the log.
 pub fn discover_noting(env: &Env, skipped: &mut Vec<DetectError>) -> Vec<Game> {
     let mut groups: BTreeMap<PathBuf, Vec<App>> = BTreeMap::new();
-    let mut running = None;
+    let running = running_app_id(&env.home);
     for root in roots(env) {
-        running = running.or_else(|| running_app_id(&root));
         let found = libraries(&root).unwrap_or_else(|error| {
             skipped.push(error);
             // The root is a library whatever its list of others says.
@@ -284,7 +280,21 @@ pub fn discover_noting(env: &Env, skipped: &mut Vec<DetectError>) -> Vec<Game> {
                     .install_dir
                     .canonicalize()
                     .unwrap_or(app.install_dir.clone());
-                groups.entry(key).or_default().push(app);
+                // A symlink in `common` must not make its target the game folder.
+                let common = library.join("steamapps/common");
+                let common = common.canonicalize().unwrap_or(common);
+                if !key.starts_with(&common) {
+                    skipped.push(DetectError::new(
+                        app.install_dir.display().to_string(),
+                        "install directory resolves outside its library",
+                    ));
+                    continue;
+                }
+                let group = groups.entry(key).or_default();
+                // A library listed by two roots is read twice.
+                if group.iter().all(|seen| seen.appid != app.appid) {
+                    group.push(app);
+                }
             }
         }
     }
@@ -295,7 +305,10 @@ pub fn discover_noting(env: &Env, skipped: &mut Vec<DetectError>) -> Vec<Game> {
         let Some(primary) = apps.first() else {
             continue;
         };
-        let state = group_state(&apps, running);
+        let mut state = group_state(&apps, running);
+        if let Err(detail) = crate::model::refuse_install_path_with(&install_dir, Some(&env.home)) {
+            state = InstallState::Broken { detail };
+        }
         games.push(Game {
             id: GameId::new(Launcher::Steam, primary.appid.to_string()),
             also: apps
@@ -495,6 +508,98 @@ mod tests {
         check(
             steamworks.is_tool,
             "Steamworks Common Redistributables is a tool",
+        )
+    }
+
+    #[test]
+    fn registry_next_to_the_steam_symlink_reports_the_running_game() -> TestResult {
+        let (tmp, env) = fixture()?;
+        let registry = tmp.path().join(".steam/registry.vdf");
+        std::fs::create_dir_all(registry.parent().ctx("registry folder")?)
+            .ctx("creating ~/.steam")?;
+        // Latin-1 bytes in an unrelated value must not stop the read.
+        let mut text = b"\"Registry\" { \"HKCU\" { \"Software\" { \"Valve\" { \"Steam\" { \"Name\" \"Caf\xe9\" \"RunningAppID\" \"105600\" } } } } }".to_vec();
+        text.push(b'\n');
+        std::fs::write(&registry, text).ctx("writing registry.vdf")?;
+        check_eq(running_app_id(&env.home), Some(105_600), "the appid")?;
+        let games = discover_noting(&env, &mut Vec::new());
+        let terraria = games
+            .iter()
+            .find(|g| g.id.key == "105600")
+            .ctx("Terraria")?;
+        check_eq(
+            terraria.state.clone(),
+            InstallState::Busy(BusyReason::Running),
+            "a running game is busy, not stale",
+        )
+    }
+
+    #[test]
+    fn a_symlinked_install_folder_and_a_shared_library_are_handled() -> TestResult {
+        let (tmp, env) = fixture()?;
+        let steamapps = tmp.path().join(".local/share/Steam/steamapps");
+        let outside = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&outside).ctx("outside folder")?;
+        std::os::unix::fs::symlink(&outside, steamapps.join("common/Linked")).ctx("symlink")?;
+        std::fs::write(
+            steamapps.join("appmanifest_500.acf"),
+            "\"AppState\" { \"appid\" \"500\" \"name\" \"Linked\" \"installdir\" \"Linked\" \"StateFlags\" \"4\" }",
+        )
+        .ctx("manifest")?;
+        // A second root whose library list names the first root again.
+        let flatpak = tmp
+            .path()
+            .join(".var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps");
+        std::fs::create_dir_all(&flatpak).ctx("flatpak root")?;
+        std::fs::write(
+            flatpak.join("libraryfolders.vdf"),
+            format!(
+                "\"libraryfolders\" {{ \"0\" {{ \"path\" \"{}\" }} }}",
+                tmp.path().join(".local/share/Steam").display()
+            ),
+        )
+        .ctx("flatpak libraryfolders")?;
+        let mut skipped = Vec::new();
+        let games = discover_noting(&env, &mut skipped);
+        check(
+            games.iter().all(|g| g.install_dir != outside),
+            "a link out of the library is not a game folder",
+        )?;
+        check(
+            skipped.iter().any(|e| e.to_string().contains("outside")),
+            "the refusal is reported",
+        )?;
+        let terraria = games
+            .iter()
+            .find(|g| g.id.key == "105600")
+            .ctx("Terraria")?;
+        check(terraria.also.is_empty(), "a game is not its own alias")?;
+        let nested = tmp
+            .path()
+            .join(".local/share/Steam/steamapps/appmanifest_501.acf");
+        std::fs::write(
+            &nested,
+            "\"AppState\" { \"appid\" \"501\" \"name\" \"Nested\" \"installdir\" \"A/B\" \"StateFlags\" \"4\" }",
+        )
+        .ctx("nested manifest")?;
+        check(
+            read_app_manifest(&nested, &tmp.path().join(".local/share/Steam")).is_err(),
+            "a two-component installdir is refused",
+        )
+    }
+
+    #[test]
+    fn tools_are_matched_by_id_or_exact_name() -> TestResult {
+        let tool = |appid: u32, name: &str| crate::model::steam_state::is_tool(appid, name);
+        check(tool(1, "Proton 9.0 (Beta)"), "versioned Proton")?;
+        check(tool(1, "Proton Experimental"), "Proton Experimental")?;
+        check(tool(1, "Steam Linux Runtime 3.0 (sniper)"), "runtime")?;
+        check(tool(228_980, "anything"), "listed appid")?;
+        check(!tool(1, "Protonwar"), "a game starting with Proton")?;
+        check(!tool(1, "Proton Pulse"), "another such game")?;
+        check(
+            !tool(1, "Steamworks Tycoon"),
+            "a game starting with Steamworks",
         )
     }
 
