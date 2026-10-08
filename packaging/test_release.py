@@ -4,8 +4,10 @@ import importlib.util
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import tomllib
@@ -22,6 +24,14 @@ def module(filename):
 
 
 class ReleaseTests(unittest.TestCase):
+    def require_tools(self, *names):
+        """Skip locally when a tool is missing, but fail under CI, which installs them."""
+        missing = [name for name in names if not shutil.which(name)]
+        if missing and os.environ.get('CI'):
+            self.fail(f'CI must provide: {", ".join(missing)}')
+        if missing:
+            self.skipTest(f'{", ".join(missing)} needed')
+
     def test_acceptance_requires_complete_evidence_for_each_backend(self):
         acceptance = module('check-acceptance.py')
         with tempfile.TemporaryDirectory() as temporary:
@@ -260,6 +270,19 @@ class ReleaseTests(unittest.TestCase):
             if source.suffix == '.md':
                 self.assertTrue(source.is_file(), source)
 
+    def test_installed_docs_have_no_dead_relative_links(self):
+        bundle = module('package-release.py')
+        inputs = bundle.linux_inputs(HERE, None)
+        installed = {destination.rsplit('/', 1)[1] for destination in inputs if destination.startswith('share/doc/flummox/')}
+        for destination, source in inputs.items():
+            if not destination.startswith('share/doc/flummox/') or source.suffix != '.md':
+                continue
+            for target in re.findall(r'\]\(([^)\s]+)\)', source.read_text()):
+                if target.startswith(('http://', 'https://', '#', 'mailto:')):
+                    continue
+                with self.subTest(document=destination, link=target):
+                    self.assertIn(target.split('#')[0], installed)
+
     def test_release_workflow_guards(self):
         workflow = (HERE.parent / '.github/workflows/release.yml').read_text()
         self.assertNotIn('rust-cache', workflow)
@@ -372,10 +395,8 @@ class ReleaseTests(unittest.TestCase):
             self.assertFalse((root / f'dist/flummox-{version}-linux-aarch64.tar.xz').is_file())
 
     def test_linux_download_strips_debug_without_changing_build_outputs(self):
-        import shutil
         import tarfile
-        if not shutil.which('cc') or not shutil.which('objcopy'):
-            self.skipTest('Native ELF compiler and objcopy are needed')
+        self.require_tools('cc', 'objcopy', 'readelf')
         bundle = module('package-release.py')
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -396,10 +417,8 @@ class ReleaseTests(unittest.TestCase):
             self.assertIn('.gnu_debuglink', sections)
 
     def test_signed_manifest_rejects_modified_artifacts_and_wrong_keys(self):
-        import shutil
         manifest = module('release-manifest.py')
-        if not shutil.which('minisign'):
-            self.skipTest('minisign is needed for signature tests')
+        self.require_tools('minisign')
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             for name in manifest.artifact_names('0.0.2'):
