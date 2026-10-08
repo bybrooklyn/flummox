@@ -153,6 +153,36 @@ impl SandboxPlan {
     }
 }
 
+/// Makes creating a socket fail for this thread and every thread it starts.
+///
+/// Landlock governs files and does not cover connecting to a socket by path,
+/// so a sandboxed worker could still reach the coordinator's control socket
+/// and send it commands. A worker talks only over the pipes it was started
+/// with, so it loses `socket` altogether. Call it where [`restrict`] is
+/// called: before any other thread exists.
+pub fn deny_sockets() -> Result<(), String> {
+    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, apply_filter};
+
+    let arch = std::env::consts::ARCH
+        .try_into()
+        .map_err(|error| format!("seccomp does not know this processor: {error}"))?;
+    // An empty rule list matches the call whatever its arguments.
+    let rules = [(libc::SYS_socket, vec![]), (libc::SYS_socketpair, vec![])]
+        .into_iter()
+        .collect();
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM as u32),
+        arch,
+    )
+    .map_err(|error| error.to_string())?;
+    let program: BpfProgram = filter
+        .try_into()
+        .map_err(|error: seccompiler::BackendError| error.to_string())?;
+    apply_filter(&program).map_err(|error| error.to_string())
+}
+
 /// Restricts this process to the paths in `plan`, permanently.
 ///
 /// Never fails: a kernel without Landlock returns
