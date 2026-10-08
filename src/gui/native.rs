@@ -297,6 +297,7 @@ enum Message {
     MeasureQualification,
     QualificationMeasured(std::result::Result<crate::allocation::Allocation, String>),
     SaveQualification,
+    OpenChangelog,
     CloseQualification,
     QualificationSaved(std::result::Result<String, String>),
     Recover(PathBuf),
@@ -696,6 +697,17 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::CloseQualification => state.qualification = None,
+        Message::OpenChangelog => {
+            if let Err(error) = super::open_changelog() {
+                state.status = Some(Status {
+                    error: true,
+                    text: format!(
+                        "Could not open a browser ({error}). The changelog is at {}",
+                        super::CHANGELOG_URL
+                    ),
+                });
+            }
+        }
         Message::MeasureQualification => {
             if let Some(wizard) = &state.qualification {
                 let roots = vec![wizard.game.install_dir.clone()];
@@ -1621,10 +1633,17 @@ fn settings_page(state: &State) -> Element<'_, Message> {
         container(maintenance).id("settings-maintenance"),
         container(appearance).id("settings-appearance"),
         container(reports).id("settings-reports"),
-        container(column![
-            theme::section_title("About"),
-            theme::muted(format!("{PLATFORM} · {}", env!("CARGO_PKG_VERSION")))
-        ])
+        container(
+            column![
+                theme::section_title("About"),
+                theme::muted(format!("{PLATFORM} · {}", env!("CARGO_PKG_VERSION"))),
+                button("What changed")
+                    .on_press(Message::OpenChangelog)
+                    .style(theme::secondary_button),
+                theme::muted(super::CHANGELOG_URL)
+            ]
+            .spacing(8)
+        )
         .id("settings-about")
     ]
     .spacing(28);

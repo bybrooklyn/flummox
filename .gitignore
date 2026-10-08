@@ -8,3 +8,8 @@
 __pycache__/
 
 /release-debug
+
+# Editor and agent tooling, not part of Flummox.
+/package.json
+/package-lock.json
+/node_modules

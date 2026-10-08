@@ -71,6 +71,17 @@ and community report sharing remain separate work. Apple Developer ID,
 notarization, and Windows Authenticode require publisher credentials; current
 release authentication uses a separate stable Minisign key.
 
+## Research for a later release
+
+Precompression: repackers unpack data a game already compressed (zlib, Oodle)
+so a stronger compressor can work on it, then rebuild the original bytes. The
+native tier cannot do this, because the engine must find its files in the
+format it reads. A Maximum Space store sits between the game and the disk, so
+it could hold the unpacked form and rebuild on read. Whether the rebuild is
+exact for each codec, and what it costs per read, is unmeasured. The other
+repacker features considered on 2026-10-08 (dropping language packs, an
+on-demand verify button, a low-impact mode) are not planned.
+
 ## Dependency update (2026-10-03)
 
 The manifest now requires current stable direct releases and the lockfile updates

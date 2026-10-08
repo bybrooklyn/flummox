@@ -26,6 +26,32 @@ mod view;
 
 use anyhow::Result;
 
+/// Where Settings > About sends a reader for what each version changed.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+const CHANGELOG_URL: &str = "https://github.com/bybrooklyn/flummox/blob/main/CHANGELOG.md";
+
+/// Opens the changelog in the desktop's browser.
+///
+/// The address is a constant, so nothing a game or launcher supplies reaches
+/// the helper's arguments.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn open_changelog() -> std::io::Result<()> {
+    let helper = if cfg!(windows) {
+        "explorer.exe"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(helper)
+        .arg(CHANGELOG_URL)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+}
+
 #[cfg(target_os = "linux")]
 use crate::launchers::Env;
 #[cfg(target_os = "linux")]

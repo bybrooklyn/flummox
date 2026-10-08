@@ -1588,9 +1588,11 @@ fn preferences(state: &State) -> Element<'_, Message> {
         container(panel(
             column![
                 text("About Flummox").size(17),
-                theme::muted(format!("Version {}", env!("CARGO_PKG_VERSION")))
+                theme::muted(format!("Version {}", env!("CARGO_PKG_VERSION"))),
+                secondary("What changed", Message::OpenChangelog),
+                theme::muted(super::CHANGELOG_URL)
             ]
-            .spacing(5)
+            .spacing(8)
         )).id("settings-about")
     ]
     .spacing(16)
