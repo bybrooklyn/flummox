@@ -19,6 +19,7 @@ env:
 jobs:
   prepare:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     outputs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
@@ -75,6 +76,7 @@ jobs:
             arch: x86_64
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
@@ -201,6 +203,7 @@ jobs:
     needs: [prepare, build]
     if: needs.prepare.outputs.prerelease == 'false'
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     container: archlinux:base
     steps:
       - name: Install packaging dependencies
@@ -253,6 +256,7 @@ jobs:
     needs: [prepare, build]
     if: needs.prepare.outputs.prerelease == 'false'
     runs-on: macos-14
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -297,6 +301,7 @@ jobs:
       (needs.arch.result == 'success' || needs.arch.result == 'skipped') &&
       (needs.homebrew-check.result == 'success' || needs.homebrew-check.result == 'skipped')
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     # This environment accepts only v* tags. Secrets stored in it cannot be
     # read by a workflow edited on a branch.
     environment: release
@@ -343,6 +348,7 @@ jobs:
       (needs.arch.result == 'success' || needs.arch.result == 'skipped') &&
       (needs.homebrew-check.result == 'success' || needs.homebrew-check.result == 'skipped')
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     permissions:
       contents: write
     steps:
@@ -393,6 +399,7 @@ jobs:
     needs: [prepare, publish]
     if: needs.prepare.outputs.prerelease == 'false'
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     environment: release
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
