@@ -506,6 +506,9 @@ impl Overlay {
         deleted.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
         for rel in deleted {
             let path = destination.join(rel);
+            if !parents_are_directories(&destination, rel)? {
+                continue;
+            }
             if let Ok(metadata) = std::fs::symlink_metadata(&path) {
                 if metadata.is_dir() {
                     std::fs::remove_dir_all(path)?;
@@ -528,8 +531,25 @@ impl Overlay {
             ensure!(safe_path(rel), "Unsafe path in update files");
             let output = destination.join(rel);
             let metadata = std::fs::symlink_metadata(entry.path())?;
+            ensure!(
+                parents_are_directories(&destination, rel)?,
+                "The folder for {} is missing from the destination",
+                rel.display()
+            );
             if metadata.is_dir() {
-                std::fs::create_dir_all(&output)?;
+                // A link or file where the layer holds a folder is replaced.
+                // Creating through it would write wherever the link points.
+                match std::fs::symlink_metadata(&output) {
+                    Ok(old) if old.is_dir() => {}
+                    Ok(_) => {
+                        std::fs::remove_file(&output)?;
+                        std::fs::create_dir(&output)?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::create_dir(&output)?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
                 directories.push((output, metadata));
             } else {
                 if let Ok(old) = std::fs::symlink_metadata(&output) {
@@ -612,4 +632,68 @@ pub(super) fn commit(
     );
     overlay.apply_to(&merged)?;
     super::create(&merged, output, options, cancel)
+}
+
+/// Whether every folder between `root` and `rel` exists as a real directory.
+///
+/// Fails when one of them is a symlink or a file, because a write or removal
+/// below it would land outside `root`. `false` means a folder is missing.
+fn parents_are_directories(root: &Path, rel: &Path) -> Result<bool> {
+    let mut current = root.to_path_buf();
+    for part in rel.parent().into_iter().flat_map(Path::components) {
+        current.push(part);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => ensure!(
+                metadata.is_dir(),
+                "{} is not a folder, so updates below it were not applied",
+                current.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{Ctx, TestResult, check, check_eq};
+
+    #[test]
+    fn applying_updates_never_writes_through_a_destination_symlink() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let outside = temp.path().join("outside");
+        let game = temp.path().join("game");
+        std::fs::create_dir(&outside).ctx("outside")?;
+        std::fs::create_dir(&game).ctx("game")?;
+        std::fs::write(outside.join("x"), b"victim").ctx("outside file")?;
+        symlink("../outside", game.join("l")).ctx("destination symlink")?;
+        // The layer a game leaves after replacing that link with a folder.
+        let layer = temp.path().join("layer");
+        drop(Overlay::open(&layer).ctx("new layer")?);
+        std::fs::create_dir(layer.join(FILES).join("l")).ctx("layer folder")?;
+        std::fs::write(layer.join(FILES).join("l/x"), b"planted").ctx("layer file")?;
+
+        Overlay::open(&layer)
+            .ctx("layer")?
+            .apply_to(&game)
+            .ctx("apply")?;
+        check_eq(
+            std::fs::read(outside.join("x")).ctx("outside after")?,
+            b"victim".to_vec(),
+            "the folder behind the link is untouched",
+        )?;
+        check(
+            std::fs::symlink_metadata(game.join("l"))
+                .ctx("replaced link")?
+                .is_dir(),
+            "the link became the folder the layer holds",
+        )?;
+        check_eq(
+            std::fs::read(game.join("l/x")).ctx("applied file")?,
+            b"planted".to_vec(),
+            "the update landed inside the game",
+        )
+    }
 }
