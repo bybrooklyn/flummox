@@ -865,7 +865,19 @@ fn a_recreated_or_replaced_folder_shows_only_its_own_files() -> TestResult {
         "the moved folder's file is visible at its new place",
     )?;
     drop(overlay);
-    let reopened = overlay::Overlay::open(&temp.path().join("updates")).ctx("reopen")?;
+    // Another test forking a child at this moment shares the lock until that
+    // child execs, so the layer can look held for an instant.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let reopened = loop {
+        match overlay::Overlay::open(&temp.path().join("updates")) {
+            Ok(layer) => break layer,
+            Err(error) => check(
+                std::time::Instant::now() < deadline,
+                format!("reopen: {error}"),
+            )?,
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
     check_eq(
         names(&reopened, "saves")?,
         Vec::<String>::new(),
