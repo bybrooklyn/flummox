@@ -489,9 +489,20 @@ mod enabled {
             std::fs::read_dir(&install.game_path)?.next().is_none(),
             "The launcher path did not unmount cleanly"
         );
-        // The empty mount point is removed so a rename can put the restored
-        // folder at this path. Until that rename the game path does not exist.
-        std::fs::remove_dir(&install.game_path)?;
+        // The restored folder is renamed over the game path, so the empty
+        // mount point goes immediately before each rename and is put back if
+        // the rename fails. Everything that can fail earlier, such as
+        // replaying updates, runs while the launcher path still exists.
+        let publish = |restored: &std::path::Path| -> Result<()> {
+            std::fs::remove_dir(&install.game_path)?;
+            if let Err(error) = std::fs::rename(restored, &install.game_path) {
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&install.game_path)?;
+                return Err(error).context("Putting the restored game folder in place");
+            }
+            Ok(())
+        };
         // After a compaction the retained original predates the updates the
         // new store absorbed, and the update layer no longer describes changes
         // to it. Only the store and its layer are current then.
@@ -501,15 +512,7 @@ mod enabled {
             .filter(|_| install.previous_store_path.is_none());
         if let Some(backup) = current_backup {
             crate::pack::overlay::Overlay::open(&install.writes_path)?.apply_to(backup)?;
-            match std::fs::rename(backup, &install.game_path) {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    std::fs::DirBuilder::new()
-                        .mode(0o700)
-                        .create(&install.game_path)?;
-                    return Err(error).context("Restoring the original game folder");
-                }
-            }
+            return publish(backup);
         }
         // No current original: rebuild in a sibling staging folder, apply the
         // update layer, then rename the result into place.
@@ -523,8 +526,7 @@ mod enabled {
         let restored = staging.path().join("game");
         crate::pack::restore(&install.store_path, &restored, cancel)?;
         crate::pack::overlay::Overlay::open(&install.writes_path)?.apply_to(&restored)?;
-        std::fs::rename(&restored, &install.game_path)
-            .context("Publishing the restored game folder")?;
+        publish(&restored)?;
         std::fs::set_permissions(&install.game_path, Permissions::from_mode(0o755))?;
         Ok(())
     }

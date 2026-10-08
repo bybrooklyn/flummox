@@ -653,10 +653,20 @@ pub(super) fn invalidate_receipts(store: &Path, game: &Path, keep: Option<&str>)
     Ok(())
 }
 
+/// Why a job is held, in the order a user can act on it.
+fn pause_reason(by_user: bool, playing: Option<&str>) -> String {
+    if by_user {
+        "Paused by you".into()
+    } else if let Some(game) = playing {
+        format!("Paused while you play {game}")
+    } else {
+        "Waiting for the original drive or launcher activity to finish".into()
+    }
+}
+
 /// Spawns a worker child, writes the job to its stdin, and starts a thread
 /// that turns its stdout lines into events. The worker's stderr is discarded.
-fn start(job: &Job, db: &Connection) -> Result<Active> {
-    let _store = db;
+fn start(job: &Job) -> Result<Active> {
     let mut child = std::process::Command::new(binary()?)
         .arg("__worker")
         .stdin(Stdio::piped())
@@ -1165,13 +1175,7 @@ fn poll_pack(
             let _finished = event(job, WorkerEvent::Progress(update), db)?;
         }
         if paused && job.pack_interruptible && job.phase != Phase::Cancelling {
-            job.message = if job.user_paused {
-                "Paused by you".into()
-            } else if let Some(game) = &snapshot.gaming {
-                format!("Paused while you play {game}")
-            } else {
-                "Waiting for the original drive or launcher activity to finish".into()
-            };
+            job.message = pause_reason(job.user_paused, snapshot.gaming.as_deref());
         }
         job.elapsed = running.started.elapsed().as_secs();
         save(db, job)?;
@@ -1622,13 +1626,7 @@ pub(super) fn run() -> Result<()> {
                 }
             }
             if a.paused && !finished && job.phase != Phase::Cancelling {
-                job.message = if job.user_paused {
-                    "Paused by you".into()
-                } else if let Some(game) = &snapshot.gaming {
-                    format!("Paused while you play {game}")
-                } else {
-                    "Waiting for the original drive or launcher activity to finish".into()
-                };
+                job.message = pause_reason(job.user_paused, snapshot.gaming.as_deref());
             }
             job.elapsed = a.started.elapsed().as_secs();
             // Progress reaches the database at most once a second. `event`
@@ -1715,7 +1713,7 @@ pub(super) fn run() -> Result<()> {
                     }
                     continue;
                 }
-                match start(job, &db) {
+                match start(job) {
                     Ok(a) => active = Some(a),
                     Err(e) => {
                         job.phase = Phase::Failed;

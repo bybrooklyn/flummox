@@ -46,6 +46,8 @@ open items are listed there.
 - A game is chosen by id before title, and an empty name is refused.
 - A job's sandbox no longer reaches the background worker's own files.
 - Restoring a Maximum Space game never writes through a link inside it.
+- In a Maximum Space game, a folder that an updater moves aside and recreates
+  starts empty, as it would on an ordinary drive.
 - Steam games with old-encoding names are listed, and manifests Flummox had
   to skip appear as scan warnings.
 

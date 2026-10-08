@@ -356,7 +356,13 @@ pub(super) fn pack_compact_observed(
         let _removed = remove_store(&new_store);
         return Err(error);
     }
-    let frozen = controller.freeze()?;
+    let frozen = match controller.freeze() {
+        Ok(frozen) => frozen,
+        Err(error) => {
+            let _removed = remove_store(&new_store);
+            return Err(error);
+        }
+    };
     if frozen.generation() != baseline {
         let _removed = remove_store(&new_store);
         bail!("The game changed while compaction finished; retry when launcher updates settle")
