@@ -210,6 +210,15 @@ pub fn read_app_manifest(path: &Path, library: &Path) -> Result<App, DetectError
     let install_name = obj
         .get_str("installdir")
         .ok_or_else(|| DetectError::new(ctx(), "no installdir"))?;
+    // A manifest on a shared or removable library must not name a folder
+    // outside it, such as `../../..` or an absolute path.
+    if install_name.is_empty()
+        || !Path::new(install_name)
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(DetectError::new(ctx(), "installdir leaves the library"));
+    }
     Ok(App {
         appid,
         name: obj.get_str("name").unwrap_or("").to_owned(),

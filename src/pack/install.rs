@@ -259,6 +259,10 @@ mod enabled {
     /// Restarts an existing mount or completes an interrupted transaction.
     pub(crate) fn recover(install: &mut Install) -> Result<Option<MountedInstall>> {
         if install.phase == InstallPhase::Reclaiming {
+            // The retained original is the only other copy of the game, so an
+            // interrupted reclaim finishes only while the store still opens.
+            Reader::open(&install.store_path)
+                .context("The store is unreadable, so the retained original was kept")?;
             finish_reclaim(install)?;
         }
         if install.phase == InstallPhase::Pruning {
@@ -428,7 +432,14 @@ mod enabled {
             "The launcher path did not unmount cleanly"
         );
         std::fs::remove_dir(&install.game_path)?;
-        if let Some(backup) = &install.backup_path {
+        // After a compaction the retained original predates the updates the
+        // new store absorbed, and the update layer no longer describes changes
+        // to it. Only the store and its layer are current then.
+        let current_backup = install
+            .backup_path
+            .as_ref()
+            .filter(|_| install.previous_store_path.is_none());
+        if let Some(backup) = current_backup {
             crate::pack::overlay::Overlay::open(&install.writes_path)?.apply_to(backup)?;
             match std::fs::rename(backup, &install.game_path) {
                 Ok(()) => return Ok(()),

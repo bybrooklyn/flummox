@@ -163,6 +163,27 @@ fn managed_pack_remounts_after_coordinator_restart_and_keeps_updates() -> TestRe
         b"launcher update".to_vec(),
         "automatic remount exposes persistent updates",
     )?;
+    std::fs::write(game.join("only-before"), b"written before compaction")
+        .ctx("update that is never rewritten")?;
+    let refused = request(
+        &home,
+        Request::PackCompact {
+            game_path: game.clone(),
+        },
+    );
+    check(
+        refused
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.contains("Reclaim the retained original")),
+        format!("compaction waits for the original to be reclaimed: {refused:?}"),
+    )?;
+    request(
+        &home,
+        Request::PackReclaim {
+            game_path: game.clone(),
+        },
+    )?;
     let snapshot = request(
         &home,
         Request::PackCompact {
@@ -236,6 +257,11 @@ fn managed_pack_remounts_after_coordinator_restart_and_keeps_updates() -> TestRe
     check(
         snapshot.packs.is_empty(),
         "rollback removes the durable mount",
+    )?;
+    check_eq(
+        std::fs::read(game.join("only-before")).ctx("restored earlier update")?,
+        b"written before compaction".to_vec(),
+        "rollback keeps updates the compacted store absorbed",
     )?;
     check_eq(
         std::fs::read(game.join("data")).ctx("restored update")?,
@@ -866,7 +892,7 @@ fn automatic_storage_rejects_a_mismatched_qualification_before_creation() -> Tes
 
 #[cfg(feature = "pack-mount")]
 #[test]
-fn queued_activation_compaction_reclaim_and_restore_preserve_updates() -> TestResult {
+fn queued_activation_reclaim_compaction_and_restore_preserve_updates() -> TestResult {
     use flummox::jobs::PackTask;
     if !Path::new("/dev/fuse").exists() {
         check(
@@ -925,6 +951,7 @@ fn queued_activation_compaction_reclaim_and_restore_preserve_updates() -> TestRe
     check(backup.is_dir(), "activation retains original")?;
     std::fs::write(source.join("asset"), b"patched").ctx("mounted patch")?;
     std::fs::write(source.join("download"), b"new content").ctx("mounted new file")?;
+    enqueue(PackTask::Reclaim)?;
     let compacted = enqueue(PackTask::Compact)?;
     check(
         compacted
@@ -936,7 +963,6 @@ fn queued_activation_compaction_reclaim_and_restore_preserve_updates() -> TestRe
         "compaction retains previous version",
     )?;
     enqueue(PackTask::Prune)?;
-    enqueue(PackTask::Reclaim)?;
     let restored = enqueue(PackTask::Restore)?;
     check(
         restored.packs.is_empty(),
@@ -1001,6 +1027,106 @@ fn graceful_restart_preserves_settings_and_rejects_old_mutations() -> TestResult
     check(
         request(&home, Request::Snapshot)?.reduced_motion,
         "replacement keeps durable settings",
+    )
+}
+
+/// Stands in for a coordinator of another version: answers each request with
+/// `version` and returns the commands it was sent, stopping after a restart.
+fn other_version_coordinator(
+    home: &Path,
+    version: u32,
+    requests: usize,
+) -> Result<std::thread::JoinHandle<Result<Vec<serde_json::Value>, String>>, String> {
+    let dir = home.join("state/flummox/desktop");
+    std::fs::create_dir_all(&dir).ctx("state folder")?;
+    std::fs::write(dir.join("owner.lock"), b"").ctx("owner lock")?;
+    let socket = dir.join("control.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).ctx("bind")?;
+    Ok(std::thread::spawn(move || {
+        let mut commands = Vec::new();
+        for _ in 0..requests {
+            let (mut stream, _) = listener.accept().ctx("accept")?;
+            let mut line = String::new();
+            BufReader::new(&stream)
+                .read_line(&mut line)
+                .ctx("request")?;
+            let request: serde_json::Value = serde_json::from_str(&line).ctx("request JSON")?;
+            let command = request.get("command").cloned().ctx("command")?;
+            let restart = command == serde_json::json!("Restart");
+            let error = if restart {
+                serde_json::Value::Null
+            } else {
+                "Worker protocol changed. Restart Flummox.".into()
+            };
+            if restart {
+                std::fs::remove_file(&socket).ctx("remove socket")?;
+            }
+            serde_json::to_writer(
+                &mut stream,
+                &serde_json::json!({"version": version, "snapshot": null, "error": error}),
+            )
+            .ctx("reply")?;
+            stream.write_all(b"\n").ctx("delimiter")?;
+            commands.push(command);
+            if restart {
+                break;
+            }
+        }
+        Ok(commands)
+    }))
+}
+
+fn jobs_command(home: &Path, arguments: &[&str]) -> Result<std::process::Output, String> {
+    Command::new(env!("CARGO_BIN_EXE_flummox"))
+        .args(arguments)
+        .env("HOME", home)
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .output()
+        .ctx("run flummox")
+}
+
+#[test]
+fn an_older_idle_coordinator_is_replaced_and_a_newer_one_is_left_alone() -> TestResult {
+    let temp = tempfile::tempdir().ctx("upgrade fixture")?;
+    let home = temp.path().join("older");
+    let older = other_version_coordinator(&home, flummox::jobs::VERSION - 1, 2)?;
+    let output = jobs_command(&home, &["--json", "jobs"])?;
+    let commands = older.join().map_err(|_| "older coordinator thread")??;
+    check_eq(
+        commands,
+        vec![serde_json::json!("Snapshot"), serde_json::json!("Restart")],
+        "the client asks the older coordinator to restart",
+    )?;
+    check(
+        output.status.success(),
+        format!(
+            "the command is answered by this version: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )?;
+    check_eq(
+        request(&home, Request::Snapshot)?.jobs.len(),
+        0,
+        "the replacement coordinator answers this protocol",
+    )?;
+    // The replacement was started by the command above, so nothing here owns
+    // it. An idle coordinator exits when asked to restart.
+    request(&home, Request::Restart).ctx("stop replacement")?;
+
+    let home = temp.path().join("newer");
+    let newer = other_version_coordinator(&home, flummox::jobs::VERSION + 1, 1)?;
+    let output = jobs_command(&home, &["jobs"])?;
+    let commands = newer.join().map_err(|_| "newer coordinator thread")??;
+    check_eq(
+        commands,
+        vec![serde_json::json!("Snapshot")],
+        "a newer coordinator is never asked to restart",
+    )?;
+    check(!output.status.success(), "the command fails")?;
+    check(
+        String::from_utf8_lossy(&output.stderr).contains("newer Flummox"),
+        format!("the error names the cause: {:?}", output),
     )
 }
 

@@ -52,7 +52,13 @@ fn binary() -> Result<PathBuf> {
 
 /// Connects to the same user's coordinator, starting it when necessary.
 /// The socket is reachable only through an owner-only directory.
+///
+/// An idle coordinator left running by an older version is replaced first.
 pub fn request(command: Command) -> Result<Snapshot> {
+    exchange(command, true)
+}
+
+fn exchange(command: Command, may_replace: bool) -> Result<Snapshot> {
     let restarting = matches!(&command, Command::Restart);
     let dir = state_dir()?;
     let socket = dir.join("control.sock");
@@ -102,17 +108,28 @@ pub fn request(command: Command) -> Result<Snapshot> {
         &mut stream,
         &Request {
             version: VERSION,
-            command,
+            command: command.clone(),
         },
     )?;
     stream.write_all(b"\n")?;
     // Check the envelope before decoding a snapshot from a different schema.
     let response: serde_json::Value = read_message(&mut BufReader::new(stream))?;
-    if !restarting {
+    let running = response.get("version").and_then(serde_json::Value::as_u64);
+    if !restarting && running != Some(u64::from(VERSION)) {
+        // Only an older coordinator is replaced. If each version replaced the
+        // other, two installed copies would restart the coordinator in turn.
         ensure!(
-            response.get("version").and_then(serde_json::Value::as_u64) == Some(u64::from(VERSION)),
-            "The background worker uses an older protocol. Finish jobs, restore mounted games, then run flummox jobs restart. Workers predating restart support require logging out and back in."
+            running.is_some_and(|version| version < u64::from(VERSION)),
+            "The background worker belongs to a newer Flummox. Update this copy, or close the newer one and run flummox jobs restart."
         );
+        ensure!(
+            may_replace,
+            "The background worker still uses an older protocol after restarting. Log out and back in."
+        );
+        exchange(Command::Restart, false).context(
+            "The background worker belongs to an older Flummox and could not be replaced",
+        )?;
+        return exchange(command, false);
     }
     if let Some(error) = response.get("error").and_then(serde_json::Value::as_str) {
         bail!("{error}");
@@ -152,6 +169,25 @@ pub(super) fn read_message<T: serde::de::DeserializeOwned>(reader: &mut impl Buf
         "Incomplete or oversized worker message"
     );
     Ok(serde_json::from_str(&line)?)
+}
+
+/// Fails reads after a deadline. The socket timeout bounds one read, so a
+/// client sending a byte at a time could otherwise hold the accept loop.
+struct Within<R> {
+    inner: R,
+    until: Instant,
+}
+
+impl<R: Read> Read for Within<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if Instant::now() >= self.until {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "The request took too long to arrive",
+            ));
+        }
+        self.inner.read(buffer)
+    }
 }
 
 struct Active {
@@ -208,6 +244,9 @@ fn pack_activate(
     store_path: &Path,
     writes_path: &Path,
 ) -> Result<()> {
+    // Activation moves this folder aside and mounts over it, so it gets the
+    // same refusals as any other job target.
+    let game_path = &super::validate_folder(game_path)?;
     ensure!(
         crate::busy::process_using(game_path, &crate::busy::ProcFs::new()).is_none(),
         "Close the game and launcher activity before activating its store"
@@ -340,6 +379,12 @@ fn pack_reclaim(snapshot: &mut Snapshot, db: &Connection, game_path: &Path) -> R
         .iter_mut()
         .find(|install| install.game_path == canonical)
         .context("This game has no activated store")?;
+    // Chunks are otherwise checked only as the game reads them, and the store
+    // may have been activated weeks ago. This is the last moment a damaged
+    // store can still be replaced from the original.
+    crate::pack::Reader::open(&install.store_path)
+        .and_then(|store| store.verify(&std::sync::atomic::AtomicBool::new(false)))
+        .context("The store failed verification, so the original was kept")?;
     crate::pack::reclaim(install)?;
     save_packs(db, snapshot)?;
     let install = snapshot
@@ -420,6 +465,13 @@ fn pack_compact_observed(
     ensure!(
         install.previous_store_path.is_none() && install.previous_writes_path.is_none(),
         "Reclaim the previous compacted version before compacting again"
+    );
+    // Restoring from the retained original replays the update layer onto it.
+    // Compaction empties that layer, so the original would come back without
+    // the updates the new store absorbed.
+    ensure!(
+        install.backup_path.is_none(),
+        "Reclaim the retained original before compacting updates"
     );
     let old_store = install.store_path.clone();
     let old_writes = install.writes_path.clone();
@@ -1859,7 +1911,10 @@ pub(super) fn run() -> Result<()> {
                 stream.set_write_timeout(Some(Duration::from_secs(2)))?;
                 let mut restart = false;
                 let result = (|| -> Result<()> {
-                    let message: Request = read_message(&mut BufReader::new(&mut stream))?;
+                    let message: Request = read_message(&mut BufReader::new(Within {
+                        inner: &mut stream,
+                        until: Instant::now() + Duration::from_secs(2),
+                    }))?;
                     ensure!(
                         message.version == VERSION || matches!(&message.command, Command::Restart),
                         "Worker protocol changed. Restart Flummox."

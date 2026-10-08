@@ -361,7 +361,13 @@ impl Db {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
-            std::fs::create_dir_all(parent).map_err(|source| DbError::Io {
+            // The database lists every game path, so its folder is private.
+            std::os::unix::fs::DirBuilderExt::mode(
+                std::fs::DirBuilder::new().recursive(true),
+                0o700,
+            )
+            .create(parent)
+            .map_err(|source| DbError::Io {
                 path: parent.to_path_buf(),
                 source,
             })?;

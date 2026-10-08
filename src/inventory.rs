@@ -130,7 +130,9 @@ pub struct Inventory {
 impl Inventory {
     /// Total size of every file found.
     pub fn total_bytes(&self) -> u64 {
-        self.files.iter().map(|f| f.size).sum()
+        self.files
+            .iter()
+            .fold(0, |total, f| total.saturating_add(f.size))
     }
 
     /// Files the planner wants to compress.
@@ -140,7 +142,8 @@ impl Inventory {
 
     /// Total size of the files to compress.
     pub fn compressible_bytes(&self) -> u64 {
-        self.to_compress().map(|f| f.size).sum()
+        self.to_compress()
+            .fold(0, |total, f| total.saturating_add(f.size))
     }
 }
 

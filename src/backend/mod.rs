@@ -426,7 +426,7 @@ pub fn for_kind(kind: BackendKind) -> Option<Box<dyn Backend>> {
 pub fn free_bytes(path: &Path) -> io::Result<u64> {
     let stat =
         nix::sys::statvfs::statvfs(path).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-    Ok(stat.blocks_available() as u64 * stat.fragment_size() as u64)
+    Ok((stat.blocks_available() as u64).saturating_mul(stat.fragment_size() as u64))
 }
 
 /// The estimator model matching a backend and its options.

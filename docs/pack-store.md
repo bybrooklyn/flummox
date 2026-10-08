@@ -138,6 +138,12 @@ flummox pack prune /launcher/game/path
 Only one previous version is retained. Another compaction is refused until it
 is pruned.
 
+Compaction is refused while the original from activation is still retained.
+Restoring from that original replays the update layer onto it, and compaction
+empties the layer, so the original would come back without the updates the new
+store absorbed. Run `flummox pack reclaim` first. Reclaim verifies every chunk
+in the store before it deletes the original.
+
 For an unmanaged or already stopped writable layer, merge changes into a new
 store directly:
 

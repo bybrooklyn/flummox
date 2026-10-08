@@ -61,7 +61,10 @@ impl SandboxStatus {
     /// A line suitable for the activity log or `doctor`.
     pub fn describe(&self) -> String {
         match self {
-            Self::Enforced => "sandboxed: this process can only reach the game folder".to_owned(),
+            Self::Enforced => {
+                "sandboxed: this process can write only to the game folder and Flummox's own state"
+                    .to_owned()
+            }
             Self::Partial => {
                 "partly sandboxed: this kernel's Landlock is older than we asked for".to_owned()
             }
