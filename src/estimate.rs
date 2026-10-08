@@ -12,6 +12,7 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
+use crate::db::NOT_ATTEMPTED;
 use crate::fsprobe::FsInfo;
 use crate::inventory::Inventory;
 
@@ -289,6 +290,11 @@ pub struct EstimateOpts {
     /// comparing against the raw file size would promise savings that are
     /// already banked.
     pub mount_level: Option<i32>,
+    /// The lowest level the plan applies, when it spans several.
+    ///
+    /// A file recorded at or above this has already had its chance. `None`
+    /// means `level`.
+    pub floor: Option<i32>,
 }
 
 impl EstimateOpts {
@@ -299,11 +305,23 @@ impl EstimateOpts {
             // Only zstd is modelled; lzo and zlib would need their own curves.
             (algo == "zstd").then_some(level.unwrap_or(3))
         });
-        Self { level, mount_level }
+        Self {
+            level,
+            mount_level,
+            floor: None,
+        }
+    }
+
+    /// Sets the lowest level of the plan being estimated.
+    #[must_use]
+    pub fn with_floor(self, floor: i32) -> Self {
+        Self {
+            floor: Some(floor),
+            ..self
+        }
     }
 }
 
-/// Samples one file and estimates its disk usage before and after.
 /// Measures how much of a file is already stored compressed.
 ///
 /// Without this the estimator can only guess the current state from the
@@ -581,6 +599,20 @@ pub(crate) fn estimate_open_file_pair(
     Ok((native_estimate, maximum_estimate))
 }
 
+/// The options for one file, pricing its compressed share at the level an
+/// earlier pass recorded for it.
+///
+/// A recorded level of [`NOT_ATTEMPTED`] or below leaves `opts` as given.
+fn opts_for_recorded(opts: &EstimateOpts, recorded: Option<i32>) -> EstimateOpts {
+    match recorded.filter(|level| *level > NOT_ATTEMPTED) {
+        Some(level) => EstimateOpts {
+            mount_level: Some(level),
+            ..*opts
+        },
+        None => *opts,
+    }
+}
+
 /// Estimates a whole game from an inventory.
 ///
 /// Files are sampled in parallel; `install_dir` is the directory the
@@ -632,6 +664,16 @@ pub fn estimate_game_cancellable(
     )
 }
 
+/// What the estimate does with one candidate file.
+enum Plan {
+    /// Sample it, pricing its compressed share at the recorded level if any.
+    Sample(Option<i32>),
+    /// An earlier pass at or above the plan's floor already tried it.
+    AlreadyTried,
+    /// The sampling budget was spent before this file.
+    OutOfBudget,
+}
+
 /// [`estimate_game_cancellable`] with the sampling budget as a parameter.
 fn estimate_game_budgeted(
     install_dir: &Path,
@@ -647,78 +689,71 @@ fn estimate_game_budgeted(
     // Largest first, so the budget is spent where most of the bytes are and
     // whatever goes unsampled is the small remainder.
     candidates.sort_by_key(|entry| std::cmp::Reverse(entry.size));
-    let budget = std::sync::atomic::AtomicU64::new(sample_bytes);
-    let results: Vec<(FileEstimate, bool)> = candidates
-        .par_iter()
+    // The sampled set is chosen here, in order, before any thread starts. A
+    // shared budget spent by whichever worker got there first made the set
+    // depend on scheduling. Each file is charged the most it can read.
+    let mut remaining = sample_bytes;
+    let per_file_cap = u64::from(BtrfsModel::BLOCK) * MAX_BLOCKS_PER_FILE;
+    let plans: Vec<Plan> = candidates
+        .iter()
         .map(|entry| {
-            if cancelled() {
-                return (
-                    FileEstimate {
-                        size: entry.size,
-                        ..FileEstimate::default()
-                    },
-                    false,
-                );
-            }
-            // Read once and clamp. Two threads can both pass a bare `== 0`
-            // check and both subtract, wrapping the counter to about 1.8e19,
-            // after which the budget stops limiting anything.
-            let remaining = budget.load(std::sync::atomic::Ordering::Acquire);
-            if remaining == 0 {
-                // Out of sampling budget: assume the file behaves like the
-                // ones already measured by leaving it out of both totals.
-                return (
-                    FileEstimate {
-                        size: entry.size,
-                        ..FileEstimate::default()
-                    },
-                    false,
-                );
-            }
-            let path = entry.path(install_dir);
             // A pass at this level or higher has already had its chance at
             // this file; whatever it left uncompressed, it left uncompressed
             // for a reason. Claiming a further saving here is how the
             // estimator used to promise space that a rerun could not deliver.
-            if probe
-                .attempted_level(&path)
-                .is_some_and(|applied| applied >= opts.level)
-            {
-                return (
-                    FileEstimate {
-                        size: entry.size,
-                        disk_now: entry.size,
-                        disk_after: entry.size,
-                        sampled: 0,
-                        inspection: crate::classify::Inspection::default(),
-                    },
-                    false,
-                );
+            let recorded = probe.attempted_level(&entry.path(install_dir));
+            if recorded.is_some_and(|applied| applied >= opts.floor.unwrap_or(opts.level)) {
+                Plan::AlreadyTried
+            } else if remaining == 0 {
+                Plan::OutOfBudget
+            } else {
+                remaining = remaining.saturating_sub(entry.size.min(per_file_cap));
+                Plan::Sample(recorded)
             }
-            let measured = probe.measure(&path).and_then(|(compressed, mapped)| {
-                (mapped > 0).then(|| compressed as f64 / mapped as f64)
-            });
-            match estimate_file_with(&path, entry.size, model, opts, measured) {
-                Ok(est) => {
-                    // Saturating, not wrapping: `remaining` was read before
-                    // the file was sampled, so another thread may have spent
-                    // the budget in between.
-                    let _spent = budget.try_update(
-                        std::sync::atomic::Ordering::AcqRel,
-                        std::sync::atomic::Ordering::Acquire,
-                        |left| Some(left.saturating_sub(est.sampled)),
-                    );
-                    let worth = est.worthwhile();
-                    (est, worth)
-                }
-                // An unreadable file is simply not a candidate.
-                Err(_) => (
+        })
+        .collect();
+    let results: Vec<(FileEstimate, bool)> = candidates
+        .par_iter()
+        .zip(plans.par_iter())
+        .map(|(entry, plan)| {
+            let unsampled = || {
+                (
                     FileEstimate {
                         size: entry.size,
                         ..FileEstimate::default()
                     },
                     false,
-                ),
+                )
+            };
+            let recorded = match plan {
+                _ if cancelled() => return unsampled(),
+                Plan::OutOfBudget => return unsampled(),
+                Plan::AlreadyTried => {
+                    return (
+                        FileEstimate {
+                            size: entry.size,
+                            disk_now: entry.size,
+                            disk_after: entry.size,
+                            sampled: 0,
+                            inspection: crate::classify::Inspection::default(),
+                        },
+                        false,
+                    );
+                }
+                Plan::Sample(recorded) => *recorded,
+            };
+            let path = entry.path(install_dir);
+            let measured = probe.measure(&path).and_then(|(compressed, mapped)| {
+                (mapped > 0).then(|| compressed as f64 / mapped as f64)
+            });
+            let per_file = opts_for_recorded(opts, recorded);
+            match estimate_file_with(&path, entry.size, model, &per_file, measured) {
+                Ok(est) => {
+                    let worth = est.worthwhile();
+                    (est, worth)
+                }
+                // An unreadable file is simply not a candidate.
+                Err(_) => unsampled(),
             }
         })
         .collect();
@@ -900,6 +935,7 @@ mod tests {
         let opts = EstimateOpts {
             level: 3,
             mount_level: None,
+            floor: None,
         };
         let (native, _) = estimate_open_file_pair(
             &file,
@@ -979,10 +1015,12 @@ mod tests {
         let native_opts = EstimateOpts {
             level: 9,
             mount_level: None,
+            floor: None,
         };
         let maximum_opts = EstimateOpts {
             level: 19,
             mount_level: None,
+            floor: None,
         };
         let (native, maximum) = estimate_open_file_pair(
             &file,
@@ -1119,6 +1157,7 @@ mod tests {
         let opts = EstimateOpts {
             level: 9,
             mount_level: None,
+            floor: None,
         };
 
         let zeros = tmp.path().join("zeros.dat");
@@ -1184,6 +1223,7 @@ mod tests {
         let opts = EstimateOpts {
             level: 9,
             mount_level: None,
+            floor: None,
         };
 
         // A zstd header over bytes that really are incompressible. This is the
@@ -1233,6 +1273,7 @@ mod tests {
             &EstimateOpts {
                 level: 15,
                 mount_level: None,
+                floor: None,
             },
         )
         .ctx("estimate on a plain mount")?;
@@ -1243,6 +1284,7 @@ mod tests {
             &EstimateOpts {
                 level: 15,
                 mount_level: Some(1),
+                floor: None,
             },
         )
         .ctx("estimate on a zstd:1 mount")?;
@@ -1274,6 +1316,7 @@ mod tests {
         let opts = EstimateOpts {
             level: 9,
             mount_level: None,
+            floor: None,
         };
         let whole = estimate_game_budgeted(dir, &inv, &model, &opts, &NoProbe, None, u64::MAX);
         check_eq(whole.unsampled_files, 0, "control: everything sampled")?;
@@ -1293,6 +1336,151 @@ mod tests {
         )
     }
 
+    /// A probe that reports one recorded level, and optionally that every
+    /// file is already stored compressed.
+    struct Recorded {
+        level: Option<i32>,
+        all_compressed: bool,
+    }
+
+    impl DiskProbe for Recorded {
+        fn measure(&self, _path: &Path) -> Option<(u64, u64)> {
+            self.all_compressed.then_some((1000, 1000))
+        }
+
+        fn attempted_level(&self, _path: &Path) -> Option<i32> {
+            self.level
+        }
+    }
+
+    /// Words drawn from a 2048-word vocabulary: compressible, and by an
+    /// amount that moves with the level.
+    fn wordy(len: usize) -> Vec<u8> {
+        let letters = noise(2048 * 8);
+        let vocabulary: Vec<&[u8]> = letters.chunks(8).collect();
+        let picks = noise(len);
+        let mut out = Vec::with_capacity(len + 16);
+        for pick in picks.chunks(2) {
+            let index = pick
+                .iter()
+                .fold(0usize, |acc, byte| (acc << 8) | usize::from(*byte))
+                % 2048;
+            let word = vocabulary.get(index).copied().unwrap_or_default();
+            out.extend(word.iter().map(|byte| b'a' + byte % 26));
+            out.push(b' ');
+            if out.len() >= len {
+                break;
+            }
+        }
+        out
+    }
+
+    fn one_game(dir: &Path, bytes: Vec<u8>) -> Result<Inventory, String> {
+        std::fs::write(dir.join("data.dat"), bytes).ctx("write data.dat")?;
+        inventory::walk(dir, &inventory::WalkOpts::default()).ctx("walk the game dir")
+    }
+
+    #[test]
+    fn a_file_recorded_at_the_plan_floor_is_not_offered_again() -> TestResult {
+        let tmp = tempfile::tempdir().ctx("tempdir")?;
+        let inv = one_game(tmp.path(), wordy(2 * 1024 * 1024))?;
+        let model = BtrfsModel { level: 15 };
+        let max = EstimateOpts {
+            level: 15,
+            mount_level: None,
+            floor: Some(9),
+        };
+        let probe = |level| Recorded {
+            level,
+            all_compressed: false,
+        };
+        let fresh = estimate_game_with(tmp.path(), &inv, &model, &max, &probe(None));
+        check(
+            fresh.files == 1 && fresh.saving() > 0,
+            format!("control: an unrecorded file is offered: {fresh:?}"),
+        )?;
+        let after_max = estimate_game_with(tmp.path(), &inv, &model, &max, &probe(Some(9)));
+        check_eq(
+            after_max.files,
+            0,
+            "a level-9 file has had its chance under a 9 to 15 plan",
+        )?;
+        let below = estimate_game_with(tmp.path(), &inv, &model, &max, &probe(Some(3)));
+        check_eq(below.files, 1, "a level-3 file is still offered")
+    }
+
+    #[test]
+    fn already_compressed_data_is_priced_at_its_recorded_level() -> TestResult {
+        let tmp = tempfile::tempdir().ctx("tempdir")?;
+        let path = tmp.path().join("data.dat");
+        let size = write_file(&path, wordy(2 * 1024 * 1024))?;
+        let model = BtrfsModel { level: 19 };
+        let opts = EstimateOpts {
+            level: 19,
+            mount_level: None,
+            floor: None,
+        };
+        let now_at = |recorded: Option<i32>| -> Result<u64, String> {
+            let per_file = opts_for_recorded(&opts, recorded);
+            estimate_file_with(&path, size, &model, &per_file, Some(1.0))
+                .map(|est| est.disk_now)
+                .ctx("estimate with a recorded level")
+        };
+        let (low, high, unknown) = (now_at(Some(1))?, now_at(Some(12))?, now_at(None)?);
+        check(low > 0 && high > 0, "control: both were sampled")?;
+        check(
+            low > high,
+            format!("level 1 holds more bytes than level 12: {low} vs {high}"),
+        )?;
+        check(
+            unknown != low || unknown != high,
+            "control: an unrecorded file is priced at the default, not at both",
+        )?;
+        check_eq(
+            now_at(Some(NOT_ATTEMPTED))?,
+            unknown,
+            "a skipped file's zero is not a level",
+        )
+    }
+
+    #[test]
+    fn the_sampled_set_does_not_depend_on_thread_count() -> TestResult {
+        let tmp = tempfile::tempdir().ctx("tempdir")?;
+        let dir = tmp.path();
+        for index in 0..12 {
+            std::fs::write(
+                dir.join(format!("part-{index:02}.dat")),
+                "the quick brown fox ".repeat(50_000 + index * 1000),
+            )
+            .ctx("write a part")?;
+        }
+        let inv = inventory::walk(dir, &inventory::WalkOpts::default()).ctx("walk the game dir")?;
+        let model = BtrfsModel { level: 9 };
+        let opts = EstimateOpts {
+            level: 9,
+            mount_level: None,
+            floor: None,
+        };
+        let budget = 2 * 1024 * 1024;
+        let mut seen = Vec::new();
+        for threads in [1, 2, 8, 8, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .ctx("pool")?;
+            seen.push(pool.install(|| {
+                estimate_game_budgeted(dir, &inv, &model, &opts, &NoProbe, None, budget)
+            }));
+        }
+        let first = seen.first().ctx("one result")?;
+        check(first.inspected_files > 0, "control: something was sampled")?;
+        check(first.unsampled_files > 0, "control: the budget bound")?;
+        for other in &seen {
+            check_eq(*other, *first, "every thread count gives the same estimate")?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn game_estimate_sums_only_worthwhile_files() -> TestResult {
         let tmp = tempfile::tempdir().ctx("tempdir")?;
@@ -1307,6 +1495,7 @@ mod tests {
             &EstimateOpts {
                 level: 9,
                 mount_level: None,
+                floor: None,
             },
         );
         check_eq(est.files, 1, "one worthwhile file")?;
