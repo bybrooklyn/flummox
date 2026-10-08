@@ -90,7 +90,7 @@ impl Wizard {
         Self::start_cancellable(
             game,
             &std::sync::atomic::AtomicBool::new(false),
-            &crate::pack::NoObserver,
+            &crate::observer::NoObserver,
         )
     }
 
@@ -99,7 +99,7 @@ impl Wizard {
     pub fn start_cancellable(
         game: Game,
         cancel: &std::sync::atomic::AtomicBool,
-        observer: &dyn crate::pack::Observer,
+        observer: &dyn crate::observer::Observer,
     ) -> Result<Self> {
         let corpus = baseline_cancellable(&game, cancel, observer)?;
         let before = crate::allocation::measure(std::slice::from_ref(&game.install_dir));
@@ -187,7 +187,7 @@ pub fn baseline(game: &Game) -> Result<Corpus> {
     baseline_cancellable(
         game,
         &std::sync::atomic::AtomicBool::new(false),
-        &crate::pack::NoObserver,
+        &crate::observer::NoObserver,
     )
 }
 
@@ -196,7 +196,7 @@ pub fn baseline(game: &Game) -> Result<Corpus> {
 pub fn baseline_cancellable(
     game: &Game,
     cancel: &std::sync::atomic::AtomicBool,
-    observer: &dyn crate::pack::Observer,
+    observer: &dyn crate::observer::Observer,
 ) -> Result<Corpus> {
     #[cfg(target_os = "linux")]
     return compatibility::corpus(&game.install_dir, cancel, observer);
@@ -443,12 +443,12 @@ mod tests {
             is_tool: false,
         };
         let running = std::sync::atomic::AtomicBool::new(false);
-        let wizard = Wizard::start_cancellable(game.clone(), &running, &crate::pack::NoObserver)
+        let wizard = Wizard::start_cancellable(game.clone(), &running, &crate::observer::NoObserver)
             .ctx("control: an uncancelled start hashes the folder")?;
         check_eq(wizard.corpus.files, 1, "control: the file was hashed")?;
         let stopped = std::sync::atomic::AtomicBool::new(true);
         check(
-            Wizard::start_cancellable(game, &stopped, &crate::pack::NoObserver).is_err(),
+            Wizard::start_cancellable(game, &stopped, &crate::observer::NoObserver).is_err(),
             "a start cancelled up front returns an error",
         )
     }

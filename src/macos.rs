@@ -1073,11 +1073,11 @@ pub fn run() -> Result<()> {
         ),
         Command::Compress { folder } => println!(
             "{}",
-            optimize_folder_with(&folder, &interrupt_flag()?, stderr_progress())?
+            optimize_folder_with(&folder, &*interrupt_flag()?, stderr_progress())?
         ),
         Command::Decompress { folder } => println!(
             "{}",
-            restore_folder_with(&folder, &interrupt_flag()?, stderr_progress())?
+            restore_folder_with(&folder, &*interrupt_flag()?, stderr_progress())?
         ),
         Command::Recovery => println!("{}", serde_json::to_string_pretty(&recovery()?)?),
         Command::Recover { folder } => recover_folder(&folder)?,

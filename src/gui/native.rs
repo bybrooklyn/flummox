@@ -671,7 +671,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             // GoTo's own task restores the page's old scroll offset. It is dropped
             // because the jump scrolls to the section.
             let _navigation = update(state, Message::GoTo(Page::Settings));
-            return super::surface::jump(section, Message::JumpOffset);
+            return super::surface::jump("Settings", section, Message::JumpOffset);
         }
         Message::JumpOffset(offset) => {
             state.scroll_redraw_until = Some(Instant::now() + Duration::from_millis(150));

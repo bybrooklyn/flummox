@@ -47,6 +47,7 @@ pub mod libraries;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod model;
+pub mod observer;
 #[cfg(any(windows, target_os = "macos"))]
 pub mod native;
 #[cfg(target_os = "macos")]
