@@ -5,6 +5,12 @@
 
 #![allow(unsafe_code)]
 
+mod activity;
+pub mod coordinator;
+mod ipc;
+pub(crate) mod launchers;
+mod tray;
+
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::{

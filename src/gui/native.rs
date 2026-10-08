@@ -85,7 +85,7 @@ fn scan() -> std::result::Result<Scan, String> {
     #[cfg(windows)]
     let (catalog, stamp) = {
         let snapshot =
-            crate::windows_coordinator::request(crate::windows_coordinator::Command::Snapshot)
+            crate::windows::coordinator::request(crate::windows::coordinator::Command::Snapshot)
                 .map_err(|error| error.to_string())?;
         (
             crate::desktop_discovery::Catalog {
@@ -149,7 +149,7 @@ impl std::fmt::Display for GameSort {
 }
 struct State {
     #[cfg(windows)]
-    worker: crate::windows_coordinator::Snapshot,
+    worker: crate::windows::coordinator::Snapshot,
     #[cfg(windows)]
     worker_error: Option<String>,
     #[cfg(windows)]
@@ -240,9 +240,9 @@ impl Default for State {
 #[derive(Debug, Clone)]
 enum Message {
     #[cfg(windows)]
-    Worker(std::result::Result<crate::windows_coordinator::Snapshot, String>),
+    Worker(std::result::Result<crate::windows::coordinator::Snapshot, String>),
     #[cfg(windows)]
-    WorkerCommand(crate::windows_coordinator::Command),
+    WorkerCommand(crate::windows::coordinator::Command),
     #[cfg(windows)]
     Automatic(PathBuf, bool),
     #[cfg(windows)]
@@ -421,7 +421,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         #[cfg(windows)]
         Message::WorkerCommand(command) => {
             state.worker_enabled =
-                !matches!(command, crate::windows_coordinator::Command::Shutdown);
+                !matches!(command, crate::windows::coordinator::Command::Shutdown);
             return worker_send(command);
         }
         #[cfg(windows)]
@@ -799,7 +799,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             #[cfg(windows)]
             return Task::batch([
                 scan,
-                worker_send(crate::windows_coordinator::Command::Refresh),
+                worker_send(crate::windows::coordinator::Command::Refresh),
             ]);
             #[cfg(target_os = "macos")]
             return scan;
@@ -902,7 +902,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     job.phase.active() && job.phase != crate::desktop_jobs::Phase::Waiting
                 })
             {
-                return worker_send(crate::windows_coordinator::Command::Cancel(job.id));
+                return worker_send(crate::windows::coordinator::Command::Cancel(job.id));
             }
             if let Some(cancel) = &state.cancel {
                 cancel.store(true, Ordering::Relaxed);
@@ -1412,8 +1412,8 @@ fn save_preferences(state: &mut State) -> Task<Message> {
             #[cfg(target_os = "macos")]
             let result = crate::libraries::data_dir().and_then(|root| preferences.save(&root));
             #[cfg(windows)]
-            let result = crate::windows_coordinator::request(
-                crate::windows_coordinator::Command::Settings(preferences),
+            let result = crate::windows::coordinator::request(
+                crate::windows::coordinator::Command::Settings(preferences),
             )
             .map(|_| ());
             result.map_err(|error| error.to_string())
@@ -1590,7 +1590,7 @@ fn settings_page(state: &State) -> Element<'_, Message> {
     ]
     .spacing(8);
     #[cfg(windows)]
-    let maintenance = column![theme::section_title("Maintenance"), theme::muted("Enable maintenance separately for each location. Existing games establish a baseline; new installs and changed builds can be queued. Closing the window keeps the worker running."), button(if state.worker.maintenance_paused { "Resume background work" } else { "Pause background work" }).on_press(Message::WorkerCommand(crate::windows_coordinator::Command::Maintenance(!state.worker.maintenance_paused))), button(if state.worker_enabled { "Stop background worker" } else { "Start background worker" }).on_press(Message::WorkerCommand(if state.worker_enabled { crate::windows_coordinator::Command::Shutdown } else { crate::windows_coordinator::Command::Snapshot }))].spacing(12);
+    let maintenance = column![theme::section_title("Maintenance"), theme::muted("Enable maintenance separately for each location. Existing games establish a baseline; new installs and changed builds can be queued. Closing the window keeps the worker running."), button(if state.worker.maintenance_paused { "Resume background work" } else { "Pause background work" }).on_press(Message::WorkerCommand(crate::windows::coordinator::Command::Maintenance(!state.worker.maintenance_paused))), button(if state.worker_enabled { "Stop background worker" } else { "Start background worker" }).on_press(Message::WorkerCommand(if state.worker_enabled { crate::windows::coordinator::Command::Shutdown } else { crate::windows::coordinator::Command::Snapshot }))].spacing(12);
     #[cfg(windows)]
     let maintenance = maintenance.push(
         checkbox(state.preferences.start_at_login)
@@ -1669,16 +1669,16 @@ fn start(state: &mut State, folder: PathBuf, optimize: bool) -> Task<Message> {
                 folder,
             )
         });
-    worker_send(crate::windows_coordinator::Command::Enqueue {
+    worker_send(crate::windows::coordinator::Command::Enqueue {
         game,
         restore: !optimize,
     })
 }
 #[cfg(windows)]
-fn worker_send(command: crate::windows_coordinator::Command) -> Task<Message> {
+fn worker_send(command: crate::windows::coordinator::Command) -> Task<Message> {
     Task::perform(
         background(move || {
-            crate::windows_coordinator::request(command).map_err(|error| error.to_string())
+            crate::windows::coordinator::request(command).map_err(|error| error.to_string())
         }),
         Message::Worker,
     )
@@ -1688,7 +1688,7 @@ fn polls() -> impl iced::futures::Stream<Item = Message> {
     iced::futures::stream::unfold((), |_| async {
         let result = background(|| {
             std::thread::sleep(Duration::from_secs(1));
-            crate::windows_coordinator::poll().map_err(|error| error.to_string())
+            crate::windows::coordinator::poll().map_err(|error| error.to_string())
         })
         .await;
         Some((Message::Worker(result), ()))
@@ -1734,18 +1734,18 @@ fn worker_jobs(state: &State) -> iced::widget::Column<'_, Message> {
                 controls = controls
                     .push(
                         button(if job.user_paused { "Resume" } else { "Pause" }).on_press(
-                            Message::WorkerCommand(crate::windows_coordinator::Command::Pause {
+                            Message::WorkerCommand(crate::windows::coordinator::Command::Pause {
                                 id: job.id,
                                 paused: !job.user_paused,
                             }),
                         ),
                     )
                     .push(button("Cancel").on_press(Message::WorkerCommand(
-                        crate::windows_coordinator::Command::Cancel(job.id),
+                        crate::windows::coordinator::Command::Cancel(job.id),
                     )));
             } else if job.phase != Phase::Completed {
                 controls = controls.push(button("Retry").on_press(Message::WorkerCommand(
-                    crate::windows_coordinator::Command::Retry(job.id),
+                    crate::windows::coordinator::Command::Retry(job.id),
                 )));
             }
             let row: Element<'_, Message> = container(

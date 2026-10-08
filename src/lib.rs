@@ -68,15 +68,5 @@ pub mod watch;
 #[cfg(windows)]
 pub mod windows;
 #[cfg(windows)]
-mod windows_activity;
-#[cfg(windows)]
-pub mod windows_coordinator;
-#[cfg(windows)]
-mod windows_ipc;
-#[cfg(windows)]
-mod windows_launchers;
-#[cfg(windows)]
-mod windows_tray;
-#[cfg(windows)]
 #[path = "launchers/vdf.rs"]
 mod windows_vdf;

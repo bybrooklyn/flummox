@@ -259,7 +259,8 @@ impl Store {
             std::fs::metadata(path)?.len() <= 1024 * 1024,
             "Compatibility report exceeds 1 MiB"
         );
-        let report: Report = serde_json::from_slice(&std::fs::read(path)?)?;
+        let bytes = std::fs::read(path).context("Reading the report")?;
+        let report: Report = serde_json::from_slice(&bytes).context("Parsing the report")?;
         report.validate()?;
         Ok(report)
     }
