@@ -85,6 +85,141 @@ impl Observations {
     }
 }
 
+/// What automatic upkeep remembers about one Maximum Space install, keyed by
+/// its game path. Stored as settings row 7 and never sent to clients.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Upkeep {
+    /// The game's build when updates were last folded into the store.
+    build: Option<String>,
+    /// The game has been seen running since then.
+    played: bool,
+}
+
+/// Update-layer size that counts as a game update when no build number says
+/// so: this many bytes, or a twentieth of the store if that is more. Games
+/// that keep saves in their own folder stay well under it.
+const UPKEEP_LAYER_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The upkeep a confirmed, mounted install is due, if any.
+///
+/// Nothing is due while the original from activation is kept, because the
+/// user has not yet confirmed the game runs from its store. After that,
+/// updates are folded in when the build changed or the update layer grew
+/// large, and the previous version is deleted once the folded-in one has
+/// been played. The first sight of an install only records its build.
+fn upkeep_due(
+    install: &crate::pack::Install,
+    build: Option<&str>,
+    layer_bytes: u64,
+    record: &mut Upkeep,
+) -> Option<PackTask> {
+    if install.phase != crate::pack::InstallPhase::Mounted || install.backup_path.is_some() {
+        return None;
+    }
+    if install.previous_store_path.is_some() {
+        return record.played.then_some(PackTask::Prune);
+    }
+    let store = install
+        .summary
+        .as_ref()
+        .map_or(0, |summary| summary.archive_bytes);
+    let large = layer_bytes >= UPKEEP_LAYER_BYTES.max(store / 20);
+    let rebuilt = match (&record.build, build) {
+        (Some(recorded), Some(current)) => recorded != current && layer_bytes > 0,
+        _ => false,
+    };
+    if record.build.is_none() {
+        record.build = build.map(str::to_owned);
+    }
+    (large || rebuilt).then_some(PackTask::Compact)
+}
+
+/// Bytes of regular files in an update layer's upper tree. An unreadable
+/// layer counts as empty, which only delays upkeep.
+fn layer_bytes(writes: &Path) -> u64 {
+    walkdir::WalkDir::new(writes.join("files"))
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+        .filter_map(|entry| entry.metadata().ok())
+        .fold(0u64, |total, metadata| total.saturating_add(metadata.len()))
+}
+
+/// Queues the upkeep each install is due and records what was decided.
+///
+/// A task is not queued while its game is busy or has a job waiting, or
+/// while the last attempt at the same task needs attention. That last rule
+/// keeps a failing task from being queued again every scan.
+fn run_upkeep(
+    snapshot: &mut Snapshot,
+    games: &[Game],
+    records: &mut std::collections::HashMap<String, Upkeep>,
+    db: &Connection,
+) {
+    let installs = snapshot.packs.clone();
+    records.retain(|path, _| {
+        installs
+            .iter()
+            .any(|install| install.game_path.to_string_lossy() == *path)
+    });
+    for install in &installs {
+        let Some(game) = games
+            .iter()
+            .find(|game| game.install_dir == install.game_path)
+        else {
+            continue;
+        };
+        let record = records
+            .entry(install.game_path.to_string_lossy().into_owned())
+            .or_default();
+        let Some(task) = upkeep_due(
+            install,
+            game.build.as_deref(),
+            layer_bytes(&install.writes_path),
+            record,
+        ) else {
+            continue;
+        };
+        let jobs = || {
+            snapshot
+                .jobs
+                .iter()
+                .rev()
+                .filter(|job| job.game.install_dir == game.install_dir)
+        };
+        let stuck = jobs()
+            .find(|job| job.pack.as_ref() == Some(&task))
+            .is_some_and(|job| {
+                matches!(
+                    job.phase,
+                    Phase::Failed | Phase::Partial | Phase::Interrupted
+                )
+            });
+        if !game.state.is_idle() || stuck || jobs().any(|job| job.phase.active()) {
+            continue;
+        }
+        let compacting = task == PackTask::Compact;
+        match enqueue_job(
+            snapshot,
+            game.clone(),
+            Operation::Pack,
+            CompressOpts::default(),
+            Some(task),
+            db,
+        ) {
+            Ok(()) if compacting => {
+                record.build.clone_from(&game.build);
+                record.played = false;
+            }
+            Ok(()) => {}
+            Err(error) => {
+                tracing::warn!(%error, game = %game.title, "store upkeep was not queued");
+            }
+        }
+    }
+}
+
 /// Writes one job to the queue table, replacing its previous row.
 fn save(db: &Connection, job: &Job) -> Result<()> {
     db.execute(
@@ -176,7 +311,7 @@ fn open_store(path: &Path) -> Result<(Connection, Snapshot)> {
     let db = Connection::open(path)?;
     db.busy_timeout(Duration::from_secs(5))?;
     // Settings rows: 1 libraries and exclusions, 2 maintenance observations,
-    // 3 reduced motion, 4 pack installs, 5 theme, 6 motion.
+    // 3 reduced motion, 4 pack installs, 5 theme, 6 motion, 7 store upkeep.
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
         CREATE TABLE IF NOT EXISTS queue(id INTEGER PRIMARY KEY, data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS settings(id INTEGER PRIMARY KEY, data TEXT NOT NULL);
@@ -1342,6 +1477,14 @@ pub(super) fn run() -> Result<()> {
         .transpose()?
         .unwrap_or_default();
     let mut initialized = !known.0.is_empty();
+    let mut upkeep: std::collections::HashMap<String, Upkeep> = db
+        .query_row("SELECT data FROM settings WHERE id=7", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()?
+        .map(|json| serde_json::from_str(&json))
+        .transpose()?
+        .unwrap_or_default();
     let mut last_client = Instant::now();
     let mut games = Vec::new();
     let mut last_save = Instant::now();
@@ -1455,6 +1598,25 @@ pub(super) fn run() -> Result<()> {
             if std::fs::read_dir("/proc/self/fd").is_err() {
                 snapshot.gaming = Some("process information is unavailable".into());
             }
+            // A store with updates folded in counts as played once its game
+            // is seen running. Upkeep deletes the previous version after that.
+            if let Some(title) = &snapshot.gaming {
+                for install in snapshot
+                    .packs
+                    .iter()
+                    .filter(|install| install.previous_store_path.is_some())
+                {
+                    if games
+                        .iter()
+                        .any(|game| game.install_dir == install.game_path && game.title == *title)
+                    {
+                        upkeep
+                            .entry(install.game_path.to_string_lossy().into_owned())
+                            .or_default()
+                            .played = true;
+                    }
+                }
+            }
         }
         // Maintenance, after each finished scan: queue compression for new
         // installs and settled updates in automatic libraries, and save the
@@ -1482,6 +1644,16 @@ pub(super) fn run() -> Result<()> {
             if before != after {
                 db.execute(
                     "INSERT OR REPLACE INTO settings(id,data) VALUES(2,?1)",
+                    [after],
+                )?;
+            }
+            // Store upkeep, on the same fresh game list.
+            let before = serde_json::to_string(&upkeep)?;
+            run_upkeep(&mut snapshot, &games, &mut upkeep, &db);
+            let after = serde_json::to_string(&upkeep)?;
+            if before != after {
+                db.execute(
+                    "INSERT OR REPLACE INTO settings(id,data) VALUES(7,?1)",
                     [after],
                 )?;
             }
@@ -2111,6 +2283,164 @@ mod tests {
             "interrupted undo cannot revive old compression receipts",
         )
     }
+    #[test]
+    fn upkeep_folds_in_updates_and_deletes_the_previous_version_after_play() -> TestResult {
+        let temp = tempfile::tempdir().ctx("upkeep fixture")?;
+        let folder = temp.path().join("game");
+        let writes = temp.path().join("updates");
+        std::fs::create_dir(&folder).ctx("game folder")?;
+        std::fs::create_dir_all(writes.join("files")).ctx("update layer")?;
+        let (db, mut snapshot) = open_store(&temp.path().join("queue.sqlite")).ctx("queue")?;
+        let mut game = Game {
+            id: crate::model::GameId::new(crate::model::Launcher::Steam, "42"),
+            also: vec![],
+            title: "Upkeep".into(),
+            install_dir: folder.clone(),
+            build: Some("1".into()),
+            size_hint: None,
+            state: crate::model::InstallState::Idle,
+            is_tool: false,
+        };
+        snapshot.packs.push(crate::pack::Install {
+            game_path: folder.clone(),
+            store_path: temp.path().join("store"),
+            writes_path: writes.clone(),
+            backup_path: Some(temp.path().join("original")),
+            previous_store_path: None,
+            previous_writes_path: None,
+            summary: None,
+            phase: crate::pack::InstallPhase::Mounted,
+            message: String::new(),
+        });
+        let mut records = std::collections::HashMap::new();
+        let queued = |snapshot: &Snapshot| -> Vec<PackTask> {
+            snapshot
+                .jobs
+                .iter()
+                .filter_map(|job| job.pack.clone())
+                .collect()
+        };
+        std::fs::write(writes.join("files/patch.bin"), b"update").ctx("update")?;
+        game.build = Some("2".into());
+
+        // While the original is kept the user has not confirmed the game
+        // runs, so nothing is done however much has changed.
+        run_upkeep(
+            &mut snapshot,
+            std::slice::from_ref(&game),
+            &mut records,
+            &db,
+        );
+        check(queued(&snapshot).is_empty(), "nothing before confirmation")?;
+
+        // Confirmed. The first sight only records the build.
+        snapshot.packs.first_mut().ctx("install")?.backup_path = None;
+        run_upkeep(
+            &mut snapshot,
+            std::slice::from_ref(&game),
+            &mut records,
+            &db,
+        );
+        check(
+            queued(&snapshot).is_empty(),
+            "the first sight is a baseline",
+        )?;
+
+        // A new build with updates in the layer is folded in, once.
+        game.build = Some("3".into());
+        run_upkeep(
+            &mut snapshot,
+            std::slice::from_ref(&game),
+            &mut records,
+            &db,
+        );
+        run_upkeep(
+            &mut snapshot,
+            std::slice::from_ref(&game),
+            &mut records,
+            &db,
+        );
+        check_eq(
+            queued(&snapshot),
+            vec![PackTask::Compact],
+            "one compaction for one update",
+        )?;
+
+        // The compaction ran and kept the previous version. It is deleted
+        // only after the game has been played.
+        {
+            let job = snapshot.jobs.first_mut().ctx("compaction job")?;
+            job.phase = Phase::Completed;
+        }
+        snapshot
+            .packs
+            .first_mut()
+            .ctx("install")?
+            .previous_store_path = Some(temp.path().join("previous"));
+        run_upkeep(
+            &mut snapshot,
+            std::slice::from_ref(&game),
+            &mut records,
+            &db,
+        );
+        check_eq(
+            queued(&snapshot).len(),
+            1,
+            "no delete before the game is played",
+        )?;
+        records
+            .get_mut(folder.to_string_lossy().as_ref())
+            .ctx("upkeep record")?
+            .played = true;
+        run_upkeep(
+            &mut snapshot,
+            std::slice::from_ref(&game),
+            &mut records,
+            &db,
+        );
+        check_eq(
+            queued(&snapshot),
+            vec![PackTask::Compact, PackTask::Prune],
+            "the previous version goes after play",
+        )?;
+
+        // A delete that failed is left for the user and not queued again.
+        snapshot.jobs.last_mut().ctx("prune job")?.phase = Phase::Failed;
+        run_upkeep(
+            &mut snapshot,
+            std::slice::from_ref(&game),
+            &mut records,
+            &db,
+        );
+        check_eq(queued(&snapshot).len(), 2, "a failed task is not requeued")
+    }
+
+    #[test]
+    fn a_large_update_layer_counts_as_an_update_without_a_build_number() -> TestResult {
+        let install = crate::pack::Install {
+            game_path: "/fixture/game".into(),
+            store_path: "/fixture/store".into(),
+            writes_path: "/fixture/updates".into(),
+            backup_path: None,
+            previous_store_path: None,
+            previous_writes_path: None,
+            summary: None,
+            phase: crate::pack::InstallPhase::Mounted,
+            message: String::new(),
+        };
+        let mut record = Upkeep::default();
+        check_eq(
+            upkeep_due(&install, None, UPKEEP_LAYER_BYTES - 1, &mut record),
+            None,
+            "saves and settings in the game folder are left alone",
+        )?;
+        check_eq(
+            upkeep_due(&install, None, UPKEEP_LAYER_BYTES, &mut record),
+            Some(PackTask::Compact),
+            "a layer this large is an update",
+        )
+    }
+
     #[test]
     fn a_late_pause_is_harmless_and_waiting_jobs_say_what_holds_them() -> TestResult {
         let temp = tempfile::tempdir().ctx("queue fixture")?;

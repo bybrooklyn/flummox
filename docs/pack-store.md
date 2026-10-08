@@ -138,6 +138,14 @@ flummox pack prune /launcher/game/path
 Only one previous version is retained. Another compaction is refused until it
 is pruned.
 
+The coordinator does this upkeep by itself for a confirmed install. After each
+scan it queues a compaction when the game's build changed with updates in the
+layer, or when the layer has grown past 256 MiB or a twentieth of the store,
+whichever is larger. It queues the prune once the game has been seen running
+since that compaction. Neither is queued while the game is busy or has a job
+waiting, and a task whose last attempt needs attention is not queued again.
+What it remembers for each install is private to the coordinator.
+
 Compaction is refused while the original from activation is still retained.
 Restoring from that original replays the update layer onto it, and compaction
 empties the layer, so the original would come back without the updates the new

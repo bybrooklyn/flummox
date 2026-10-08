@@ -356,9 +356,9 @@ pub struct State {
     pub progress: std::collections::HashMap<i64, Animation<f32>>,
     /// Store paths the user typed or picked.
     pub pack_paths: std::collections::HashMap<String, String>,
-    /// Games whose reclaim or prune button is showing its confirm step.
+    /// The game whose "delete the original" button is showing its confirm
+    /// step. At most one at a time.
     pub confirm_reclaim: std::collections::HashSet<String>,
-    pub confirm_prune: std::collections::HashSet<String>,
     /// Games with the advanced storage section open.
     pub advanced: std::collections::HashSet<String>,
     /// Games with an active pack job. Their actions are disabled.
@@ -444,7 +444,6 @@ impl State {
             progress: Default::default(),
             pack_paths: Default::default(),
             confirm_reclaim: Default::default(),
-            confirm_prune: Default::default(),
             advanced: Default::default(),
             pending: Default::default(),
             analysis_queuing: false,
@@ -1014,8 +1013,6 @@ pub enum Message {
     PackCreate(String),
     /// Show the confirm step for reclaiming the retained original.
     PackReclaimPrompt(String),
-    /// Show the confirm step for deleting the previous store.
-    PackPrunePrompt(String),
     ToggleAdvanced(String),
 }
 
@@ -1481,7 +1478,6 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                     .go(true, Instant::now());
             }
             state.confirm_reclaim.clear();
-            state.confirm_prune.clear();
             for (target, animation) in &mut state.nav {
                 animation.go_mut(*target == page, Instant::now());
             }
@@ -1557,7 +1553,6 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                     state.advanced.retain(|id| valid.contains(id));
                     state.pack_paths.retain(|id, _| valid.contains(id));
                     state.confirm_reclaim.retain(|id| valid.contains(id));
-                    state.confirm_prune.retain(|id| valid.contains(id));
                     if state
                         .expanded
                         .as_ref()
@@ -1703,7 +1698,6 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::Expand(id) => {
             state.confirm_reclaim.clear();
-            state.confirm_prune.clear();
             if state.expanded.as_ref() == Some(&id) {
                 state.detail.go_mut(!state.detail.value(), Instant::now());
             } else {
@@ -2005,16 +1999,10 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 ]);
             }
         }
-        // Only one confirm step is open at a time, across both kinds.
+        // Only one confirm step is open at a time.
         Message::PackReclaimPrompt(id) => {
-            state.confirm_prune.clear();
             state.confirm_reclaim.clear();
             state.confirm_reclaim.insert(id);
-        }
-        Message::PackPrunePrompt(id) => {
-            state.confirm_reclaim.clear();
-            state.confirm_prune.clear();
-            state.confirm_prune.insert(id);
         }
         Message::ToggleAdvanced(id) => {
             if !state.advanced.remove(&id) {

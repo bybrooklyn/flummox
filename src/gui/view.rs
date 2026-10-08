@@ -817,7 +817,12 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
         {
             return job.phase.label().to_owned();
         }
-        if compressed {
+        if matches!(
+            state.result(game),
+            Some(super::app::Outcome::AwaitingConfirm { .. })
+        ) {
+            "Play it, then confirm".into()
+        } else if compressed {
             "Compressed".into()
         } else {
             game.id.launcher.label().into()
@@ -903,17 +908,27 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
         // Compress is the main action. A compressed game only offers another
         // analysis, which is not, so it gets the quieter button.
         let ready = !state.pending.contains(&id) && working.is_none();
-        line = line.push(if compressed {
-            secondary_maybe(
-                "Analyze again",
-                ready.then(|| Message::One(id.clone(), Operation::Analyze)),
-            )
-        } else {
-            action_maybe(
-                "Compress",
-                ready.then(|| Message::One(id.clone(), Operation::Compress)),
-            )
-        });
+        line = line.push(
+            if state
+                .snapshot
+                .packs
+                .iter()
+                .any(|install| install.game_path == game.install_dir)
+            {
+                // A stored game's next step is in its details.
+                secondary("Details", Message::Expand(id.clone()))
+            } else if compressed {
+                secondary_maybe(
+                    "Analyze again",
+                    ready.then(|| Message::One(id.clone(), Operation::Analyze)),
+                )
+            } else {
+                action_maybe(
+                    "Compress",
+                    ready.then(|| Message::One(id.clone(), Operation::Compress)),
+                )
+            },
+        );
     }
     // Detail pane. It stays in the tree while its closing animation runs.
     let mut contents = column![line].spacing(12);
@@ -948,13 +963,16 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
         }
         // The one choice that matters: how this game is compressed. Each mode
         // shows what it is predicted to save once the game is analyzed.
-        if item.supported {
+        let stored = state
+            .snapshot
+            .packs
+            .iter()
+            .any(|install| install.game_path == game.install_dir);
+        // A game that already runs from a store shows its Maximum card below
+        // and none of this: its mode is settled, and the native Analyze and
+        // Decompress do not apply to a mounted store.
+        if item.supported && !stored {
             let chosen = state.choice_for(game);
-            let stored = state
-                .snapshot
-                .packs
-                .iter()
-                .any(|install| install.game_path == game.install_dir);
             let mut modes = row![].spacing(8);
             for (choice, name, available) in [
                 (StorageChoice::Standard, "Standard", item.native_supported),
@@ -968,10 +986,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                     Some(saving) => format!("{name} · about {}", size(saving)),
                     None => name.to_owned(),
                 };
-                // The mode of a game that already runs from a store is not
-                // changed here. Decompress it first.
-                let pick =
-                    (!stored && choice != chosen).then(|| Message::Choice(id.clone(), choice));
+                let pick = (choice != chosen).then(|| Message::Choice(id.clone(), choice));
                 modes = modes.push(if choice == chosen {
                     action_maybe(label, pick)
                 } else {
@@ -1010,7 +1025,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
         }
         // Advanced: the native preset, then the store controls.
         let preset_id = id.clone();
-        if item.native_supported && state.advanced.contains(&id) {
+        if item.native_supported && !stored && state.advanced.contains(&id) {
             details = details
                 .push(
                     row![
@@ -1028,151 +1043,132 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                     "Balanced is recommended. Max takes longer for a little more.",
                 ));
         }
-        // Advanced storage. A game with a pack install gets its summary and
-        // maintenance actions. A game without one gets the form that creates
-        // a store.
-        if item.pack_supported && state.advanced.contains(&id) {
-            if let Some(install) = state
-                .snapshot
-                .packs
-                .iter()
-                .find(|install| install.game_path == game.install_dir)
-            {
+        // Maximum Space. A game that runs from a store gets a card that says
+        // where it stands and offers the one next step. A game that does not
+        // gets the store form, under Advanced.
+        let install = state
+            .snapshot
+            .packs
+            .iter()
+            .find(|install| install.game_path == game.install_dir);
+        if let Some(install) = install {
+            let ready = !state.pending.contains(&id) && working.is_none();
+            let queue = |task: crate::jobs::PackTask| {
+                Message::Send(Command::EnqueuePack {
+                    game: game.clone(),
+                    task,
+                })
+            };
+            let saved = install.summary.as_ref().map(|summary| {
+                let used = summary.archive_bytes.saturating_sub(summary.shared_bytes);
+                (summary.logical_bytes, used)
+            });
+            details = details.push(text("Maximum").size(16));
+            if install.phase != crate::pack::InstallPhase::Mounted {
+                details = details.push(theme::muted(format!(
+                    "{} · {}",
+                    install.phase.label(),
+                    install.message
+                )));
+            } else if install.backup_path.is_some() {
+                // Step two of three: the store is mounted and the original
+                // is still on disk, so nothing has been saved yet.
                 details = details
-                    .push(text("Maximum Space storage").size(16))
-                    .push(theme::muted(format!(
-                        "{} · {}",
-                        install.phase.label(),
-                        install.message
-                    )));
-                // Bytes shared with another game's store are not charged to
-                // this game when comparing against its logical size.
-                if let Some(summary) = &install.summary {
-                    let used = summary.archive_bytes.saturating_sub(summary.shared_bytes);
-                    let difference = summary.logical_bytes.abs_diff(used);
-                    let result = if used <= summary.logical_bytes {
-                        format!("{} smaller", size(difference))
-                    } else {
-                        format!("{} larger", size(difference))
-                    };
-                    details = details
-                    .push(theme::muted(format!(
-                        "{} additional store data for {} of game files · {result}",
-                        size(used),
-                        size(summary.logical_bytes)
-                    )))
-                    .push(theme::muted(format!(
-                        "{} stayed raw · {} compressed to {} · {} deduplicated · {} zero-filled",
-                        size(summary.raw_bytes),
-                        size(summary.compressed_input_bytes),
-                        size(summary.compressed_bytes),
-                        size(summary.duplicate_bytes),
-                        size(summary.zero_bytes)
-                    )));
-                    if summary.shared_bytes > 0 {
-                        details = details.push(theme::muted(format!(
-                            "{} shares physical allocation with another game store",
-                            size(summary.shared_bytes)
-                        )));
-                    }
-                }
-                // Two button rows follow. While a previous store is retained,
-                // compacting gives way to deleting that store. While the
-                // original is retained, it can be reclaimed. Both deletions
-                // take a second press on a confirm button.
-                details = details
-                    .push(theme::muted(format!(
-                        "Store: {} · updates: {}",
-                        install.store_path.display(),
-                        install.writes_path.display()
-                    )))
-                    .push(if let Some(previous) = &install.previous_store_path {
-                        Element::from(theme::muted(format!(
-                            "Previous store retained: {}",
-                            previous.display()
-                        )))
-                    } else {
-                        Element::from(theme::muted("Compact after large updates"))
-                    })
-                    .push(
-                        row![
-                            if install.previous_store_path.is_some() {
-                                Element::from(theme::muted("Play this version before deleting the previous one"))
-                            } else {
-                                secondary_maybe(
-                                    "Compact updates",
-                                    (!state.pending.contains(&id)).then(|| {
-                                        Message::Send(Command::PackCompact {
-                                            game_path: game.install_dir.clone(),
-                                        })
-                                    }),
-                                )
-                            },
-                            if install.previous_store_path.is_some() {
-                                if state.confirm_prune.contains(&id) {
-                                    secondary_maybe(
-                                        "Confirm delete previous",
-                                        (!state.pending.contains(&id)).then(|| {
-                                            Message::Send(Command::PackPrune {
-                                                game_path: game.install_dir.clone(),
-                                            })
-                                        }),
-                                    )
-                                } else {
-                                    secondary_maybe(
-                                        "Delete the previous version",
-                                        (!state.pending.contains(&id))
-                                            .then(|| Message::PackPrunePrompt(id.clone())),
-                                    )
-                                }
-                            } else {
-                                Element::from(Space::new().width(0))
-                            }
-                        ]
-                        .spacing(8),
-                    )
-                    .push(theme::muted(if install.backup_path.is_some() {
-                        "The original is kept. Play the game first; space is saved when you delete the original."
-                    } else {
-                        "Decompress rebuilds ordinary files from the store and updates. Keep enough free space for the whole game."
+                    .push(theme::muted(match saved {
+                        Some((before, after)) => format!(
+                            "Play the game once. If it works, delete the original to save about {}.",
+                            size(before.saturating_sub(after))
+                        ),
+                        None => "Play the game once. If it works, delete the original to save the space.".into(),
                     }))
                     .push(
                         row![
+                            if state.confirm_reclaim.contains(&id) {
+                                action_maybe(
+                                    "Yes, delete the original",
+                                    ready.then(|| queue(crate::jobs::PackTask::Reclaim)),
+                                )
+                            } else {
+                                action_maybe(
+                                    "It works, delete the original",
+                                    ready.then(|| Message::PackReclaimPrompt(id.clone())),
+                                )
+                            },
                             secondary_maybe(
                                 "Decompress to ordinary files",
-                                (!state.pending.contains(&id)).then(|| {
-                                    Message::Send(Command::PackRollback {
-                                        game_path: game.install_dir.clone(),
-                                    })
-                                })
+                                ready.then(|| queue(crate::jobs::PackTask::Restore)),
+                            )
+                        ]
+                        .spacing(8),
+                    )
+                    .push(theme::muted(
+                        "The store is checked in full before the original is deleted.",
+                    ));
+            } else {
+                details = details
+                    .push(theme::muted(match saved {
+                        Some((before, after)) => {
+                            format!("{} → {}", size(before), size(after))
+                        }
+                        None => "Running from its compressed store".into(),
+                    }))
+                    .push(theme::muted(if install.previous_store_path.is_some() {
+                        "An update was folded in. The previous version is deleted after you next play the game."
+                    } else {
+                        "Game updates are folded in automatically while the game is closed."
+                    }))
+                    .push(secondary_maybe(
+                        "Decompress to ordinary files",
+                        ready.then(|| queue(crate::jobs::PackTask::Restore)),
+                    ))
+                    .push(theme::muted(
+                        "Decompressing needs free space for the whole game.",
+                    ));
+            }
+            details = details.push(secondary(
+                if state.advanced.contains(&id) {
+                    "Hide advanced"
+                } else {
+                    "Advanced"
+                },
+                Message::ToggleAdvanced(id.clone()),
+            ));
+            if state.advanced.contains(&id) {
+                details = details.push(theme::muted(format!(
+                    "Store: {} · updates: {}",
+                    install.store_path.display(),
+                    install.writes_path.display()
+                )));
+                if let Some(previous) = &install.previous_store_path {
+                    details = details.push(theme::muted(format!(
+                        "Previous version: {}",
+                        previous.display()
+                    )));
+                }
+                if install.backup_path.is_none()
+                    && install.phase == crate::pack::InstallPhase::Mounted
+                {
+                    details = details.push(
+                        row![
+                            secondary_maybe(
+                                "Fold in updates now",
+                                (ready && install.previous_store_path.is_none())
+                                    .then(|| queue(crate::jobs::PackTask::Compact)),
                             ),
-                            if install.backup_path.is_some() {
-                                if state.confirm_reclaim.contains(&id) {
-                                    secondary_maybe(
-                                        "Confirm delete original",
-                                        (!state.pending.contains(&id)).then(|| {
-                                            Message::Send(Command::PackReclaim {
-                                                game_path: game.install_dir.clone(),
-                                            })
-                                        }),
-                                    )
-                                } else {
-                                    secondary_maybe(
-                                        "Delete the original",
-                                        (!state.pending.contains(&id))
-                                            .then(|| Message::PackReclaimPrompt(id.clone())),
-                                    )
-                                }
-                            } else {
-                                Element::from(theme::muted("Original deleted"))
-                            }
+                            secondary_maybe(
+                                "Delete the previous version now",
+                                (ready && install.previous_store_path.is_some())
+                                    .then(|| queue(crate::jobs::PackTask::Prune)),
+                            )
                         ]
                         .spacing(8),
                     );
-            } else {
-                let path_id = id.clone();
-                let store = state.store_path(game).display().to_string();
-                details = details
+                }
+            }
+        } else if item.pack_supported && state.advanced.contains(&id) {
+            let path_id = id.clone();
+            let store = state.store_path(game).display().to_string();
+            details = details
                     .push(text("Maximum Space storage").size(16))
                     .push(theme::muted("Verified chunks can be shared across games"))
                     .push(
@@ -1199,7 +1195,6 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                         ]
                         .spacing(8),
                     );
-            }
         }
         if let Some(note) = &item.note {
             details = details.push(theme::muted(note));
