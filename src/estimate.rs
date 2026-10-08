@@ -272,6 +272,15 @@ impl Estimate {
         self.saving() as f64 / self.disk_now as f64
     }
 
+    /// The bytes a saving is judged against: the whole install, or the
+    /// current usage of the files that were sampled if that is larger.
+    ///
+    /// `disk_now` covers only files expected to shrink, so a relative
+    /// threshold taken against it flatters a game that is mostly video.
+    pub fn current_bytes(&self) -> u64 {
+        self.install_bytes.max(self.disk_now)
+    }
+
     /// Bytes a writable pack is projected to free, when it was sampled.
     pub fn maximum_saving(&self) -> Option<u64> {
         self.maximum_after

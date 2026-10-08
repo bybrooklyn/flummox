@@ -92,15 +92,31 @@ pub fn clears_threshold(saving: u64, current: u64, policy: Policy) -> bool {
             >= current.saturating_mul(u64::from(policy.minimum_ratio_bps))
 }
 
-/// Low with no sampled file or under 4 MiB sampled. Medium when fewer than a
-/// quarter of the eligible files were sampled. High otherwise.
+/// Sampled bytes per ten thousand install bytes, or `None` when the install
+/// size is unknown.
+fn coverage_bps(estimate: &Estimate) -> Option<u64> {
+    (estimate.install_bytes > 0).then(|| {
+        let bps = u128::from(estimate.sampled) * 10_000 / u128::from(estimate.install_bytes);
+        u64::try_from(bps).unwrap_or(u64::MAX)
+    })
+}
+
+/// Low with no sampled file, under 4 MiB sampled, or under 0.05% of the
+/// install's bytes sampled. Medium when fewer than a quarter of the eligible
+/// files were sampled or under 0.5% of the bytes were. High otherwise.
 fn confidence(estimate: &Estimate) -> Confidence {
     let considered = estimate
         .inspected_files
         .saturating_add(estimate.unsampled_files);
-    if estimate.inspected_files == 0 || estimate.sampled < 4 * 1024 * 1024 {
+    let coverage = coverage_bps(estimate);
+    if estimate.inspected_files == 0
+        || estimate.sampled < 4 * 1024 * 1024
+        || coverage.is_some_and(|bps| bps < 5)
+    {
         Confidence::Low
-    } else if considered > 0 && estimate.inspected_files.saturating_mul(4) < considered {
+    } else if (considered > 0 && estimate.inspected_files.saturating_mul(4) < considered)
+        || coverage.is_some_and(|bps| bps < 50)
+    {
         Confidence::Medium
     } else {
         Confidence::High
@@ -120,19 +136,17 @@ pub fn choose(
 ) -> Recommendation {
     let native = estimate.saving();
     let maximum = estimate.maximum_saving();
-    let native_worthwhile = clears_threshold(native, estimate.disk_now, policy);
+    let current = estimate.current_bytes();
+    let native_worthwhile = clears_threshold(native, current, policy);
     let maximum_worthwhile = maximum.is_some_and(|saving| {
-        clears_threshold(saving, estimate.disk_now, policy)
+        clears_threshold(saving, current, policy)
             && saving.saturating_sub(native).saturating_mul(10_000)
-                >= estimate
-                    .disk_now
-                    .saturating_mul(u64::from(policy.maximum_advantage_bps))
+                >= current.saturating_mul(u64::from(policy.maximum_advantage_bps))
     });
     // Without a native backend there is nothing to beat, so the pack only
     // has to clear the ordinary thresholds.
-    let maximum_is_only_mode = maximum.is_some_and(|saving| {
-        !native_available && clears_threshold(saving, estimate.disk_now, policy)
-    });
+    let maximum_is_only_mode = maximum
+        .is_some_and(|saving| !native_available && clears_threshold(saving, current, policy));
     let (mode, predicted_saving) =
         if maximum_compatible && (maximum_worthwhile || maximum_is_only_mode) {
             (StorageMode::MaximumSpace, maximum.unwrap_or(native))
@@ -144,6 +158,10 @@ pub fn choose(
 
     let mut reasons = Vec::new();
     match mode {
+        StorageMode::Skip if maximum_is_only_mode && !maximum_compatible => reasons.push(
+            "This drive has no native compression. Maximum Space could save space here, but automatic activation waits for a game-specific compatibility result."
+                .into(),
+        ),
         StorageMode::Skip if maximum_worthwhile && !maximum_compatible => reasons.push(
             "Maximum Space could save more, but automatic activation waits for a game-specific compatibility result. Its advanced controls remain available for local testing."
                 .into(),
@@ -200,10 +218,11 @@ pub fn choose(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{TestResult, check_eq};
+    use crate::testutil::{TestResult, check, check_eq};
 
     fn estimate(native_after: u64, maximum_after: Option<u64>) -> Estimate {
         Estimate {
+            install_bytes: 10 * 1024 * 1024 * 1024,
             disk_now: 10 * 1024 * 1024 * 1024,
             disk_after: native_after,
             maximum_after,
@@ -243,6 +262,7 @@ mod tests {
     fn smaller_games_can_still_receive_a_useful_recommendation() -> TestResult {
         let mut measured = estimate(100 * 1024 * 1024, None);
         measured.disk_now = 200 * 1024 * 1024;
+        measured.install_bytes = 200 * 1024 * 1024;
         check_eq(
             choose(&measured, true, false, Policy::default()).mode,
             StorageMode::Native,
@@ -264,6 +284,85 @@ mod tests {
             choose(&measured, false, false, Policy::default()).mode,
             StorageMode::Skip,
             "a filesystem without a native backend cannot select one",
+        )
+    }
+
+    #[test]
+    fn the_threshold_is_measured_against_the_whole_install() -> TestResult {
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+        // A 50 GiB game: 49 GiB of incompressible video, 1 GiB of DLLs that
+        // shrink by 30 percent. Only the DLLs reach `disk_now`.
+        let realistic = Estimate {
+            install_bytes: 50 * gib,
+            disk_now: gib,
+            disk_after: gib - 300 * mib,
+            sampled: 32 * mib,
+            inspected_files: 20,
+            ..Estimate::default()
+        };
+        check_eq(
+            choose(&realistic, true, false, Policy::default()).mode,
+            StorageMode::Skip,
+            "300 MiB is 0.6 percent of the game",
+        )?;
+        let mut compressible = realistic;
+        compressible.install_bytes = gib;
+        check_eq(
+            choose(&compressible, true, false, Policy::default()).mode,
+            StorageMode::Native,
+            "control: the same saving on a 1 GiB game is worth taking",
+        )
+    }
+
+    #[test]
+    fn confidence_falls_with_the_share_of_bytes_sampled() -> TestResult {
+        let gib = 1024 * 1024 * 1024;
+        let mib = 1024 * 1024;
+        let thin = Estimate {
+            install_bytes: 90 * gib,
+            disk_now: 90 * gib,
+            disk_after: 45 * gib,
+            sampled: 30 * mib,
+            inspected_files: 30,
+            ..Estimate::default()
+        };
+        check_eq(
+            choose(&thin, true, false, Policy::default()).confidence,
+            Confidence::Low,
+            "30 files of 3 GB with 30 MiB read is not a strong estimate",
+        )?;
+        let thorough = Estimate {
+            install_bytes: gib,
+            sampled: 32 * mib,
+            ..thin
+        };
+        check_eq(
+            choose(&thorough, true, false, Policy::default()).confidence,
+            Confidence::High,
+            "control: the same sample of a 1 GiB game is strong",
+        )
+    }
+
+    #[test]
+    fn a_drive_without_native_support_names_the_pack_gate() -> TestResult {
+        let gib = 1024 * 1024 * 1024;
+        let measured = estimate(8 * gib, Some(7 * gib));
+        let skipped = choose(&measured, false, false, Policy::default());
+        check_eq(
+            skipped.mode,
+            StorageMode::Skip,
+            "the pack is not yet approved",
+        )?;
+        check(
+            skipped
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("compatibility")),
+            format!(
+                "the reason names the compatibility gate: {:?}",
+                skipped.reasons
+            ),
         )
     }
 }
