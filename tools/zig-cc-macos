@@ -1,0 +1,11 @@
+#!/bin/sh
+# A C compiler for `just mac-lint`: zig, which ships the macOS headers.
+# cc-rs adds flags meant for Apple clang; zig takes its target another way.
+for arg in "$@"; do
+    shift
+    case "$arg" in
+        --target=* | -mmacosx-version-min=*) ;;
+        *) set -- "$@" "$arg" ;;
+    esac
+done
+exec ${ZIG:-zig} cc -target aarch64-macos "$@"

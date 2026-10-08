@@ -109,6 +109,13 @@ win:
 win-lint:
     cargo xwin clippy --target x86_64-pc-windows-msvc --all-features --all-targets -- -D warnings
 
+# Type-check and lint the Mac code and its tests from Linux. Needs zig and
+# `rustup target add aarch64-apple-darwin`. Set ZIG when zig is not on PATH,
+# for example ZIG="python -m ziglang". Nothing is linked or run, so this
+# finds what the compiler rejects and no more.
+mac-lint:
+    CC_aarch64_apple_darwin="{{justfile_directory()}}/tools/zig-cc-macos" AR_aarch64_apple_darwin="{{justfile_directory()}}/tools/zig-ar" cargo clippy --target aarch64-apple-darwin --all-features --all-targets -- -D warnings
+
 # Everything CI runs, in the order CI runs it.
 #
 # `prose` is in here so a push cannot go through with the style rules broken.

@@ -93,7 +93,7 @@ const SCHEMA_VERSION: i32 = 2;
 ///
 /// Named `hidden`, not `excluded`. SQLite calls the rejected row of an upsert
 /// `excluded`, so `SET title = excluded.title` against a table of that name
-/// reads the table instead and quietly updates nothing.
+/// reads the table instead and updates nothing, with no error.
 const SCHEMA_V2: &str = "
 CREATE TABLE IF NOT EXISTS hidden(
     id       TEXT PRIMARY KEY,
@@ -465,7 +465,7 @@ impl Db {
         let tx = self.conn.transaction()?;
         // An explicit upsert rather than INSERT OR REPLACE: REPLACE deletes
         // the old row first, and that would cascade through the foreign key
-        // and silently take every fingerprint with it.
+        // and take every fingerprint with it, with no error.
         tx.execute(
             "INSERT INTO games(
                  id, launcher, title, path, backend, level, preset,

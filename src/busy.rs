@@ -1,6 +1,6 @@
 //! Detects whether anything is using an install directory.
 //!
-//! Launcher metadata is the first signal, but it lies: this machine has three
+//! Launcher metadata is the first signal, but it can be wrong: this machine has three
 //! Steam apps flagged "running" with nothing running. So before touching a
 //! directory we also look for a live process with a file open inside it.
 
@@ -47,7 +47,7 @@ impl ProcInfo {
     }
 
     /// Whether this process is executing code from `dir`: its executable or
-    /// a mapped executable file lies inside it. A shell with its working
+    /// a mapped executable file is inside it. A shell with its working
     /// directory there, or a launcher reading the files, does not qualify.
     pub fn runs_from(&self, dir: &Path) -> bool {
         self.any_inside(self.exe.iter().chain(self.exec_maps.iter()), dir)

@@ -7,10 +7,10 @@
 //! against the install directory's handle. Everything downstream of it is a
 //! job that *rewrites* the files it opens.
 //!
-//! A boundary like that is exactly the wrong place for three examples. Three
+//! Three examples cannot cover a boundary like that. Three
 //! examples say `..` is rejected; a property says *nothing built from `..` is
 //! ever accepted, whatever it is wrapped in*. The difference is the case
-//! nobody wrote down: `a/../../b`, `./..`, `foo/..bar/../..`, a component that
+//! no example covers: `a/../../b`, `./..`, `foo/..bar/../..`, a component that
 //! merely looks like a parent reference, a path whose escape is hidden behind
 //! a dozen harmless-looking names.
 //!
@@ -64,7 +64,7 @@ proptest! {
     ///
     /// The failure mode this guards against is a check that is *too* strict:
     /// rejecting `..weird`, `Portal 2`, or a Chinese-titled directory would
-    /// make the tool silently skip real game files, and a skipped file looks
+    /// make the tool skip real game files with no message, and a skipped file looks
     /// exactly like a file that was not worth compressing.
     #[test]
     fn ordinary_names_are_accepted_however_odd(

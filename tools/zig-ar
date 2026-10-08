@@ -1,0 +1,3 @@
+#!/bin/sh
+# The archiver that goes with `tools/zig-cc-macos`.
+exec ${ZIG:-zig} ar "$@"

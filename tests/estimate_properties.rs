@@ -4,7 +4,7 @@
 //! built from: the estimate on the Games page, the "you will save 14 GB"
 //! before a job, and the comparison against what the job actually freed. It is
 //! also the one part of the estimator with no feedback loop. If it is wrong,
-//! nothing downstream notices, the tool just quietly promises the wrong
+//! nothing downstream reports it, the tool promises the wrong
 //! number and loses the user's trust the first time they check with `df`.
 //!
 //! Examples can only pin down the three or four block sizes someone thought

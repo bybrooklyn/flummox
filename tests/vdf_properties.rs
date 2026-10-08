@@ -9,7 +9,7 @@
 //! scan.
 //!
 //! That turns "the parser handles malformed input" into a claim that cannot be
-//! checked with examples: the interesting inputs are the ones nobody thought
+//! checked with examples: the interesting inputs are the ones no author thought
 //! to write down. The properties here therefore quantify over arbitrary input
 //! and assert the things that must hold for *all* of it:
 //!

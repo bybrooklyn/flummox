@@ -196,7 +196,7 @@ const SCAN_DEADLINE: Duration = Duration::from_secs(120);
 /// A scan stuck reading a dead network mount never finishes, and no new one
 /// starts while it is current. The worker moves to `abandoned`, a warning is
 /// raised, and every game in `games` becomes not idle, so no job starts or
-/// continues on states nobody has confirmed. Returns whether it gave up.
+/// continues on states no scan has confirmed. Returns whether it gave up.
 fn abandon_slow_scan(
     discovery: &mut Option<crate::launchers::scan_job::Worker>,
     started: Instant,
@@ -619,7 +619,7 @@ fn enqueue(
 /// Validates a request and appends it to the queue and the database. Returns
 /// `Ok` without queueing when an active job already covers the same folder,
 /// operation and storage task. Refuses excluded games, a folder that contains
-/// or lies inside another discovered game, and a queue of 200 active jobs.
+/// or sits inside another discovered game, and a queue of 200 active jobs.
 fn enqueue_job(
     snapshot: &mut Snapshot,
     game: Game,
@@ -3241,7 +3241,7 @@ mod tests {
         check_eq(
             at_limit.len(),
             limit,
-            "control: the request is exactly the limit",
+            "control: the request is the limit to the byte",
         )?;
         read_message::<Request>(&mut std::io::Cursor::new(at_limit))
             .ctx("control: a request at the limit parses")?;
