@@ -210,6 +210,7 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
     let open = state.expanded.take();
     state.page = Page::Games;
     render(&state, 1100, 900, &output.join("games-groups.png"))?;
+    render(&state, 720, 900, &output.join("games-groups-narrow.png"))?;
     state.show_low = true;
     render(&state, 1100, 1000, &output.join("games-groups-all.png"))?;
     state.show_low = false;
@@ -379,8 +380,34 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
             "Could not rewrite data/pak2.pak: permission denied".into(),
         ];
     }
+    // A job that failed outright, and one the coordinator lost.
+    let template = state
+        .snapshot
+        .jobs
+        .iter()
+        .find(|job| job.id == 6)
+        .cloned()
+        .ctx("fixture partial job")?;
+    for (id, title, phase) in [
+        (8, "Platformer", Phase::Failed),
+        (9, "Roguelike", Phase::Interrupted),
+    ] {
+        state.snapshot.jobs.push(Job {
+            id,
+            game: Game {
+                id: GameId::new(Launcher::Manual, format!("fixture-{id}")),
+                title: title.into(),
+                ..template.game.clone()
+            },
+            phase,
+            message: "The worker stopped before finishing".into(),
+            errors: vec!["Could not read data/level1.pak: input/output error".into()],
+            ..template.clone()
+        });
+    }
     state.page = Page::Queue;
     render(&state, 1100, 1800, &output.join("jobs-errors.png"))?;
+    state.snapshot.jobs.retain(|job| job.id < 8);
     state.page = Page::Games;
     // Selection bar, and the bar that offers to sort again.
     state.selected.insert("manual:native".into());
@@ -389,6 +416,12 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
     render(&state, 1100, 720, &output.join("games-stale-order.png"))?;
     state.selected.clear();
     state.order_stale = false;
+    // A compatibility hash in progress disables its button.
+    state.expanded = Some(game.id.to_string());
+    state.qualifying = true;
+    render(&state, 1100, 1250, &output.join("games-qualifying.png"))?;
+    state.qualifying = false;
+    state.expanded = None;
     // The three reasons the list can be empty.
     state.query = "no such game".into();
     render(&state, 1100, 720, &output.join("games-empty-search.png"))?;

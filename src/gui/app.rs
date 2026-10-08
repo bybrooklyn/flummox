@@ -340,6 +340,10 @@ pub struct State {
     /// A command waiting for the user to accept its space plan.
     pub planned: Option<(Command, crate::storage::SpacePlan)>,
     pub qualification: Option<crate::qualification::Wizard>,
+    /// Whether the wizard is still hashing a game's files.
+    pub qualifying: bool,
+    /// Set to stop that hash, which reads the whole install.
+    pub qualify_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     // Navigation and scrolling.
     /// The highlight animation of each sidebar entry.
     pub nav: Vec<(Page, Animation<bool>)>,
@@ -466,6 +470,8 @@ impl State {
             snapshot: Snapshot::default(),
             planned: None,
             qualification: None,
+            qualifying: false,
+            qualify_cancel: Default::default(),
             nav: PAGES
                 .into_iter()
                 .chain(std::iter::once(Page::Settings))
@@ -854,6 +860,13 @@ impl State {
             StorageChoice::Standard
         }
     }
+    /// Closes the wizard and stops a hash that is still running.
+    pub fn stop_qualifying(&mut self) {
+        self.qualify_cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.qualifying = false;
+        self.qualification = None;
+    }
     /// What `choice` is predicted to save for this game. `None` until it has
     /// been analyzed, and zero when the saving is too small to bother with
     /// or the drive does not support that mode.
@@ -867,7 +880,7 @@ impl State {
         };
         let worthwhile = crate::recommendation::clears_threshold(
             saving,
-            estimate.disk_now,
+            estimate.current_bytes(),
             crate::recommendation::Policy::default(),
         );
         Some(if worthwhile { saving } else { 0 })
@@ -1678,24 +1691,42 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
     match message {
         // Compatibility qualification wizard.
         Message::Qualify(id) => {
+            // The hash reads every file, so a second press while it runs
+            // would start a second read of the install.
+            if state.qualifying {
+                return Task::none();
+            }
             if let Some(game) = state
                 .games
                 .iter()
                 .find(|row| row.game.id.to_string() == id && row.game.state.is_idle())
                 .map(|row| row.game.clone())
             {
+                state.qualifying = true;
+                state.qualify_cancel = Default::default();
+                let cancel = state.qualify_cancel.clone();
                 return Task::perform(
                     background(move || {
-                        crate::qualification::Wizard::start(game).map_err(|error| error.to_string())
+                        crate::qualification::Wizard::start_cancellable(
+                            game,
+                            &cancel,
+                            &crate::pack::NoObserver,
+                        )
+                        .map_err(|error| error.to_string())
                     }),
                     |result| Message::QualificationReady(result.and_then(|result| result)),
                 );
             }
         }
-        Message::QualificationReady(result) => match result {
-            Ok(wizard) => state.qualification = Some(wizard),
-            Err(error) => state.show_status(Status::error(error)),
-        },
+        Message::QualificationReady(result) => {
+            // A result that arrives after the user cancelled is dropped.
+            if std::mem::take(&mut state.qualifying) {
+                match result {
+                    Ok(wizard) => state.qualification = Some(wizard),
+                    Err(error) => state.show_status(Status::error(error)),
+                }
+            }
+        }
         Message::QualificationField(field, text) => {
             if let Some(wizard) = &mut state.qualification {
                 wizard.field(field, text);
@@ -1755,7 +1786,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                 }
             }
         }
-        Message::CloseQualification => state.qualification = None,
+        Message::CloseQualification => state.stop_qualifying(),
         Message::OpenChangelog => {
             if let Err(error) = super::open_changelog() {
                 state.show_status(Status::error(format!(
@@ -1766,7 +1797,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::QualificationSaved(result) => match result {
             Ok(path) => {
-                state.qualification = None;
+                state.stop_qualifying();
                 state.show_status(Status::info(format!(
                     "Compatibility report saved to {}",
                     path.display()
@@ -3765,6 +3796,80 @@ mod tests {
             refusal_text(&[("a".into(), "Why.".into())], "job"),
             Some("1 job could not be queued. Why.".to_owned()),
             "one",
+        )
+    }
+    #[test]
+    fn a_prospect_is_judged_against_the_whole_install() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        let row = named("video-heavy", true);
+        let game = row.game.clone();
+        state.games.push(row);
+        let mut estimate_job = job(
+            1,
+            &game,
+            Operation::Analyze,
+            Phase::Completed,
+            1_000_000_000,
+        );
+        if let Some(estimate) = &mut estimate_job.estimate {
+            // Most of the install is video that will not shrink, so the
+            // saving is a quarter of what can shrink and 1% of the install.
+            estimate.install_bytes = 100_000_000_000;
+            estimate.disk_now = 4_000_000_000;
+            estimate.disk_after = 3_000_000_000;
+        }
+        state.snapshot.jobs.push(estimate_job);
+        check_eq(
+            state.prospect(&game, StorageChoice::Standard),
+            Some(0),
+            "a 1% saving of the install is too little to promise",
+        )?;
+        if let Some(estimate) = state
+            .snapshot
+            .jobs
+            .first_mut()
+            .and_then(|job| job.estimate.as_mut())
+        {
+            estimate.install_bytes = 4_000_000_000;
+        }
+        check_eq(
+            state.prospect(&game, StorageChoice::Standard),
+            Some(1_000_000_000),
+            "control: the same saving of a small install clears the threshold",
+        )
+    }
+
+    #[test]
+    fn qualifying_runs_once_and_closing_stops_the_hash() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        let row = named("hashed", true);
+        let id = row.game.id.to_string();
+        state.games.push(row);
+        let _first = update(&mut state, Message::Qualify(id.clone()));
+        check(state.qualifying, "the first press starts the hash")?;
+        let flag = state.qualify_cancel.clone();
+        check(
+            !flag.load(std::sync::atomic::Ordering::Relaxed),
+            "control: the hash is not cancelled while it runs",
+        )?;
+        let _second = update(&mut state, Message::Qualify(id));
+        check(
+            std::sync::Arc::ptr_eq(&flag, &state.qualify_cancel),
+            "a second press does not start another hash",
+        )?;
+        let _closed = update(&mut state, Message::CloseQualification);
+        check(
+            flag.load(std::sync::atomic::Ordering::Relaxed),
+            "closing sets the cancel flag the hash reads",
+        )?;
+        check(!state.qualifying, "the button is available again")?;
+        let _late = update(
+            &mut state,
+            Message::QualificationReady(Err("Compatibility verification stopped".into())),
+        );
+        check(
+            state.status.is_none(),
+            "a result that arrives after cancelling shows nothing",
         )
     }
 }
