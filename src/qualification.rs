@@ -7,6 +7,24 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 
+#[cfg(target_os = "linux")]
+pub use crate::pack::{NoObserver, Observer};
+
+/// The stop points a hash offers on targets without the storage module.
+#[cfg(not(target_os = "linux"))]
+pub trait Observer {
+    /// Called between files. An error stops the hash there.
+    fn checkpoint(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The observer for callers that want no extra stop points.
+#[cfg(not(target_os = "linux"))]
+pub struct NoObserver;
+#[cfg(not(target_os = "linux"))]
+impl Observer for NoObserver {}
+
 /// A text input of the wizard form.
 #[derive(Debug, Clone, Copy)]
 pub enum Field {
@@ -90,7 +108,7 @@ impl Wizard {
         Self::start_cancellable(
             game,
             &std::sync::atomic::AtomicBool::new(false),
-            &crate::pack::NoObserver,
+            &NoObserver,
         )
     }
 
@@ -99,7 +117,7 @@ impl Wizard {
     pub fn start_cancellable(
         game: Game,
         cancel: &std::sync::atomic::AtomicBool,
-        observer: &dyn crate::pack::Observer,
+        observer: &dyn Observer,
     ) -> Result<Self> {
         let corpus = baseline_cancellable(&game, cancel, observer)?;
         let before = crate::allocation::measure(std::slice::from_ref(&game.install_dir));
@@ -187,7 +205,7 @@ pub fn baseline(game: &Game) -> Result<Corpus> {
     baseline_cancellable(
         game,
         &std::sync::atomic::AtomicBool::new(false),
-        &crate::pack::NoObserver,
+        &NoObserver,
     )
 }
 
@@ -196,7 +214,7 @@ pub fn baseline(game: &Game) -> Result<Corpus> {
 pub fn baseline_cancellable(
     game: &Game,
     cancel: &std::sync::atomic::AtomicBool,
-    observer: &dyn crate::pack::Observer,
+    observer: &dyn Observer,
 ) -> Result<Corpus> {
     #[cfg(target_os = "linux")]
     return compatibility::corpus(&game.install_dir, cancel, observer);
@@ -269,7 +287,10 @@ pub fn baseline_cancellable(
 /// Renders the wizard form. `field`, `check` and `mode` turn an edit into the
 /// caller's message. The save button is enabled only while
 /// [`Wizard::report`] succeeds, and its error is shown otherwise.
-#[cfg(feature = "gui")]
+#[cfg(all(
+    feature = "gui",
+    any(target_os = "linux", target_os = "macos", windows)
+))]
 pub fn view<'a, Message: Clone + 'a>(
     wizard: &'a Wizard,
     field: impl Fn(Field, String) -> Message + Clone + 'a,
@@ -279,8 +300,25 @@ pub fn view<'a, Message: Clone + 'a>(
     save: Message,
     cancel: Message,
 ) -> iced::Element<'a, Message> {
-    use iced::widget::{button, checkbox, column, pick_list, row, text, text_input};
-    let mut form = column![text(format!("Qualify {}", wizard.game.title)).size(20), text("Use a disposable game copy. Measure the ordinary install, then compression, launch, gameplay, update, verification, restart, and restoration.").size(13), text(format!("Baseline: {} files · {} logical bytes", wizard.corpus.files, wizard.corpus.bytes)).size(12), pick_list([StorageMode::Native, StorageMode::MaximumSpace], Some(wizard.mode), mode)].spacing(8);
+    use crate::gui::theme;
+    use iced::widget::{checkbox, column, pick_list, row, text_input};
+    let mut form = column![
+        theme::section_text(format!("Qualify {}", wizard.game.title)),
+        theme::muted("Use a disposable game copy. Measure the ordinary install, then compression, launch, gameplay, update, verification, restart, and restoration."),
+        theme::muted(format!(
+            "Baseline: {} files · {}",
+            wizard.corpus.files,
+            humansize::format_size(wizard.corpus.bytes, humansize::DECIMAL)
+        )),
+        theme::field(
+            "Storage mode",
+            pick_list([StorageMode::Native, StorageMode::MaximumSpace], Some(wizard.mode), mode)
+                .padding(theme::INPUT_PADDING)
+                .style(theme::pick_list)
+                .menu_style(theme::pick_menu)
+        )
+    ]
+    .spacing(theme::PAGE_GAP / 2.0);
     // One text input per `Field`, then one checkbox per `Check`.
     for (label, value, kind) in [
         ("Game build", &wizard.build, Field::Build),
@@ -306,11 +344,13 @@ pub fn view<'a, Message: Clone + 'a>(
         ),
     ] {
         let field = field.clone();
-        form = form.push(
+        form = form.push(theme::field(
+            label,
             text_input(label, value)
                 .on_input(move |value| field(kind, value))
-                .padding(8),
-        );
+                .padding(theme::INPUT_PADDING)
+                .style(theme::text_input),
+        ));
     }
     for (label, value, kind) in [
         (
@@ -352,20 +392,21 @@ pub fn view<'a, Message: Clone + 'a>(
                 .on_toggle(move |value| check(kind, value)),
         );
     }
-    form = form.push(button("Measure compressed copy").on_press(measure));
+    form = form.push(theme::secondary("Measure compressed copy", measure));
     if let Some(measurement) = &wizard.measurement {
-        form = form.push(text(measurement).size(12));
+        form = form.push(theme::muted(measurement));
     }
-    form = form.push(text("Record actual allocated bytes; whole-drive free-space changes include other processes. Reports retain failed checks and do not claim untested games are compatible.").size(12));
+    form = form.push(theme::muted("Record actual allocated bytes; whole-drive free-space changes include other processes. Reports retain failed checks and do not claim untested games are compatible."));
     if let Err(error) = wizard.report() {
-        form = form.push(text(error.to_string()).size(12));
+        form = form.push(theme::danger_text(error.to_string()));
     }
     form.push(
         row![
-            button("Save local report").on_press_maybe(wizard.report().is_ok().then_some(save)),
-            button("Close").on_press(cancel)
+            theme::action_maybe("Save local report", wizard.report().is_ok().then_some(save)),
+            theme::secondary("Close", cancel)
         ]
-        .spacing(8),
+        .spacing(8)
+        .wrap(),
     )
     .into()
 }
@@ -443,12 +484,12 @@ mod tests {
             is_tool: false,
         };
         let running = std::sync::atomic::AtomicBool::new(false);
-        let wizard = Wizard::start_cancellable(game.clone(), &running, &crate::pack::NoObserver)
+        let wizard = Wizard::start_cancellable(game.clone(), &running, &NoObserver)
             .ctx("control: an uncancelled start hashes the folder")?;
         check_eq(wizard.corpus.files, 1, "control: the file was hashed")?;
         let stopped = std::sync::atomic::AtomicBool::new(true);
         check(
-            Wizard::start_cancellable(game, &stopped, &crate::pack::NoObserver).is_err(),
+            Wizard::start_cancellable(game, &stopped, &NoObserver).is_err(),
             "a start cancelled up front returns an error",
         )
     }
