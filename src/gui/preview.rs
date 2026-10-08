@@ -189,6 +189,7 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
     for (page, name) in [
         (Page::Overview, "overview"),
         (Page::Games, "games"),
+        (Page::Queue, "jobs"),
         (Page::Drives, "drives"),
         (Page::Settings, "settings"),
     ] {
@@ -283,8 +284,8 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
     }
     render(&state, 720, 720, &output.join("queue-switching.png"))?;
 
-    // One job in each phase the Jobs section groups by.
-    state.page = Page::Settings;
+    // One job in each phase the Jobs page groups by.
+    state.page = Page::Queue;
     state.snapshot_loaded = true;
     let mut job = state
         .snapshot

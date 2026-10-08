@@ -1,7 +1,7 @@
 //! Renders cached application state. No filesystem access occurs during drawing.
 
 use super::{
-    app::{Filter, GameRow, Message, PAGES, Page, Sort, State},
+    app::{Filter, GameRow, Message, PAGES, Page, Sort, State, StorageChoice},
     theme,
 };
 use crate::{
@@ -294,8 +294,11 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         !state.reduced_motion && state.motion != MotionPreference::Reduced,
         page_key.label(),
     ));
-    // The bar for the job in progress, on every page.
-    if let Some(job) = state.active() {
+    // The bar for the job in progress, on every page but Jobs, which already
+    // shows it.
+    if let Some(job) = state.active()
+        && state.page != Page::Queue
+    {
         body = body.push(
             container(panel(
                 row![
@@ -305,7 +308,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
                     ]
                     .spacing(6)
                     .width(Length::Fill),
-                    secondary("View queue", Message::GoTo(Page::Queue))
+                    secondary("See jobs", Message::GoTo(Page::Queue))
                 ]
                 .spacing(16)
                 .align_y(Alignment::Center),
@@ -820,20 +823,36 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
             game.id.launcher.label().into()
         }
     });
-    let saving = state
-        .recommendation(game)
-        .map(|choice| {
-            if choice.predicted_saving == 0 {
-                "Little extra space expected".into()
-            } else {
-                format!("About {} to save", size(choice.predicted_saving))
-            }
-        })
-        .unwrap_or_else(|| match state.result(game) {
+    // Under the size: what the chosen mode would save, or what compressing
+    // already gained.
+    // A compression or decompression in progress for this game. Its row
+    // reports the work and offers nothing that would queue it again.
+    let working = state
+        .latest(game)
+        .filter(|job| job.phase.active() && job.operation != Operation::Analyze);
+    let saving = if let Some(job) = working {
+        if job.files_total > 0 {
+            format!(
+                "{} · {} of {} files",
+                kind_words(job),
+                job.files_done,
+                job.files_total
+            )
+        } else {
+            kind_words(job).to_owned()
+        }
+    } else if compressed {
+        match state.result(game) {
             Some(outcome) => outcome_words(outcome),
-            None if compressed => "Compressed".into(),
+            None => "Compressed".into(),
+        }
+    } else {
+        match state.prospect(game, state.choice_for(game)) {
+            Some(0) => "Little to save".into(),
+            Some(saving) => format!("About {} to save", size(saving)),
             None => "Not analyzed yet".into(),
-        });
+        }
+    };
     // Summary line: checkbox, artwork, title and status, size and saving,
     // then the main button. The button reads "Recheck" and queues an analysis
     // once the game is compressed.
@@ -853,6 +872,17 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
             text(
                 game.size_hint
                     .or_else(|| state.estimate(game).map(|estimate| estimate.install_bytes))
+                    // An estimate stops counting once a job starts, but the
+                    // size it measured is still the size.
+                    .or_else(|| {
+                        state
+                            .snapshot
+                            .jobs
+                            .iter()
+                            .rev()
+                            .filter(|job| job.game.install_dir == game.install_dir)
+                            .find_map(|job| job.estimate.map(|estimate| estimate.install_bytes))
+                    })
                     .or_else(|| match state.result(game) {
                         Some(super::app::Outcome::Estimated { installed, .. }) => Some(installed),
                         Some(super::app::Outcome::Measured { before, .. }) => Some(before),
@@ -872,7 +902,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
     if item.supported {
         // Compress is the main action. A compressed game only offers another
         // analysis, which is not, so it gets the quieter button.
-        let ready = !state.pending.contains(&id);
+        let ready = !state.pending.contains(&id) && working.is_none();
         line = line.push(if compressed {
             secondary_maybe(
                 "Analyze again",
@@ -916,24 +946,49 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                     .on_show(move |_| Message::ArtworkVisible(source.clone())),
             );
         }
-        // Preset, Analyze and Decompress.
-        let preset_id = id.clone();
+        // The one choice that matters: how this game is compressed. Each mode
+        // shows what it is predicted to save once the game is analyzed.
         if item.supported {
+            let chosen = state.choice_for(game);
+            let stored = state
+                .snapshot
+                .packs
+                .iter()
+                .any(|install| install.game_path == game.install_dir);
+            let mut modes = row![].spacing(8);
+            for (choice, name, available) in [
+                (StorageChoice::Standard, "Standard", item.native_supported),
+                (StorageChoice::Maximum, "Maximum", item.pack_supported),
+            ] {
+                if !available {
+                    continue;
+                }
+                let label = match state.prospect(game, choice) {
+                    Some(0) => format!("{name} · little to save"),
+                    Some(saving) => format!("{name} · about {}", size(saving)),
+                    None => name.to_owned(),
+                };
+                // The mode of a game that already runs from a store is not
+                // changed here. Decompress it first.
+                let pick =
+                    (!stored && choice != chosen).then(|| Message::Choice(id.clone(), choice));
+                modes = modes.push(if choice == chosen {
+                    action_maybe(label, pick)
+                } else {
+                    secondary_maybe(label, pick)
+                });
+            }
             details = details
-                .extend(
-                    [row![
-                        theme::muted("Compression"),
-                        pick_list(
-                            [Preset::Fast, Preset::Balanced, Preset::Max],
-                            Some(state.preset_for(&id)),
-                            move |preset| Message::Preset(preset_id.clone(), preset)
-                        )
-                    ]
-                    .spacing(12)]
-                    .into_iter()
-                    .map(Element::from),
-                )
-                .push(theme::muted("Balanced is recommended"))
+                .push(theme::muted("How to compress"))
+                .push(modes)
+                .push(theme::muted(match chosen {
+                    StorageChoice::Standard => {
+                        "Standard is quick, and the game's files stay exactly where they are."
+                    }
+                    StorageChoice::Maximum => {
+                        "Maximum saves more and takes minutes. The game runs from a compressed store, and the original is kept until you confirm it works."
+                    }
+                }))
                 .push(
                     row![
                         secondary("Analyze", Message::One(id.clone(), Operation::Analyze)),
@@ -943,17 +998,35 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                         )
                     ]
                     .spacing(8),
-                );
+                )
+                .push(secondary(
+                    if state.advanced.contains(&id) {
+                        "Hide advanced"
+                    } else {
+                        "Advanced"
+                    },
+                    Message::ToggleAdvanced(id.clone()),
+                ));
         }
-        if item.pack_supported {
-            details = details.push(secondary(
-                if state.advanced.contains(&id) {
-                    "Hide advanced storage"
-                } else {
-                    "Advanced storage"
-                },
-                Message::ToggleAdvanced(id.clone()),
-            ));
+        // Advanced: the native preset, then the store controls.
+        let preset_id = id.clone();
+        if item.native_supported && state.advanced.contains(&id) {
+            details = details
+                .push(
+                    row![
+                        theme::muted("Standard strength"),
+                        pick_list(
+                            [Preset::Fast, Preset::Balanced, Preset::Max],
+                            Some(state.preset_for(&id)),
+                            move |preset| Message::Preset(preset_id.clone(), preset)
+                        )
+                    ]
+                    .spacing(12)
+                    .align_y(Alignment::Center),
+                )
+                .push(theme::muted(
+                    "Balanced is recommended. Max takes longer for a little more.",
+                ));
         }
         // Advanced storage. A game with a pack install gets its summary and
         // maintenance actions. A game without one gets the form that creates
@@ -1131,13 +1204,15 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
         if let Some(note) = &item.note {
             details = details.push(theme::muted(note));
         }
-        details = details.push(secondary_maybe(
-            "Qualify compatibility",
-            item.game
-                .state
-                .is_idle()
-                .then(|| Message::Qualify(id.clone())),
-        ));
+        if state.advanced.contains(&id) {
+            details = details.push(secondary_maybe(
+                "Qualify compatibility",
+                item.game
+                    .state
+                    .is_idle()
+                    .then(|| Message::Qualify(id.clone())),
+            ));
+        }
         details = details.push(secondary(
             "Exclude",
             Message::Send(Command::Exclude {
@@ -1652,7 +1727,6 @@ fn drives(state: &State) -> Element<'_, Message> {
 fn settings_page(state: &State) -> Element<'_, Message> {
     let links = iced::widget::Row::with_children(
         [
-            ("Jobs", "settings-jobs"),
             ("Locations", "settings-locations"),
             ("Recovery", "settings-recovery"),
             ("Maintenance", "settings-maintenance"),
@@ -1677,7 +1751,6 @@ fn settings_page(state: &State) -> Element<'_, Message> {
     column![
         theme::page_title("Settings"),
         links,
-        container(queue(state)).id("settings-jobs"),
         container(drives(state)).id("settings-locations"),
         container(recovery(state)).id("settings-recovery"),
         preferences(state),

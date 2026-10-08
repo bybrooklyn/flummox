@@ -15,9 +15,17 @@ Landlock, `/proc` and btrfs are Linux interfaces.
 
 The presentation follows these rules:
 
-- A game exposes one primary action beside its estimated saving and state.
-- Restore and analysis belong in expanded details.
-- Pack creation, paths, compaction and reclaim live under Advanced storage.
+- A game exposes one primary action, Compress, beside its estimated saving
+  or its result.
+- The window uses three verbs: Compress, Decompress and Analyze.
+- A game has one mode choice, Standard or Maximum. Several games at once
+  always use Standard.
+- Decompress, Analyze and the mode choice belong in expanded details. The
+  native preset, store paths and the compatibility form live under Advanced.
+- A job starts without a confirmation when its space plan passes. The plan is
+  shown only when it fails.
+- Jobs have their own page. A command the worker refuses is shown for a few
+  seconds and is not treated as a lost connection.
 - Controls are disabled before dispatch when a capability or prerequisite is
   unavailable.
 - Progress is measured. Work without a known total uses text instead of a

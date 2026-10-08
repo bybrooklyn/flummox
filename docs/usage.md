@@ -5,19 +5,35 @@ Capabilities by platform are in [status](status.md).
 
 ## Use the window
 
-Open `flummox-gui` on Linux, choose Games, select your games, and press **Free
-up space**. Analysis starts in the background. Search, drive and launcher
-filters, and sorting help with larger libraries. Expanding a game shows its
-path, compression preset, analysis, and recovery actions. Browse for a game folder
-or paste its path. Native dialogs use KDialog on KDE and Zenity elsewhere when
-available; a missing dialog helper leaves the path field usable. Maximum compares
-levels 9, 15, 19, and 22 per unique chunk and keeps the smallest result;
-ties use the cheaper level. Balanced remains the quicker native default.
+Open `flummox-gui` on Linux and choose Games. Analysis starts in the
+background, and the list sorts itself into four groups: worth compressing,
+not analyzed yet, compressed, and little to gain. Press **Compress** on a game,
+or tick several and press **Compress selected**. The job starts at once when
+the drive has room, and the window stays where you were. A compressed game
+shows what it saved; on btrfs that figure is an estimate and says so.
+
+Open a game to choose how it is compressed:
+
+- **Standard** is quick, and the game's files stay exactly where they are.
+  It is the default wherever the drive can compress in place.
+- **Maximum** saves more and takes minutes. The game runs from a compressed
+  store mounted at its usual path, and the original is kept until you confirm
+  the game works. It is chosen one game at a time; compressing several games
+  at once always uses Standard.
+
+**Decompress** puts a game back and **Analyze** estimates it again. Advanced
+holds the Standard strength (Fast, Balanced, Max), the store location, and the
+compatibility report form. Maximum compares levels 9, 15, 19 and 22 for each
+unique chunk and keeps the smallest; ties use the cheaper level.
+
+Browse for a game folder or paste its path. Native dialogs use KDialog on KDE
+and Zenity elsewhere when available; a missing dialog helper leaves the path
+field usable.
 
 On Windows, choose a locally detected Steam, Epic, GOG or Heroic game, or add
-another installed-game folder, then press **Optimize**. Flummox reports files
+another installed-game folder, then press **Compress**. Flummox reports files
 processed and allocated bytes freed while Windows works. **Stop** finishes the
-current file and keeps completed work valid. **Restore** removes WOF backing
+current file and keeps completed work valid. **Decompress** removes WOF backing
 and leaves the same files at the same paths.
 
 The window theme and responsive layout are shared across targets. Linux-only
@@ -25,7 +41,9 @@ storage controls appear only when their backend and FUSE support are available.
 Mac uses built-in APFS compression with staged verification and durable replacement
 journals. Unsupported desktop targets retain the informational shell.
 
-Settings > Jobs groups running, waiting, attention and completed work. Linux
+The Jobs page groups running, waiting, attention and completed work. A job
+you pause keeps its place, and the jobs behind it say they are waiting for it.
+Linux
 jobs support pause, resume, cancel and retry for native work and Maximum Space
 preparation. Store creation and compaction report measured progress; verification
 reports checked items. File switches, restoration and reclaim finish without

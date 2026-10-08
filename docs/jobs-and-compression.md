@@ -69,7 +69,9 @@ records retain their recovery path across coordinator restart.
 A qualification must match the game build, platform, full corpus, and policy.
 Analysis records the identity of the matching report. Automatic activation
 rehashes the installed corpus before creation and again before the final switch.
-Manual Advanced storage remains available for local testing without a report.
+Choosing Maximum for one game in the window proceeds without a report: the
+original is kept until the user confirms the game runs. Library-wide and
+automatic work never choose Maximum.
 Creating or activating a store keeps the original allocation until explicit
 reclaim. Rebuilding ordinary files after reclaim requires additional free space.
 

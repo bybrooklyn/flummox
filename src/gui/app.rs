@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 
 /// A navigation destination.
 ///
-/// Queue, Drives and Recovery are sections inside Settings. Going to one
-/// opens Settings scrolled to that section.
+/// Drives and Recovery are sections inside Settings. Going to one opens
+/// Settings scrolled to that section. Queue is the Jobs page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Overview,
@@ -29,12 +29,12 @@ pub enum Page {
 }
 /// The pages listed at the top of the sidebar. Settings is drawn apart from
 /// them, at the bottom.
-pub const PAGES: [Page; 2] = [Page::Overview, Page::Games];
+pub const PAGES: [Page; 3] = [Page::Overview, Page::Games, Page::Queue];
 impl Page {
     /// The page that is shown for this destination.
     pub fn main(self) -> Self {
         match self {
-            Self::Overview | Self::Games => self,
+            Self::Overview | Self::Games | Self::Queue => self,
             _ => Self::Settings,
         }
     }
@@ -43,14 +43,14 @@ impl Page {
         match self.main() {
             Self::Overview => 0,
             Self::Games => 1,
-            _ => 2,
+            Self::Queue => 2,
+            _ => 3,
         }
     }
     /// The id of the Settings container to scroll to, for a destination that
     /// is a section. `view::settings_page` must give a container this id.
     pub fn section(self) -> Option<&'static str> {
         match self {
-            Self::Queue => Some("settings-jobs"),
             Self::Drives => Some("settings-locations"),
             Self::Recovery => Some("settings-recovery"),
             _ => None,
@@ -62,7 +62,7 @@ impl Page {
         match self {
             Self::Overview => "Overview",
             Self::Games => "Games",
-            Self::Queue => "Queue",
+            Self::Queue => "Jobs",
             Self::Drives => "Drives",
             Self::Recovery => "Recovery",
             Self::Settings => "Settings",
@@ -215,6 +215,16 @@ impl Sort {
         }
     }
 }
+/// How a game is compressed when its Compress button is pressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageChoice {
+    /// Native compression in place. Quick, and the files stay where they are.
+    Standard,
+    /// A Maximum Space store mounted at the game's path. Saves more, takes
+    /// minutes, and keeps the original until the user confirms the game runs.
+    Maximum,
+}
+
 /// What compressing a game gained, for its row and its History entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -363,6 +373,9 @@ pub struct State {
     pub order_stale: bool,
     /// The "Little to gain" group is expanded.
     pub show_low: bool,
+    /// Modes the user picked, by game. A game without an entry uses
+    /// `State::choice_for`'s default.
+    pub choices: std::collections::HashMap<String, StorageChoice>,
     /// A snapshot has been applied at least once.
     snapshot_loaded_before: bool,
 }
@@ -438,6 +451,7 @@ impl State {
             worth_order: Default::default(),
             order_stale: false,
             show_low: false,
+            choices: Default::default(),
             snapshot_loaded_before: false,
         }
     }
@@ -552,6 +566,46 @@ impl State {
                     })
             })
     }
+    /// The mode this game's Compress button uses. Standard unless the user
+    /// chose otherwise, the game already runs from a store, or its drive has
+    /// no native compression, in which case Maximum is the only mode.
+    pub fn choice_for(&self, game: &Game) -> StorageChoice {
+        if let Some(choice) = self.choices.get(&game.id.to_string()) {
+            return *choice;
+        }
+        let stored = self
+            .snapshot
+            .packs
+            .iter()
+            .any(|install| install.game_path == game.install_dir);
+        let only_mode = self
+            .games
+            .iter()
+            .any(|row| row.game.id == game.id && !row.native_supported && row.pack_supported);
+        if stored || only_mode {
+            StorageChoice::Maximum
+        } else {
+            StorageChoice::Standard
+        }
+    }
+    /// What `choice` is predicted to save for this game. `None` until it has
+    /// been analyzed, and zero when the saving is too small to bother with
+    /// or the drive does not support that mode.
+    pub fn prospect(&self, game: &Game, choice: StorageChoice) -> Option<u64> {
+        let estimate = self.estimate(game)?;
+        let row = self.games.iter().find(|row| row.game.id == game.id)?;
+        let saving = match choice {
+            StorageChoice::Standard if row.native_supported => estimate.saving(),
+            StorageChoice::Maximum if row.pack_supported => estimate.maximum_saving().unwrap_or(0),
+            _ => 0,
+        };
+        let worthwhile = crate::recommendation::clears_threshold(
+            saving,
+            estimate.disk_now,
+            crate::recommendation::Policy::default(),
+        );
+        Some(if worthwhile { saving } else { 0 })
+    }
     /// A game's place in the Worth order as captured, with games seen since
     /// the capture counted as not analyzed.
     pub fn worth(&self, game: &Game) -> (u8, u64) {
@@ -578,14 +632,9 @@ impl State {
                     };
                     (2, saved)
                 } else {
-                    match self.recommendation(&row.game) {
-                        Some(choice)
-                            if choice.predicted_saving > 0
-                                && choice.mode != crate::recommendation::StorageMode::Skip =>
-                        {
-                            (0, choice.predicted_saving)
-                        }
-                        Some(_) => (3, 0),
+                    match self.prospect(&row.game, self.choice_for(&row.game)) {
+                        Some(0) => (3, 0),
+                        Some(saving) => (0, saving),
                         None => (1, row.game.size_hint.unwrap_or(0)),
                     }
                 };
@@ -659,62 +708,68 @@ impl State {
             .join(format!("{identity}.store"))
     }
 
-    /// Builds the command behind the main Compress action.
+    /// Builds the command that compresses `game` with `choice`.
     ///
-    /// A Maximum Space recommendation becomes a create-and-activate pack job
-    /// and needs a stored report matching the estimate's qualification.
-    /// Anything else becomes a native compression at the game's preset, which
-    /// fails when the drive has no native support.
-    fn optimize_command(&self, game: Game) -> Result<Command, String> {
-        if self
-            .recommendation(&game)
-            .is_some_and(|r| r.mode == crate::recommendation::StorageMode::MaximumSpace)
-        {
-            let identity = self
-                .estimate(&game)
-                .and_then(|estimate| estimate.maximum_qualification);
-            let report = self
-                .reports
-                .iter()
-                .find(|r| {
-                    r.identity().ok() == identity
-                        && r.qualifies(
-                            &game,
-                            &r.corpus.sha256,
-                            crate::compatibility::Policy::default(),
-                        )
+    /// Standard is a native compression at the game's preset. Maximum builds
+    /// a store and mounts it, keeping the original until the user confirms.
+    /// A saved compatibility report for this build is attached when there is
+    /// one, and the job proceeds without one when the user chose this mode.
+    fn optimize_command(&self, game: Game, choice: StorageChoice) -> Result<Command, String> {
+        let row = self
+            .games
+            .iter()
+            .find(|r| r.game.id == game.id)
+            .ok_or_else(|| "Game no longer exists".to_owned())?;
+        match choice {
+            StorageChoice::Standard => {
+                if !row.native_supported {
+                    return Err(format!(
+                        "{}'s drive has no native compression. Open the game and choose Maximum.",
+                        game.title
+                    ));
+                }
+                let options = crate::backend::CompressOpts {
+                    preset: self.preset_for(&game.id.to_string()),
+                    ..Default::default()
+                };
+                Ok(Command::Enqueue {
+                    game,
+                    operation: Operation::Compress,
+                    options,
                 })
-                .cloned()
-                .ok_or_else(|| {
-                    "Refresh and analyze this game after importing its compatibility report."
-                        .to_owned()
-                })?;
-            Ok(Command::EnqueuePack {
-                task: PackTask::Activate {
-                    store: self.store_path(&game),
-                    create: true,
-                    qualification: Some(Box::new(report)),
-                },
-                game,
-            })
-        } else {
-            let row = self
-                .games
-                .iter()
-                .find(|r| r.game.id == game.id)
-                .ok_or_else(|| "Game no longer exists".to_owned())?;
-            if !row.native_supported {
-                return Err("Maximum Space needs a matching qualification for the primary action. Use Advanced storage to test this game locally.".into());
             }
-            let options = crate::backend::CompressOpts {
-                preset: self.preset_for(&game.id.to_string()),
-                ..Default::default()
-            };
-            Ok(Command::Enqueue {
-                game,
-                operation: Operation::Compress,
-                options,
-            })
+            StorageChoice::Maximum => {
+                if !row.pack_supported {
+                    return Err(format!(
+                        "Maximum is not available for {} on this drive.",
+                        game.title
+                    ));
+                }
+                let identity = self
+                    .estimate(&game)
+                    .and_then(|estimate| estimate.maximum_qualification);
+                let report = self
+                    .reports
+                    .iter()
+                    .find(|r| {
+                        identity.is_some()
+                            && r.identity().ok() == identity
+                            && r.qualifies(
+                                &game,
+                                &r.corpus.sha256,
+                                crate::compatibility::Policy::default(),
+                            )
+                    })
+                    .cloned();
+                Ok(Command::EnqueuePack {
+                    task: PackTask::Activate {
+                        store: self.store_path(&game),
+                        create: true,
+                        qualification: report.map(Box::new),
+                    },
+                    game,
+                })
+            }
         }
     }
 
@@ -724,9 +779,8 @@ impl State {
         self.games
             .iter()
             .filter(|row| row.supported && !self.compressed(&row.game))
-            .filter_map(|row| self.recommendation(&row.game))
-            .filter(|choice| choice.mode != crate::recommendation::StorageMode::Skip)
-            .map(|choice| choice.predicted_saving)
+            // The library-wide action only ever uses Standard.
+            .filter_map(|row| self.prospect(&row.game, StorageChoice::Standard))
             .sum()
     }
 
@@ -888,6 +942,8 @@ pub enum Message {
     Rescan,
     Scanned(Result<ScanResult, String>),
     Snapshot(Result<Snapshot, String>),
+    /// The worker's reply to a command the user gave.
+    Commanded(Result<Snapshot, String>),
     /// A space plan is ready for review, with the command it belongs to.
     Planned(Result<(Command, crate::storage::SpacePlan), String>),
     /// The user accepted the plan in `State::planned`.
@@ -918,6 +974,8 @@ pub enum Message {
     Expand(String),
     /// Go to Games and open this game's detail pane.
     ReviewGame(String),
+    /// Set how this game's Compress button compresses it.
+    Choice(String, StorageChoice),
     Sort(Sort),
     /// Expand or collapse the "Little to gain" group.
     ToggleLow,
@@ -1009,7 +1067,7 @@ fn send(command: Command) -> Task<Message> {
 fn send_unchecked(command: Command) -> Task<Message> {
     Task::perform(
         background(move || jobs::request(command).map_err(|e| e.to_string())),
-        |r| Message::Snapshot(r.and_then(|r| r)),
+        |result| Message::Commanded(result.and_then(|snapshot| snapshot)),
     )
 }
 
@@ -1025,8 +1083,45 @@ fn send_many(commands: Vec<Command>) -> Task<Message> {
             }
             Ok(snapshot)
         }),
-        |result| Message::Snapshot(result.and_then(|snapshot| snapshot)),
+        |result| Message::Commanded(result.and_then(|snapshot| snapshot)),
     )
+}
+
+/// Queues one job for each game and shows the Jobs page. Several games at
+/// once are always compressed with Standard: Maximum is chosen game by game.
+/// A game that cannot take the job is left out and counted in a notice, so
+/// one of them does not stop the rest.
+fn queue_standard(state: &mut State, games: Vec<Game>, operation: Operation) -> Task<Message> {
+    let wanted = games.len();
+    let commands: Vec<Command> = games
+        .into_iter()
+        .filter_map(|game| {
+            if operation == Operation::Compress {
+                state.optimize_command(game, StorageChoice::Standard).ok()
+            } else {
+                Some(Command::Enqueue {
+                    options: crate::backend::CompressOpts {
+                        preset: state.preset_for(&game.id.to_string()),
+                        ..Default::default()
+                    },
+                    game,
+                    operation,
+                })
+            }
+        })
+        .collect();
+    let skipped = wanted - commands.len();
+    if skipped > 0 {
+        state.show_status(Status::info(format!(
+            "{skipped} game{} left out: their drive needs Maximum, which is chosen per game.",
+            if skipped == 1 { " was" } else { "s were" }
+        )));
+    }
+    if commands.is_empty() {
+        return Task::none();
+    }
+    let navigation = update(state, Message::GoTo(Page::Queue));
+    Task::batch([navigation, send_many(commands)])
 }
 
 /// Plans a job that mounts a store over the game, creating the store first
@@ -1278,6 +1373,14 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
         },
         // Space plan review.
         Message::Planned(result) => match result {
+            // A plan with room to spare starts at once. The review appears
+            // only when the plan fails its own check, to say what is short.
+            Ok((command, plan)) if plan.check().is_ok() => {
+                return send_unchecked(Command::EnqueuePlanned {
+                    command: Box::new(command),
+                    plan,
+                });
+            }
             Ok(plan) => state.planned = Some(plan),
             Err(error) => state.show_status(Status::error(error)),
         },
@@ -1472,6 +1575,16 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             return update(state, Message::Snapshot(result));
         }
 
+        // The reply to something the user asked for. A refusal is about that
+        // request, so it is shown for a few seconds and the connection is
+        // not marked as lost.
+        Message::Commanded(result) => match result {
+            Ok(snapshot) => return update(state, Message::Snapshot(Ok(snapshot))),
+            Err(refusal) => {
+                state.show_status(Status::error(refusal));
+                state.status_deadline = Some(Instant::now() + Duration::from_secs(8));
+            }
+        },
         Message::Snapshot(result) => match result {
             Ok(snapshot) => {
                 // Replies can arrive out of order. One from an earlier worker,
@@ -1606,6 +1719,16 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             state.capture_order();
         }
         Message::ToggleLow => state.show_low = !state.show_low,
+        Message::Choice(id, choice) => {
+            state.choices.insert(id, choice);
+            // The predicted saving differs by mode, so the game may belong
+            // in another group now.
+            if state.expanded.is_some() {
+                state.order_stale = true;
+            } else {
+                state.capture_order();
+            }
+        }
         Message::Filter(filter) => {
             state.filter = filter;
             state.capture_order();
@@ -1625,11 +1748,11 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 // Compress follows the recommendation, which may choose a pack
                 // job. Analyze and Decompress are queued as asked.
                 if operation == Operation::Compress {
-                    match state.optimize_command(game) {
-                        Ok(command) => {
-                            let navigation = update(state, Message::GoTo(Page::Queue));
-                            return Task::batch([navigation, send(command)]);
-                        }
+                    let choice = state.choice_for(&game);
+                    match state.optimize_command(game, choice) {
+                        // The row and the work bar both show the job, so the
+                        // window stays where the button was pressed.
+                        Ok(command) => return send(command),
                         Err(error) => {
                             state.show_status(Status::error(error));
                             return Task::none();
@@ -1640,52 +1763,19 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                     preset: state.preset_for(&id),
                     ..Default::default()
                 };
-                let navigation = if operation != Operation::Analyze {
-                    update(state, Message::GoTo(Page::Queue))
-                } else {
-                    Task::none()
-                };
-                return Task::batch([
-                    navigation,
-                    send(Command::Enqueue {
-                        game,
-                        operation,
-                        options,
-                    }),
-                ]);
+                return send(Command::Enqueue {
+                    game,
+                    operation,
+                    options,
+                });
             }
         }
         Message::Queue(operation) => {
-            let commands: Result<Vec<_>, _> = state
-                .actionable_selection()
-                .into_iter()
-                .map(|game| {
-                    if operation == Operation::Compress {
-                        state.optimize_command(game)
-                    } else {
-                        Ok(Command::Enqueue {
-                            options: crate::backend::CompressOpts {
-                                preset: state.preset_for(&game.id.to_string()),
-                                ..Default::default()
-                            },
-                            game,
-                            operation,
-                        })
-                    }
-                })
-                .collect();
-            let commands = match commands {
-                Ok(commands) => commands,
-                Err(error) => {
-                    state.show_status(Status::error(error));
-                    return Task::none();
-                }
-            };
-            let navigation = update(state, Message::GoTo(Page::Queue));
-            return Task::batch([navigation, send_many(commands)]);
+            let games = state.actionable_selection();
+            return queue_standard(state, games, operation);
         }
         Message::OptimizeLibrary => {
-            let commands: Result<Vec<_>, _> = state
+            let games: Vec<Game> = state
                 .games
                 .iter()
                 .filter(|row| {
@@ -1693,20 +1783,17 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                         && row.game.state.is_idle()
                         && !state.compressed(&row.game)
                         && state
-                            .recommendation(&row.game)
-                            .is_some_and(|r| r.mode != crate::recommendation::StorageMode::Skip)
+                            .prospect(&row.game, StorageChoice::Standard)
+                            .is_some_and(|saving| saving > 0)
                 })
-                .map(|row| state.optimize_command(row.game.clone()))
+                .map(|row| row.game.clone())
                 .collect();
-            match commands {
-                Ok(commands) if !commands.is_empty() => {
-                    let navigation = update(state, Message::GoTo(Page::Queue));
-                    return Task::batch([navigation, send_many(commands)]);
-                }
-                Ok(_) => state.show_status(Status::info(
+            if games.is_empty() {
+                state.show_status(Status::info(
                     "Analysis has not found a game worth compressing yet.",
-                )),
-                Err(error) => state.show_status(Status::error(error)),
+                ));
+            } else {
+                return queue_standard(state, games, Operation::Compress);
             }
         }
         Message::Send(command) => {
@@ -2106,7 +2193,7 @@ mod tests {
             "earlier page moves downward into view",
         )?;
         let _task = update(&mut state, Message::GoTo(Page::Queue));
-        check_eq(state.page, Page::Settings, "jobs live in Settings")?;
+        check_eq(state.page, Page::Queue, "jobs have their own page")?;
         let _task = update(&mut state, Message::Snapshot(Err("offline".into())));
         check(
             state.connection_error.is_some(),
@@ -2314,6 +2401,99 @@ mod tests {
             state.result(&game("big-win")),
             None,
             "a game that is only analyzed has no result",
+        )
+    }
+
+    #[test]
+    fn compress_uses_standard_unless_the_game_was_set_to_maximum() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        let mut both = named("both", true);
+        both.pack_supported = true;
+        let mut store_only = named("store-only", true);
+        store_only.native_supported = false;
+        store_only.pack_supported = true;
+        state.games.push(both.clone());
+        state.games.push(store_only.clone());
+        let mut analysis = job(
+            1,
+            &both.game,
+            Operation::Analyze,
+            Phase::Completed,
+            900_000_000,
+        );
+        if let Some(estimate) = &mut analysis.estimate {
+            estimate.maximum_after = Some(2_000_000_000);
+        }
+        state.snapshot.jobs.push(analysis);
+
+        check_eq(
+            state.choice_for(&both.game),
+            StorageChoice::Standard,
+            "a drive with native compression defaults to Standard",
+        )?;
+        check_eq(
+            state.choice_for(&store_only.game),
+            StorageChoice::Maximum,
+            "a drive without it has only Maximum",
+        )?;
+        check_eq(
+            state.prospect(&both.game, StorageChoice::Standard),
+            Some(900_000_000),
+            "Standard's predicted saving",
+        )?;
+        check_eq(
+            state.prospect(&both.game, StorageChoice::Maximum),
+            Some(2_000_000_000),
+            "Maximum's predicted saving",
+        )?;
+        check(
+            matches!(
+                state.optimize_command(both.game.clone(), state.choice_for(&both.game)),
+                Ok(Command::Enqueue {
+                    operation: Operation::Compress,
+                    ..
+                })
+            ),
+            "the default is a native compression",
+        )?;
+        let _task = update(
+            &mut state,
+            Message::Choice(both.game.id.to_string(), StorageChoice::Maximum),
+        );
+        check(
+            matches!(
+                state.optimize_command(both.game.clone(), state.choice_for(&both.game)),
+                Ok(Command::EnqueuePack {
+                    task: PackTask::Activate {
+                        create: true,
+                        qualification: None,
+                        ..
+                    },
+                    ..
+                })
+            ),
+            "a game set to Maximum builds and mounts a store, with no report needed",
+        )?;
+        check(
+            state
+                .optimize_command(store_only.game.clone(), StorageChoice::Standard)
+                .is_err(),
+            "Standard is refused where the drive cannot do it",
+        )?;
+        // Several games at once use Standard, and the one that cannot is
+        // left out without stopping the other.
+        state.selected.insert(both.game.id.to_string());
+        state.selected.insert(store_only.game.id.to_string());
+        let _task = update(&mut state, Message::Queue(Operation::Compress));
+        check(
+            state
+                .status
+                .as_ref()
+                .is_some_and(|status| status.text.contains("1 game was left out")),
+            format!(
+                "the skipped game is reported: {:?}",
+                state.status.as_ref().map(|s| &s.text)
+            ),
         )
     }
 

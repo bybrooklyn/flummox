@@ -85,7 +85,7 @@ pub struct Recommendation {
 }
 
 /// Whether a saving meets both the absolute and the relative minimum.
-fn clears_threshold(saving: u64, current: u64, policy: Policy) -> bool {
+pub fn clears_threshold(saving: u64, current: u64, policy: Policy) -> bool {
     saving >= policy.minimum_saving
         && current > 0
         && saving.saturating_mul(10_000)

@@ -1483,9 +1483,9 @@ fn cmd_status(env: &Env, out: Output, selector: &str, cancel: &Arc<AtomicBool>) 
         backend.kind().label()
     );
     println!("  files      : {}", status.files);
-    println!("  mapped     : {}", size(status.total_bytes));
+    println!("  on disk    : {} of game data", size(status.total_bytes));
     println!(
-        "  compressed : {} ({:.0}% of mapped data is in compressed extents)",
+        "  compressed : {} ({:.0}% of this game's data is stored compressed)",
         size(status.compressed_bytes),
         status.ratio() * 100.0
     );
