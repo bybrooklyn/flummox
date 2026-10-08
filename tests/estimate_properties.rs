@@ -178,3 +178,129 @@ proptest! {
         prop_assert_eq!(model.level(), level, "the model reports the level it was built with");
     }
 }
+
+use flummox::estimate::{EstimateOpts, PackModel, estimate_open_file, sample_offset};
+use std::io::Write;
+
+/// The kinds of file content the sampling properties range over.
+#[derive(Debug, Clone, Copy)]
+enum Content {
+    Zeros,
+    Noise,
+    /// Compressible head and tail around an incompressible body.
+    ZerosAroundNoise,
+}
+
+/// Pseudo-random bytes from splitmix64, a word at a time.
+fn noise(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed;
+    let mut out = Vec::with_capacity(len + 8);
+    while out.len() < len {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        out.extend_from_slice(&(z ^ (z >> 31)).to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+fn content(kind: Content, len: usize, seed: u64) -> Vec<u8> {
+    match kind {
+        Content::Zeros => vec![0u8; len],
+        Content::Noise => noise(len, seed),
+        Content::ZerosAroundNoise => {
+            let edge = len / 8;
+            let mut bytes = vec![0u8; edge];
+            bytes.extend(noise(len - 2 * edge, seed));
+            bytes.extend(vec![0u8; edge]);
+            bytes
+        }
+    }
+}
+
+fn contents() -> impl Strategy<Value = Content> {
+    prop_oneof![
+        Just(Content::Zeros),
+        Just(Content::Noise),
+        Just(Content::ZerosAroundNoise),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 1024,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    /// The pack model obeys the same whole-sector and never-above-raw rules.
+    #[test]
+    fn the_pack_model_costs_whole_sectors_and_never_more_than_raw(
+        uncompressed in sizes(),
+        compressed in sizes(),
+    ) {
+        let model = PackModel { level: 19 };
+        let cost = model.disk_cost(uncompressed, compressed);
+        prop_assert_eq!(cost % SECTOR, 0, "{} is not a whole number of sectors", cost);
+        prop_assert!(cost <= rounded(uncompressed), "{cost} exceeds the raw cost");
+    }
+
+    /// Sample windows stay inside the file, never go backwards, and do not
+    /// overlap while the windows fit in the file.
+    #[test]
+    fn sample_windows_stay_inside_the_file(
+        size in 1u64..=(64 << 30),
+        window in 1u64..=(4 << 20),
+        samples in 1u64..=64,
+    ) {
+        let window = window.min(size);
+        let mut previous_end = 0u64;
+        for index in 0..samples {
+            let start = sample_offset(index, size, window, samples);
+            prop_assert!(start + window <= size, "window {index} leaves the file");
+            prop_assert!(start >= previous_end || samples * window > size, "window {index} overlaps");
+            previous_end = start + window;
+        }
+    }
+}
+
+proptest! {
+    // Each case writes a file and compresses it, so far fewer cases.
+    #![proptest_config(ProptestConfig {
+        cases: 24,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    /// Sampling a file never reads past it, never promises to grow it, and
+    /// reads the whole of a file that fits in the sampling limit.
+    #[test]
+    fn a_file_estimate_stays_within_the_file(
+        kind in contents(),
+        len in 1usize..=(600 * 1024),
+        seed in any::<u64>(),
+    ) {
+        let fail = |e: std::io::Error| TestCaseError::fail(e.to_string());
+        let dir = tempfile::tempdir().map_err(fail)?;
+        let path = dir.path().join("data.bin");
+        let bytes = content(kind, len, seed);
+        let mut file = std::fs::File::create(&path).map_err(fail)?;
+        file.write_all(&bytes).map_err(fail)?;
+        drop(file);
+        let handle = std::fs::File::open(&path).map_err(fail)?;
+        let opts = EstimateOpts { level: 3, mount_level: None, floor: None };
+        let est = estimate_open_file(&handle, len as u64, &BtrfsModel { level: 3 }, &opts, None)
+            .map_err(fail)?;
+        prop_assert!(est.sampled <= len as u64, "read {} of {len}", est.sampled);
+        prop_assert!(est.disk_after <= est.disk_now, "{est:?}");
+        prop_assert_eq!(est.sampled, len as u64, "a file under 4 MiB is read whole");
+        // Controls: zeros must shrink and noise must not.
+        match kind {
+            Content::Zeros if len >= 16 * 1024 => prop_assert!(est.saving() > 0, "{est:?}"),
+            Content::Noise => prop_assert_eq!(est.saving(), 0, "{:?}", est),
+            _ => {}
+        }
+    }
+}
