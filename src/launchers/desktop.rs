@@ -25,8 +25,10 @@ fn json(path: &Path) -> anyhow::Result<Value> {
 }
 /// Builds a game record for an absolute install path. A path that is not a
 /// directory now is kept and marked `Broken`, so a game on a disconnected
-/// drive stays listed. A relative path gives `None`.
+/// drive stays listed. So is a path [`crate::model::refuse_install_path_with`]
+/// refuses. A relative path gives `None`.
 fn game(
+    home: Option<&Path>,
     launcher: Launcher,
     key: String,
     title: String,
@@ -37,7 +39,9 @@ fn game(
     if !path.is_absolute() {
         return None;
     }
-    let state = if path.is_dir() {
+    let state = if let Err(detail) = crate::model::refuse_install_path_with(&path, home) {
+        InstallState::Broken { detail }
+    } else if path.is_dir() {
         InstallState::Idle
     } else {
         InstallState::Broken {
@@ -58,14 +62,12 @@ fn game(
 /// Reads the games out of an `installed.json`. The list may be an array or
 /// an object keyed by app name, at the top level or under `installed`.
 /// Entries without an `install_path` are skipped.
-fn parse_installed(value: &Value, launcher: Launcher) -> Vec<Game> {
+fn parse_installed(value: &Value, launcher: Launcher, home: Option<&Path>) -> Vec<Game> {
     let mut games = vec![];
-    let entries: Vec<(String, &Value)> = match value.get("installed").unwrap_or(value) {
-        Value::Array(entries) => entries
-            .iter()
-            .enumerate()
-            .map(|(i, v)| (i.to_string(), v))
-            .collect(),
+    let list = value.get("installed").unwrap_or(value);
+    let positional = list.is_array();
+    let entries: Vec<(String, &Value)> = match list {
+        Value::Array(entries) => entries.iter().map(|v| (String::new(), v)).collect(),
         Value::Object(entries) => entries.iter().map(|(k, v)| (k.clone(), v)).collect(),
         _ => vec![],
     };
@@ -73,11 +75,17 @@ fn parse_installed(value: &Value, launcher: Launcher) -> Vec<Game> {
         let Some(path) = item.get("install_path").and_then(Value::as_str) else {
             continue;
         };
-        let key = item
-            .get("app_name")
-            .and_then(Value::as_str)
-            .unwrap_or(&key)
-            .to_owned();
+        // Heroic has written both spellings. The array position is never an
+        // id, since it shifts when an earlier game is uninstalled.
+        let named = ["app_name", "appName"]
+            .iter()
+            .find_map(|name| item.get(*name).and_then(Value::as_str))
+            .filter(|name| !name.is_empty());
+        let key = match (named, positional) {
+            (Some(name), _) => name.to_owned(),
+            (None, false) => key,
+            (None, true) => path.to_owned(),
+        };
         let title = item
             .get("title")
             .and_then(Value::as_str)
@@ -91,12 +99,14 @@ fn parse_installed(value: &Value, launcher: Launcher) -> Vec<Game> {
         let build = item
             .get("version")
             .or_else(|| item.get("build_id"))
+            .or_else(|| item.get("buildId"))
             .map(|v| {
                 v.as_str()
                     .map(str::to_owned)
                     .unwrap_or_else(|| v.to_string())
             });
         if let Some(mut game) = game(
+            home,
             launcher,
             key,
             title,
@@ -117,7 +127,7 @@ fn parse_installed(value: &Value, launcher: Launcher) -> Vec<Game> {
     games
 }
 /// Lists installed games from a Lutris `pga.db`, opened read-only.
-fn lutris(path: &Path) -> anyhow::Result<Vec<Game>> {
+fn lutris(path: &Path, home: Option<&Path>) -> anyhow::Result<Vec<Game>> {
     let db =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     db.busy_timeout(std::time::Duration::from_millis(500))?;
@@ -126,12 +136,19 @@ fn lutris(path: &Path) -> anyhow::Result<Vec<Game>> {
     for row in stmt.query_map([], |r| {
         Ok((
             r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
+            r.get::<_, Option<String>>(1)?,
             r.get::<_, String>(2)?,
         ))
     })? {
-        let (id, title, path) = row?;
+        // One row that cannot be read must not hide the others.
+        let Ok((id, title, path)) = row else { continue };
+        let title = title.filter(|t| !t.is_empty()).unwrap_or_else(|| {
+            Path::new(&path)
+                .file_name()
+                .map_or_else(|| id.to_string(), |s| s.to_string_lossy().into_owned())
+        });
         if let Some(game) = game(
+            home,
             Launcher::Lutris,
             id.to_string(),
             title,
@@ -167,7 +184,9 @@ pub(super) fn discover(env: &Env, scan: &mut Scan) {
                 continue;
             }
             match json(&path) {
-                Ok(value) => scan.games.extend(parse_installed(&value, launcher)),
+                Ok(value) => scan
+                    .games
+                    .extend(parse_installed(&value, launcher, Some(&env.home))),
                 Err(e) => scan.warnings.push(DetectError::new(
                     format!("Reading {}", path.display()),
                     std::io::Error::other(e.to_string()),
@@ -183,7 +202,7 @@ pub(super) fn discover(env: &Env, scan: &mut Scan) {
         if !path.exists() {
             continue;
         }
-        match lutris(&path) {
+        match lutris(&path, Some(&env.home)) {
             Ok(games) => scan.games.extend(games),
             Err(e) => scan.warnings.push(DetectError::new(
                 format!("Reading {}", path.display()),
@@ -251,7 +270,16 @@ fn add_custom(scan: &mut Scan, library: &crate::jobs::Library) {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Game folder".into());
         let key = path.to_string_lossy().into_owned();
-        if let Some(game) = game(Launcher::Manual, key, name, path, None, None) {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        if let Some(game) = game(
+            home.as_deref(),
+            Launcher::Manual,
+            key,
+            name,
+            path,
+            None,
+            None,
+        ) {
             scan.games.push(game);
         }
     }
@@ -284,6 +312,7 @@ pub(super) fn merge(scan: &mut Scan) {
             games.push(game);
         }
     }
+    crate::model::flag_swallowing_games(&mut games);
     scan.games = games;
 }
 
@@ -359,13 +388,149 @@ mod tests {
         )
     }
     #[test]
+    fn a_collection_folder_holding_a_steam_library_is_not_one_game() -> TestResult {
+        use crate::jobs::{FolderKind, Library};
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let root = temp.path().join("games");
+        let steam_game = root.join("SteamLibrary/steamapps/common/Deep Game");
+        let real = root.join("Real Game");
+        let empty_library = root.join("OldLibrary");
+        for dir in [&steam_game, &real, &empty_library.join("steamapps")] {
+            std::fs::create_dir_all(dir).ctx("fixture folder")?;
+        }
+        let mut scan = Scan::default();
+        scan.games.push(
+            game(
+                None,
+                Launcher::Steam,
+                "7".into(),
+                "Deep Game".into(),
+                steam_game,
+                None,
+                None,
+            )
+            .ctx("steam game")?,
+        );
+        add_custom(
+            &mut scan,
+            &Library {
+                path: root,
+                automatic: false,
+                custom: true,
+                folder_kind: FolderKind::Collection,
+            },
+        );
+        merge(&mut scan);
+        let state_of = |title: &str| {
+            scan.games
+                .iter()
+                .find(|g| g.title == title)
+                .map(|g| g.state.is_idle())
+        };
+        check_eq(state_of("Real Game"), Some(true), "a real game stays idle")?;
+        check_eq(
+            state_of("Deep Game"),
+            Some(true),
+            "the Steam game stays idle",
+        )?;
+        check_eq(
+            state_of("SteamLibrary"),
+            Some(false),
+            "a folder that contains a discovered game must not be a job target",
+        )?;
+        check_eq(
+            state_of("OldLibrary"),
+            Some(false),
+            "a folder that holds steamapps must not be a job target",
+        )
+    }
+    #[test]
     fn reads_installed_manifests_and_preserves_unavailable_games() -> TestResult {
         let data = serde_json::json!({"a":{"title":"A game","install_path":"/unavailable/game","version":"2"},"bad":{"install_path":"relative"}});
-        let games = parse_installed(&data, Launcher::HeroicLegendary);
+        let games = parse_installed(&data, Launcher::HeroicLegendary, None);
         check_eq(games.len(), 1, "relative paths are refused")?;
         let game = games.first().ctx("one installed game")?;
         check_eq(game.title.as_str(), "A game", "title")?;
         check(!game.state.is_idle(), "a disconnected game stays visible")
+    }
+    #[test]
+    fn heroic_ids_come_from_the_app_name_and_never_from_the_position() -> TestResult {
+        let ids = |data: serde_json::Value| -> Vec<String> {
+            parse_installed(&data, Launcher::HeroicGog, None)
+                .into_iter()
+                .map(|g| g.id.key)
+                .collect()
+        };
+        let camel = ids(serde_json::json!({"installed":[
+            {"appName":"111","install_path":"/g/one","buildId":"7"},
+            {"app_name":"222","install_path":"/g/two"}]}));
+        check_eq(
+            camel,
+            vec!["111".to_owned(), "222".to_owned()],
+            "both spellings",
+        )?;
+        let unnamed = |paths: &[&str]| {
+            ids(
+                serde_json::json!({"installed": paths.iter().map(|p| serde_json::json!({"install_path": p})).collect::<Vec<_>>()}),
+            )
+        };
+        let before = unnamed(&["/g/one", "/g/two"]);
+        let after = unnamed(&["/g/two"]);
+        check_eq(
+            after.first(),
+            before.get(1),
+            "removing an earlier entry must not change a later game's id",
+        )?;
+        let built = parse_installed(
+            &serde_json::json!([{"appName":"1","install_path":"/g/one","buildId":"9"}]),
+            Launcher::HeroicGog,
+            None,
+        );
+        check_eq(
+            built.first().and_then(|g| g.build.as_deref()),
+            Some("9"),
+            "buildId is read",
+        )
+    }
+    #[test]
+    fn launcher_paths_that_cover_the_home_or_leave_it_are_listed_broken() -> TestResult {
+        let home = Path::new("/home/someone");
+        for path in ["/", "/home", "/home/someone", "/games/../etc"] {
+            let games = parse_installed(
+                &serde_json::json!({"a": {"install_path": path}}),
+                Launcher::HeroicGog,
+                Some(home),
+            );
+            let game = games.first().ctx(path)?;
+            check(!game.state.is_idle(), format!("{path} must not be idle"))?;
+        }
+        let games = parse_installed(
+            &serde_json::json!({"a": {"install_path": "/home/someone/Games/One"}}),
+            Launcher::HeroicGog,
+            Some(home),
+        );
+        check(
+            !games
+                .first()
+                .ctx("game under home")?
+                .state
+                .to_string()
+                .contains("home folder"),
+            "a game folder under the home is not refused as the home",
+        )
+    }
+    #[test]
+    fn a_lutris_row_without_a_name_does_not_hide_the_others() -> TestResult {
+        let temp = tempfile::tempdir().ctx("temporary library")?;
+        let path = temp.path().join("pga.db");
+        let db = rusqlite::Connection::open(&path).ctx("fixture database")?;
+        db.execute_batch("CREATE TABLE games(id INTEGER,name TEXT,directory TEXT,installed INTEGER); INSERT INTO games VALUES(1,NULL,'/unavailable/one',1),(2,'Named','/unavailable/two',1);").ctx("fixture rows")?;
+        drop(db);
+        check_eq(
+            lutris(&path, None).ctx("read fixture")?.len(),
+            2,
+            "both rows listed",
+        )
     }
     #[test]
     fn reads_lutris_without_changing_its_database() -> TestResult {
@@ -376,7 +541,7 @@ mod tests {
         drop(db);
         let before = std::fs::read(&path).ctx("before")?;
         check_eq(
-            lutris(&path).ctx("read fixture")?.len(),
+            lutris(&path, None).ctx("read fixture")?.len(),
             1,
             "installed entries only",
         )?;

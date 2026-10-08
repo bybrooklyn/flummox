@@ -140,7 +140,14 @@ pub fn steam_roots() -> (Vec<PathBuf>, Vec<String>) {
             match result {
                 Ok(Some(path)) => {
                     let path = PathBuf::from(path);
-                    if !roots.contains(&path) {
+                    // The registry spells the path in lower case with forward slashes.
+                    let key = |p: &PathBuf| {
+                        p.to_string_lossy()
+                            .replace('\\', "/")
+                            .trim_end_matches('/')
+                            .to_lowercase()
+                    };
+                    if !roots.iter().any(|known| key(known) == key(&path)) {
                         roots.push(path);
                     }
                 }
@@ -170,17 +177,16 @@ pub fn gog(catalog: &mut crate::desktop_discovery::Catalog) {
                         };
                         let title = key.string("gameName")?.unwrap_or_else(|| id.clone());
                         let path = PathBuf::from(path);
-                        ensure!(
-                            path.is_absolute() && path.parent().is_some(),
-                            "GOG install directory is invalid"
-                        );
+                        ensure!(path.is_absolute(), "GOG install directory is invalid");
                         // `manual_game` fills the common fields. Its id is then replaced
                         // with a GOG id made from the subkey's name.
                         let mut game = crate::desktop::manual_game(title, path);
                         game.id =
                             crate::model::GameId::new(crate::model::Launcher::Gog, id.clone());
                         game.build = key.string("buildId")?.or(key.string("version")?);
-                        if !game.install_dir.is_dir() {
+                        if let Err(detail) = crate::model::refuse_install_path(&game.install_dir) {
+                            game.state = crate::model::InstallState::Broken { detail };
+                        } else if !game.install_dir.is_dir() {
                             game.state = crate::model::InstallState::Broken {
                                 detail: "Drive or folder unavailable".into(),
                             };

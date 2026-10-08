@@ -254,18 +254,16 @@ impl<'a> Lexer<'a> {
                     self.bump();
                 }
                 Some('/') => {
-                    self.bump();
-                    if self.peek() == Some('/') {
-                        while let Some(c) = self.bump() {
-                            if c == '\n' {
-                                break;
-                            }
-                        }
-                    } else {
-                        // A lone '/' starts an unquoted token; put it back by
-                        // treating it as the start of one.
-                        self.peeked = Some('/');
+                    // `peeked` holds the first slash, `rest` starts at the next
+                    // character. A lone slash starts an unquoted token and is
+                    // left in `peeked` for it.
+                    if self.rest.clone().next() != Some('/') {
                         return;
+                    }
+                    while let Some(c) = self.bump() {
+                        if c == '\n' {
+                            break;
+                        }
                     }
                 }
                 _ => return,
@@ -478,6 +476,23 @@ mod tests {
                 .and_then(|o| o.get_u32("RunningAppID")),
             Some(105600),
             "the same value by explicit path",
+        )
+    }
+
+    #[test]
+    fn a_lone_slash_keeps_the_character_after_it() -> TestResult {
+        let obj = parse("\"r\" { \"path\" /mnt/games\n\"k\" /\n\"c\" 1 // note\n\"d\" 2 }")
+            .ctx("unquoted tokens")?;
+        check_eq(obj.get_str("path"), Some("/mnt/games"), "a path")?;
+        check_eq(obj.get_str("k"), Some("/"), "a bare slash")?;
+        check_eq(obj.get_str("c"), Some("1"), "a comment after a value")?;
+        let closing = parse("\"r\" { \"k\" /}").ctx("slash before a brace")?;
+        check_eq(closing.get_str("k"), Some("/"), "the brace still closes")?;
+        let lines = parse("\"r\" {\n\"a\" /x\n\"b\" 1 }").ctx("line count")?;
+        check_eq(
+            lines.get_str("b"),
+            Some("1"),
+            "the entry after a slash token",
         )
     }
 
