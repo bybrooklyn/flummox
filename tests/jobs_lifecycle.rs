@@ -516,6 +516,71 @@ fn a_compress_worker_reports_its_totals_once() -> TestResult {
 }
 
 #[test]
+fn analysis_scales_in_the_files_its_budget_did_not_reach() -> TestResult {
+    let temp = tempfile::TempDir::new_in(std::env::current_dir().ctx("cwd")?).ctx("fixture")?;
+    if flummox::fsprobe::probe(temp.path())
+        .ctx("filesystem")?
+        .fstype
+        != "btrfs"
+    {
+        eprintln!("skipped: analysis scaling requires btrfs");
+        return Ok(());
+    }
+    let home = temp.path().join("home");
+    let path = temp.path().join("game");
+    std::fs::create_dir_all(&home).ctx("fixture home")?;
+    std::fs::create_dir_all(&path).ctx("fixture game")?;
+    // Analysis samples at most 1 MiB from a file and 32 MiB in all, so 48
+    // files of this size leave a third of the game unsampled.
+    let chunk = b"analysis fixture payload line\n".repeat(40_000);
+    let anchor = flummox::safeio::Anchor::open(&path).ctx("anchor")?;
+    let files = 48u64;
+    for index in 0..files {
+        let name = format!("payload-{index:02}.bin");
+        std::fs::write(path.join(&name), &chunk).ctx("fixture payload")?;
+        flummox::backend::btrfs::decompress_fd(
+            &anchor.open_file(Path::new(&name)).ctx("fixture file")?,
+        )
+        .ctx("raw baseline")?;
+    }
+    drop(anchor);
+    let total = files * chunk.len() as u64;
+    let _service = start(&home)?;
+    let snapshot = request(
+        &home,
+        Request::Enqueue {
+            game: Game {
+                id: GameId::new(Launcher::Manual, "analysis-fixture"),
+                also: vec![],
+                title: "Analysis Fixture".into(),
+                install_dir: path.clone(),
+                build: None,
+                size_hint: None,
+                state: InstallState::Idle,
+                is_tool: false,
+            },
+            operation: Operation::Analyze,
+            options: Default::default(),
+        },
+    )?;
+    let job = finished(&home, snapshot.jobs.last().ctx("job queued")?.id)?;
+    check_eq(job.phase, Phase::Completed, format!("analysis: {job:?}"))?;
+    let estimate = job.estimate.ctx("estimate")?;
+    check(
+        estimate.unsampled_files > 0,
+        format!("control: the budget must run out for this to test anything: {estimate:?}"),
+    )?;
+    check(
+        estimate.disk_now > total / 10 * 9 && estimate.disk_now < total / 10 * 11,
+        format!("the estimate covers the whole game of {total} bytes: {estimate:?}"),
+    )?;
+    check(
+        estimate.saving() > total / 2,
+        format!("repeated text saves most of its size: {estimate:?}"),
+    )
+}
+
+#[test]
 fn user_pause_holds_a_queued_job_and_resume_completes_it() -> TestResult {
     let temp = tempfile::TempDir::new_in(std::env::current_dir().ctx("cwd")?).ctx("fixture")?;
     if flummox::fsprobe::probe(temp.path())

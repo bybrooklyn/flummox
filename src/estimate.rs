@@ -615,9 +615,33 @@ pub fn estimate_game_cancellable(
     probe: &dyn DiskProbe,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Estimate {
+    estimate_game_budgeted(
+        install_dir,
+        inv,
+        model,
+        opts,
+        probe,
+        cancel,
+        MAX_SAMPLE_BYTES,
+    )
+}
+
+/// [`estimate_game_cancellable`] with the sampling budget as a parameter.
+fn estimate_game_budgeted(
+    install_dir: &Path,
+    inv: &Inventory,
+    model: &dyn UnitModel,
+    opts: &EstimateOpts,
+    probe: &dyn DiskProbe,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    sample_bytes: u64,
+) -> Estimate {
     let cancelled = || cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
-    let candidates: Vec<_> = inv.to_compress().collect();
-    let budget = std::sync::atomic::AtomicU64::new(MAX_SAMPLE_BYTES);
+    let mut candidates: Vec<_> = inv.to_compress().collect();
+    // Largest first, so the budget is spent where most of the bytes are and
+    // whatever goes unsampled is the small remainder.
+    candidates.sort_by_key(|entry| std::cmp::Reverse(entry.size));
+    let budget = std::sync::atomic::AtomicU64::new(sample_bytes);
     let results: Vec<(FileEstimate, bool)> = candidates
         .par_iter()
         .map(|entry| {
@@ -700,14 +724,20 @@ pub fn estimate_game_cancellable(
         already_compressed_mount: opts.mount_level.is_some(),
         ..Estimate::default()
     };
+    // Sizes of the files that were sampled and of those the budget did not
+    // reach, for scaling the result up afterwards.
+    let mut sampled_size = 0u64;
+    let mut unsampled_size = 0u64;
     for (est, worthwhile) in results {
         out.sampled = out.sampled.saturating_add(est.sampled);
         out.inspected_files += u64::from(est.sampled > 0);
         if est.sampled > 0 {
             out.format_evidence.observe(est.inspection);
+            sampled_size = sampled_size.saturating_add(est.size);
         }
         if est.sampled == 0 && est.disk_now == 0 && est.disk_after == 0 {
             out.unsampled_files += 1;
+            unsampled_size = unsampled_size.saturating_add(est.size);
         }
         if !worthwhile {
             out.skipped_files = out.skipped_files.saturating_add(1);
@@ -717,6 +747,20 @@ pub fn estimate_game_cancellable(
         out.bytes = out.bytes.saturating_add(est.size);
         out.disk_now = out.disk_now.saturating_add(est.disk_now);
         out.disk_after = out.disk_after.saturating_add(est.disk_after);
+    }
+    // The totals so far cover only the sampled files. Leaving the rest out
+    // reported about a quarter of what a pass freed on a 6,700-file game, so
+    // the unsampled bytes are assumed to behave like the sampled ones. A
+    // cancelled estimate stays as measured.
+    if unsampled_size > 0 && sampled_size > 0 && !cancelled() {
+        let scale = unsampled_size as f64 / sampled_size as f64;
+        out.bytes = out.bytes.saturating_add((out.bytes as f64 * scale) as u64);
+        out.disk_now = out
+            .disk_now
+            .saturating_add((out.disk_now as f64 * scale) as u64);
+        out.disk_after = out
+            .disk_after
+            .saturating_add((out.disk_after as f64 * scale) as u64);
     }
     out
 }
@@ -1120,6 +1164,41 @@ mod tests {
         check(
             on_zstd1.saving() < raw.saving(),
             format!("raw {raw:?} vs {on_zstd1:?}"),
+        )
+    }
+
+    #[test]
+    fn files_beyond_the_sampling_budget_are_scaled_in() -> TestResult {
+        let tmp = tempfile::tempdir().ctx("tempdir")?;
+        let dir = tmp.path();
+        for index in 0..6 {
+            std::fs::write(
+                dir.join(format!("part-{index}.dat")),
+                vec![b'a'; 1024 * 1024],
+            )
+            .ctx("write a part")?;
+        }
+        let inv = inventory::walk(dir, &inventory::WalkOpts::default()).ctx("walk the game dir")?;
+        let model = BtrfsModel { level: 9 };
+        let opts = EstimateOpts {
+            level: 9,
+            mount_level: None,
+        };
+        let whole = estimate_game_budgeted(dir, &inv, &model, &opts, &NoProbe, None, u64::MAX);
+        check_eq(whole.unsampled_files, 0, "control: everything sampled")?;
+        // A single thread makes the number of files the budget reaches exact.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .ctx("pool")?;
+        let short = pool.install(|| {
+            estimate_game_budgeted(dir, &inv, &model, &opts, &NoProbe, None, 2 * 1024 * 1024)
+        });
+        check_eq(short.unsampled_files, 4, "the budget reached two files")?;
+        check_eq(
+            short.saving(),
+            whole.saving(),
+            "six equal files save the same whether two or six were sampled",
         )
     }
 
