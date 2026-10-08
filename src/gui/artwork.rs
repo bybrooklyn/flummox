@@ -96,12 +96,22 @@ pub fn save_override(game: String, path: PathBuf) -> Result<()> {
     let mut items = overrides()?;
     items.retain(|item| item.game != game);
     items.push(Override { game, path });
-    // Write a temporary file in the same directory and rename it over the
-    // old one, so a reader never sees a partial list.
+    write_overrides(&items)
+}
+/// Removes the saved image for a game, so it goes back to its default
+/// artwork. Blocks on file I/O.
+pub fn clear_override(game: &str) -> Result<()> {
+    let mut items = overrides()?;
+    items.retain(|item| item.game != game);
+    write_overrides(&items)
+}
+/// Writes the list through a temporary file in the same directory, renamed
+/// over the old one, so a reader never sees a partial list.
+fn write_overrides(items: &[Override]) -> Result<()> {
     let root = crate::libraries::data_dir()?;
     crate::libraries::private_dir(&root)?;
     let mut file = tempfile::NamedTempFile::new_in(&root)?;
-    serde_json::to_writer(&mut file, &items)?;
+    serde_json::to_writer(&mut file, items)?;
     file.flush()?;
     file.as_file().sync_all()?;
     file.persist(root.join("artwork.json"))?;
@@ -270,14 +280,15 @@ impl Cache {
             })
     }
     /// Queues `source` for decoding unless it is cached, in flight or queued.
+    /// The newest request goes first, since it is the one on screen now.
     pub fn request(&mut self, source: Source) {
         if self.entries.iter().any(|(key, _)| *key == source)
             || self.pending.contains(&source)
-            || self.waiting.contains(&source)
         {
             return;
         }
-        self.waiting.push_back(source);
+        self.waiting.retain(|queued| *queued != source);
+        self.waiting.push_front(source);
     }
     /// Takes the next source to decode, or `None` while two are in flight.
     /// The caller must report each one back through `loaded`.

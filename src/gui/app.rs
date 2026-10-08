@@ -8,11 +8,24 @@ use crate::{
         Snapshot, ThemePreference,
     },
     launchers::Env,
-    model::Game,
+    model::{Game, GameId},
 };
 use iced::{Animation, Task, animation::Easing};
-use std::path::PathBuf;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// Animation lengths in milliseconds as (expressive, subtle). Reduced motion
+/// gives zero. Every transition in the window takes its length from here.
+mod timing {
+    pub const NAV: (u64, u64) = (220, 140);
+    pub const PAGE: (u64, u64) = (180, 120);
+    pub const DETAIL: (u64, u64) = (260, 150);
+    pub const TOAST: (u64, u64) = (240, 150);
+}
+/// The easing of every transition.
+const EASING: Easing = Easing::EaseOutCubic;
 
 /// A navigation destination.
 ///
@@ -92,11 +105,13 @@ pub struct GameRow {
 }
 impl GameRow {
     /// Probes the filesystem under the game's install directory. Blocks, so
-    /// it runs inside `scan`.
+    /// it runs inside `scan`. A game that runs from a mounted store is probed
+    /// through the folder that holds the mount, since the mount itself is FUSE.
     fn probe(
         game: Game,
         artwork: Option<super::artwork::Source>,
         cover: Option<super::artwork::Source>,
+        packs: &[crate::pack::Install],
     ) -> Self {
         // `libraries` marks a game it could not rediscover with this detail
         // prefix. Its directory may be gone, so it is not probed.
@@ -114,7 +129,8 @@ impl GameRow {
                 cover,
             };
         }
-        match fsprobe::probe(&game.install_dir) {
+        let (target, stored) = probe_target(&game, packs);
+        match fsprobe::probe(target) {
             Ok(fs) => {
                 let tier = fsprobe::tier_for(&fs);
                 let native_supported = match &tier {
@@ -122,9 +138,10 @@ impl GameRow {
                     fsprobe::Tier::Pack | fsprobe::Tier::Unsupported(_) => false,
                 };
                 // Mounting a store needs the `pack-mount` feature and FUSE.
-                let pack_supported = cfg!(feature = "pack-mount")
-                    && std::path::Path::new("/dev/fuse").exists()
-                    && matches!(tier, fsprobe::Tier::Native(_) | fsprobe::Tier::Pack);
+                let pack_supported = stored
+                    || (cfg!(feature = "pack-mount")
+                        && std::path::Path::new("/dev/fuse").exists()
+                        && matches!(tier, fsprobe::Tier::Native(_) | fsprobe::Tier::Pack));
                 let supported = native_supported || pack_supported;
                 Self {
                     game,
@@ -153,6 +170,25 @@ impl GameRow {
         }
     }
 }
+/// The directory to probe for `game`, and whether the game runs from a
+/// mounted Maximum Space store.
+///
+/// A store is mounted at the game's own path, so probing that path reports the
+/// FUSE mount. The drive is the one holding the mount's parent folder, which
+/// is what `storage::volume_existing` reads.
+fn probe_target<'a>(
+    game: &'a Game,
+    packs: &[crate::pack::Install],
+) -> (&'a std::path::Path, bool) {
+    if packs
+        .iter()
+        .any(|install| install.game_path == game.install_dir)
+    {
+        let parent = game.install_dir.parent().unwrap_or(&game.install_dir);
+        return (parent, true);
+    }
+    (&game.install_dir, false)
+}
 /// A mountpoint that holds at least one game.
 #[derive(Debug, Clone)]
 pub struct Drive {
@@ -164,10 +200,10 @@ pub struct Drive {
 /// Everything one background scan read. `update` swaps it into `State` whole.
 #[derive(Debug, Clone)]
 pub struct ScanResult {
-    /// The worker epoch and scan generation of the snapshot the scan started
-    /// from. `update` discards the result when the worker has moved on.
+    /// The worker epoch of the snapshot the scan started from. `update`
+    /// discards the result when the worker has restarted or its game list has
+    /// changed since.
     pub worker_epoch: u64,
-    pub generation: u64,
     /// The worker's game list as scanned, tools included.
     pub discovered: Vec<Game>,
     pub reports: Vec<crate::compatibility::Report>,
@@ -367,7 +403,7 @@ pub struct State {
     analysis_queuing: bool,
     /// Group and size key per game for the Worth sort. Captured at set
     /// moments so rows do not move while an analysis is filling in estimates.
-    worth_order: std::collections::HashMap<String, (u8, u64)>,
+    worth_order: HashMap<GameId, (u8, u64)>,
     /// Estimates arrived while a row was open or selected, so the list was
     /// left as it was and the page offers to sort again.
     pub order_stale: bool,
@@ -378,6 +414,38 @@ pub struct State {
     pub choices: std::collections::HashMap<String, StorageChoice>,
     /// A snapshot has been applied at least once.
     snapshot_loaded_before: bool,
+    /// A refresh was asked for while a scan ran, so one more follows it.
+    rescan_wanted: bool,
+    /// Games whose automatic analysis the worker refused since the last scan.
+    /// They are skipped until the next scan so one refusal cannot repeat.
+    analysis_refused: HashSet<String>,
+    /// The last finished estimate per install folder and build. The worker
+    /// keeps only its newest 300 finished jobs, so this outlives them.
+    remembered: HashMap<(PathBuf, Option<String>), crate::estimate::Estimate>,
+    /// Lookups over the job list, the rows and the records.
+    index: Index,
+    /// The toast deadline a timer was started for.
+    scheduled_deadline: Option<Instant>,
+}
+
+/// Lookups built when a snapshot or a scan is applied, so rebuilding the page
+/// does not search the job list once per row. A lookup checks that its map
+/// still describes the data and searches directly when it does not.
+#[derive(Default)]
+struct Index {
+    /// Length and newest id of the job list `by_dir` was built from.
+    jobs: (usize, Option<i64>),
+    /// Positions in `snapshot.jobs`, oldest first, by install folder.
+    by_dir: HashMap<PathBuf, Vec<usize>>,
+    rows_len: usize,
+    rows: HashMap<GameId, usize>,
+    records_len: usize,
+    records: HashMap<GameId, usize>,
+}
+impl Index {
+    fn job_key(jobs: &[Job]) -> (usize, Option<i64>) {
+        (jobs.len(), jobs.last().map(|job| job.id))
+    }
 }
 impl State {
     /// An empty window state on Overview. Nothing is loaded until the first
@@ -395,8 +463,8 @@ impl State {
             warnings: vec![],
             status: None,
             status_reveal: Animation::new(false)
-                .duration(Duration::from_millis(180))
-                .easing(Easing::EaseOutCubic),
+                .duration(Duration::from_millis(timing::TOAST.0))
+                .easing(EASING),
             status_deadline: None,
             snapshot: Snapshot::default(),
             planned: None,
@@ -408,15 +476,15 @@ impl State {
                     (
                         page,
                         Animation::new(page == Page::Overview)
-                            .duration(Duration::from_millis(200))
-                            .easing(Easing::EaseOutCubic),
+                            .duration(Duration::from_millis(timing::NAV.0))
+                            .easing(EASING),
                     )
                 })
                 .collect(),
             scroll_redraw_until: None,
             page_reveal: Animation::new(true)
-                .duration(Duration::from_millis(240))
-                .easing(Easing::EaseOutCubic),
+                .duration(Duration::from_millis(timing::PAGE.0))
+                .easing(EASING),
             page_direction: 1.0,
             scroll_positions: Default::default(),
             snapshot_loaded: false,
@@ -439,7 +507,9 @@ impl State {
             folder_kind: FolderKind::Collection,
             picker_busy: false,
             shown: 40,
-            detail: Animation::new(false).duration(Duration::from_millis(200)),
+            detail: Animation::new(false)
+                .duration(Duration::from_millis(timing::DETAIL.0))
+                .easing(EASING),
             polling: true,
             progress: Default::default(),
             pack_paths: Default::default(),
@@ -452,6 +522,188 @@ impl State {
             show_low: false,
             choices: Default::default(),
             snapshot_loaded_before: false,
+            rescan_wanted: false,
+            analysis_refused: Default::default(),
+            remembered: Default::default(),
+            index: Default::default(),
+            scheduled_deadline: None,
+        }
+    }
+    /// Rebuilds the lookups over the snapshot, the rows and the records.
+    fn reindex(&mut self) {
+        let mut by_dir: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+        for (position, job) in self.snapshot.jobs.iter().enumerate() {
+            by_dir
+                .entry(job.game.install_dir.clone())
+                .or_default()
+                .push(position);
+        }
+        self.index = Index {
+            jobs: Index::job_key(&self.snapshot.jobs),
+            by_dir,
+            rows_len: self.games.len(),
+            rows: self
+                .games
+                .iter()
+                .enumerate()
+                .map(|(position, row)| (row.game.id.clone(), position))
+                .collect(),
+            records_len: self.records.len(),
+            records: self
+                .records
+                .iter()
+                .enumerate()
+                .map(|(position, record)| (record.id.clone(), position))
+                .collect(),
+        };
+    }
+    /// The jobs for an install folder, newest first.
+    fn jobs_for<'a>(&'a self, dir: &Path) -> Box<dyn Iterator<Item = &'a Job> + 'a> {
+        let jobs = &self.snapshot.jobs;
+        let positions: Cow<'a, [usize]> = if self.index.jobs == Index::job_key(jobs) {
+            Cow::Borrowed(self.index.by_dir.get(dir).map(Vec::as_slice).unwrap_or(&[]))
+        } else {
+            Cow::Owned(
+                jobs.iter()
+                    .enumerate()
+                    .filter(|(_, job)| job.game.install_dir == dir)
+                    .map(|(position, _)| position)
+                    .collect(),
+            )
+        };
+        match positions {
+            Cow::Borrowed(list) => Box::new(list.iter().rev().filter_map(move |i| jobs.get(*i))),
+            Cow::Owned(list) => Box::new(list.into_iter().rev().filter_map(move |i| jobs.get(i))),
+        }
+    }
+    /// The row for a game id.
+    fn row_of(&self, id: &GameId) -> Option<&GameRow> {
+        if self.index.rows_len == self.games.len()
+            && let Some(row) = self
+                .index
+                .rows
+                .get(id)
+                .and_then(|position| self.games.get(*position))
+                .filter(|row| row.game.id == *id)
+        {
+            return Some(row);
+        }
+        self.games.iter().find(|row| row.game.id == *id)
+    }
+    /// The database record of a compression at this game's installed build.
+    /// A record at level 0 marks a decompressed game and does not count.
+    fn record_of(&self, game: &Game) -> Option<&GameRecord> {
+        let matches =
+            |r: &&GameRecord| r.id == game.id && r.build == game.build && r.level > 0;
+        if self.index.records_len == self.records.len() {
+            return self
+                .index
+                .records
+                .get(&game.id)
+                .and_then(|position| self.records.get(*position))
+                .filter(matches);
+        }
+        self.records.iter().find(matches)
+    }
+    /// Whether the worker was told not to touch this game.
+    pub fn is_excluded(&self, game: &Game) -> bool {
+        self.snapshot.excluded.iter().any(|id| {
+            id.split_once(':').is_some_and(|(launcher, key)| {
+                game.ids()
+                    .any(|g| g.launcher.slug() == launcher && g.key == key)
+            })
+        })
+    }
+    /// Whether a bulk action may consider this row: its drive supports a
+    /// mode and the game is not excluded.
+    pub fn eligible(&self, row: &GameRow) -> bool {
+        row.supported && !self.is_excluded(&row.game)
+    }
+    /// The title of the game with this id string, else the id itself.
+    pub fn title_of(&self, id: &str) -> String {
+        self.games
+            .iter()
+            .find(|row| row.game.ids().any(|g| g.to_string() == id))
+            .map(|row| row.game.title.clone())
+            .unwrap_or_else(|| id.to_owned())
+    }
+    /// Closes the detail pane. With no animation the row is released at once,
+    /// otherwise `Tick` releases it when the animation ends.
+    fn close_detail(&mut self) {
+        self.detail.go_mut(false, Instant::now());
+        if self.reduced_motion {
+            self.expanded = None;
+        }
+    }
+    /// Opens the detail pane for a game and leaves it open if it already is.
+    fn open_detail(&mut self, id: String) {
+        self.confirm_reclaim.clear();
+        if self.expanded.as_ref() == Some(&id) {
+            if !self.detail.value() {
+                self.detail.go_mut(true, Instant::now());
+            }
+            return;
+        }
+        self.expanded = Some(id);
+        self.detail = Animation::new(false)
+            .duration(self.motion_duration(timing::DETAIL))
+            .easing(EASING)
+            .go(true, Instant::now());
+    }
+    /// Re-sorts the list, unless a pane is open or a row is ticked, in which
+    /// case the page offers to sort again.
+    fn refresh_order(&mut self) {
+        if self.expanded.is_some() || !self.selected.is_empty() {
+            self.order_stale = true;
+        } else {
+            self.capture_order();
+        }
+    }
+    /// The Games list as drawn: the filtered rows, without the "Little to
+    /// gain" group while it is collapsed.
+    pub fn listed<'a>(&self, filtered: &[&'a GameRow]) -> Vec<&'a GameRow> {
+        filtered
+            .iter()
+            .copied()
+            .filter(|row| {
+                self.sort != Sort::Worth || self.show_low || self.worth(&row.game).0 != 3
+            })
+            .collect()
+    }
+    /// Makes the row for this id part of the page that is drawn: clears the
+    /// filters that hide it and raises the page size and the collapsed group
+    /// as far as it needs.
+    fn reveal_game(&mut self, id: &str) {
+        let visible = |state: &Self| {
+            let filtered = state.filtered();
+            state
+                .listed(&filtered)
+                .iter()
+                .take(state.shown)
+                .any(|row| row.game.id.to_string() == id)
+        };
+        if visible(self) || !self.games.iter().any(|row| row.game.id.to_string() == id) {
+            return;
+        }
+        self.query.clear();
+        self.filter = Filter::All;
+        self.drive_filter = None;
+        self.launcher_filter = None;
+        self.capture_order();
+        if self
+            .games
+            .iter()
+            .any(|row| row.game.id.to_string() == id && self.worth(&row.game).0 == 3)
+        {
+            self.show_low = true;
+        }
+        let filtered = self.filtered();
+        let position = self
+            .listed(&filtered)
+            .iter()
+            .position(|row| row.game.id.to_string() == id);
+        if let Some(position) = position {
+            self.shown = self.shown.max(position / 40 * 40 + 40);
         }
     }
     /// Replaces the toast and restarts its reveal animation.
@@ -459,14 +711,14 @@ impl State {
         self.status_deadline = (!status.is_error).then(|| Instant::now() + Duration::from_secs(4));
         self.status = Some(status);
         self.status_reveal = Animation::new(false)
-            .duration(self.motion_duration(240, 150))
-            .easing(self.motion_easing())
+            .duration(self.motion_duration(timing::TOAST))
+            .easing(EASING)
             .go(true, Instant::now());
     }
 
-    /// An animation length in milliseconds for the current motion setting.
-    /// Reduced motion gives zero.
-    fn motion_duration(&self, expressive: u64, subtle: u64) -> Duration {
+    /// An animation length for the current motion setting, from one of the
+    /// `timing` pairs. Reduced motion gives zero.
+    fn motion_duration(&self, (expressive, subtle): (u64, u64)) -> Duration {
         Duration::from_millis(match self.motion {
             MotionPreference::Expressive => expressive,
             MotionPreference::Subtle => subtle,
@@ -474,11 +726,11 @@ impl State {
         })
     }
 
-    fn motion_easing(&self) -> Easing {
-        match self.motion {
-            MotionPreference::Expressive => Easing::EaseOutCubic,
-            MotionPreference::Subtle | MotionPreference::Reduced => Easing::EaseOutCubic,
-        }
+    /// Shows the worker's refusal of something the user asked for. It leaves
+    /// after a few seconds and is not a lost connection.
+    fn show_refusal(&mut self, text: String) {
+        self.show_status(Status::error(text));
+        self.status_deadline = Some(Instant::now() + Duration::from_secs(8));
     }
 
     /// Starts hiding the toast. With motion it stays in `status` until `Tick`
@@ -509,22 +761,46 @@ impl State {
             })
             .unwrap_or(crate::backend::Preset::Balanced)
     }
-    /// Sum of the launchers' size hints. Games without one count as zero.
+    /// How big a game is: the launcher's figure, else what its analysis
+    /// measured, else what its compression recorded. A custom folder has no
+    /// launcher figure. The row, the total and the Size sort all use this.
+    pub fn size_of(&self, game: &Game) -> Option<u64> {
+        game.size_hint
+            .or_else(|| self.estimate(game).map(|estimate| estimate.install_bytes))
+            // An estimate stops counting once a job starts, but the size it
+            // measured is still the size.
+            .or_else(|| {
+                self.jobs_for(&game.install_dir).find_map(|job| {
+                    job.estimate
+                        .as_ref()
+                        .filter(|_| matches!(job.phase, Phase::Completed | Phase::Partial))
+                        .map(|estimate| estimate.install_bytes)
+                })
+            })
+            .or_else(|| match self.result(game) {
+                Some(Outcome::Estimated { installed, .. }) => Some(installed),
+                Some(Outcome::Measured { before, .. }) => Some(before),
+                _ => None,
+            })
+            .filter(|bytes| *bytes > 0)
+    }
+    /// Sum of `size_of` over the games. A game with no known size counts as
+    /// zero.
     pub fn total_bytes(&self) -> u64 {
-        self.games.iter().filter_map(|g| g.game.size_hint).sum()
+        self.games
+            .iter()
+            .filter_map(|row| self.size_of(&row.game))
+            .sum()
     }
     /// The newest job of any kind for this install directory.
     pub fn latest(&self, game: &Game) -> Option<&Job> {
-        self.snapshot
-            .jobs
-            .iter()
-            .rev()
-            .find(|j| j.game.install_dir == game.install_dir)
+        self.jobs_for(&game.install_dir).next()
     }
     /// What compressing this game gained, or `None` when it is not compressed.
     ///
     /// A Maximum Space install reports its store's own sizes. A native pass
-    /// reports the estimate its job carried, else the one in its record.
+    /// reports the saving in its record, else the estimate its
+    /// job carried.
     pub fn result(&self, game: &Game) -> Option<Outcome> {
         if let Some(install) = self
             .snapshot
@@ -549,20 +825,18 @@ impl State {
         if !self.compressed(game) {
             return None;
         }
-        self.snapshot
-            .jobs
-            .iter()
-            .rev()
-            .filter(|job| job.game.install_dir == game.install_dir && job.game.build == game.build)
-            .find_map(job_outcome)
+        // The record carries the saving across later passes, which analyse
+        // only the files that changed. The newest job's own estimate covers
+        // only its pass, so it is the fallback for a game with no record yet.
+        self.record_of(game)
+            .map(|record| Outcome::Estimated {
+                installed: record.install_bytes,
+                saved: u64::try_from(record.est_saving).unwrap_or(0),
+            })
             .or_else(|| {
-                self.records
-                    .iter()
-                    .find(|record| record.id == game.id && record.build == game.build)
-                    .map(|record| Outcome::Estimated {
-                        installed: record.install_bytes,
-                        saved: u64::try_from(record.est_saving).unwrap_or(0),
-                    })
+                self.jobs_for(&game.install_dir)
+                    .filter(|job| job.game.build == game.build)
+                    .find_map(job_outcome)
             })
     }
     /// The mode this game's Compress button uses. Standard unless the user
@@ -578,9 +852,8 @@ impl State {
             .iter()
             .any(|install| install.game_path == game.install_dir);
         let only_mode = self
-            .games
-            .iter()
-            .any(|row| row.game.id == game.id && !row.native_supported && row.pack_supported);
+            .row_of(&game.id)
+            .is_some_and(|row| !row.native_supported && row.pack_supported);
         if stored || only_mode {
             StorageChoice::Maximum
         } else {
@@ -592,7 +865,7 @@ impl State {
     /// or the drive does not support that mode.
     pub fn prospect(&self, game: &Game, choice: StorageChoice) -> Option<u64> {
         let estimate = self.estimate(game)?;
-        let row = self.games.iter().find(|row| row.game.id == game.id)?;
+        let row = self.row_of(&game.id)?;
         let saving = match choice {
             StorageChoice::Standard if row.native_supported => estimate.saving(),
             StorageChoice::Maximum if row.pack_supported => estimate.maximum_saving().unwrap_or(0),
@@ -608,10 +881,7 @@ impl State {
     /// A game's place in the Worth order as captured, with games seen since
     /// the capture counted as not analyzed.
     pub fn worth(&self, game: &Game) -> (u8, u64) {
-        self.worth_order
-            .get(&game.id.to_string())
-            .copied()
-            .unwrap_or((1, 0))
+        self.worth_order.get(&game.id).copied().unwrap_or((1, 0))
     }
     /// Recomputes every game's place in the Worth order from what is known now.
     pub fn capture_order(&mut self) {
@@ -637,7 +907,7 @@ impl State {
                         None => (1, row.game.size_hint.unwrap_or(0)),
                     }
                 };
-                (row.game.id.to_string(), place)
+                (row.game.id.clone(), place)
             })
             .collect();
         self.order_stale = false;
@@ -651,29 +921,40 @@ impl State {
     }
     /// The estimate that still applies to this game at its installed build.
     ///
-    /// Jobs are read newest first, and the search ends at the first job that
-    /// is neither an analysis nor still queued. So once a compression or
-    /// decompression has started, earlier estimates no longer count.
+    /// Jobs are read newest first. A finished analysis supplies the estimate.
+    /// The search ends with nothing at a compression or decompression that
+    /// completed or is running, since it used the saving up. One that was
+    /// cancelled or failed changed nothing. When the worker has dropped every
+    /// job for this build, the estimate remembered from the last analysis
+    /// applies unless the game is compressed.
     pub fn estimate(&self, game: &Game) -> Option<&crate::estimate::Estimate> {
-        self.snapshot
-            .jobs
-            .iter()
-            .rev()
-            .filter(|j| j.game.install_dir == game.install_dir && j.game.build == game.build)
-            .take_while(|j| j.operation == Operation::Analyze || j.phase == Phase::Queued)
-            .filter(|j| {
-                !matches!(
-                    j.phase,
-                    Phase::Cancelled | Phase::Failed | Phase::Interrupted
-                )
-            })
-            .find_map(|j| j.estimate.as_ref())
+        for job in self
+            .jobs_for(&game.install_dir)
+            .filter(|job| job.game.build == game.build)
+        {
+            if job.operation == Operation::Analyze {
+                if matches!(job.phase, Phase::Completed | Phase::Partial)
+                    && let Some(estimate) = &job.estimate
+                {
+                    return Some(estimate);
+                }
+            } else if matches!(job.phase, Phase::Completed | Phase::Partial)
+                || (job.phase.active() && job.phase != Phase::Queued)
+            {
+                return None;
+            }
+        }
+        if self.compressed(game) {
+            return None;
+        }
+        self.remembered
+            .get(&(game.install_dir.clone(), game.build.clone()))
     }
     /// What to do with this game, from its estimate and what its drive
     /// supports. `None` until an estimate exists. Maximum Space is offered
     /// only when the estimate says a qualification matched.
     pub fn recommendation(&self, game: &Game) -> Option<crate::recommendation::Recommendation> {
-        let row = self.games.iter().find(|row| row.game.id == game.id)?;
+        let row = self.row_of(&game.id)?;
         self.estimate(game).map(|estimate| {
             crate::recommendation::choose(
                 estimate,
@@ -777,7 +1058,7 @@ impl State {
     pub fn potential_saving(&self) -> u64 {
         self.games
             .iter()
-            .filter(|row| row.supported && !self.compressed(&row.game))
+            .filter(|row| self.eligible(row) && !self.compressed(&row.game))
             // The library-wide action only ever uses Standard.
             .filter_map(|row| self.prospect(&row.game, StorageChoice::Standard))
             .sum()
@@ -800,11 +1081,38 @@ impl State {
     pub fn analysis_queuing(&self) -> bool {
         self.analysis_queuing
     }
+    /// Whether any job or remembered estimate exists for the game's installed
+    /// build, so another analysis would repeat one.
+    fn analysis_known(&self, game: &Game) -> bool {
+        self.jobs_for(&game.install_dir)
+            .any(|job| job.game.build == game.build)
+            || self
+                .remembered
+                .contains_key(&(game.install_dir.clone(), game.build.clone()))
+    }
+    /// Keeps the estimate of each finished analysis in the snapshot, and
+    /// drops the one a completed compression or decompression used up.
+    fn remember_estimates(&mut self) {
+        for job in &self.snapshot.jobs {
+            let key = (job.game.install_dir.clone(), job.game.build.clone());
+            if job.operation == Operation::Analyze {
+                if matches!(job.phase, Phase::Completed | Phase::Partial)
+                    && let Some(estimate) = &job.estimate
+                {
+                    self.remembered.insert(key, estimate.clone());
+                }
+            } else if matches!(job.phase, Phase::Completed | Phase::Partial) {
+                self.remembered.remove(&key);
+            }
+        }
+    }
     /// Whether the game counts as compressed at its installed build.
     ///
     /// True with a pack install. Otherwise the newest started job that is
     /// not an analysis decides: it must be a completed compression of this
-    /// build. With no such job, a database record of this build decides.
+    /// build. A cancelled, failed or interrupted job changed nothing and is
+    /// passed over. With no deciding job, a database record of this build
+    /// that is not level 0 decides.
     pub fn compressed(&self, game: &Game) -> bool {
         if self
             .snapshot
@@ -814,10 +1122,12 @@ impl State {
         {
             return true;
         }
-        let action = self.snapshot.jobs.iter().rev().find(|j| {
-            j.game.install_dir == game.install_dir
-                && j.operation != Operation::Analyze
-                && j.phase != Phase::Queued
+        let action = self.jobs_for(&game.install_dir).find(|j| {
+            j.operation != Operation::Analyze
+                && !matches!(
+                    j.phase,
+                    Phase::Queued | Phase::Cancelled | Phase::Failed | Phase::Interrupted
+                )
         });
         match action {
             Some(j) => {
@@ -825,10 +1135,7 @@ impl State {
                     && j.phase == Phase::Completed
                     && j.game.build == game.build
             }
-            None => self
-                .records
-                .iter()
-                .any(|r| r.id == game.id && r.build == game.build),
+            None => self.record_of(game).is_some(),
         }
     }
     /// The Games list: rows that are not excluded and pass the search, the
@@ -840,12 +1147,8 @@ impl State {
             .games
             .iter()
             .filter(|row| {
-                !self
-                    .snapshot
-                    .excluded
-                    .iter()
-                    .any(|id| row.game.ids().any(|g| g.to_string() == *id))
-                    && row.game.title.to_lowercase().contains(&query)
+                !self.is_excluded(&row.game)
+                    && (query.is_empty() || row.game.title.to_lowercase().contains(&query))
                     && self
                         .drive_filter
                         .as_ref()
@@ -875,48 +1178,80 @@ impl State {
                     }
             })
             .collect();
-        games.sort_by(|a, b| {
-            match self.sort {
-                Sort::Name => a
-                    .game
-                    .title
-                    .to_lowercase()
-                    .cmp(&b.game.title.to_lowercase()),
-                Sort::Size => b.game.size_hint.cmp(&a.game.size_hint),
-                Sort::Worth => {
-                    let (group_a, key_a) = self.worth(&a.game);
-                    let (group_b, key_b) = self.worth(&b.game);
-                    group_a.cmp(&group_b).then(key_b.cmp(&key_a))
-                }
+        match self.sort {
+            Sort::Name => games
+                .sort_by_cached_key(|row| (row.game.title.to_lowercase(), row.game.title.clone())),
+            Sort::Size => {
+                let sizes: HashMap<&GameId, Option<u64>> = games
+                    .iter()
+                    .map(|row| (&row.game.id, self.size_of(&row.game)))
+                    .collect();
+                games.sort_by(|a, b| {
+                    sizes
+                        .get(&b.game.id)
+                        .cmp(&sizes.get(&a.game.id))
+                        .then(a.game.title.cmp(&b.game.title))
+                });
             }
-            .then(a.game.title.cmp(&b.game.title))
-        });
+            Sort::Worth => games.sort_by(|a, b| {
+                let (group_a, key_a) = self.worth(&a.game);
+                let (group_b, key_b) = self.worth(&b.game);
+                group_a
+                    .cmp(&group_b)
+                    .then(key_b.cmp(&key_a))
+                    .then(a.game.title.cmp(&b.game.title))
+            }),
+        }
         games
     }
     /// The job for the bar under the page: the first one in progress, else
-    /// the first one queued.
+    /// the first one queued. Analyses are not listed on the Jobs page, so
+    /// they are not here either.
     pub fn active(&self) -> Option<&Job> {
-        self.snapshot
+        let mut shown = self
+            .snapshot
             .jobs
             .iter()
+            .filter(|j| j.operation != Operation::Analyze);
+        shown
+            .clone()
             .find(|j| j.phase.active() && j.phase != Phase::Queued)
-            .or_else(|| self.snapshot.jobs.iter().find(|j| j.phase == Phase::Queued))
+            .or_else(|| shown.find(|j| j.phase == Phase::Queued))
     }
 
-    /// Selected games a bulk action may queue: supported, idle and without
-    /// an active pack job.
+    /// Selected games a bulk action may queue: supported, not excluded, idle
+    /// and without an active pack job.
     pub fn actionable_selection(&self) -> Vec<Game> {
         self.games
             .iter()
             .filter(|row| {
                 self.selected.contains(&row.game.id.to_string())
-                    && row.supported
+                    && self.eligible(row)
                     && row.game.state.is_idle()
                     && !self.pending.contains(&row.game.id.to_string())
             })
             .map(|row| row.game.clone())
             .collect()
     }
+}
+
+/// What a batch of commands came back with.
+#[derive(Debug, Clone)]
+pub struct Batch {
+    /// The worker's state after the last command it accepted.
+    pub snapshot: Snapshot,
+    /// The game id (empty for a command without one) and the reason, for each
+    /// command the worker refused.
+    pub refused: Vec<(String, String)>,
+}
+
+/// Why adding a folder failed.
+#[derive(Debug, Clone)]
+pub enum FolderError {
+    /// The path is not a folder that exists.
+    Missing,
+    /// The worker refused it, with its reason.
+    Refused(String),
 }
 
 /// Everything `update` reacts to: user input, and the results of background
@@ -959,7 +1294,19 @@ pub enum Message {
     CloseQualification,
     QualificationSaved(Result<PathBuf, String>),
     DiagnosticsExported(Result<PathBuf, String>),
-    AnalysisQueued(Result<Snapshot, String>),
+    AnalysisQueued(Result<Batch, String>),
+    /// The reply to a batch of commands the user gave.
+    Batched(Result<Batch, String>),
+    /// The folder check and the worker's answer to "Add folder".
+    FolderAdded(Result<Snapshot, FolderError>),
+    /// Go to Games, filtered to the games that need attention.
+    ReviewAttention,
+    /// Clear the search, the status filter and the drive and launcher filters.
+    ClearFilters,
+    /// The measured position of a game's row, ready to scroll to.
+    RowOffset(f32),
+    /// Go back to the game's default artwork.
+    ClearArtwork(String),
     /// Hide the toast.
     Dismiss,
     /// A frame passed, or a scroll set from code finished. Drives the toast's
@@ -1067,19 +1414,43 @@ fn send_unchecked(command: Command) -> Task<Message> {
 }
 
 /// Sends commands in order on one thread, with no space plan review, and
-/// delivers the last reply. The first failure stops the batch; commands
-/// already sent stay queued.
+/// delivers the last reply with the commands the worker refused. A refusal
+/// does not stop the commands after it.
 fn send_many(commands: Vec<Command>) -> Task<Message> {
-    Task::perform(
-        background(move || {
-            let mut snapshot = jobs::request(Command::Snapshot).map_err(|e| e.to_string())?;
-            for command in commands {
-                snapshot = jobs::request(command).map_err(|e| e.to_string())?;
+    Task::perform(background(move || send_batch(commands)), |result| {
+        Message::Batched(result.and_then(|result| result))
+    })
+}
+
+/// Sends the commands one after another. Blocks. Fails only when the first
+/// snapshot request does.
+fn send_batch(commands: Vec<Command>) -> Result<Batch, String> {
+    let mut snapshot = jobs::request(Command::Snapshot).map_err(|e| e.to_string())?;
+    let mut refused = vec![];
+    for command in commands {
+        let game = match &command {
+            Command::Enqueue { game, .. } | Command::EnqueuePack { game, .. } => {
+                game.id.to_string()
             }
-            Ok(snapshot)
-        }),
-        |result| Message::Commanded(result.and_then(|snapshot| snapshot)),
-    )
+            _ => String::new(),
+        };
+        match jobs::request(command) {
+            Ok(next) => snapshot = next,
+            Err(error) => refused.push((game, error.to_string())),
+        }
+    }
+    Ok(Batch { snapshot, refused })
+}
+
+/// One sentence for the commands of a batch that the worker refused: how many
+/// and the first reason.
+fn refusal_text(refused: &[(String, String)], noun: &str) -> Option<String> {
+    let (_, reason) = refused.first()?;
+    let count = refused.len();
+    Some(format!(
+        "{count} {noun}{} could not be queued. {reason}",
+        if count == 1 { "" } else { "s" }
+    ))
 }
 
 /// Queues one job for each game and shows the Jobs page. Several games at
@@ -1088,23 +1459,33 @@ fn send_many(commands: Vec<Command>) -> Task<Message> {
 /// one of them does not stop the rest.
 fn queue_standard(state: &mut State, games: Vec<Game>, operation: Operation) -> Task<Message> {
     let wanted = games.len();
+    let mut queued = vec![];
     let commands: Vec<Command> = games
         .into_iter()
         .filter_map(|game| {
-            if operation == Operation::Compress {
+            let id = game.id.to_string();
+            let command = if operation == Operation::Compress {
                 state.optimize_command(game, StorageChoice::Standard).ok()
             } else {
                 Some(Command::Enqueue {
                     options: crate::backend::CompressOpts {
-                        preset: state.preset_for(&game.id.to_string()),
+                        preset: state.preset_for(&id),
                         ..Default::default()
                     },
                     game,
                     operation,
                 })
+            };
+            if command.is_some() {
+                queued.push(id);
             }
+            command
         })
         .collect();
+    // The ticks have done their job once the commands are on their way.
+    for id in &queued {
+        state.selected.remove(id);
+    }
     let skipped = wanted - commands.len();
     if skipped > 0 {
         state.show_status(Status::info(format!(
@@ -1152,7 +1533,7 @@ fn pack_activate(state: &mut State, id: &str, create: bool) -> Task<Message> {
 fn scan(env: Env) -> Result<ScanResult, String> {
     let snapshot = jobs::request(Command::Snapshot).map_err(|error| error.to_string())?;
     let worker_epoch = snapshot.worker_epoch;
-    let generation = snapshot.scan_generation;
+    let packs = snapshot.packs;
     let discovered = snapshot.discovered;
     let scanned_discovery = discovered.clone();
     let mut warnings = snapshot.scan_warnings;
@@ -1166,7 +1547,7 @@ fn scan(env: Env) -> Result<ScanResult, String> {
         .map(|g| {
             let source = artwork.as_ref().ok().and_then(|index| index.source(&g));
             let cover = artwork.as_ref().ok().and_then(|index| index.cover(&g));
-            GameRow::probe(g, source, cover)
+            GameRow::probe(g, source, cover, &packs)
         })
         .collect();
     // One entry per distinct mountpoint, in the order games first use it.
@@ -1206,7 +1587,6 @@ fn scan(env: Env) -> Result<ScanResult, String> {
     };
     Ok(ScanResult {
         worker_epoch,
-        generation,
         discovered: scanned_discovery,
         reports,
         games,
@@ -1217,47 +1597,64 @@ fn scan(env: Env) -> Result<ScanResult, String> {
     })
 }
 
-/// Queues only newly visible games. Existing results and failures are kept
-/// until a user requests another analysis or the launcher's build changes.
-fn analyze_visible(state: &mut State) -> Task<Message> {
+/// The games to analyse next: every eligible, idle game with no job, no
+/// remembered estimate and no refusal for its installed build, largest first.
+///
+/// The Games page does not decide this. At most 40 analyses are queued or
+/// running at once, which keeps a batch under the worker's queue limit.
+fn analysis_candidates(state: &State) -> Vec<Game> {
+    let active = state
+        .snapshot
+        .jobs
+        .iter()
+        .filter(|job| job.operation == Operation::Analyze && job.phase.active())
+        .count();
+    let room = 40_usize.saturating_sub(active);
+    if room == 0 {
+        return vec![];
+    }
+    let mut rows: Vec<&GameRow> = state
+        .games
+        .iter()
+        .filter(|row| {
+            state.eligible(row)
+                && row.game.state.is_idle()
+                && !state
+                    .analysis_refused
+                    .contains(&row.game.id.to_string())
+                && !state.analysis_known(&row.game)
+        })
+        .collect();
+    rows.sort_by_cached_key(|row| std::cmp::Reverse(state.size_of(&row.game)));
+    rows.into_iter()
+        .take(room)
+        .map(|row| row.game.clone())
+        .collect()
+}
+
+/// Queues analyses for the games `analysis_candidates` picks. Existing results
+/// and failures are kept until a user requests another analysis or the
+/// launcher's build changes.
+fn analyze_pending(state: &mut State) -> Task<Message> {
     if state.analysis_queuing || state.scanning {
         return Task::none();
     }
-    // A game with any job for its installed build, whatever the outcome, is
-    // left alone. At most 40 are queued per call.
-    let games: Vec<_> = state
-        .filtered()
-        .into_iter()
-        .take(state.shown)
-        .filter(|row| {
-            row.supported
-                && row.game.state.is_idle()
-                && !state.snapshot.jobs.iter().any(|job| {
-                    job.game.install_dir == row.game.install_dir && job.game.build == row.game.build
-                })
-        })
-        .take(40)
-        .map(|row| row.game.clone())
-        .collect();
+    let games = analysis_candidates(state);
     if games.is_empty() {
         return Task::none();
     }
     state.analysis_queuing = true;
-    Task::perform(
-        background(move || {
-            let mut snapshot = jobs::request(Command::Snapshot).map_err(|e| e.to_string())?;
-            for game in games {
-                snapshot = jobs::request(Command::Enqueue {
-                    game,
-                    operation: Operation::Analyze,
-                    options: Default::default(),
-                })
-                .map_err(|e| e.to_string())?;
-            }
-            Ok(snapshot)
-        }),
-        |result| Message::AnalysisQueued(result.and_then(|result| result)),
-    )
+    let commands = games
+        .into_iter()
+        .map(|game| Command::Enqueue {
+            game,
+            operation: Operation::Analyze,
+            options: Default::default(),
+        })
+        .collect();
+    Task::perform(background(move || send_batch(commands)), |result| {
+        Message::AnalysisQueued(result.and_then(|result| result))
+    })
 }
 
 /// Applies one message to the state and returns the work it starts.
@@ -1266,6 +1663,29 @@ fn analyze_visible(state: &mut State) -> Task<Message> {
 /// `background` and comes back as another message. Arms that do not return
 /// early fall through to `artwork_tasks`.
 pub fn update(state: &mut State, message: Message) -> Task<Message> {
+    let task = apply(state, message);
+    Task::batch([task, toast_timer(state)])
+}
+
+/// A timer that sends `Tick` when the toast is due to leave, started once per
+/// deadline. The window needs no frames for it, so a toast on screen does not
+/// rebuild the page sixty times a second.
+fn toast_timer(state: &mut State) -> Task<Message> {
+    let Some(deadline) = state.status_deadline else {
+        return Task::none();
+    };
+    if state.scheduled_deadline == Some(deadline) {
+        return Task::none();
+    }
+    state.scheduled_deadline = Some(deadline);
+    let wait = deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(30);
+    Task::perform(background(move || std::thread::sleep(wait)), |_| {
+        Message::Tick
+    })
+}
+
+/// The body of `update`, before the toast timer is attached.
+fn apply(state: &mut State, message: Message) -> Task<Message> {
     match message {
         // Compatibility qualification wizard.
         Message::Qualify(id) => {
@@ -1371,6 +1791,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             // A plan with room to spare starts at once. The review appears
             // only when the plan fails its own check, to say what is short.
             Ok((command, plan)) if plan.check().is_ok() => {
+                state.planned = None;
                 return send_unchecked(Command::EnqueuePlanned {
                     command: Box::new(command),
                     plan,
@@ -1380,18 +1801,12 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             Err(error) => state.show_status(Status::error(error)),
         },
         Message::StartPlanned => {
-            if let Some((command, plan)) = state.planned.take() {
-                // The plan is checked again here. A plan that fails is dropped
-                // along with its command.
-                match plan.check() {
-                    Ok(()) => {
-                        return send_unchecked(Command::EnqueuePlanned {
-                            command: Box::new(command),
-                            plan,
-                        });
-                    }
-                    Err(error) => state.show_status(Status::error(error.to_string())),
-                }
+            // The stored numbers are the ones that failed, so checking them
+            // again could not change the answer. The command is planned
+            // afresh from the drive's current free space. The panel stays up
+            // until that plan passes and the job starts.
+            if let Some((command, _)) = &state.planned {
+                return send(command.clone());
             }
         }
         Message::CancelPlanned => state.planned = None,
@@ -1427,6 +1842,14 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
         // Artwork. Decodes are started by `artwork_tasks` after the match.
         Message::ArtworkVisible(source) => state.artwork_cache.request(source),
         Message::ArtworkLoaded(source, image) => state.artwork_cache.loaded(source, image),
+        Message::ClearArtwork(game) => {
+            return Task::perform(
+                background(move || {
+                    super::artwork::clear_override(&game).map_err(|error| error.to_string())
+                }),
+                |result| Message::ArtworkSaved(result.and_then(|result| result)),
+            );
+        }
         Message::ArtworkSaved(result) => match result {
             Ok(()) => return update(state, Message::Refresh),
             Err(error) => state.show_status(Status::error(error)),
@@ -1437,7 +1860,11 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             // pending. Dropping that task left them pending for good, and
             // with two decodes allowed at once artwork loading could stall.
             let navigation = update(state, Message::GoTo(Page::Settings));
-            return navigation.chain(super::surface::jump(section, Message::JumpOffset));
+            return navigation.chain(super::surface::jump(
+                "Settings",
+                section,
+                Message::JumpOffset,
+            ));
         }
         Message::JumpOffset(offset) => {
             state.scroll_redraw_until = Some(Instant::now() + Duration::from_millis(150));
@@ -1449,6 +1876,34 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 },
             )
             .chain(Task::done(Message::Tick));
+        }
+        Message::RowOffset(offset) => {
+            state.scroll_redraw_until = Some(Instant::now() + Duration::from_millis(150));
+            return iced::widget::operation::scroll_to(
+                Page::Games.label(),
+                iced::widget::operation::AbsoluteOffset {
+                    x: None,
+                    y: Some(offset),
+                },
+            )
+            .chain(Task::done(Message::Tick));
+        }
+        Message::ClearFilters => {
+            state.query.clear();
+            state.filter = Filter::All;
+            state.drive_filter = None;
+            state.launcher_filter = None;
+            state.shown = 40;
+            state.capture_order();
+        }
+        Message::ReviewAttention => {
+            state.filter = Filter::Attention;
+            state.query.clear();
+            state.drive_filter = None;
+            state.launcher_filter = None;
+            state.shown = 40;
+            state.capture_order();
+            return update(state, Message::GoTo(Page::Games));
         }
         Message::GoTo(destination) => {
             let page = destination.main();
@@ -1466,8 +1921,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                     state.capture_order();
                 }
                 state.page_reveal = Animation::new(false)
-                    .duration(state.motion_duration(180, 120))
-                    .easing(state.motion_easing())
+                    .duration(state.motion_duration(timing::PAGE))
+                    .easing(EASING)
                     .go(true, Instant::now());
             }
             state.confirm_reclaim.clear();
@@ -1477,7 +1932,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             // A section destination scrolls to its section. Any other page
             // change returns to where that page was last scrolled.
             if let Some(section) = destination.section() {
-                return super::surface::jump(section, Message::JumpOffset);
+                return super::surface::jump("Settings", section, Message::JumpOffset);
             }
             if changed {
                 let offset = super::surface::recorded(&state.scroll_positions, page.label());
@@ -1495,6 +1950,9 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::Rescan => return send(Command::RefreshDiscovery),
         Message::Refresh => {
             if state.scanning {
+                // The running scan may have read the data before whatever
+                // asked for this, so one more follows it.
+                state.rescan_wanted = true;
                 return Task::none();
             }
             state.scanning = true;
@@ -1513,7 +1971,6 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                     if scan.worker_epoch > 0
                         && state.snapshot_loaded
                         && (scan.worker_epoch != state.snapshot.worker_epoch
-                            || scan.generation != state.snapshot.scan_generation
                             || scan.discovered != state.snapshot.discovered)
                     {
                         return update(state, Message::Refresh);
@@ -1522,7 +1979,9 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                     state.reports = scan.reports;
                     state.drives = scan.drives;
                     state.records = scan.records;
-                    state.capture_order();
+                    state.reindex();
+                    state.refresh_order();
+                    state.analysis_refused.clear();
                     state.activity = scan.activity;
                     state.warnings = scan.warnings;
                     // Drop per-game interface state for games that are gone.
@@ -1541,6 +2000,12 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                     });
                     state.advanced.retain(|id| valid.contains(id));
                     state.pack_paths.retain(|id, _| valid.contains(id));
+                    let dirs: HashSet<_> = state
+                        .games
+                        .iter()
+                        .map(|row| row.game.install_dir.clone())
+                        .collect();
+                    state.remembered.retain(|(dir, _), _| dirs.contains(dir));
                     state.confirm_reclaim.retain(|id| valid.contains(id));
                     if state
                         .expanded
@@ -1552,22 +2017,55 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 }
                 Err(e) => state.show_status(Status::error(e)),
             }
-            return analyze_visible(state);
+            if std::mem::take(&mut state.rescan_wanted) {
+                return update(state, Message::Refresh);
+            }
+            return analyze_pending(state);
         }
         Message::AnalysisQueued(result) => {
             state.analysis_queuing = false;
-            return update(state, Message::Snapshot(result));
+            match result {
+                // A refused analysis is not a lost connection. Those games
+                // are skipped until the next scan and the rest went through.
+                Ok(batch) => {
+                    state
+                        .analysis_refused
+                        .extend(batch.refused.iter().map(|(id, _)| id.clone()));
+                    let notice = refusal_text(&batch.refused, "analysis")
+                        .map(|text| text.replace("could not be queued", "were skipped"));
+                    let task = update(state, Message::Snapshot(Ok(batch.snapshot)));
+                    if let Some(text) = notice {
+                        state.show_status(Status::info(text));
+                    }
+                    return task;
+                }
+                Err(error) => return update(state, Message::Snapshot(Err(error))),
+            }
         }
+        Message::Batched(result) => match result {
+            Ok(batch) => {
+                let task = update(state, Message::Snapshot(Ok(batch.snapshot)));
+                if let Some(text) = refusal_text(&batch.refused, "job") {
+                    state.show_refusal(text);
+                }
+                return task;
+            }
+            Err(refusal) => state.show_refusal(refusal),
+        },
+        Message::FolderAdded(result) => match result {
+            Ok(snapshot) => return update(state, Message::Snapshot(Ok(snapshot))),
+            Err(FolderError::Missing) => {
+                state.folder_error = Some("Choose an existing game folder.".into());
+            }
+            Err(FolderError::Refused(refusal)) => state.show_refusal(refusal),
+        },
 
         // The reply to something the user asked for. A refusal is about that
         // request, so it is shown for a few seconds and the connection is
         // not marked as lost.
         Message::Commanded(result) => match result {
             Ok(snapshot) => return update(state, Message::Snapshot(Ok(snapshot))),
-            Err(refusal) => {
-                state.show_status(Status::error(refusal));
-                state.status_deadline = Some(Instant::now() + Duration::from_secs(8));
-            }
+            Err(refusal) => state.show_refusal(refusal),
         },
         Message::Snapshot(result) => match result {
             Ok(snapshot) => {
@@ -1634,32 +2132,42 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 let first = !state.snapshot_loaded_before;
                 state.snapshot_loaded_before = true;
                 state.snapshot = snapshot;
+                state.remember_estimates();
+                state.reindex();
+                // An excluded game cannot take part in a bulk action.
+                let excluded = &state.snapshot.excluded;
+                state.selected.retain(|id| !excluded.contains(id));
                 // Estimates settle when the last analysis ends. The list is
                 // sorted then, unless that would move a row the user has open
                 // or ticked.
                 if first || (analyzing && !state.analysis_active()) {
-                    if state.expanded.is_some() || !state.selected.is_empty() {
-                        state.order_stale = true;
-                    } else {
-                        state.capture_order();
-                    }
+                    state.refresh_order();
                 }
                 state.polling = true;
                 // A changed library list, a changed game list or finished work
-                // all mean the scanned data is out of date.
+                // all mean the scanned data is out of date. The first
+                // snapshot differs from the empty one only because it is the
+                // first.
                 if libraries_changed {
-                    state.show_status(Status::info("Library settings saved."));
+                    if !first {
+                        state.show_status(Status::info("Library settings saved."));
+                    }
                     return update(state, Message::Refresh);
                 }
                 if completed_work || discovery_changed {
                     return update(state, Message::Refresh);
                 }
-                return analyze_visible(state);
+                return analyze_pending(state);
             }
             Err(e) => {
+                // Announce the loss once. Every failed poll after it would
+                // bring the toast back after the user dismissed it.
+                let first = state.connection_error.is_none();
                 state.connection_error = Some(e.clone());
                 state.polling = true;
-                state.show_status(Status::error(e));
+                if first {
+                    state.show_status(Status::error(e));
+                }
             }
         },
         // The Games list.
@@ -1671,7 +2179,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::Select(id, selected) => {
             let actionable = state.games.iter().any(|row| {
                 row.game.id.to_string() == id
-                    && row.supported
+                    && state.eligible(row)
                     && row.game.state.is_idle()
                     && !state.pending.contains(&id)
             });
@@ -1683,18 +2191,21 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::ReviewGame(id) => {
             let navigation = update(state, Message::GoTo(Page::Games));
-            return Task::batch([navigation, update(state, Message::Expand(id))]);
+            state.reveal_game(&id);
+            state.open_detail(id.clone());
+            let scroll = super::surface::jump(
+                Page::Games.label(),
+                format!("game-{id}"),
+                Message::RowOffset,
+            );
+            return Task::batch([navigation, scroll]);
         }
         Message::Expand(id) => {
-            state.confirm_reclaim.clear();
-            if state.expanded.as_ref() == Some(&id) {
-                state.detail.go_mut(!state.detail.value(), Instant::now());
+            if state.expanded.as_ref() == Some(&id) && state.detail.value() {
+                state.confirm_reclaim.clear();
+                state.close_detail();
             } else {
-                state.expanded = Some(id);
-                state.detail = Animation::new(false)
-                    .duration(state.motion_duration(260, 150))
-                    .easing(state.motion_easing())
-                    .go(true, Instant::now());
+                state.open_detail(id);
             }
         }
         Message::Sort(sort) => {
@@ -1706,11 +2217,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             state.choices.insert(id, choice);
             // The predicted saving differs by mode, so the game may belong
             // in another group now.
-            if state.expanded.is_some() {
-                state.order_stale = true;
-            } else {
-                state.capture_order();
-            }
+            state.refresh_order();
         }
         Message::Filter(filter) => {
             state.filter = filter;
@@ -1762,7 +2269,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 .games
                 .iter()
                 .filter(|row| {
-                    row.supported
+                    state.eligible(row)
                         && row.game.state.is_idle()
                         && !state.compressed(&row.game)
                         && state
@@ -1916,22 +2423,32 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::FolderKind(kind) => state.folder_kind = kind,
         Message::AddFolder => {
-            let Some(env) = Env::current() else {
-                state.folder_error = Some("Cannot locate your home folder.".into());
-                return Task::none();
-            };
-            let folder = jobs::folder_path(&state.folder, &env.home);
-            if !folder.is_dir() || folder.parent().is_none() {
-                state.folder_error = Some("Choose an existing game folder.".into());
-                return Task::none();
-            }
+            let folder = jobs::folder_path(&state.folder, &state.env.home);
             state.folder_error = None;
-            return send(Command::Library(Library {
-                path: folder,
+            let library = Library {
+                path: folder.clone(),
                 automatic: false,
                 custom: true,
                 folder_kind: state.folder_kind,
-            }));
+            };
+            // A folder on a dead network mount can stall `is_dir`, so the
+            // check runs away from the window thread.
+            return Task::perform(
+                background(move || {
+                    if !folder.is_dir() || folder.parent().is_none() {
+                        return Err(FolderError::Missing);
+                    }
+                    jobs::request(Command::Library(library))
+                        .map_err(|error| FolderError::Refused(error.to_string()))
+                }),
+                |result| {
+                    Message::FolderAdded(
+                        result
+                            .map_err(FolderError::Refused)
+                            .and_then(|result| result),
+                    )
+                },
+            );
         }
         Message::Preset(id, preset) => {
             state.presets.insert(id, preset);
@@ -1941,12 +2458,11 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             state.reduced_motion = motion == MotionPreference::Reduced;
             // The sidebar animations are rebuilt at their current value with
             // the new timing. The setting is also sent to the worker.
-            let duration = state.motion_duration(220, 140);
-            let easing = state.motion_easing();
+            let duration = state.motion_duration(timing::NAV);
             for (_, animation) in &mut state.nav {
                 *animation = Animation::new(animation.value())
                     .duration(duration)
-                    .easing(easing);
+                    .easing(EASING);
             }
             return send(Command::Motion(motion));
         }
@@ -2015,11 +2531,19 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             {
                 state.status = None;
             }
+            // The row of a closed pane stays in `expanded` while the pane
+            // animates out, and is released when the animation ends.
+            if state.expanded.is_some()
+                && !state.detail.value()
+                && !state.detail.is_animating(Instant::now())
+            {
+                state.expanded = None;
+            }
         }
         Message::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
             use iced::keyboard::{Key, key::Named};
-            // Tab moves focus, Escape closes the detail pane and clears the
-            // selection, and the command key with F or R searches or rescans.
+            // Tab moves focus, Escape closes the storage plan, else the detail
+            // pane and the selection, and the command key with F or R searches or rescans.
             match key {
                 Key::Named(Named::Tab) => {
                     return if modifiers.shift() {
@@ -2029,7 +2553,11 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                     };
                 }
                 Key::Named(Named::Escape) => {
-                    state.detail.go_mut(false, Instant::now());
+                    // An open storage plan is closed first and nothing else.
+                    if state.planned.take().is_some() {
+                        return Task::none();
+                    }
+                    state.close_detail();
                     state.selected.clear();
                 }
                 Key::Character(key) if modifiers.command() && key.as_str() == "f" => {
@@ -2565,7 +3093,6 @@ mod tests {
             &mut state,
             Message::Scanned(Ok(ScanResult {
                 worker_epoch: 0,
-                generation: 0,
                 discovered: vec![],
                 reports: vec![],
                 games: vec![],
@@ -2577,5 +3104,441 @@ mod tests {
         );
         check(state.selected.is_empty(), "stale selection is removed")?;
         check(state.expanded.is_none(), "stale details are closed")
+    }
+
+    // The tests below cover the second audit pass.
+
+    fn analysis_of(id: i64, key: &str, saving: u64) -> Job {
+        job(
+            id,
+            &named(key, true).game,
+            Operation::Analyze,
+            Phase::Completed,
+            saving,
+        )
+    }
+
+    fn snapshot_of(revision: u64, jobs: Vec<Job>) -> Snapshot {
+        Snapshot {
+            worker_epoch: 1,
+            revision,
+            jobs,
+            ..Snapshot::default()
+        }
+    }
+
+    fn escape() -> iced::keyboard::Event {
+        use iced::keyboard::{Key, Location, Modifiers, key};
+        iced::keyboard::Event::KeyPressed {
+            key: Key::Named(key::Named::Escape),
+            modified_key: Key::Named(key::Named::Escape),
+            physical_key: key::Physical::Code(key::Code::Escape),
+            location: Location::Standard,
+            modifiers: Modifiers::empty(),
+            text: None,
+            repeat: false,
+        }
+    }
+
+    fn short_plan() -> (Command, crate::storage::SpacePlan) {
+        (
+            Command::Enqueue {
+                game: game(),
+                operation: Operation::Compress,
+                options: Default::default(),
+            },
+            crate::storage::SpacePlan {
+                retained_original: false,
+                requirements: vec![crate::storage::Requirement {
+                    volume: crate::storage::Volume {
+                        identity: "fixture".into(),
+                        path: "/fixture".into(),
+                        available: 1_000,
+                    },
+                    additional: 4_000_000_000,
+                    headroom: 200_000_000,
+                    reasons: vec![],
+                }],
+            },
+        )
+    }
+
+    fn scan_of(games: Vec<GameRow>) -> ScanResult {
+        ScanResult {
+            worker_epoch: 0,
+            discovered: vec![],
+            reports: vec![],
+            games,
+            drives: vec![],
+            records: vec![],
+            activity: vec![],
+            warnings: vec![],
+        }
+    }
+
+    #[test]
+    fn a_closed_detail_pane_stops_holding_the_list_still() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        state.reduced_motion = true;
+        state.games.push(named("alpha", true));
+        state.games.push(named("beta", true));
+        let beta = named("beta", true).game;
+        let _task = update(
+            &mut state,
+            Message::Snapshot(Ok(snapshot_of(
+                1,
+                vec![job(1, &beta, Operation::Analyze, Phase::Analyzing, 0)],
+            ))),
+        );
+        // The snapshot carries the motion setting, so this comes after it.
+        state.reduced_motion = true;
+        let _task = update(&mut state, Message::Expand("manual:alpha".into()));
+        let _task = update(&mut state, Message::Expand("manual:alpha".into()));
+        check(state.expanded.is_none(), "closing the pane releases the row")?;
+        // With motion, the row is released when the closing animation ends.
+        state.reduced_motion = false;
+        state.expanded = Some("manual:alpha".into());
+        state.detail = Animation::new(false);
+        let _task = update(&mut state, Message::Tick);
+        check(state.expanded.is_none(), "a finished close releases the row")?;
+        let done = job(
+            1,
+            &beta,
+            Operation::Analyze,
+            Phase::Completed,
+            2_000_000_000,
+        );
+        let _task = update(&mut state, Message::Snapshot(Ok(snapshot_of(2, vec![done]))));
+        check(!state.order_stale, "nothing is held, so no banner")?;
+        check_eq(
+            order(&state),
+            ["beta", "alpha"].map(String::from).to_vec(),
+            "the list sorted itself when the analysis finished",
+        )
+    }
+
+    #[test]
+    fn a_failed_poll_shows_the_disconnect_toast_once() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        state.reduced_motion = true;
+        let _task = update(&mut state, Message::Snapshot(Err("offline".into())));
+        check(state.status.is_some(), "the first failure is announced")?;
+        let _task = update(&mut state, Message::Dismiss);
+        check(state.status.is_none(), "control: dismissal hides the toast")?;
+        let _task = update(&mut state, Message::Snapshot(Err("offline".into())));
+        check(
+            state.status.is_none(),
+            "a later failed poll does not undo the dismissal",
+        )
+    }
+
+    #[test]
+    fn a_failing_plan_can_be_checked_again() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        let _task = update(&mut state, Message::Planned(Ok(short_plan())));
+        check(state.planned.is_some(), "a plan that fails is shown")?;
+        let _task = update(&mut state, Message::StartPlanned);
+        check(
+            state.planned.is_some(),
+            "the plan stays on screen while it is checked again",
+        )?;
+        check(
+            state.status.is_none(),
+            "checking again does not report the old numbers as a new error",
+        )
+    }
+
+    #[test]
+    fn the_work_bar_ignores_analyses() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        let mut running = analysis_of(1, "alpha", 0);
+        running.phase = Phase::Analyzing;
+        state.snapshot.jobs.push(running);
+        check(state.active().is_none(), "the Jobs page hides analyses")?;
+        let mut compress = analysis_of(2, "beta", 0);
+        compress.operation = Operation::Compress;
+        compress.phase = Phase::Running;
+        state.snapshot.jobs.push(compress);
+        check_eq(
+            state.active().map(|job| job.id),
+            Some(2),
+            "control: a compression is shown",
+        )
+    }
+
+    #[test]
+    fn compress_selected_clears_the_ticks() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        state.games.push(row(true));
+        let _task = update(&mut state, Message::Select("manual:fixture".into(), true));
+        check_eq(state.selected.len(), 1, "control: the row is ticked")?;
+        let _task = update(&mut state, Message::Queue(Operation::Compress));
+        check(state.selected.is_empty(), "queued games are unticked")
+    }
+
+    #[test]
+    fn one_size_serves_the_total_and_the_sort() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        let mut known = named("known", true);
+        known.game.size_hint = Some(1_000_000_000);
+        let mut custom = named("custom", true);
+        custom.game.size_hint = None;
+        state.games.push(known);
+        state.games.push(custom);
+        state
+            .snapshot
+            .jobs
+            .push(analysis_of(1, "custom", 100_000_000));
+        check_eq(
+            state.total_bytes(),
+            5_000_000_000,
+            "a custom folder counts its analysed size",
+        )?;
+        let _task = update(&mut state, Message::Sort(Sort::Size));
+        check_eq(
+            order(&state),
+            ["custom", "known"].map(String::from).to_vec(),
+            "and sorts by it",
+        )
+    }
+
+    #[test]
+    fn reviewing_the_open_game_keeps_it_open_and_visible() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        state.games.push(named("alpha", true));
+        let _task = update(&mut state, Message::Expand("manual:alpha".into()));
+        let _task = update(&mut state, Message::ReviewGame("manual:alpha".into()));
+        check(state.detail.value(), "review does not toggle the pane shut")?;
+        state.query = "zzz".into();
+        let _task = update(&mut state, Message::ReviewGame("manual:alpha".into()));
+        check(
+            state.query.is_empty(),
+            "a search that hides the game is cleared",
+        )
+    }
+
+    #[test]
+    fn a_cancelled_compression_keeps_the_estimate_and_the_state() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        state.games.push(named("alpha", true));
+        let alpha = named("alpha", true).game;
+        state
+            .snapshot
+            .jobs
+            .push(analysis_of(1, "alpha", 900_000_000));
+        state
+            .snapshot
+            .jobs
+            .push(job(2, &alpha, Operation::Compress, Phase::Cancelled, 0));
+        check(
+            state.estimate(&alpha).is_some(),
+            "the analysis still applies after a cancel",
+        )?;
+        check(!state.compressed(&alpha), "nothing was compressed")?;
+        check(state.potential_saving() > 0, "it stays in the total")?;
+        state.snapshot.jobs = vec![
+            job(
+                3,
+                &alpha,
+                Operation::Compress,
+                Phase::Completed,
+                500_000_000,
+            ),
+            job(4, &alpha, Operation::Compress, Phase::Failed, 0),
+        ];
+        check(
+            state.compressed(&alpha),
+            "a failed retry does not undo a finished pass",
+        )
+    }
+
+    #[test]
+    fn an_analysis_in_progress_is_not_an_estimate() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        let mut running = analysis_of(1, "alpha", 900_000_000);
+        running.phase = Phase::Analyzing;
+        state.snapshot.jobs.push(running);
+        check(
+            state.estimate(&named("alpha", true).game).is_none(),
+            "partial sums are not shown as a result",
+        )
+    }
+
+    #[test]
+    fn the_record_decides_the_saving_and_level_zero_is_not_compressed() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        let alpha = named("alpha", true).game;
+        state.games.push(named("alpha", true));
+        state.snapshot.jobs.push(job(
+            1,
+            &alpha,
+            Operation::Compress,
+            Phase::Completed,
+            200_000_000,
+        ));
+        let mut record = GameRecord::new(
+            alpha.id.clone(),
+            "alpha",
+            alpha.install_dir.clone(),
+            fsprobe::BackendKind::Btrfs,
+            &Default::default(),
+        );
+        record.build = alpha.build.clone();
+        record.level = 3;
+        record.install_bytes = 4_000_000_000;
+        record.est_saving = 5_000_000_000;
+        state.records.push(record.clone());
+        check_eq(
+            state.result(&alpha),
+            Some(Outcome::Estimated {
+                installed: 4_000_000_000,
+                saved: 5_000_000_000,
+            }),
+            "the carried figure beats the last pass's own estimate",
+        )?;
+        state.snapshot.jobs.clear();
+        record.level = 0;
+        state.records = vec![record];
+        check(
+            !state.compressed(&alpha),
+            "a decompressed record is not a compressed game",
+        )
+    }
+
+    #[test]
+    fn estimates_outlive_the_workers_job_history() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        state.games.push(named("alpha", true));
+        let alpha = named("alpha", true).game;
+        let _task = update(
+            &mut state,
+            Message::Snapshot(Ok(snapshot_of(
+                1,
+                vec![analysis_of(1, "alpha", 900_000_000)],
+            ))),
+        );
+        check(state.estimate(&alpha).is_some(), "control: estimate known")?;
+        let _task = update(&mut state, Message::Snapshot(Ok(snapshot_of(2, vec![]))));
+        check(
+            state.estimate(&alpha).is_some(),
+            "pruning the finished job does not forget the estimate",
+        )
+    }
+
+    #[test]
+    fn a_scan_applied_with_a_row_open_leaves_the_order_alone() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        state.games.push(named("alpha", true));
+        state.games.push(named("beta", true));
+        state.capture_order();
+        state.expanded = Some("manual:alpha".into());
+        state
+            .snapshot
+            .jobs
+            .push(analysis_of(1, "beta", 2_000_000_000));
+        let _task = update(
+            &mut state,
+            Message::Scanned(Ok(scan_of(vec![named("alpha", true), named("beta", true)]))),
+        );
+        check_eq(
+            order(&state),
+            ["alpha", "beta"].map(String::from).to_vec(),
+            "rows hold still under an open pane",
+        )?;
+        check(state.order_stale, "and the page offers to sort again")
+    }
+
+    #[test]
+    fn a_scan_is_kept_when_only_the_generation_moved() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        state.snapshot_loaded = true;
+        state.snapshot.worker_epoch = 5;
+        state.snapshot.scan_generation = 2;
+        state.snapshot.discovered = vec![game()];
+        let mut scan = scan_of(vec![row(true)]);
+        scan.worker_epoch = 5;
+        scan.discovered = vec![game()];
+        let _task = update(&mut state, Message::Scanned(Ok(scan)));
+        check_eq(state.games.len(), 1, "an identical game list is applied")
+    }
+
+    #[test]
+    fn a_refresh_asked_for_during_a_scan_runs_afterwards() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        state.scanning = true;
+        let _task = update(&mut state, Message::Refresh);
+        let _task = update(&mut state, Message::Scanned(Ok(scan_of(vec![]))));
+        check(state.scanning, "the dropped refresh was started again")
+    }
+
+    #[test]
+    fn library_settings_are_not_announced_on_the_first_snapshot() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        let mut first = snapshot_of(1, vec![]);
+        first.libraries.push(jobs::Library {
+            path: "/games".into(),
+            automatic: true,
+            custom: true,
+            folder_kind: jobs::FolderKind::Collection,
+        });
+        let _task = update(&mut state, Message::Snapshot(Ok(first)));
+        check(state.status.is_none(), "launch is not a settings change")
+    }
+
+    #[test]
+    fn analysis_continues_past_a_first_page_of_analysed_games() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        let mut jobs = vec![];
+        for number in 0..60_i64 {
+            let key = format!("g{number:02}");
+            state.games.push(named(&key, true));
+            if number < 40 {
+                jobs.push(analysis_of(number + 1, &key, 500_000_000));
+            }
+        }
+        let _task = update(&mut state, Message::Snapshot(Ok(snapshot_of(1, jobs))));
+        check(
+            state.analysis_queuing(),
+            "games beyond the visible page are still analysed",
+        )
+    }
+
+    #[test]
+    fn excluded_games_are_not_offered_by_the_library_action() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        state.games.push(named("a", true));
+        state.games.push(named("b", true));
+        state.snapshot.jobs.push(analysis_of(1, "a", 500_000_000));
+        state.snapshot.jobs.push(analysis_of(2, "b", 700_000_000));
+        state.snapshot.excluded = vec!["manual:b".into()];
+        check_eq(
+            state.potential_saving(),
+            500_000_000,
+            "an excluded game is not in the total",
+        )?;
+        state.selected.insert("manual:b".into());
+        check(
+            state.actionable_selection().is_empty(),
+            "nor in a ticked selection",
+        )
+    }
+
+    #[test]
+    fn escape_closes_the_storage_plan() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        state.planned = Some(short_plan());
+        let _task = update(&mut state, Message::Keyboard(escape()));
+        check(state.planned.is_none(), "Escape dismisses the plan")
+    }
+
+    #[test]
+    fn adding_a_folder_does_not_touch_the_disk_on_the_window_thread() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        state.folder = "/nonexistent/flummox-test-folder".into();
+        let _task = update(&mut state, Message::AddFolder);
+        check(
+            state.folder_error.is_none(),
+            "the folder is checked in the background",
+        )
     }
 }
