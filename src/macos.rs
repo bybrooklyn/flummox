@@ -421,6 +421,29 @@ fn verify_bundle(path: &Path) -> Result<()> {
     Ok(())
 }
 
+// Treats a missing path as already removed.
+fn ignore_missing(result: std::io::Result<()>) -> std::io::Result<()> {
+    match result {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+// True when nothing exists at `path`. Any other failure to look is an error.
+fn is_missing(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
+// Deletes the journal and syncs its directory.
+fn remove_journal(record: &Recovery) -> Result<()> {
+    let path = journal_path(record)?;
+    std::fs::remove_file(&path)?;
+    File::open(path.parent().context("Journal has no parent")?)?.sync_all()?;
+    Ok(())
+}
+
 // Deletes the staging directory with whichever copy it holds, then the journal.
 // Refuses a directory whose name lacks the `.flummox-work-` prefix.
 fn clear_record(record: &Recovery) -> Result<()> {
@@ -434,9 +457,11 @@ fn clear_record(record: &Recovery) -> Result<()> {
             .is_some_and(|name| name.to_string_lossy().starts_with(".flummox-work-")),
         "Unexpected staging directory"
     );
-    std::fs::remove_dir_all(parent)?;
-    std::fs::remove_file(journal_path(record)?)?;
-    Ok(())
+    ignore_missing(std::fs::remove_dir_all(parent))?;
+    if let Some(outer) = parent.parent() {
+        File::open(outer)?.sync_all()?;
+    }
+    remove_journal(record)
 }
 
 /// Restores a journaled original only when both identities still match.
@@ -451,25 +476,37 @@ pub fn recover_original(record: &Recovery) -> Result<()> {
         "Reconnect the original drive"
     );
     idle(&root)?;
+    // The work directory is gone and the journal remains: a crash between the two
+    // deletions in `clear_record`, or a journal whose work directory was never
+    // kept. The source must hold the verified new copy or the untouched original.
+    if is_missing(&record.staged)? {
+        let current = identity(&record.source)?;
+        ensure!(
+            (current == record.candidate && hash(&record.source)? == record.hash)
+                || current == record.original,
+            "Files changed after interruption; retain both copies for review"
+        );
+        return remove_journal(record);
+    }
     // The journal was written but the swap never ran. The original is in place, so
     // only the candidate and the journal need removing.
     if identity(&record.source)? == record.original && identity(&record.staged)? == record.candidate
     {
         return clear_record(record);
     }
-    // Otherwise the files must be exactly swapped. Swap them back and check the
-    // original's bytes before deleting anything.
+    // Otherwise the files must be exactly swapped. Check the original's bytes
+    // where it sits, so a bad original is never put back over the new copy.
     ensure!(
         identity(&record.source)? == record.candidate
             && identity(&record.staged)? == record.original,
         "Files changed after interruption; retain both copies for review"
     );
-    swap(&record.source, &record.staged)?;
-    File::open(record.source.parent().context("File has no parent")?)?.sync_all()?;
     ensure!(
-        hash(&record.source)? == record.hash,
+        hash(&record.staged)? == record.hash,
         "Original verification failed; recovery copies retained"
     );
+    swap(&record.source, &record.staged)?;
+    File::open(record.source.parent().context("File has no parent")?)?.sync_all()?;
     clear_record(record)
 }
 
