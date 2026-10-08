@@ -373,6 +373,7 @@ impl BtrfsBackend {
         let applied_level = std::sync::atomic::AtomicI64::new(i64::from(i32::MAX));
         let errors = std::sync::Mutex::new(Vec::new());
         let completed = std::sync::Mutex::new(Vec::new());
+        let report = std::sync::Mutex::new(());
 
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads.max(1))
@@ -424,6 +425,9 @@ impl BtrfsBackend {
                     }
                     Err(e) => return fail(e),
                 }
+                // Counting and reporting under one lock keeps events in
+                // counting order, so no later event carries a smaller total.
+                let _ordered = report.lock();
                 let done = files_done.fetch_add(1, Ordering::Relaxed) + 1;
                 let bdone = bytes_done.fetch_add(entry.size, Ordering::Relaxed) + entry.size;
                 ctx.events.event(Event::Progress {

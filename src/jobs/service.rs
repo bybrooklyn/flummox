@@ -2003,7 +2003,7 @@ pub(super) fn run() -> Result<()> {
                     break;
                 }
             }
-            if a.paused && job.phase != Phase::Cancelling {
+            if a.paused && !finished && job.phase != Phase::Cancelling {
                 job.message = if job.user_paused {
                     "Paused by you".into()
                 } else if let Some(game) = &snapshot.gaming {

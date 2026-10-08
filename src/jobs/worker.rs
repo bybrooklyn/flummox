@@ -225,10 +225,16 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
 
     if job.operation != Operation::Decompress {
         summary.maximum_after = Some(0);
-        output.event(Event::Started {
-            files: inv.files.len() as u64,
-            bytes: inv.total_bytes(),
-        });
+        // A storage job reports totals once, from the backend, when rewriting
+        // starts. Totals here would fill the progress bar during sampling and
+        // empty it again for the rewrite.
+        let counted = job.operation == Operation::Analyze;
+        if counted {
+            output.event(Event::Started {
+                files: inv.files.len() as u64,
+                bytes: inv.total_bytes(),
+            });
+        }
         let model = backend.model(&job.options);
         let opts = EstimateOpts::new(job.options.btrfs_level(), &fs);
         let probe = backend.disk_probe();
@@ -329,10 +335,18 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
             }
             output.send(WorkerEvent::Estimate(summary));
             inspected_bytes = inspected_bytes.saturating_add(entry.size);
-            output.event(Event::Progress {
-                files_done: index as u64 + 1,
-                bytes_done: inspected_bytes,
-                current: entry.rel.display().to_string(),
+            output.event(if counted {
+                Event::Progress {
+                    files_done: index as u64 + 1,
+                    bytes_done: inspected_bytes,
+                    current: entry.rel.display().to_string(),
+                }
+            } else {
+                Event::Progress {
+                    files_done: 0,
+                    bytes_done: 0,
+                    current: format!("Analyzing {}", entry.rel.display()),
+                }
             });
         }
         summary.rewrite_files = candidates.len() as u64;
