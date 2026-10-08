@@ -379,7 +379,7 @@ fn plan(state: &mut State, optimize: bool) -> Task<Message> {
     let planned_folder = folder.clone();
     Task::perform(
         background(move || {
-            crate::storage::native_plan(&folder, !optimize).map_err(|error| error.to_string())
+            crate::storage::per_file_plan(&folder, !optimize).map_err(|error| error.to_string())
         }),
         move |result| Message::Planned(planned_folder.clone(), optimize, result),
     )
