@@ -783,10 +783,20 @@ mod tests {
         std::fs::create_dir(layer.join(FILES).join("l")).ctx("layer folder")?;
         std::fs::write(layer.join(FILES).join("l/x"), b"planted").ctx("layer file")?;
 
-        Overlay::open(&layer)
-            .ctx("layer")?
-            .apply_to(&game)
-            .ctx("apply")?;
+        // Another test forking a child shares the lock until that child
+        // execs, so the layer can look held for an instant after the drop.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let reopened = loop {
+            match Overlay::open(&layer) {
+                Ok(reopened) => break reopened,
+                Err(error) => check(
+                    std::time::Instant::now() < deadline,
+                    format!("layer: {error}"),
+                )?,
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        reopened.apply_to(&game).ctx("apply")?;
         check_eq(
             std::fs::read(outside.join("x")).ctx("outside after")?,
             b"victim".to_vec(),
