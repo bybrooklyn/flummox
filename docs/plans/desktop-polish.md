@@ -140,10 +140,12 @@ online metadata and publisher signing remain deferred.
 - An isolated live Linux window check covered wheel input, jump links, scroll
   restoration, keyboard navigation, missing-art layouts, picker cancellation and
   an attention job retained across navigation. A disposable btrfs run retained
-  completed history and selection. Physical trackpads, running/paused GUI
-  states, KDE and second-session dialogs and real drive disconnection remain
-  unverified. The complete Linux `just ci` gate passes, including coordinator
-  lifecycle tests and a btrfs worker round trip.
+  completed history and selection. A later
+  [live run](../validation/2026-10-07-live-job-states.md) covered running,
+  waiting, paused and resumed rows on real btrfs work. Physical trackpads, KDE
+  and second-session dialogs and real drive disconnection remain unverified.
+  The complete Linux `just ci` gate passes, including coordinator lifecycle
+  tests and a btrfs worker round trip.
 - Native Windows/Mac CI passes at `be09967` and the latest `848eda3` CI run also
   passes. Windows installer lifecycle and isolated coordinator fixtures ran in
   CI, but manual tray/Explorer restart, login, busy/updating games, unplugged

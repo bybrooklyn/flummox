@@ -7,14 +7,16 @@ motion, stable jobs, asynchronous discovery, local artwork and Windows expansion
 Those changes are implemented in the 0.0.2 source. The
 [desktop delivery record](validation/2026-10-06-desktop-polish.md) separates
 fixture and live Linux evidence from the graphical and platform acceptance
-still needed.
+still needed. Running, waiting, paused and resumed job rows have
+[live evidence](validation/2026-10-07-live-job-states.md).
 
 ## Release acceptance
 
 Native Factorio simulation and Super Meat Boy Proton startup passed disposable
 storage-cycle smoke checks. See [the evidence](validation/2026-10-04-linux-smoke.md)
-for measured results and the remaining limits. The typed-path GUI flow passed an isolated graphical check with a spaced
-collection path and an invalid path control. A later live Linux check opened
+for measured results and the remaining limits. The typed-path GUI flow passed
+an isolated graphical check with a spaced collection path and an invalid path
+control. A later live Linux check opened
 and cancelled the native picker; KDE and a second desktop session still need
 interactive selection and cancellation checks.
 

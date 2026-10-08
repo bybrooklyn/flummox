@@ -372,6 +372,124 @@ fn native_worker_reuses_receipts_and_reprocesses_a_changed_file() -> TestResult 
 }
 
 #[test]
+fn a_compress_worker_reports_its_totals_once() -> TestResult {
+    let temp = tempfile::TempDir::new_in(std::env::current_dir().ctx("cwd")?).ctx("fixture")?;
+    if flummox::fsprobe::probe(temp.path())
+        .ctx("filesystem")?
+        .fstype
+        != "btrfs"
+    {
+        eprintln!("skipped: worker progress requires btrfs");
+        return Ok(());
+    }
+    let home = temp.path().join("home");
+    let path = temp.path().join("game");
+    std::fs::create_dir_all(&home).ctx("fixture home")?;
+    std::fs::create_dir_all(&path).ctx("fixture game")?;
+    let chunk = b"progress fixture payload line\n".repeat(40_000);
+    let anchor = flummox::safeio::Anchor::open(&path).ctx("anchor")?;
+    for index in 0..4 {
+        let name = format!("payload-{index}.bin");
+        std::fs::write(path.join(&name), &chunk).ctx("fixture payload")?;
+        // Without a raw baseline the mount default leaves nothing to rewrite.
+        flummox::backend::btrfs::decompress_fd(
+            &anchor.open_file(Path::new(&name)).ctx("fixture file")?,
+        )
+        .ctx("raw baseline")?;
+    }
+    drop(anchor);
+    // The coordinator creates the receipt store a worker reads, and its
+    // finished analysis supplies a complete job record to hand to one.
+    let mut service = start(&home)?;
+    let snapshot = request(
+        &home,
+        Request::Enqueue {
+            game: Game {
+                id: GameId::new(Launcher::Manual, "progress-fixture"),
+                also: vec![],
+                title: "Progress Fixture".into(),
+                install_dir: path.clone(),
+                build: None,
+                size_hint: None,
+                state: InstallState::Idle,
+                is_tool: false,
+            },
+            operation: Operation::Analyze,
+            options: Default::default(),
+        },
+    )?;
+    let mut job = finished(&home, snapshot.jobs.last().ctx("job queued")?.id)?;
+    check_eq(job.phase, Phase::Completed, format!("analysis: {job:?}"))?;
+    service.stop()?;
+    job.operation = Operation::Compress;
+
+    let mut worker = Command::new(env!("CARGO_BIN_EXE_flummox"))
+        .arg("__worker")
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .ctx("start worker")?;
+    // Closing this pipe asks the worker to stop, so it stays open until exit.
+    let mut input = worker.stdin.take().ctx("worker stdin")?;
+    serde_json::to_writer(
+        &mut input,
+        &serde_json::json!({"version": flummox::jobs::VERSION, "job": job}),
+    )
+    .ctx("work")?;
+    input.write_all(b"\n").ctx("delimiter")?;
+    let mut started = 0;
+    let mut last_bytes = 0;
+    let mut done = None;
+    for line in BufReader::new(worker.stdout.take().ctx("worker stdout")?).lines() {
+        let event: serde_json::Value =
+            serde_json::from_str(&line.ctx("worker line")?).ctx("event JSON")?;
+        if let Some(totals) = event.pointer("/Progress/Started") {
+            started += 1;
+            check_eq(
+                totals.get("files").and_then(|files| files.as_u64()),
+                Some(4),
+                "the rewrite counts every fixture file",
+            )?;
+        }
+        if let Some(bytes) = event
+            .pointer("/Progress/Progress/bytes_done")
+            .and_then(|bytes| bytes.as_u64())
+        {
+            check(
+                started > 0 || bytes == 0,
+                format!("progress before the totals were known: {event}"),
+            )?;
+            check(
+                bytes >= last_bytes,
+                format!("progress moved backwards from {last_bytes}: {event}"),
+            )?;
+            last_bytes = bytes;
+        }
+        if let Some(result) = event.get("Done") {
+            done = Some(result.clone());
+        }
+    }
+    drop(input);
+    check(worker.wait().ctx("reap worker")?.success(), "worker exit")?;
+    check_eq(started, 1, "one set of totals for one progress bar")?;
+    check_eq(
+        last_bytes,
+        4 * chunk.len() as u64,
+        "progress ends at the total",
+    )?;
+    let done = done.ctx("the worker reported an outcome")?;
+    check_eq(
+        (done.get("cancelled"), done.get("errors")),
+        (Some(&false.into()), Some(&serde_json::json!([]))),
+        "the worker finished cleanly",
+    )
+}
+
+#[test]
 fn user_pause_holds_a_queued_job_and_resume_completes_it() -> TestResult {
     let temp = tempfile::TempDir::new_in(std::env::current_dir().ctx("cwd")?).ctx("fixture")?;
     if flummox::fsprobe::probe(temp.path())
@@ -386,11 +504,9 @@ fn user_pause_holds_a_queued_job_and_resume_completes_it() -> TestResult {
     let path = temp.path().join("game");
     std::fs::create_dir_all(&home).ctx("fixture home")?;
     std::fs::create_dir_all(&path).ctx("fixture game")?;
-    // Enough compressible data that pausing lands before the worker finishes:
-    // small fixtures rewrite in milliseconds on this filesystem.
     let chunk = b"pause fixture payload line for compression testing\n".repeat(150_000);
     let mut names = Vec::new();
-    for index in 0..64 {
+    for index in 0..8 {
         let name = format!("payload-{index}.bin");
         std::fs::write(path.join(&name), &chunk).ctx("fixture payload")?;
         names.push(name);
@@ -409,19 +525,45 @@ fn user_pause_holds_a_queued_job_and_resume_completes_it() -> TestResult {
             .ctx("baseline extents")?;
     check(mapped > 0, "baseline maps actual extents")?;
     check_eq(compressed, 0, "the baseline must be uncompressed")?;
-    // A retained directory handle would make the test itself look like a running game.
     drop(anchor);
     let _service = start(&home)?;
-    let game = Game {
-        id: GameId::new(Launcher::Manual, "pause-fixture"),
-        also: vec![],
-        title: "Pause Fixture".into(),
-        install_dir: path.clone(),
-        build: None,
-        size_hint: None,
-        state: InstallState::Idle,
-        is_tool: false,
+    request(
+        &home,
+        Request::Library(flummox::jobs::Library {
+            path: path.clone(),
+            automatic: false,
+            custom: true,
+            folder_kind: flummox::jobs::FolderKind::Game,
+        }),
+    )?;
+    request(&home, Request::RefreshDiscovery)?;
+    // The rewrite takes milliseconds, so a pause sent after Enqueue can arrive
+    // once the work is done. An open file makes the coordinator treat the game
+    // as running, which keeps the job queued until the pause is recorded.
+    let playing =
+        std::fs::File::open(path.join(names.first().ctx("fixture name")?)).ctx("open game file")?;
+    let settled = |wanted: bool, what: &str| -> Result<Snapshot, String> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let snapshot = request(&home, Request::Snapshot)?;
+            let found = snapshot.discovered.iter().any(|g| g.install_dir == path);
+            if found && snapshot.gaming.is_some() == wanted {
+                return Ok(snapshot);
+            }
+            check(
+                Instant::now() < deadline,
+                format!("{what}: discovered {found}, gaming {:?}", snapshot.gaming),
+            )?;
+            std::thread::sleep(Duration::from_millis(100));
+        }
     };
+    let snapshot = settled(true, "the open file never counted as play")?;
+    let game = snapshot
+        .discovered
+        .iter()
+        .find(|g| g.install_dir == path)
+        .cloned()
+        .ctx("discovered fixture")?;
     let snapshot = request(
         &home,
         Request::Enqueue {
@@ -430,26 +572,24 @@ fn user_pause_holds_a_queued_job_and_resume_completes_it() -> TestResult {
             options: Default::default(),
         },
     )?;
-    let id = snapshot.jobs.last().ctx("job queued")?.id;
-    request(&home, Request::Pause { id, paused: true }).ctx("pause job")?;
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let snapshot = request(&home, Request::Snapshot)?;
-        let job = snapshot
-            .jobs
-            .iter()
-            .find(|j| j.id == id)
-            .ctx("paused job")?;
-        if job.phase == Phase::Paused {
-            check(job.user_paused, "pause records the user request")?;
-            break;
-        }
-        check(
-            Instant::now() < deadline,
-            format!("job never paused: {job:?}"),
-        )?;
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let queued = snapshot
+        .jobs
+        .iter()
+        .find(|j| j.operation == Operation::Compress)
+        .ctx("job queued")?;
+    check_eq(queued.phase, Phase::Queued, "play keeps the job queued")?;
+    let id = queued.id;
+    let snapshot = request(&home, Request::Pause { id, paused: true }).ctx("pause job")?;
+    let job = snapshot
+        .jobs
+        .iter()
+        .find(|j| j.id == id)
+        .ctx("paused job")?;
+    check_eq(job.phase, Phase::Paused, "a queued job pauses at once")?;
+    check(job.user_paused, "pause records the user request")?;
+    drop(playing);
+    settled(false, "play never ended")?;
+    // Without the pause, the job would start now that nothing uses the game.
     std::thread::sleep(Duration::from_millis(500));
     let snapshot = request(&home, Request::Snapshot)?;
     let held = snapshot.jobs.iter().find(|j| j.id == id).ctx("held job")?;
