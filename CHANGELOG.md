@@ -26,6 +26,12 @@ version has no download yet. [Full notes](docs/releases/0.0.2.md).
 
 ### Changed
 
+- Maximum is a guided flow. The game's details say where it stands and offer
+  the one next step: play the game, then confirm to delete the original.
+- After you confirm, game updates are folded into the store automatically
+  while the game is closed, and the previous version is deleted after you
+  next play. The buttons for doing either by hand moved under Advanced.
+
 - Each game has one choice of how to compress it: Standard or Maximum, each
   with what it is predicted to save. The preset list and store controls moved
   under Advanced. Maximum can be chosen for a game without a compatibility

@@ -208,6 +208,15 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
     state.show_low = true;
     render(&state, 1100, 1000, &output.join("games-groups-all.png"))?;
     state.show_low = false;
+    // The two states of a game that runs from a store: the original still
+    // kept, and the original deleted.
+    for (key, name) in [
+        ("manual:kept", "maximum-original"),
+        ("manual:confirmed", "maximum-confirmed"),
+    ] {
+        state.expanded = Some(key.into());
+        render(&state, 1100, 1250, &output.join(format!("{name}.png")))?;
+    }
     state.expanded = open;
     // The storage plan review that precedes a job.
     state.planned = Some((

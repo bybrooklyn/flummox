@@ -21,6 +21,14 @@ Open a game to choose how it is compressed:
   the game works. It is chosen one game at a time; compressing several games
   at once always uses Standard.
 
+A game set to Maximum is walked through three steps. Press **Compress** and
+Flummox builds the store and switches the game to it. Play the game once, then
+press **It works, delete the original**; that is when the space is saved, and
+the whole store is checked first. From then on, game updates are folded into
+the store automatically while the game is closed, and the previous version is
+deleted after you next play. **Decompress to ordinary files** undoes it at any
+point.
+
 **Decompress** puts a game back and **Analyze** estimates it again. Advanced
 holds the Standard strength (Fast, Balanced, Max), the store location, and the
 compatibility report form. Maximum compares levels 9, 15, 19 and 22 for each
