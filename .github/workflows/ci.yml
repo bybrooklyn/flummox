@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# Nothing here publishes, so the token only needs to read the code.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # A warning that only appears in CI is a warning nobody reads.
@@ -18,17 +22,17 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the toolchain
         run: rustup toolchain install stable --profile minimal --component clippy
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Lint Windows code and tests
         run: cargo clippy --locked --all-features --all-targets -- -D warnings
       - name: Test on Windows
         env:
           FLUMMOX_NATIVE_PREVIEW_DIR: ${{ runner.temp }}/flummox-previews
         run: cargo test --locked --all-features
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: windows-desktop-previews
@@ -66,17 +70,17 @@ jobs:
     name: macOS native APFS app
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the toolchain
         run: rustup toolchain install stable --profile minimal --component clippy
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Check every target with warnings denied
         run: cargo clippy --locked --all-features --all-targets -- -D warnings
       - name: Test portable modules
         env:
           FLUMMOX_NATIVE_PREVIEW_DIR: ${{ runner.temp }}/flummox-previews
         run: cargo test --locked --all-features
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: macos-desktop-previews
@@ -89,7 +93,7 @@ jobs:
     name: Build, test, lint and dependency policy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install the toolchain
         run: rustup toolchain install stable --profile minimal --component clippy
@@ -107,11 +111,11 @@ jobs:
       # CI runs the same recipes the pre-push hook runs. While CI called cargo
       # directly the two drifted, and a licence failure reached main because
       # the local checks and the remote ones were not the same checks.
-      - uses: taiki-e/install-action@v2.87.22
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: just,cargo-deny
 
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # lint, then test, then the dependency policy.
       - name: just ci
@@ -121,7 +125,7 @@ jobs:
     name: Filesystem matrix (btrfs)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install the toolchain
         run: rustup toolchain install stable --profile minimal
@@ -139,7 +143,7 @@ jobs:
           sudo mount -o loop,compress=zstd:1 /tmp/btrfs.img /tmp/btrfs
           sudo chown "$(id -u):$(id -g)" /tmp/btrfs
 
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # These tests create their temporary directories inside the current
       # directory, so running from the mount is what selects them. Anywhere
@@ -181,7 +185,7 @@ jobs:
     name: Compressed store mount and executable reads
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the toolchain
         run: rustup toolchain install stable --profile minimal
       - name: Enable unprivileged FUSE mounts
@@ -190,7 +194,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends fuse3
           sudo modprobe fuse
           test -c /dev/fuse
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Require mounted reads and fixture execution
         env:
           FLUMMOX_REQUIRE_FUSE: '1'
