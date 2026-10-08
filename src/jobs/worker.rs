@@ -133,7 +133,7 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
     std::thread::spawn(move || {
         let mut input = input;
         loop {
-            match service::read_message(&mut input) {
+            match client::read_message(&mut input) {
                 Ok(Control::Cancel) => {
                     control_cancel.store(true, Ordering::Relaxed);
                 }
@@ -418,7 +418,7 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
 pub(super) fn run() -> Result<()> {
     let output = Output(Mutex::new(std::io::stdout()));
     let mut input = BufReader::new(std::io::stdin());
-    let result = service::read_message(&mut input).and_then(|work| execute(work, input, &output));
+    let result = client::read_message(&mut input).and_then(|work| execute(work, input, &output));
     if let Err(error) = result {
         output.send(WorkerEvent::Failed(format!("{error:#}")));
     }

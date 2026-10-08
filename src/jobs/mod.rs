@@ -4,6 +4,8 @@
 //! transfers ownership or terminates a worker.
 
 mod autostart;
+mod client;
+mod packs;
 mod service;
 mod worker;
 
@@ -15,7 +17,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub use service::{configured_libraries, request, state_dir};
+pub use client::{configured_libraries, request, state_dir};
 
 /// Protocol version. A mismatched installed worker is rejected before work.
 pub const VERSION: u32 = 8;
