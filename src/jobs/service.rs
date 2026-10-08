@@ -575,7 +575,10 @@ fn enqueue_job(
         ensure!(
             existing.pack == pack,
             "{} is already waiting or running for this game. Wait for it to finish first.",
-            existing.pack.as_ref().map_or("A storage task", PackTask::label)
+            existing
+                .pack
+                .as_ref()
+                .map_or("A storage task", PackTask::label)
         );
         return Ok(());
     }
@@ -1073,10 +1076,7 @@ fn start(job: &Job) -> Result<Active> {
 }
 
 /// Sends `job` to a spawned worker and starts the thread that reads its events.
-fn connect(
-    child: &mut Child,
-    job: &Job,
-) -> Result<(ChildStdin, mpsc::Receiver<WorkerEvent>)> {
+fn connect(child: &mut Child, job: &Job) -> Result<(ChildStdin, mpsc::Receiver<WorkerEvent>)> {
     let mut input = child.stdin.take().context("Worker stdin is unavailable")?;
     serde_json::to_writer(
         &mut input,
@@ -1793,12 +1793,12 @@ pub(super) fn run() -> Result<()> {
         // Discovery scans. A scan starts on request, every 3 seconds while
         // a job is running or can start, and every 30 seconds otherwise. It runs on its own
         // thread and at most one runs at a time.
-        let scan_interval = if has_runnable_work(&snapshot, active.is_some() || pack_active.is_some())
-        {
-            3
-        } else {
-            30
-        };
+        let scan_interval =
+            if has_runnable_work(&snapshot, active.is_some() || pack_active.is_some()) {
+                3
+            } else {
+                30
+            };
         if discovery.is_none()
             && (refresh_requested || last_scan.elapsed() >= Duration::from_secs(scan_interval))
         {
@@ -2376,13 +2376,15 @@ mod tests {
         )
     }
 
-
     #[test]
     fn the_coordinator_refuses_relative_paths() -> TestResult {
         let temp = tempfile::tempdir().ctx("state")?;
         let (db, mut snapshot) = open_store(&temp.path().join("jobs.sqlite")).ctx("store")?;
         // `src` exists relative to the test's working directory.
-        check(Path::new("src").is_dir(), "control: the relative folder exists")?;
+        check(
+            Path::new("src").is_dir(),
+            "control: the relative folder exists",
+        )?;
         let relative = apply(
             Command::Enqueue {
                 game: game(Path::new("src"), "relative"),
@@ -2475,7 +2477,6 @@ mod tests {
         queue(&mut snapshot, &inside).ctx("control: the game's own folder is accepted")
     }
 
-
     #[test]
     fn a_cancelled_upkeep_task_is_not_queued_again() -> TestResult {
         let temp = tempfile::tempdir().ctx("upkeep fixture")?;
@@ -2501,11 +2502,21 @@ mod tests {
             message: String::new(),
         });
         let mut records = std::collections::HashMap::new();
-        run_upkeep(&mut snapshot, std::slice::from_ref(&game), &mut records, &db);
+        run_upkeep(
+            &mut snapshot,
+            std::slice::from_ref(&game),
+            &mut records,
+            &db,
+        );
         check_eq(snapshot.jobs.len(), 1, "the update queues one compaction")?;
         snapshot.jobs.first_mut().ctx("job")?.phase = Phase::Cancelled;
         for _scan in 0..3 {
-            run_upkeep(&mut snapshot, std::slice::from_ref(&game), &mut records, &db);
+            run_upkeep(
+                &mut snapshot,
+                std::slice::from_ref(&game),
+                &mut records,
+                &db,
+            );
         }
         check_eq(
             snapshot.jobs.len(),
@@ -2536,7 +2547,12 @@ mod tests {
             check_eq(job.phase, Phase::Cancelling, "a cancel stays a cancel")?;
         }
         job.phase = Phase::Paused;
-        event(job, WorkerEvent::Progress(crate::backend::Event::Resumed), &db).ctx("resume")?;
+        event(
+            job,
+            WorkerEvent::Progress(crate::backend::Event::Resumed),
+            &db,
+        )
+        .ctx("resume")?;
         check_eq(
             job.phase,
             Phase::Analyzing,
@@ -2544,7 +2560,12 @@ mod tests {
         )?;
         job.operation = Operation::Compress;
         job.phase = Phase::Paused;
-        event(job, WorkerEvent::Progress(crate::backend::Event::Resumed), &db).ctx("resume")?;
+        event(
+            job,
+            WorkerEvent::Progress(crate::backend::Event::Resumed),
+            &db,
+        )
+        .ctx("resume")?;
         check_eq(job.phase, Phase::Running, "control: other jobs run")
     }
 
@@ -2561,11 +2582,8 @@ mod tests {
             &db,
         )
         .ctx("job")?;
-        db.execute(
-            "INSERT INTO queue(id, data) VALUES(99, 'not a job')",
-            [],
-        )
-        .ctx("damaged row")?;
+        db.execute("INSERT INTO queue(id, data) VALUES(99, 'not a job')", [])
+            .ctx("damaged row")?;
         drop(db);
         let (_db, restored) = open_store(&path).ctx("reopen with a damaged row")?;
         check_eq(restored.jobs.len(), 1, "the readable job is still loaded")
@@ -2577,7 +2595,10 @@ mod tests {
             interruptible: std::sync::atomic::AtomicBool::new(true),
             ..Default::default()
         };
-        check(stoppable.cancel_if_interruptible(), "accepted before the switch")?;
+        check(
+            stoppable.cancel_if_interruptible(),
+            "accepted before the switch",
+        )?;
         check(
             stoppable.cancel.load(std::sync::atomic::Ordering::SeqCst),
             "the flag is set",
@@ -2597,7 +2618,8 @@ mod tests {
     #[test]
     fn a_full_progress_channel_does_not_block_pause_and_cancel_requests() -> TestResult {
         let (send, receive) = mpsc::sync_channel(1);
-        send.send(crate::backend::Event::Resumed).ctx("fill the channel")?;
+        send.send(crate::backend::Event::Resumed)
+            .ctx("fill the channel")?;
         let control = std::sync::Arc::new(PackControl {
             interruptible: std::sync::atomic::AtomicBool::new(true),
             events: Some(send),
@@ -2606,7 +2628,10 @@ mod tests {
         let beginning = control.clone();
         let transaction = std::thread::spawn(move || beginning.transaction("switching"));
         let until = Instant::now() + Duration::from_secs(5);
-        while control.interruptible.load(std::sync::atomic::Ordering::SeqCst) {
+        while control
+            .interruptible
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             check(Instant::now() < until, "the transaction began")?;
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -2628,7 +2653,6 @@ mod tests {
             "a cancel is refused once the step must finish",
         )
     }
-
 
     #[test]
     fn upkeep_measures_the_update_layer_only_when_the_answer_needs_it() -> TestResult {
@@ -2781,7 +2805,11 @@ mod tests {
         for _attempt in 0..10 {
             delay = next_recovery_delay(delay, false);
         }
-        check_eq(delay, Duration::from_secs(300), "the delay stops at five minutes")?;
+        check_eq(
+            delay,
+            Duration::from_secs(300),
+            "the delay stops at five minutes",
+        )?;
         check_eq(
             next_recovery_delay(delay, true),
             Duration::from_secs(5),
@@ -3002,7 +3030,11 @@ mod tests {
         let base = padded(0)?.len();
         let limit = usize::try_from(LIMIT).ctx("limit")?;
         let at_limit = padded(limit - base)?;
-        check_eq(at_limit.len(), limit, "control: the request is exactly the limit")?;
+        check_eq(
+            at_limit.len(),
+            limit,
+            "control: the request is exactly the limit",
+        )?;
         read_message::<Request>(&mut std::io::Cursor::new(at_limit))
             .ctx("control: a request at the limit parses")?;
         let over = padded(limit - base + 1)?;

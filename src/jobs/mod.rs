@@ -547,9 +547,20 @@ fn validate_folder_for(
     let media_root = path.starts_with("/run/media") && path.components().count() <= 4;
     anyhow::ensure!(
         !media_root
-            && ["/home", "/var", "/var/home", "/mnt", "/media", "/run", "/opt", "/srv", "/root", "/tmp"]
-                .iter()
-                .all(|shared| path != Path::new(shared)),
+            && [
+                "/home",
+                "/var",
+                "/var/home",
+                "/mnt",
+                "/media",
+                "/run",
+                "/opt",
+                "/srv",
+                "/root",
+                "/tmp"
+            ]
+            .iter()
+            .all(|shared| path != Path::new(shared)),
         "Choose a game folder, not a system or shared folder."
     );
     if let Some(state) =
@@ -768,7 +779,9 @@ mod folder_tests {
             started.elapsed() >= std::time::Duration::from_millis(200),
             "the second holder waited for the first",
         )?;
-        release.join().map_err(|_| "release thread panicked".to_string())
+        release
+            .join()
+            .map_err(|_| "release thread panicked".to_string())
     }
 
     #[test]

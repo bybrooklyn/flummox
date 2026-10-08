@@ -712,9 +712,21 @@ mod tests {
 
     #[test]
     fn a_cancelled_pass_records_only_the_share_it_rewrote() -> TestResult {
-        check_eq(pass_saving(1000, 100, 1, true), 10, "cancelled at one percent")?;
-        check_eq(pass_saving(1000, 100, 100, true), 1000, "cancelled at the end")?;
-        check_eq(pass_saving(1000, 100, 1, false), 1000, "control: a finished pass")?;
+        check_eq(
+            pass_saving(1000, 100, 1, true),
+            10,
+            "cancelled at one percent",
+        )?;
+        check_eq(
+            pass_saving(1000, 100, 100, true),
+            1000,
+            "cancelled at the end",
+        )?;
+        check_eq(
+            pass_saving(1000, 100, 1, false),
+            1000,
+            "control: a finished pass",
+        )?;
         check_eq(pass_saving(1000, 0, 0, true), 1000, "nothing planned")?;
         // Cancelled at one percent of a game estimated to save 300: the record
         // says 3, not 300, and the resumed pass adds the rest.
@@ -729,9 +741,15 @@ mod tests {
 
     #[test]
     fn a_sliver_of_budget_is_not_spent_on_a_large_file() -> TestResult {
-        check(budget_spent(2048, 2_000_000_000), "a 2 KiB sliver on a 2 GB file")?;
+        check(
+            budget_spent(2048, 2_000_000_000),
+            "a 2 KiB sliver on a 2 GB file",
+        )?;
         check(budget_spent(0, 1), "nothing left")?;
-        check(!budget_spent(2048, 2048), "control: a file the sliver covers whole")?;
+        check(
+            !budget_spent(2048, 2048),
+            "control: a file the sliver covers whole",
+        )?;
         check(
             !budget_spent(MIN_SAMPLE, 2_000_000_000),
             "control: a workable remainder is used",
@@ -741,7 +759,11 @@ mod tests {
     #[test]
     fn a_pass_with_nothing_to_do_keeps_the_recorded_level() -> TestResult {
         check_eq(recorded_level(None, Some(9)), 9, "kept")?;
-        check_eq(recorded_level(Some(15), Some(9)), 15, "control: a real pass wins")?;
+        check_eq(
+            recorded_level(Some(15), Some(9)),
+            15,
+            "control: a real pass wins",
+        )?;
         check_eq(recorded_level(None, None), 0, "nothing known")
     }
 
