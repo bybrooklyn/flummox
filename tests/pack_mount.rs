@@ -8,8 +8,8 @@ use flummox::{
 };
 use std::{
     fs,
-    io::{Read, Seek, SeekFrom},
-    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
+    io::{Read, Seek, SeekFrom, Write},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink},
     path::Path,
     sync::atomic::AtomicBool,
 };
@@ -355,4 +355,283 @@ fn writable_layer_survives_remount_and_keeps_the_store_immutable() -> TestResult
         store.is_file() && writes.is_dir(),
         "commit retains rollback data",
     )
+}
+
+// True when a FUSE mount can run here. Fails the test run when FUSE is
+// required and missing, so CI cannot skip these by accident.
+fn fuse_ready(what: &str) -> Result<bool, String> {
+    if Path::new("/dev/fuse").exists() {
+        return Ok(true);
+    }
+    check(
+        std::env::var_os("FLUMMOX_REQUIRE_FUSE").is_none(),
+        "FUSE is required for this test run",
+    )?;
+    eprintln!("skipped: {what} requires /dev/fuse");
+    Ok(false)
+}
+
+// A store built from `files`, with an empty mount point and a layer path.
+struct Mounted {
+    temp: tempfile::TempDir,
+    store: std::path::PathBuf,
+    target: std::path::PathBuf,
+    writes: std::path::PathBuf,
+}
+
+fn mounted_fixture(files: &[(&str, &[u8])], links: &[(&str, &str)]) -> Result<Mounted, String> {
+    let temp = tempfile::tempdir().ctx("fixture")?;
+    let source = temp.path().join("source");
+    let target = temp.path().join("view");
+    fs::create_dir(&source).ctx("source")?;
+    fs::create_dir(&target).ctx("target")?;
+    for (name, bytes) in files {
+        fs::write(source.join(name), bytes).ctx("base file")?;
+    }
+    for (name, original) in links {
+        fs::hard_link(source.join(original), source.join(name)).ctx("base hard link")?;
+    }
+    let store = temp.path().join("game.flumpack");
+    pack::create(
+        &source,
+        &store,
+        pack::Options::default(),
+        &AtomicBool::new(false),
+    )
+    .ctx("store")?;
+    let writes = temp.path().join("writes");
+    Ok(Mounted {
+        temp,
+        store,
+        target,
+        writes,
+    })
+}
+
+#[test]
+fn a_recreated_name_does_not_join_a_file_that_still_has_another_name() -> TestResult {
+    if !fuse_ready("inode reuse check")? {
+        return Ok(());
+    }
+    let fixture = mounted_fixture(&[("t", b"base bytes")], &[("a", "t")])?;
+    let target = &fixture.target;
+    let session =
+        pack::mount::mount(&fixture.store, target, Some(&fixture.writes)).ctx("writable mount")?;
+    // A link made through the mount, then its first name removed and reused.
+    fs::write(target.join("f.tmp"), b"one").ctx("first temp file")?;
+    fs::hard_link(target.join("f.tmp"), target.join("f")).ctx("link")?;
+    fs::remove_file(target.join("f.tmp")).ctx("unlink first name")?;
+    fs::write(target.join("f.tmp"), b"two").ctx("second temp file")?;
+    check_eq(
+        fs::read(target.join("f")).ctx("read f")?,
+        b"one".to_vec(),
+        "the surviving name keeps its own bytes",
+    )?;
+    check_eq(
+        fs::read(target.join("f.tmp")).ctx("read f.tmp")?,
+        b"two".to_vec(),
+        "the new file at the reused name has its own bytes",
+    )?;
+    // A base hard link: remove one name, then create a new file there.
+    fs::remove_file(target.join("a")).ctx("remove base alias")?;
+    check_eq(
+        fs::metadata(target.join("t")).ctx("stat target")?.nlink(),
+        1,
+        "a removed name no longer counts as a link",
+    )?;
+    fs::write(target.join("a"), b"fresh").ctx("new alias")?;
+    check_eq(
+        fs::read(target.join("t")).ctx("read t")?,
+        b"base bytes".to_vec(),
+        "writing the new file leaves the old target alone",
+    )?;
+    check_eq(
+        fs::read(target.join("a")).ctx("read a")?,
+        b"fresh".to_vec(),
+        "the new file keeps its bytes",
+    )?;
+    session.umount_and_join().ctx("unmount")?;
+    drop(fixture.temp);
+    Ok(())
+}
+
+#[test]
+fn exchanging_two_names_is_refused_and_changes_nothing() -> TestResult {
+    if !fuse_ready("renameat2 check")? {
+        return Ok(());
+    }
+    let fixture = mounted_fixture(&[("a", b"first"), ("b", b"second")], &[])?;
+    let target = &fixture.target;
+    let session =
+        pack::mount::mount(&fixture.store, target, Some(&fixture.writes)).ctx("writable mount")?;
+    let exchange = rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        target.join("a"),
+        rustix::fs::CWD,
+        target.join("b"),
+        rustix::fs::RenameFlags::EXCHANGE,
+    );
+    check_eq(
+        exchange,
+        Err(rustix::io::Errno::INVAL),
+        "an exchange is not supported",
+    )?;
+    check_eq(
+        fs::read(target.join("a")).ctx("read a")?,
+        b"first".to_vec(),
+        "a keeps its bytes",
+    )?;
+    check_eq(
+        fs::read(target.join("b")).ctx("read b")?,
+        b"second".to_vec(),
+        "b keeps its bytes",
+    )?;
+    // Control: a plain rename over the same target still works.
+    fs::rename(target.join("a"), target.join("b")).ctx("plain rename")?;
+    check_eq(
+        fs::read(target.join("b")).ctx("read b after rename")?,
+        b"first".to_vec(),
+        "a plain rename replaces the target",
+    )?;
+    session.umount_and_join().ctx("unmount")
+}
+
+#[test]
+fn an_open_file_stays_readable_and_writable_after_its_name_changes() -> TestResult {
+    if !fuse_ready("open handle check")? {
+        return Ok(());
+    }
+    let fixture = mounted_fixture(&[("config", b"base config"), ("spare", b"spare")], &[])?;
+    let target = &fixture.target;
+    let session =
+        pack::mount::mount(&fixture.store, target, Some(&fixture.writes)).ctx("writable mount")?;
+    // A store file opened, then removed.
+    let first = fs::File::open(target.join("config")).ctx("open base file")?;
+    fs::remove_file(target.join("config")).ctx("unlink open file")?;
+    let mut bytes = Vec::new();
+    (&first).read_to_end(&mut bytes).ctx("read after unlink")?;
+    check_eq(bytes, b"base config".to_vec(), "unlinked store file")?;
+    drop(first);
+    // A store file opened, then renamed over by another file.
+    let held = fs::File::open(target.join("spare")).ctx("open second file")?;
+    fs::write(target.join("new.tmp"), b"replacement").ctx("temp file")?;
+    fs::rename(target.join("new.tmp"), target.join("spare")).ctx("rename over")?;
+    let mut bytes = Vec::new();
+    (&held).read_to_end(&mut bytes).ctx("read after replace")?;
+    check_eq(bytes, b"spare".to_vec(), "replaced store file")?;
+    check_eq(
+        fs::read(target.join("spare")).ctx("read replacement")?,
+        b"replacement".to_vec(),
+        "the name now holds the replacement",
+    )?;
+    // A layer file opened for writing, then removed.
+    let mut written = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target.join("log"))
+        .ctx("create log")?;
+    fs::remove_file(target.join("log")).ctx("unlink log")?;
+    written
+        .write_all(b"still writable")
+        .ctx("write after unlink")?;
+    // A mount with open files would not finish unmounting.
+    drop(written);
+    drop(held);
+    session.umount_and_join().ctx("unmount")
+}
+
+#[test]
+fn a_file_created_read_only_can_be_written_through_its_descriptor() -> TestResult {
+    if !fuse_ready("read-only create check")? {
+        return Ok(());
+    }
+    let fixture = mounted_fixture(&[("base", b"x")], &[])?;
+    let target = &fixture.target;
+    let session =
+        pack::mount::mount(&fixture.store, target, Some(&fixture.writes)).ctx("writable mount")?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o444)
+        .open(target.join("copied"))
+        .ctx("create read-only")?;
+    file.write_all(b"payload").ctx("write through descriptor")?;
+    file.set_len(3).ctx("truncate through descriptor")?;
+    file.sync_all().ctx("sync")?;
+    drop(file);
+    check_eq(
+        fs::read(target.join("copied")).ctx("read back")?,
+        b"pay".to_vec(),
+        "bytes written through the creating descriptor",
+    )?;
+    check_eq(
+        fs::metadata(target.join("copied"))
+            .ctx("mode")?
+            .permissions()
+            .mode()
+            & 0o777,
+        0o444,
+        "the file keeps its requested mode",
+    )?;
+    session.umount_and_join().ctx("unmount")
+}
+
+#[test]
+fn setting_times_on_a_symlink_leaves_what_it_points_at_alone() -> TestResult {
+    if !fuse_ready("symlink times check")? {
+        return Ok(());
+    }
+    let fixture = mounted_fixture(&[("base", b"x")], &[])?;
+    let target = &fixture.target;
+    // From the layer's `files` folder this relative link resolves to a file
+    // beside the layer, outside it.
+    let victim = fixture.temp.path().join("victim");
+    fs::write(&victim, b"outside").ctx("victim")?;
+    let before = fs::metadata(&victim).ctx("victim stat")?.mtime();
+    let session =
+        pack::mount::mount(&fixture.store, target, Some(&fixture.writes)).ctx("writable mount")?;
+    symlink("../../victim", target.join("link")).ctx("symlink")?;
+    let stamp = rustix::fs::Timespec {
+        tv_sec: 1_000_000_000,
+        tv_nsec: 0,
+    };
+    let result = rustix::fs::utimensat(
+        rustix::fs::CWD,
+        target.join("link"),
+        &rustix::fs::Timestamps {
+            last_access: stamp,
+            last_modification: stamp,
+        },
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+    );
+    check(result.is_ok(), format!("utimensat on the link: {result:?}"))?;
+    check_eq(
+        fs::metadata(&victim).ctx("victim after")?.mtime(),
+        before,
+        "the file behind the link keeps its time",
+    )?;
+    check_eq(
+        fs::symlink_metadata(target.join("link"))
+            .ctx("link stat")?
+            .mtime(),
+        1_000_000_000,
+        "the link itself takes the time",
+    )?;
+    session.umount_and_join().ctx("unmount")
+}
+
+#[test]
+fn a_layer_inside_the_mount_target_is_refused() -> TestResult {
+    if !fuse_ready("nested layer check")? {
+        return Ok(());
+    }
+    let fixture = mounted_fixture(&[("base", b"x")], &[])?;
+    let inside = fixture.target.join("layer");
+    let refused = pack::mount::mount(&fixture.store, &fixture.target, Some(&inside));
+    check(refused.is_err(), "a layer under the mount point is refused")?;
+    drop(refused);
+    // Control: the same store mounts with the layer elsewhere.
+    let session = pack::mount::mount(&fixture.store, &fixture.target, Some(&fixture.writes))
+        .ctx("mount with the layer outside")?;
+    session.umount_and_join().ctx("unmount")
 }

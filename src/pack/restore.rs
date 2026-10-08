@@ -98,8 +98,8 @@ pub fn restore(store: &Path, destination: &Path, cancel: &AtomicBool) -> Result<
                 file.set_len(*size)?;
                 ensure!(file.metadata()?.len() == *size, "Restored length mismatch");
                 file.set_times(FileTimes::new().set_modified(timestamp(entry)?))?;
-                file.set_permissions(Permissions::from_mode(entry.mode))?;
                 apply_xattrs(&path, &entry.xattrs)?;
+                file.set_permissions(Permissions::from_mode(entry.mode))?;
                 file.sync_all()?;
             }
             Kind::SlicedFile { size, .. } if entry.hardlink_to.is_none() => {
@@ -109,8 +109,8 @@ pub fn restore(store: &Path, destination: &Path, cancel: &AtomicBool) -> Result<
                     .open(&path)?;
                 file.write_all(&reader.read(&entry.path, 0, usize::try_from(*size)?)?)?;
                 file.set_times(FileTimes::new().set_modified(timestamp(entry)?))?;
-                file.set_permissions(Permissions::from_mode(entry.mode))?;
                 apply_xattrs(&path, &entry.xattrs)?;
+                file.set_permissions(Permissions::from_mode(entry.mode))?;
                 file.sync_all()?;
             }
             _ => {}
@@ -130,8 +130,8 @@ pub fn restore(store: &Path, destination: &Path, cancel: &AtomicBool) -> Result<
         if matches!(entry.kind, Kind::Directory) {
             let directory = File::open(staged.path().join(&entry.path))?;
             directory.set_times(FileTimes::new().set_modified(timestamp(entry)?))?;
-            directory.set_permissions(Permissions::from_mode(entry.mode))?;
             apply_xattrs(&staged.path().join(&entry.path), &entry.xattrs)?;
+            directory.set_permissions(Permissions::from_mode(entry.mode))?;
             directory.sync_all()?;
         }
     }

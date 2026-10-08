@@ -73,7 +73,10 @@ mod enabled {
     use crate::pack::{Reader, mount};
     use anyhow::{Context, Result, ensure};
     use std::{
-        os::unix::fs::{DirBuilderExt, MetadataExt},
+        os::unix::{
+            ffi::OsStrExt,
+            fs::{DirBuilderExt, MetadataExt},
+        },
         path::Path,
         sync::atomic::AtomicBool,
     };
@@ -100,6 +103,92 @@ mod enabled {
             self.session.umount_and_join()?;
             Ok(())
         }
+    }
+
+    /// Start of the name of a compaction's output beside the store it
+    /// replaces. The rest is the process id and an attempt number.
+    pub(crate) fn compaction_prefix(game: &Path, label: &str) -> String {
+        format!(
+            ".flummox-{}-{label}-",
+            blake3::hash(game.as_os_str().as_bytes()).to_hex()
+        )
+    }
+
+    /// Deletes compacted stores for this game that no record names. A
+    /// compaction that died after building its store leaves one, and its
+    /// links pin pool objects. A store belonging to a live process other than
+    /// this one is left alone. Returns how many were removed.
+    pub(crate) fn remove_orphaned_compactions(install: &Install) -> usize {
+        let Some(parent) = install.store_path.parent() else {
+            return 0;
+        };
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return 0;
+        };
+        let prefix = compaction_prefix(&install.game_path, "compact-store");
+        let mut removed = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let Some(rest) = name.to_str().and_then(|name| name.strip_prefix(&prefix)) else {
+                continue;
+            };
+            let Some((pid, attempt)) = rest.split_once('-') else {
+                continue;
+            };
+            let (Ok(pid), Ok(_attempt)) = (pid.parse::<u32>(), attempt.parse::<u32>()) else {
+                continue;
+            };
+            let recorded =
+                path == install.store_path || install.previous_store_path.as_ref() == Some(&path);
+            let running =
+                pid != std::process::id() && Path::new("/proc").join(pid.to_string()).exists();
+            if recorded || running {
+                continue;
+            }
+            let gone = if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            if gone.is_ok() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    // True for a folder that holds only what a directory store holds, so a
+    // store whose deletion stopped partway can still be finished.
+    fn is_partial_directory_store(path: &Path) -> bool {
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return false;
+        };
+        if !metadata.is_dir() {
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let kind = entry.file_type().ok();
+            match entry.file_name().to_str() {
+                Some("manifest" | "pool.json") if kind.is_some_and(|kind| kind.is_file()) => {}
+                Some("chunks") if kind.is_some_and(|kind| kind.is_dir()) => {
+                    let Ok(objects) = std::fs::read_dir(entry.path()) else {
+                        return false;
+                    };
+                    if !objects
+                        .flatten()
+                        .all(|object| object.file_type().is_ok_and(|kind| kind.is_file()))
+                    {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
     }
 
     // Canonical path of the update layer, created with mode 0700 if absent.
@@ -310,6 +399,7 @@ mod enabled {
             install.phase = InstallPhase::Mounted;
             install.message = "Compaction was interrupted; using the previous store".into();
         }
+        remove_orphaned_compactions(install);
         if install.phase == InstallPhase::Switching {
             return activate(install).map(Some);
         }
@@ -429,14 +519,16 @@ mod enabled {
                 "The previous and current stores use the same path"
             );
             // The record is read back from disk, so the path must still hold
-            // a store before anything under it is removed.
-            if std::fs::symlink_metadata(previous).is_ok() {
-                Reader::open(previous).with_context(|| {
-                    format!(
-                        "{} is not a store, so it was left alone",
-                        previous.display()
-                    )
-                })?;
+            // a store before anything under it is removed. A directory store
+            // whose earlier deletion stopped partway no longer opens.
+            if std::fs::symlink_metadata(previous).is_ok()
+                && let Err(error) = Reader::open(previous)
+            {
+                ensure!(
+                    is_partial_directory_store(previous),
+                    "{} is not a store, so it was left alone: {error:#}",
+                    previous.display()
+                );
             }
             let removed = if previous.is_dir() {
                 std::fs::remove_dir_all(previous)
@@ -615,6 +707,87 @@ mod tests {
         reclaiming.backup_path = Some(original.clone());
         finish_reclaim(&mut reclaiming).ctx("reclaim the real original")?;
         check(!original.exists(), "the retained original is removed")
+    }
+
+    #[test]
+    fn an_interrupted_prune_of_a_directory_store_can_finish() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let game = temp.path().join("game");
+        std::fs::create_dir(&game).ctx("game")?;
+        std::fs::write(game.join("data"), b"bytes").ctx("source")?;
+        let store = temp.path().join("old-store");
+        crate::pack::create_shared(
+            &game,
+            &store,
+            &temp.path().join("pool"),
+            crate::pack::Options::default(),
+            &AtomicBool::new(false),
+        )
+        .ctx("directory store")?;
+        check(store.is_dir(), "the fixture is a directory store")?;
+        // Control: the intact store opens, so only the damage below matters.
+        crate::pack::Reader::open(&store).ctx("intact store opens")?;
+        std::fs::remove_file(store.join("manifest")).ctx("interrupted deletion")?;
+        check(
+            crate::pack::Reader::open(&store).is_err(),
+            "the damaged store no longer opens",
+        )?;
+        let mut pruning = record(&game, InstallPhase::Pruning);
+        pruning.previous_store_path = Some(store.clone());
+        finish_prune(&mut pruning).ctx("finish the prune")?;
+        check(!store.exists(), "the partial store is removed")?;
+        check_eq(pruning.phase, InstallPhase::Mounted, "back to mounted")?;
+        // A folder with a manifest and anything else is not ours to remove.
+        let other = temp.path().join("other");
+        std::fs::create_dir(&other).ctx("other")?;
+        std::fs::write(other.join("manifest"), b"not a store").ctx("manifest")?;
+        std::fs::write(other.join("notes.txt"), b"keep").ctx("notes")?;
+        let mut pruning = record(&game, InstallPhase::Pruning);
+        pruning.previous_store_path = Some(other.clone());
+        check(
+            finish_prune(&mut pruning).is_err(),
+            "other folders are refused",
+        )?;
+        check(
+            other.join("notes.txt").exists(),
+            "their files are untouched",
+        )
+    }
+
+    #[test]
+    fn a_compaction_with_no_record_is_removed_on_recovery() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let game = temp.path().join("game");
+        let mut install = record(&game, InstallPhase::Mounted);
+        let prefix = compaction_prefix(&game, "compact-store");
+        let ours = std::process::id();
+        let orphan = temp.path().join(format!("{prefix}4000000000-0"));
+        let own_orphan = temp.path().join(format!("{prefix}{ours}-3"));
+        let recorded = temp.path().join(format!("{prefix}4000000000-1"));
+        let previous = temp.path().join(format!("{prefix}4000000000-2"));
+        let other_game = temp.path().join(format!(
+            "{}4000000000-0",
+            compaction_prefix(&temp.path().join("other"), "compact-store")
+        ));
+        for path in [&orphan, &own_orphan, &recorded, &previous, &other_game] {
+            std::fs::create_dir(path).ctx("fixture store")?;
+            std::fs::write(path.join("manifest"), b"x").ctx("fixture file")?;
+        }
+        install.store_path = recorded.clone();
+        install.previous_store_path = Some(previous.clone());
+        check_eq(
+            remove_orphaned_compactions(&install),
+            2,
+            "two orphans removed",
+        )?;
+        check(!orphan.exists(), "a dead process's store is removed")?;
+        check(
+            !own_orphan.exists(),
+            "an earlier attempt of this process is removed",
+        )?;
+        check(recorded.exists(), "the current store is kept")?;
+        check(previous.exists(), "the previous store is kept")?;
+        check(other_game.exists(), "another game's store is kept")
     }
 
     #[test]

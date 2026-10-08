@@ -25,8 +25,8 @@ pub use restore::restore;
 
 #[cfg(feature = "pack-mount")]
 pub(crate) use install::{
-    MountedInstall, activate, begin_prune, finish_prune, finish_reclaim, prepare, prepare_observed,
-    reclaim, recover, rollback,
+    MountedInstall, activate, begin_prune, compaction_prefix, finish_prune, finish_reclaim,
+    prepare, prepare_observed, reclaim, recover, rollback,
 };
 
 /// Builds a new store at `output` from `store` with the stopped update layer
