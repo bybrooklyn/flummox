@@ -12,7 +12,8 @@ binaries with Maximum Space support. Install `fuse3` for Maximum Space and
 Choose `linux-x86_64` for Intel/AMD or `linux-aarch64` for ARM64.
 The archive contains both binaries, desktop integration, and documentation.
 It is built on Ubuntu 24.04 and requires glibc 2.39 or newer plus the windowing
-libraries listed in the Arch package. It is not a static portable executable.
+libraries listed in the Arch package. The licences of the bundled crates are in
+`share/licenses/flummox/THIRD-PARTY-LICENSES.txt`. It is not a static portable executable.
 
 Verify the archive before extracting it:
 
@@ -30,8 +31,11 @@ sudo install -Dm644 share/licenses/flummox/LICENSE /usr/share/licenses/flummox/L
 Adjust the archive version to the downloaded release. Source builds are available
 for distributions with an older glibc. Launch `flummox-gui` from the desktop menu
 or terminal. The coordinator starts as the current user; no root daemon is needed.
-The optional legacy watch service is included separately and is not enabled by
-installation. The desktop manages its own login startup when maintenance or
+The archive carries the packaged watch unit under `lib/systemd/user` for
+reference, and it is not enabled by installation. `flummox watch enable` writes
+its own copy of the unit into `~/.config/systemd/user` with the hardening of
+the packaged one and the preset, level and threads you give it, so it needs no
+packaged unit. The desktop manages its own login startup when maintenance or
 mounted installs require it.
 
 ## Upgrade a running installation
@@ -114,14 +118,20 @@ Tags refer to the commit that exists when you create them. Creating a tag before
 committing your changes would release the earlier commit. `git push` alone does
 not normally push tags; push the tag explicitly as above.
 
-The tag supplies the version in the CI build's Cargo manifest and lockfile;
-there is no manual version bump required before later tags. The release includes
+The tag supplies the version in the CI build's Cargo manifest and lockfile,
+including a prerelease suffix, but its base version must equal the version in
+`Cargo.toml`, so bump `Cargo.toml` and the `pkgver` in `packaging/PKGBUILD` in
+the tagged commit. The commit must be on `main`, a stable tag needs
+`docs/releases/VERSION.md` and a passed record in `docs/validation`, and a
+tag that fails any of these stops the workflow before it builds. The release includes
 a changelog of commits since the previous reachable version tag, versioned
 Linux x86_64/ARM64 archives, an Apple Silicon app bundle, Windows x64 installer
 and portable ZIP, and an Arch package. GitHub displays each asset's SHA-256 digest;
-separate checksum downloads are omitted. All native builds,
-tests, dependency checks, and installation checks must pass before the release
-is published. Stable releases then update the Homebrew tap and AUR recipes.
+separate checksum downloads are omitted. Native builds, tests, dependency
+checks and the btrfs and FUSE tests must pass before any release is published.
+The Arch and Homebrew installation checks run for stable releases only and
+prereleases skip them. Stable releases then update the Homebrew tap and AUR
+recipes.
 `v0.0.2-rc.1` publishes a prerelease and leaves the stable package channels alone.
 Do not reuse published tags.
 
@@ -132,7 +142,7 @@ validation, and current limitations instead of the full development history.
 
 The Release workflow can be run manually on a branch to build and test downloadable
 artifacts without publishing a release. `just release` builds a local Linux
-x86_64 archive. See [release automation](release-automation.md) for credentials,
+x86_64 archive. See [release automation](https://github.com/bybrooklyn/flummox/blob/main/docs/release-automation.md) for credentials,
 retries, and signing.
 
 ## Games in other locations
