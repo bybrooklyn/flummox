@@ -237,6 +237,37 @@ fn prune_abandoned(abandoned: &mut Vec<crate::launchers::scan_job::Worker>) {
     });
 }
 
+/// Records that the game called `title` has run from a store with updates
+/// folded in, which lets upkeep delete the previous version.
+///
+/// A process that merely has the folder open, such as a shell or a client
+/// verifying files, does not count. Only code running from the game folder
+/// does.
+fn mark_played(
+    snapshot: &Snapshot,
+    games: &[Game],
+    title: &str,
+    source: &dyn crate::busy::ProcSource,
+    upkeep: &mut std::collections::HashMap<String, Upkeep>,
+) {
+    for install in snapshot
+        .packs
+        .iter()
+        .filter(|install| install.previous_store_path.is_some())
+    {
+        if games
+            .iter()
+            .any(|game| game.install_dir == install.game_path && game.title == title)
+            && crate::busy::played_from(&install.game_path, source)
+        {
+            upkeep
+                .entry(install.game_path.to_string_lossy().into_owned())
+                .or_default()
+                .played = true;
+        }
+    }
+}
+
 /// Whether the loop has work to watch for: a running worker or storage
 /// thread, or a job that can be started. A job the user paused before it
 /// started waits for the user and needs neither.
@@ -1966,21 +1997,13 @@ pub(super) fn run() -> Result<()> {
             // A store with updates folded in counts as played once its game
             // is seen running. Upkeep deletes the previous version after that.
             if let Some(title) = &snapshot.gaming {
-                for install in snapshot
-                    .packs
-                    .iter()
-                    .filter(|install| install.previous_store_path.is_some())
-                {
-                    if games
-                        .iter()
-                        .any(|game| game.install_dir == install.game_path && game.title == *title)
-                    {
-                        upkeep
-                            .entry(install.game_path.to_string_lossy().into_owned())
-                            .or_default()
-                            .played = true;
-                    }
-                }
+                mark_played(
+                    &snapshot,
+                    &games,
+                    title,
+                    &crate::busy::ProcFs::new().with_maps(),
+                    &mut upkeep,
+                );
             }
         }
         // Maintenance, after each finished scan: queue compression for new
@@ -2507,6 +2530,73 @@ mod tests {
             "a restore is refused while a compaction waits",
         )?;
         check_eq(snapshot.jobs.len(), 1, "a refused task queues nothing")
+    }
+
+    struct FakeProcs(Vec<crate::busy::ProcInfo>);
+
+    impl crate::busy::ProcSource for FakeProcs {
+        fn processes(&self) -> Vec<crate::busy::ProcInfo> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn a_shell_in_the_game_folder_does_not_count_as_playing() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let folder = temp.path().join("game");
+        std::fs::create_dir(&folder).ctx("game folder")?;
+        let (_db, mut snapshot) = open_store(&temp.path().join("jobs.sqlite")).ctx("store")?;
+        snapshot.packs.push(crate::pack::Install {
+            game_path: folder.clone(),
+            store_path: temp.path().join("store"),
+            writes_path: temp.path().join("writes"),
+            backup_path: None,
+            previous_store_path: Some(temp.path().join("previous")),
+            previous_writes_path: None,
+            summary: None,
+            phase: crate::pack::InstallPhase::Mounted,
+            message: String::new(),
+        });
+        let games = [game(&folder, "game")];
+        let key = folder.to_string_lossy().into_owned();
+        let shell = crate::busy::ProcInfo {
+            pid: 30,
+            name: "bash".into(),
+            exe: Some("/usr/bin/bash".into()),
+            cwd: Some(folder.clone()),
+            ..crate::busy::ProcInfo::default()
+        };
+        let mut records = std::collections::HashMap::new();
+        mark_played(
+            &snapshot,
+            &games,
+            "game",
+            &FakeProcs(vec![shell]),
+            &mut records,
+        );
+        check(
+            records
+                .get(&key)
+                .is_none_or(|record: &Upkeep| !record.played),
+            "a shell with its working directory there has not played the game",
+        )?;
+        let player = crate::busy::ProcInfo {
+            pid: 31,
+            name: "game".into(),
+            exe: Some(folder.join("game.bin")),
+            ..crate::busy::ProcInfo::default()
+        };
+        mark_played(
+            &snapshot,
+            &games,
+            "game",
+            &FakeProcs(vec![player]),
+            &mut records,
+        );
+        check(
+            records.get(&key).is_some_and(|record| record.played),
+            "control: a process running from the folder has",
+        )
     }
 
     #[test]

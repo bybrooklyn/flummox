@@ -25,6 +25,9 @@ pub struct ProcInfo {
     pub root: Option<PathBuf>,
     /// Open files, best effort.
     pub open_files: Vec<PathBuf>,
+    /// Files mapped with execute permission, best effort. A Wine game's
+    /// executable shows up here while the process itself is Wine's.
+    pub exec_maps: Vec<PathBuf>,
 }
 
 impl ProcInfo {
@@ -34,11 +37,23 @@ impl ProcInfo {
     /// gives paths relative to its own root, so the directory is also tried
     /// with that root stripped.
     pub fn uses_dir(&self, dir: &Path) -> bool {
-        let paths = self
-            .exe
-            .iter()
-            .chain(self.cwd.iter())
-            .chain(self.open_files.iter());
+        self.any_inside(
+            self.exe
+                .iter()
+                .chain(self.cwd.iter())
+                .chain(self.open_files.iter()),
+            dir,
+        )
+    }
+
+    /// Whether this process is executing code from `dir`: its executable or
+    /// a mapped executable file lies inside it. A shell with its working
+    /// directory there, or a launcher reading the files, does not qualify.
+    pub fn runs_from(&self, dir: &Path) -> bool {
+        self.any_inside(self.exe.iter().chain(self.exec_maps.iter()), dir)
+    }
+
+    fn any_inside<'a>(&self, paths: impl Iterator<Item = &'a PathBuf>, dir: &Path) -> bool {
         for p in paths {
             if p.starts_with(dir) {
                 return true;
@@ -114,6 +129,8 @@ pub struct ProcFs {
     /// Only processes with this uid are inspected; others' `fd` entries are
     /// unreadable anyway.
     uid: u32,
+    /// Whether to read `maps`, which costs a read per process.
+    maps: bool,
 }
 
 impl Default for ProcFs {
@@ -130,7 +147,15 @@ impl ProcFs {
         Self {
             root: PathBuf::from("/proc"),
             uid,
+            maps: false,
         }
+    }
+
+    /// Also reads each process's executable mappings into
+    /// [`ProcInfo::exec_maps`], which [`played_from`] needs.
+    #[must_use]
+    pub fn with_maps(self) -> Self {
+        Self { maps: true, ..self }
     }
 
     /// Reads a different `/proc`-shaped tree, for tests.
@@ -138,6 +163,7 @@ impl ProcFs {
         Self {
             root: root.into(),
             uid,
+            maps: false,
         }
     }
 
@@ -169,8 +195,36 @@ impl ProcFs {
             cwd: std::fs::read_link(dir.join("cwd")).ok(),
             root: std::fs::read_link(dir.join("root")).ok(),
             open_files,
+            exec_maps: if self.maps {
+                exec_maps(&dir.join("maps"))
+            } else {
+                Vec::new()
+            },
         })
     }
+}
+
+/// The files a process has mapped executable, from its `maps` file.
+///
+/// Lines read `start-end perms offset dev inode path`. Anonymous mappings and
+/// pseudo paths such as `[heap]` have no absolute path and are left out. A
+/// file that cannot be read gives an empty list.
+fn exec_maps(maps: &Path) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(maps) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.splitn(6, ' ');
+        let perms = fields.nth(1).unwrap_or_default();
+        let path = fields.nth(3).unwrap_or_default().trim_start();
+        if perms.contains('x') && path.starts_with('/') {
+            files.push(PathBuf::from(path.trim_end_matches(" (deleted)")));
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
 }
 
 impl ProcSource for ProcFs {
@@ -309,6 +363,16 @@ impl Drop for BackgroundScan {
     }
 }
 
+/// Whether any process is running code from `dir`, as opposed to merely
+/// having a file or working directory there. This process is not counted.
+pub fn played_from(dir: &Path, source: &dyn ProcSource) -> bool {
+    let own = std::process::id() as i32;
+    source
+        .processes()
+        .iter()
+        .any(|p| p.pid != own && p.runs_from(dir))
+}
+
 /// The first process using `dir`, described for the user.
 ///
 /// Returns `None` when the directory looks free.
@@ -361,6 +425,103 @@ mod tests {
             process_using(Path::new("/games/Portal"), &src),
             None,
             "an unrelated directory should look free",
+        )
+    }
+
+    #[test]
+    fn only_a_process_running_game_code_counts_as_playing() -> TestResult {
+        let game = Path::new("/games/Terraria");
+        let shell = ProcInfo {
+            pid: 20,
+            name: "bash".to_owned(),
+            exe: Some(PathBuf::from("/usr/bin/bash")),
+            cwd: Some(game.to_path_buf()),
+            ..ProcInfo::default()
+        };
+        let verifier = ProcInfo {
+            pid: 21,
+            name: "steam".to_owned(),
+            exe: Some(PathBuf::from("/home/u/.steam/steam")),
+            open_files: vec![game.join("Terraria.bin.x86_64")],
+            ..ProcInfo::default()
+        };
+        let wine = ProcInfo {
+            pid: 22,
+            name: "wine64-preloader".to_owned(),
+            exe: Some(PathBuf::from("/opt/proton/files/bin/wine64-preloader")),
+            exec_maps: vec![game.join("Game.exe")],
+            ..ProcInfo::default()
+        };
+        let bystanders = Fake(vec![shell, verifier]);
+        check(
+            process_using(game, &bystanders).is_some(),
+            "control: both still count as using the folder",
+        )?;
+        check(
+            !played_from(game, &bystanders),
+            "a shell in the folder and a client reading it are not playing",
+        )?;
+        check(
+            played_from(game, &Fake(vec![wine])),
+            "a Wine process mapping the game's executable is playing",
+        )?;
+        let native = ProcInfo {
+            pid: 23,
+            exe: Some(game.join("Terraria.bin.x86_64")),
+            ..ProcInfo::default()
+        };
+        check(
+            played_from(game, &Fake(vec![native])),
+            "a native executable inside the folder is playing",
+        )
+    }
+
+    #[test]
+    fn executable_maps_are_read_from_a_maps_file() -> TestResult {
+        let tmp = tempfile::tempdir().ctx("make a temporary directory")?;
+        let maps = tmp.path().join("maps");
+        std::fs::write(
+            &maps,
+            "55d0-55e0 r-xp 00000000 08:01 11 /games/A/game.exe\n\
+             7f00-7f10 r--p 00000000 08:01 12 /games/A/data.pak\n\
+             7f20-7f30 rwxp 00000000 00:00 0 \n\
+             7ffc-7fff r-xp 00000000 00:00 0 [vdso]\n\
+             7f40-7f50 r-xp 00000000 08:01 13 /games/A/with space.so\n",
+        )
+        .ctx("write the fake maps file")?;
+        check_eq(
+            exec_maps(&maps),
+            vec![
+                PathBuf::from("/games/A/game.exe"),
+                PathBuf::from("/games/A/with space.so"),
+            ],
+            "only executable file mappings are kept",
+        )
+    }
+
+    #[test]
+    fn mappings_are_read_only_when_asked_for() -> TestResult {
+        let tmp = tempfile::tempdir().ctx("make a temporary directory")?;
+        let proc = tmp.path().join("proc/42");
+        std::fs::create_dir_all(&proc).ctx("create the fake process directory")?;
+        std::fs::write(
+            proc.join("maps"),
+            "1000-2000 r-xp 00000000 08:01 11 /games/A/game.exe\n",
+        )
+        .ctx("write the fake maps file")?;
+        // SAFETY: getuid() takes no arguments and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let plain = ProcFs::with_root(tmp.path().join("proc"), uid).processes();
+        check(
+            plain.iter().all(|p| p.exec_maps.is_empty()),
+            "the default scan does not read maps",
+        )?;
+        let mapped = ProcFs::with_root(tmp.path().join("proc"), uid)
+            .with_maps()
+            .processes();
+        check(
+            mapped.iter().any(|p| p.runs_from(Path::new("/games/A"))),
+            "the mapped executable places the process in the folder",
         )
     }
 
