@@ -151,19 +151,34 @@ fn listener_named(pipe_name: &str) -> Result<std::fs::File> {
     // SAFETY: the successful pipe handle is uniquely transferred to this owned file.
     Ok(unsafe { std::fs::File::from_raw_handle(handle.cast()) })
 }
-/// Opens the client end, nonblocking. Fails at once if no worker is listening or
-/// the worker is serving another client.
+/// Opens the client end, nonblocking. Fails at once if no worker is listening.
+/// While the worker serves another client it retries for up to 3 seconds.
 pub fn connect() -> Result<std::fs::File> {
     connect_named(&name()?)
 }
 fn connect_named(name: &str) -> Result<std::fs::File> {
     // SECURITY_IDENTIFICATION lets the server learn who the client is and stops it
     // from acting with the client's rights.
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION)
-        .open(name)?;
+    // The pipe has one instance, so a second client finds it busy while the first
+    // is served. Waiting a moment turns that into a short delay.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let file = loop {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION)
+            .open(name)
+        {
+            Ok(file) => break file,
+            Err(error)
+                if error.raw_os_error() == i32::try_from(ERROR_PIPE_BUSY).ok()
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
     let mode = PIPE_NOWAIT;
     // SAFETY: file owns a live pipe and mode points to a valid DWORD.
     let result = unsafe {
@@ -177,6 +192,13 @@ fn connect_named(name: &str) -> Result<std::fs::File> {
     ensure!(result != 0, "Cannot set pipe timeout mode");
     Ok(file)
 }
+/// True when `error` says the pipe does not exist, meaning no worker is running.
+pub fn is_missing(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// Polls for a client. `Ok(true)` means one is connected. `Ok(false)` means none
 /// yet, so call again after a short sleep.
 pub fn accept(file: &std::fs::File) -> Result<bool> {
