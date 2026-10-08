@@ -19,8 +19,8 @@ impl StorageMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::Skip => "No change recommended",
-            Self::Native => "Transparent compression",
-            Self::MaximumSpace => "Maximum Space",
+            Self::Native => "Standard",
+            Self::MaximumSpace => "Maximum",
         }
     }
 }

@@ -421,14 +421,16 @@ fn overview(state: &State, compact: bool) -> Element<'_, Message> {
         hero(
             column![
                 theme::muted(if current > 0 {
-                    "SPACE SAVED"
+                    "SPACE SAVED (ESTIMATE)"
                 } else {
-                    "SMART COMPRESSION"
+                    "COMPRESS YOUR GAMES"
                 }),
                 text(if current > 0 {
                     size(current)
-                } else if state.scanning || state.analysis_queuing() {
-                    "Checking your library…".into()
+                } else if state.scanning {
+                    "Finding your games…".into()
+                } else if state.analysis_queuing() {
+                    "Analyzing your games…".into()
                 } else {
                     "Analyze your games".into()
                 })
@@ -436,16 +438,16 @@ fn overview(state: &State, compact: bool) -> Element<'_, Message> {
                 theme::muted(if state.scanning {
                     "Scanning…".into()
                 } else if current > 0 && potential > 0 {
-                    format!("About {} more available", size(potential))
+                    format!("About {} more to save", size(potential))
                 } else if current > 0 {
                     "Up to date".into()
                 } else {
-                    "Only worthwhile files are compressed".into()
+                    "Only files that shrink are compressed".into()
                 }),
                 row![
                     action_maybe(
                         if potential > 0 {
-                            format!("Free up about {}", size(potential))
+                            format!("Compress to save about {}", size(potential))
                         } else if state.scanning || state.analysis_queuing() {
                             "Analyzing…".into()
                         } else {
@@ -470,7 +472,7 @@ fn overview(state: &State, compact: bool) -> Element<'_, Message> {
             row![
                 theme::stat(size(total), "Installed"),
                 theme::stat(state.games.len().to_string(), "Games"),
-                theme::stat(compressed.to_string(), "Optimized")
+                theme::stat(compressed.to_string(), "Compressed")
             ]
             .spacing(36)
         )
@@ -539,7 +541,10 @@ fn overview(state: &State, compact: bool) -> Element<'_, Message> {
         for job in recent {
             content = content.push(panel(row![
                 text(&job.game.title).width(Length::Fill),
-                theme::muted(job.phase.label())
+                theme::muted(match super::app::job_outcome(job) {
+                    Some(outcome) => outcome_words(outcome),
+                    None => format!("{} · {}", kind_words(job), job.phase.label()),
+                })
             ]));
         }
     }
@@ -573,7 +578,7 @@ fn games(state: &State, compact: bool) -> Element<'_, Message> {
                     Message::Filter
                 ),
                 pick_list(
-                    [Sort::Name, Sort::Size, Sort::Saving],
+                    [Sort::Worth, Sort::Name, Sort::Size],
                     Some(state.sort),
                     Message::Sort
                 )
@@ -601,7 +606,7 @@ fn games(state: &State, compact: bool) -> Element<'_, Message> {
                 Message::Filter
             ),
             pick_list(
-                [Sort::Name, Sort::Size, Sort::Saving],
+                [Sort::Worth, Sort::Name, Sort::Size],
                 Some(state.sort),
                 Message::Sort
             )
@@ -687,17 +692,70 @@ fn games(state: &State, compact: bool) -> Element<'_, Message> {
             ))
             .into();
     }
+    if state.order_stale {
+        content = content.push(panel(
+            row![
+                theme::muted("New estimates arrived while a game was open or ticked")
+                    .width(Length::Fill),
+                secondary("Sort again", Message::Sort(state.sort))
+            ]
+            .align_y(Alignment::Center),
+        ));
+    }
     // Rows are keyed by a hash of the game id, so a row keeps its widget
-    // state when the list is filtered or reordered.
-    content = content.push(
-        iced::widget::keyed_column(filtered.iter().take(state.shown).map(|game| {
-            (
-                *blake3::hash(game.game.id.to_string().as_bytes()).as_bytes(),
-                game_row(state, game, compact),
-            )
-        }))
-        .spacing(12),
-    );
+    // state when the list is filtered or reordered. Under the Worth sort each
+    // group gets a heading keyed by its name, and the last group stays
+    // collapsed until asked for.
+    let grouped = state.sort == Sort::Worth;
+    let mut rows = Vec::new();
+    let mut heading = None;
+    for game in filtered.iter().take(state.shown) {
+        let (group, _) = state.worth(&game.game);
+        if grouped && heading != Some(group) {
+            heading = Some(group);
+            let members: Vec<_> = filtered
+                .iter()
+                .filter(|other| state.worth(&other.game).0 == group)
+                .collect();
+            let total: u64 = members.iter().map(|other| state.worth(&other.game).1).sum();
+            let name = super::app::WORTH_GROUPS
+                .get(usize::from(group))
+                .copied()
+                .unwrap_or("Games");
+            let count = format!(
+                "{} game{}",
+                members.len(),
+                if members.len() == 1 { "" } else { "s" }
+            );
+            let summary = match group {
+                0 => format!("{name} · {count} · about {} to save", size(total)),
+                2 if total > 0 => format!("{name} · {count} · about {} saved", size(total)),
+                _ => format!("{name} · {count}"),
+            };
+            let line: Element<'_, Message> = if group == 3 {
+                row![
+                    text(summary).size(15).width(Length::Fill),
+                    secondary(
+                        if state.show_low { "Hide" } else { "Show" },
+                        Message::ToggleLow
+                    )
+                ]
+                .align_y(Alignment::Center)
+                .into()
+            } else {
+                text(summary).size(15).into()
+            };
+            rows.push((*blake3::hash(name.as_bytes()).as_bytes(), line));
+        }
+        if grouped && group == 3 && !state.show_low {
+            continue;
+        }
+        rows.push((
+            *blake3::hash(game.game.id.to_string().as_bytes()).as_bytes(),
+            game_row(state, game, compact),
+        ));
+    }
+    content = content.push(iced::widget::keyed_column(rows).spacing(12));
     if filtered.len() > state.shown {
         content = content.push(secondary(
             format!("Show more · {} games", filtered.len()),
@@ -768,19 +826,13 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
             if choice.predicted_saving == 0 {
                 "Little extra space expected".into()
             } else {
-                format!(
-                    "~{} · {}",
-                    size(choice.predicted_saving),
-                    choice.mode.label()
-                )
+                format!("About {} to save", size(choice.predicted_saving))
             }
         })
-        .unwrap_or_else(|| {
-            if compressed {
-                "Up to date".into()
-            } else {
-                "Not analyzed yet".into()
-            }
+        .unwrap_or_else(|| match state.result(game) {
+            Some(outcome) => outcome_words(outcome),
+            None if compressed => "Compressed".into(),
+            None => "Not analyzed yet".into(),
         });
     // Summary line: checkbox, artwork, title and status, size and saving,
     // then the main button. The button reads "Recheck" and queues an analysis
@@ -797,8 +849,16 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
             .width(Length::Fill)
             .on_press(Message::Expand(id.clone())),
         column![
+            // A custom folder has no launcher size, so the analysis supplies it.
             text(
                 game.size_hint
+                    .or_else(|| state.estimate(game).map(|estimate| estimate.install_bytes))
+                    .or_else(|| match state.result(game) {
+                        Some(super::app::Outcome::Estimated { installed, .. }) => Some(installed),
+                        Some(super::app::Outcome::Measured { before, .. }) => Some(before),
+                        _ => None,
+                    })
+                    .filter(|bytes| *bytes > 0)
                     .map(size)
                     .unwrap_or_else(|| "Size pending".into())
             ),
@@ -810,19 +870,20 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
     .spacing(12)
     .align_y(Alignment::Center);
     if item.supported {
-        line = line.push(action_maybe(
-            if compressed { "Recheck" } else { "Compress" },
-            (!state.pending.contains(&id)).then(|| {
-                Message::One(
-                    id.clone(),
-                    if compressed {
-                        Operation::Analyze
-                    } else {
-                        Operation::Compress
-                    },
-                )
-            }),
-        ));
+        // Compress is the main action. A compressed game only offers another
+        // analysis, which is not, so it gets the quieter button.
+        let ready = !state.pending.contains(&id);
+        line = line.push(if compressed {
+            secondary_maybe(
+                "Analyze again",
+                ready.then(|| Message::One(id.clone(), Operation::Analyze)),
+            )
+        } else {
+            action_maybe(
+                "Compress",
+                ready.then(|| Message::One(id.clone(), Operation::Compress)),
+            )
+        });
     }
     // Detail pane. It stays in the tree while its closing animation runs.
     let mut contents = column![line].spacing(12);
@@ -963,7 +1024,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                     .push(
                         row![
                             if install.previous_store_path.is_some() {
-                                Element::from(theme::muted("Test this version before reclaiming"))
+                                Element::from(theme::muted("Play this version before deleting the previous one"))
                             } else {
                                 secondary_maybe(
                                     "Compact updates",
@@ -986,7 +1047,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                                     )
                                 } else {
                                     secondary_maybe(
-                                        "Reclaim previous version",
+                                        "Delete the previous version",
                                         (!state.pending.contains(&id))
                                             .then(|| Message::PackPrunePrompt(id.clone())),
                                     )
@@ -997,11 +1058,15 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                         ]
                         .spacing(8),
                     )
-                    .push(theme::muted(if install.backup_path.is_some() { "The original is retained. Test the game before reclaiming it; disk space is released when you reclaim." } else { "Restore rebuilds ordinary files from the store and updates. Keep enough free space for the restored game." }))
+                    .push(theme::muted(if install.backup_path.is_some() {
+                        "The original is kept. Play the game first; space is saved when you delete the original."
+                    } else {
+                        "Decompress rebuilds ordinary files from the store and updates. Keep enough free space for the whole game."
+                    }))
                     .push(
                         row![
                             secondary_maybe(
-                                "Restore ordinary files",
+                                "Decompress to ordinary files",
                                 (!state.pending.contains(&id)).then(|| {
                                     Message::Send(Command::PackRollback {
                                         game_path: game.install_dir.clone(),
@@ -1011,7 +1076,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                             if install.backup_path.is_some() {
                                 if state.confirm_reclaim.contains(&id) {
                                     secondary_maybe(
-                                        "Confirm reclaim original",
+                                        "Confirm delete original",
                                         (!state.pending.contains(&id)).then(|| {
                                             Message::Send(Command::PackReclaim {
                                                 game_path: game.install_dir.clone(),
@@ -1020,13 +1085,13 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                                     )
                                 } else {
                                     secondary_maybe(
-                                        "Reclaim original",
+                                        "Delete the original",
                                         (!state.pending.contains(&id))
                                             .then(|| Message::PackReclaimPrompt(id.clone())),
                                     )
                                 }
                             } else {
-                                Element::from(theme::muted("Original reclaimed"))
+                                Element::from(theme::muted("Original deleted"))
                             }
                         ]
                         .spacing(8),
@@ -1043,8 +1108,8 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                             .padding(10),
                     )
                     .push(secondary_maybe("Choose storage folder…", (!state.picker_busy).then(|| Message::Browse(super::dialog::Target::Storage(id.clone())))))
-                    .push(theme::muted("1. Create and verify a store. 2. Launch the game to test it. 3. Reclaim the original to release space."))
-                    .push(theme::muted("Creation needs room for the store alongside the original. Updates use additional space; restoring after reclaim needs room for ordinary files."))
+                    .push(theme::muted("1. Create and verify a store. 2. Play the game to test it. 3. Delete the original to save the space."))
+                    .push(theme::muted("Creation needs room for the store beside the original. Updates use more space, and decompressing later needs room for the whole game."))
                     .push(
                         row![
                             action_maybe(
@@ -1265,6 +1330,44 @@ fn recovery(state: &State) -> Element<'_, Message> {
     content.into()
 }
 
+/// What a job is doing, in the window's words. `PackTask::label` is shared
+/// with the command line, so the window names storage tasks itself.
+fn kind_words(job: &Job) -> &'static str {
+    use crate::jobs::PackTask;
+    match job.operation {
+        Operation::Analyze => "Analysis",
+        Operation::Compress => "Compression",
+        Operation::Decompress => "Decompression",
+        Operation::Pack => match &job.pack {
+            Some(PackTask::Create { .. }) => "Build Maximum store",
+            Some(PackTask::Activate { create: true, .. }) => "Maximum compression",
+            Some(PackTask::Activate { .. }) => "Switch to Maximum store",
+            Some(PackTask::Compact) => "Fold in updates",
+            Some(PackTask::Restore) => "Decompression to ordinary files",
+            Some(PackTask::VerifyRestored) => "Check decompressed files",
+            Some(PackTask::Reclaim) => "Delete the original",
+            Some(PackTask::Prune) => "Delete the previous version",
+            None => "Maximum",
+        },
+    }
+}
+
+/// A result in words. Estimates say so, and only measured sizes get an arrow.
+fn outcome_words(outcome: super::app::Outcome) -> String {
+    use super::app::Outcome;
+    match outcome {
+        Outcome::Estimated { saved: 0, .. } => "Compressed · little to save".into(),
+        Outcome::Estimated { saved, .. } => {
+            format!("About {} saved (estimate)", size(saved))
+        }
+        Outcome::Measured { before, after } => format!("{} → {}", size(before), size(after)),
+        Outcome::AwaitingConfirm { expected } => format!(
+            "Saves about {} once you delete the original",
+            size(expected)
+        ),
+    }
+}
+
 /// A job's progress bar, by bytes when a byte total is known and by files
 /// otherwise. Empty when neither total is known.
 fn progress<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
@@ -1310,16 +1413,7 @@ fn job_row<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
     } else if !job.phase.active() && job.phase != Phase::Completed {
         controls = controls.push(secondary("Retry", Message::Send(Command::Retry(job.id))));
     }
-    let kind = match job.operation {
-        Operation::Analyze => "Analysis",
-        Operation::Compress => "Compression",
-        Operation::Decompress => "Decompression",
-        Operation::Pack => job
-            .pack
-            .as_ref()
-            .map(|task| task.label())
-            .unwrap_or("Maximum Space"),
-    };
+    let kind = kind_words(job);
     let mut content = column![
         row![
             text(&job.game.title).size(16).width(Length::Fill),
@@ -1700,16 +1794,7 @@ fn preferences(state: &State) -> Element<'_, Message> {
 /// A one-line card for a finished or cancelled job in History. A cancelled
 /// job can be retried.
 fn completed_job_row(job: &Job) -> Element<'_, Message> {
-    let kind = match job.operation {
-        Operation::Analyze => "Analysis",
-        Operation::Compress => "Compression",
-        Operation::Decompress => "Decompression",
-        Operation::Pack => job
-            .pack
-            .as_ref()
-            .map(|task| task.label())
-            .unwrap_or("Maximum Space"),
-    };
+    let kind = kind_words(job);
     panel(
         row![
             text(if job.phase == Phase::Completed {
@@ -1720,14 +1805,24 @@ fn completed_job_row(job: &Job) -> Element<'_, Message> {
             .size(18),
             column![
                 text(&job.game.title).size(15),
-                theme::muted(format!(
-                    "{} · {} {} · {} · {}s",
-                    kind,
-                    job.files_done,
-                    if job.files_done == 1 { "file" } else { "files" },
-                    size(job.bytes_done),
-                    job.elapsed
-                ))
+                theme::muted(match super::app::job_outcome(job) {
+                    Some(outcome) => format!(
+                        "{} · {} · {} {} · {}s",
+                        kind,
+                        outcome_words(outcome),
+                        job.files_done,
+                        if job.files_done == 1 { "file" } else { "files" },
+                        job.elapsed
+                    ),
+                    None => format!(
+                        "{} · {} {} · {} · {}s",
+                        kind,
+                        job.files_done,
+                        if job.files_done == 1 { "file" } else { "files" },
+                        size(job.bytes_done),
+                        job.elapsed
+                    ),
+                })
             ]
             .spacing(3)
             .width(Length::Fill),

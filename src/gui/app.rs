@@ -201,19 +201,53 @@ impl Status {
 /// Order of the Games list. Size and Saving put the largest first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sort {
+    /// Games that would save the most first, then the rest in groups.
+    Worth,
     Name,
     Size,
-    Saving,
 }
 impl Sort {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Worth => "Most space to save",
             Self::Name => "Name",
             Self::Size => "Size",
-            Self::Saving => "Potential saving",
         }
     }
 }
+/// What compressing a game gained, for its row and its History entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// A native pass. Both sizes are sampled predictions, since the
+    /// filesystem does not report what compression saved.
+    Estimated { installed: u64, saved: u64 },
+    /// Maximum Space with the original deleted. Both sizes are the store's.
+    Measured { before: u64, after: u64 },
+    /// Maximum Space with the original still kept, so nothing is saved yet.
+    AwaitingConfirm { expected: u64 },
+}
+
+/// The estimated result of one finished compression job.
+pub fn job_outcome(job: &Job) -> Option<Outcome> {
+    (job.operation == Operation::Compress && job.phase == Phase::Completed)
+        .then_some(job.estimate.as_ref())
+        .flatten()
+        .map(|estimate| Outcome::Estimated {
+            installed: estimate.install_bytes,
+            saved: estimate.saving(),
+        })
+}
+
+/// Where a game sits in the Worth order: games that would save space, games
+/// not analyzed yet, compressed games, then games with little to gain or on
+/// a drive that cannot compress.
+pub const WORTH_GROUPS: [&str; 4] = [
+    "Worth compressing",
+    "Not analyzed yet",
+    "Compressed",
+    "Little to gain",
+];
+
 /// Which games the Games list shows. `State::filtered` holds the tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Filter {
@@ -321,8 +355,16 @@ pub struct State {
     pub pending: std::collections::HashSet<String>,
     /// A batch of automatic analyses is being sent to the worker.
     analysis_queuing: bool,
-    /// Estimated saving per game, computed when the Saving sort is chosen.
-    saving_order: std::collections::HashMap<String, u64>,
+    /// Group and size key per game for the Worth sort. Captured at set
+    /// moments so rows do not move while an analysis is filling in estimates.
+    worth_order: std::collections::HashMap<String, (u8, u64)>,
+    /// Estimates arrived while a row was open or selected, so the list was
+    /// left as it was and the page offers to sort again.
+    pub order_stale: bool,
+    /// The "Little to gain" group is expanded.
+    pub show_low: bool,
+    /// A snapshot has been applied at least once.
+    snapshot_loaded_before: bool,
 }
 impl State {
     /// An empty window state on Overview. Nothing is loaded until the first
@@ -369,7 +411,7 @@ impl State {
             query: String::new(),
             selected: Default::default(),
             expanded: None,
-            sort: Sort::Name,
+            sort: Sort::Worth,
             filter: Filter::All,
             drive_filter: None,
             launcher_filter: None,
@@ -393,7 +435,10 @@ impl State {
             advanced: Default::default(),
             pending: Default::default(),
             analysis_queuing: false,
-            saving_order: Default::default(),
+            worth_order: Default::default(),
+            order_stale: false,
+            show_low: false,
+            snapshot_loaded_before: false,
         }
     }
     /// Replaces the toast and restarts its reveal animation.
@@ -462,6 +507,99 @@ impl State {
             .iter()
             .rev()
             .find(|j| j.game.install_dir == game.install_dir)
+    }
+    /// What compressing this game gained, or `None` when it is not compressed.
+    ///
+    /// A Maximum Space install reports its store's own sizes. A native pass
+    /// reports the estimate its job carried, else the one in its record.
+    pub fn result(&self, game: &Game) -> Option<Outcome> {
+        if let Some(install) = self
+            .snapshot
+            .packs
+            .iter()
+            .find(|install| install.game_path == game.install_dir)
+        {
+            let summary = install.summary.as_ref()?;
+            // Bytes shared with another game's store are not charged here.
+            let after = summary.archive_bytes.saturating_sub(summary.shared_bytes);
+            return Some(if install.backup_path.is_some() {
+                Outcome::AwaitingConfirm {
+                    expected: summary.logical_bytes.saturating_sub(after),
+                }
+            } else {
+                Outcome::Measured {
+                    before: summary.logical_bytes,
+                    after,
+                }
+            });
+        }
+        if !self.compressed(game) {
+            return None;
+        }
+        self.snapshot
+            .jobs
+            .iter()
+            .rev()
+            .filter(|job| job.game.install_dir == game.install_dir && job.game.build == game.build)
+            .find_map(job_outcome)
+            .or_else(|| {
+                self.records
+                    .iter()
+                    .find(|record| record.id == game.id && record.build == game.build)
+                    .map(|record| Outcome::Estimated {
+                        installed: record.install_bytes,
+                        saved: u64::try_from(record.est_saving).unwrap_or(0),
+                    })
+            })
+    }
+    /// A game's place in the Worth order as captured, with games seen since
+    /// the capture counted as not analyzed.
+    pub fn worth(&self, game: &Game) -> (u8, u64) {
+        self.worth_order
+            .get(&game.id.to_string())
+            .copied()
+            .unwrap_or((1, 0))
+    }
+    /// Recomputes every game's place in the Worth order from what is known now.
+    pub fn capture_order(&mut self) {
+        self.worth_order = self
+            .games
+            .iter()
+            .map(|row| {
+                let place = if !row.supported {
+                    (3, 0)
+                } else if self.compressed(&row.game) {
+                    let saved = match self.result(&row.game) {
+                        Some(Outcome::Estimated { saved, .. }) => saved,
+                        Some(Outcome::Measured { before, after }) => before.saturating_sub(after),
+                        // Nothing is saved until the original is deleted.
+                        Some(Outcome::AwaitingConfirm { .. }) => 0,
+                        None => 0,
+                    };
+                    (2, saved)
+                } else {
+                    match self.recommendation(&row.game) {
+                        Some(choice)
+                            if choice.predicted_saving > 0
+                                && choice.mode != crate::recommendation::StorageMode::Skip =>
+                        {
+                            (0, choice.predicted_saving)
+                        }
+                        Some(_) => (3, 0),
+                        None => (1, row.game.size_hint.unwrap_or(0)),
+                    }
+                };
+                (row.game.id.to_string(), place)
+            })
+            .collect();
+        self.order_stale = false;
+    }
+    /// Whether an analysis is queued or running.
+    fn analysis_active(&self) -> bool {
+        self.snapshot
+            .jobs
+            .iter()
+            .any(|job| job.operation == Operation::Analyze && job.phase.active())
     }
     /// The estimate that still applies to this game at its installed build.
     ///
@@ -594,33 +732,17 @@ impl State {
 
     /// Bytes saved so far. An estimate for natively compressed games.
     pub fn current_saving(&self) -> u64 {
-        // Recorded estimates count for games still installed at the recorded
-        // build. Packed games are left out here and counted from their store
-        // summaries below.
-        let native = self
-            .records
+        // One figure per installed game, from the same source its row shows.
+        // A Maximum Space game whose original is still kept has saved nothing.
+        self.games
             .iter()
-            .filter(|record| {
-                self.games.iter().any(|row| {
-                    row.game.id == record.id
-                        && row.game.build == record.build
-                        && !self
-                            .snapshot
-                            .packs
-                            .iter()
-                            .any(|pack| pack.game_path == row.game.install_dir)
-                })
+            .filter_map(|row| self.result(&row.game))
+            .map(|outcome| match outcome {
+                Outcome::Estimated { saved, .. } => saved,
+                Outcome::Measured { before, after } => before.saturating_sub(after),
+                Outcome::AwaitingConfirm { .. } => 0,
             })
-            .filter_map(|record| u64::try_from(record.est_saving).ok())
-            .sum::<u64>();
-        let packed = self
-            .snapshot
-            .packs
-            .iter()
-            .filter_map(|install| install.summary.as_ref())
-            .map(|summary| summary.logical_bytes.saturating_sub(summary.archive_bytes))
-            .sum::<u64>();
-        native.saturating_add(packed)
+            .sum()
     }
     pub fn analysis_queuing(&self) -> bool {
         self.analysis_queuing
@@ -708,10 +830,11 @@ impl State {
                     .to_lowercase()
                     .cmp(&b.game.title.to_lowercase()),
                 Sort::Size => b.game.size_hint.cmp(&a.game.size_hint),
-                Sort::Saving => self
-                    .saving_order
-                    .get(&b.game.id.to_string())
-                    .cmp(&self.saving_order.get(&a.game.id.to_string())),
+                Sort::Worth => {
+                    let (group_a, key_a) = self.worth(&a.game);
+                    let (group_b, key_b) = self.worth(&b.game);
+                    group_a.cmp(&group_b).then(key_b.cmp(&key_a))
+                }
             }
             .then(a.game.title.cmp(&b.game.title))
         });
@@ -796,6 +919,8 @@ pub enum Message {
     /// Go to Games and open this game's detail pane.
     ReviewGame(String),
     Sort(Sort),
+    /// Expand or collapse the "Little to gain" group.
+    ToggleLow,
     Filter(Filter),
     /// Build 40 more rows of the Games list.
     ShowMore,
@@ -1244,6 +1369,9 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                     1.0
                 };
                 state.page = page;
+                if page == Page::Games {
+                    state.capture_order();
+                }
                 state.page_reveal = Animation::new(false)
                     .duration(state.motion_duration(180, 120))
                     .easing(state.motion_easing())
@@ -1306,6 +1434,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                     state.reports = scan.reports;
                     state.drives = scan.drives;
                     state.records = scan.records;
+                    state.capture_order();
                     state.activity = scan.activity;
                     state.warnings = scan.warnings;
                     // Drop per-game interface state for games that are gone.
@@ -1404,7 +1533,20 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                     .filter(|job| job.operation == Operation::Pack && job.phase.active())
                     .map(|job| job.game.id.to_string())
                     .collect();
+                let analyzing = state.analysis_active();
+                let first = !state.snapshot_loaded_before;
+                state.snapshot_loaded_before = true;
                 state.snapshot = snapshot;
+                // Estimates settle when the last analysis ends. The list is
+                // sorted then, unless that would move a row the user has open
+                // or ticked.
+                if first || (analyzing && !state.analysis_active()) {
+                    if state.expanded.is_some() || !state.selected.is_empty() {
+                        state.order_stale = true;
+                    } else {
+                        state.capture_order();
+                    }
+                }
                 state.polling = true;
                 // A changed library list, a changed game list or finished work
                 // all mean the scanned data is out of date.
@@ -1427,6 +1569,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::Query(query) => {
             state.query = query;
             state.shown = 40;
+            state.capture_order();
         }
         Message::Select(id, selected) => {
             let actionable = state.games.iter().any(|row| {
@@ -1459,21 +1602,14 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::Sort(sort) => {
-            // The savings are captured here and not refreshed until a sort is
-            // chosen again, so later estimates do not reorder the list.
             state.sort = sort;
-            state.saving_order = state
-                .games
-                .iter()
-                .map(|row| {
-                    (
-                        row.game.id.to_string(),
-                        state.estimate(&row.game).map(|e| e.saving()).unwrap_or(0),
-                    )
-                })
-                .collect();
+            state.capture_order();
         }
-        Message::Filter(filter) => state.filter = filter,
+        Message::ToggleLow => state.show_low = !state.show_low,
+        Message::Filter(filter) => {
+            state.filter = filter;
+            state.capture_order();
+        }
         Message::ShowMore => state.shown += 40,
         // Queueing work.
         Message::One(id, operation) => {
@@ -1568,7 +1704,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                     return Task::batch([navigation, send_many(commands)]);
                 }
                 Ok(_) => state.show_status(Status::info(
-                    "Analysis has not found a worthwhile compression job yet.",
+                    "Analysis has not found a game worth compressing yet.",
                 )),
                 Err(error) => state.show_status(Status::error(error)),
             }
@@ -1749,8 +1885,14 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             return send(Command::Theme(theme));
         }
         Message::SystemTheme(theme) => state.system_theme = theme,
-        Message::DriveFilter(path) => state.drive_filter = path,
-        Message::LauncherFilter(launcher) => state.launcher_filter = launcher,
+        Message::DriveFilter(path) => {
+            state.drive_filter = path;
+            state.capture_order();
+        }
+        Message::LauncherFilter(launcher) => {
+            state.launcher_filter = launcher;
+            state.capture_order();
+        }
         // Maximum Space storage.
         Message::PackPath(id, path) => {
             state.pack_paths.insert(id, path);
@@ -2063,6 +2205,163 @@ mod tests {
         check(state.compressed(&game), "completed pass is visible")?;
         game.build = Some("2".into());
         check(!state.compressed(&game), "an update needs another check")
+    }
+
+    fn named(key: &str, supported: bool) -> GameRow {
+        let mut row = row(supported);
+        row.game.id = GameId::new(Launcher::Manual, key);
+        row.game.title = key.into();
+        row.game.install_dir = format!("/fixture/{key}").into();
+        row.game.size_hint = Some(4_000_000_000);
+        row
+    }
+
+    fn job(id: i64, game: &Game, operation: Operation, phase: Phase, saving: u64) -> Job {
+        Job {
+            id,
+            game: game.clone(),
+            operation,
+            options: Default::default(),
+            phase,
+            files_done: 0,
+            bytes_done: 0,
+            files_total: 0,
+            bytes_total: 0,
+            estimate: (saving > 0).then(|| crate::estimate::Estimate {
+                install_bytes: 4_000_000_000,
+                bytes: 4_000_000_000,
+                disk_now: 4_000_000_000,
+                disk_after: 4_000_000_000 - saving,
+                files: 10,
+                inspected_files: 10,
+                sampled: 64 * 1024 * 1024,
+                ..Default::default()
+            }),
+            message: String::new(),
+            errors: vec![],
+            created: 0,
+            elapsed: 0,
+            drive_change: None,
+            user_paused: false,
+            pack: None,
+            pack_interruptible: false,
+            space_plan: None,
+        }
+    }
+
+    fn order(state: &State) -> Vec<String> {
+        state
+            .filtered()
+            .iter()
+            .map(|row| row.game.title.clone())
+            .collect()
+    }
+
+    #[test]
+    fn games_worth_compressing_come_first_and_results_are_reported() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        for (key, supported) in [
+            ("unsupported", false),
+            ("done", true),
+            ("unknown", true),
+            ("small-win", true),
+            ("big-win", true),
+        ] {
+            state.games.push(named(key, supported));
+        }
+        let game = |key: &str| named(key, true).game;
+        state.snapshot.jobs = vec![
+            job(
+                1,
+                &game("done"),
+                Operation::Compress,
+                Phase::Completed,
+                1_500_000_000,
+            ),
+            job(
+                2,
+                &game("small-win"),
+                Operation::Analyze,
+                Phase::Completed,
+                500_000_000,
+            ),
+            job(
+                3,
+                &game("big-win"),
+                Operation::Analyze,
+                Phase::Completed,
+                2_000_000_000,
+            ),
+        ];
+        check_eq(state.sort, Sort::Worth, "the list opens sorted by worth")?;
+        state.capture_order();
+        check_eq(
+            order(&state),
+            ["big-win", "small-win", "unknown", "done", "unsupported"]
+                .map(String::from)
+                .to_vec(),
+            "biggest saving first, then not analyzed, compressed, and the rest",
+        )?;
+        check_eq(
+            state.result(&game("done")),
+            Some(Outcome::Estimated {
+                installed: 4_000_000_000,
+                saved: 1_500_000_000,
+            }),
+            "a compressed game reports what its pass was estimated to save",
+        )?;
+        check_eq(
+            state.result(&game("big-win")),
+            None,
+            "a game that is only analyzed has no result",
+        )
+    }
+
+    #[test]
+    fn estimates_arriving_while_a_row_is_open_do_not_move_it() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        state.games.push(named("alpha", true));
+        state.games.push(named("beta", true));
+        let beta = named("beta", true).game;
+        let running = Snapshot {
+            worker_epoch: 1,
+            revision: 1,
+            jobs: vec![job(1, &beta, Operation::Analyze, Phase::Analyzing, 0)],
+            ..Snapshot::default()
+        };
+        let _task = update(&mut state, Message::Snapshot(Ok(running)));
+        check_eq(
+            order(&state),
+            ["alpha", "beta"].map(String::from).to_vec(),
+            "control: with no estimates the order is by title",
+        )?;
+        state.expanded = Some("manual:alpha".into());
+        let finished = Snapshot {
+            worker_epoch: 1,
+            revision: 2,
+            jobs: vec![job(
+                1,
+                &beta,
+                Operation::Analyze,
+                Phase::Completed,
+                2_000_000_000,
+            )],
+            ..Snapshot::default()
+        };
+        let _task = update(&mut state, Message::Snapshot(Ok(finished)));
+        check(state.order_stale, "the page offers to sort again")?;
+        check_eq(
+            order(&state),
+            ["alpha", "beta"].map(String::from).to_vec(),
+            "rows hold still while a game is open",
+        )?;
+        let _task = update(&mut state, Message::Sort(Sort::Worth));
+        check(!state.order_stale, "sorting clears the offer")?;
+        check_eq(
+            order(&state),
+            ["beta", "alpha"].map(String::from).to_vec(),
+            "the game with a saving moves up when asked",
+        )
     }
 
     #[test]
