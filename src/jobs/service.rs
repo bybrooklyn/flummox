@@ -659,6 +659,46 @@ fn preempt_analysis(
     Ok(())
 }
 
+/// Refuses a command that names a relative path. The coordinator keeps the
+/// working directory of whichever client started it, so a relative path
+/// would resolve against some other folder.
+fn require_absolute(command: &Command) -> Result<()> {
+    let mut paths: Vec<&Path> = Vec::new();
+    match command {
+        Command::Enqueue { game, .. } => paths.push(&game.install_dir),
+        Command::EnqueuePack { game, task } => {
+            paths.push(&game.install_dir);
+            if let PackTask::Create { store } | PackTask::Activate { store, .. } = task {
+                paths.push(store);
+            }
+        }
+        Command::Library(library) => paths.push(&library.path),
+        Command::RemoveLibrary(path) => paths.push(path),
+        Command::PackActivate {
+            game_path,
+            store_path,
+            writes_path,
+        } => paths.extend([
+            game_path.as_path(),
+            store_path.as_path(),
+            writes_path.as_path(),
+        ]),
+        Command::PackRollback { game_path }
+        | Command::PackReclaim { game_path }
+        | Command::PackCompact { game_path }
+        | Command::PackPrune { game_path } => paths.push(game_path),
+        _ => {}
+    }
+    for path in paths {
+        ensure!(
+            path.is_absolute(),
+            "The background worker needs a full path, not {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// Applies one client command to the snapshot and the database.
 /// `running_pack` is the id of the job on the storage thread, if any. An
 /// error is sent to the client as the reply.
@@ -670,6 +710,7 @@ fn apply(
     mounts: &mut Vec<PackMount>,
     running_pack: Option<i64>,
 ) -> Result<()> {
+    require_absolute(&command)?;
     match command {
         // Rechecks the plan against the drives as they are now, applies the
         // inner command, then stores the plan on the newest active job for
@@ -2335,6 +2376,45 @@ mod tests {
         )
     }
 
+
+    #[test]
+    fn the_coordinator_refuses_relative_paths() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let (db, mut snapshot) = open_store(&temp.path().join("jobs.sqlite")).ctx("store")?;
+        // `src` exists relative to the test's working directory.
+        check(Path::new("src").is_dir(), "control: the relative folder exists")?;
+        let relative = apply(
+            Command::Enqueue {
+                game: game(Path::new("src"), "relative"),
+                operation: Operation::Analyze,
+                options: CompressOpts::default(),
+            },
+            &mut snapshot,
+            &db,
+            &mut None,
+            &mut Vec::new(),
+            None,
+        );
+        check(
+            relative.is_err_and(|error| error.to_string().contains("full path")),
+            "a relative folder is refused by name",
+        )?;
+        check_eq(snapshot.jobs.len(), 0, "nothing was queued")?;
+        let reclaim = apply(
+            Command::PackReclaim {
+                game_path: "src".into(),
+            },
+            &mut snapshot,
+            &db,
+            &mut None,
+            &mut Vec::new(),
+            None,
+        );
+        check(
+            reclaim.is_err_and(|error| error.to_string().contains("full path")),
+            "a relative storage path is refused before it is resolved",
+        )
+    }
 
     #[test]
     fn a_different_storage_task_is_refused_and_the_same_one_is_not_duplicated() -> TestResult {

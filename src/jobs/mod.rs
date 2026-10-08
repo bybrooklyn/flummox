@@ -483,16 +483,17 @@ pub(crate) enum Control {
 
 /// Dispatches private process roles before the public CLI parser runs.
 pub fn entrypoint() -> anyhow::Result<bool> {
-    match std::env::args().nth(1).as_deref() {
-        Some("__coordinator") => {
-            service::run()?;
-            Ok(true)
-        }
-        Some("__worker") => {
-            worker::run()?;
-            Ok(true)
-        }
-        _ => Ok(false),
+    // `args_os`: `args` panics on an argument that is not valid UTF-8, and
+    // this runs before the command line parser sees the arguments.
+    let role = std::env::args_os().nth(1);
+    if role.as_deref() == Some(std::ffi::OsStr::new("__coordinator")) {
+        service::run()?;
+        Ok(true)
+    } else if role.as_deref() == Some(std::ffi::OsStr::new("__worker")) {
+        worker::run()?;
+        Ok(true)
+    } else {
+        Ok(false)
     }
 }
 
@@ -504,29 +505,52 @@ pub(crate) fn now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Refuses roots and application/system configuration directories.
+/// Refuses roots, the home folder and the folders above it, shared
+/// top-level folders such as `/mnt` and `/opt`, and application and system
+/// configuration directories.
 pub fn validate_folder(path: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let home = crate::launchers::Env::current().map(|env| env.home);
+    validate_folder_for(path, home.as_deref())
+}
+
+/// [`validate_folder`] for a given home folder.
+fn validate_folder_for(
+    path: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> anyhow::Result<PathBuf> {
+    use std::path::Path;
     let path = path.canonicalize()?;
     anyhow::ensure!(
         path.is_dir() && path.parent().is_some(),
         "Choose a game folder, not an entire drive."
     );
-    let home = crate::launchers::Env::current().map(|env| env.home);
-    anyhow::ensure!(
-        home.as_ref() != Some(&path),
-        "Choose a game folder, not your home folder."
-    );
+    // The folder is canonical, so the home it is compared with must be too.
+    let home = home.map(|home| home.canonicalize().unwrap_or_else(|_| home.to_path_buf()));
     if let Some(home) = &home {
+        anyhow::ensure!(
+            !home.starts_with(&path),
+            "Choose a game folder, not your home folder or one that contains it."
+        );
         for private in [".ssh", ".gnupg", ".config", ".cache"] {
             anyhow::ensure!(
                 !path.starts_with(home.join(private)),
                 "Choose an installed game folder, not application settings."
             );
         }
+        for shared in [".local", ".local/share", ".var", ".steam", "Documents"] {
+            anyhow::ensure!(
+                path != home.join(shared),
+                "Choose a game folder, not a general folder in your home."
+            );
+        }
     }
+    let media_root = path.starts_with("/run/media") && path.components().count() <= 4;
     anyhow::ensure!(
-        path != std::path::Path::new("/home") && path != std::path::Path::new("/var"),
-        "Choose a game folder, not a system folder."
+        !media_root
+            && ["/home", "/var", "/var/home", "/mnt", "/media", "/run", "/opt", "/srv", "/root", "/tmp"]
+                .iter()
+                .all(|shared| path != Path::new(shared)),
+        "Choose a game folder, not a system or shared folder."
     );
     if let Some(state) =
         crate::db::Db::default_path().and_then(|p| p.parent().map(|p| p.to_path_buf()))
@@ -689,6 +713,41 @@ pub fn space_plan(
 mod folder_tests {
     use super::*;
     use crate::testutil::{Ctx, TestResult, check, check_eq};
+
+    #[test]
+    fn folders_that_hold_the_home_or_other_users_data_are_refused() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let real = temp.path().join("real-home");
+        let link = temp.path().join("home-link");
+        let steam = real.join(".local/share/Steam/steamapps/common/Game");
+        std::fs::create_dir_all(&steam).ctx("game folder")?;
+        std::os::unix::fs::symlink(&real, &link).ctx("home symlink")?;
+        let refuses = |path: &std::path::Path, home: &std::path::Path| {
+            validate_folder_for(path, Some(home)).is_err()
+        };
+        check(refuses(&real, &link), "a symlinked home is still the home")?;
+        check(
+            refuses(temp.path(), &real),
+            "a folder that contains the home is refused",
+        )?;
+        check(refuses(&real.join(".local"), &real), "~/.local")?;
+        check(refuses(&real.join(".local/share"), &real), "~/.local/share")?;
+        check(
+            validate_folder_for(&steam, Some(&link)).is_ok(),
+            "control: a game folder deep in the home is accepted",
+        )?;
+        for shared in ["/tmp", "/mnt", "/opt", "/"] {
+            let shared = std::path::Path::new(shared);
+            check(
+                !shared.exists() || validate_folder_for(shared, None).is_err(),
+                format!("{} is refused", shared.display()),
+            )?;
+        }
+        check(
+            validate_folder_for(&steam, None).is_ok(),
+            "control: the same folder is accepted without a home",
+        )
+    }
 
     #[test]
     fn the_operation_lock_waits_for_a_holder_that_is_about_to_finish() -> TestResult {
