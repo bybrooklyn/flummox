@@ -269,6 +269,50 @@ fn intern_chunk(
     Ok(id)
 }
 
+/// Interns a run of consecutive chunks and appends their ids to `ids`.
+///
+/// Hashing and encoding run in parallel, which is where a build spends its
+/// time. Deciding which chunks are new and storing them stays in order, so
+/// the store is the same as one built a chunk at a time.
+fn intern_batch(
+    index: &mut Index,
+    known: &mut HashMap<([u8; 32], u32), u32>,
+    batch: &[Vec<u8>],
+    options: Options,
+    store: &mut impl FnMut(u32, Codec, &[u8], [u8; 32]) -> Result<Chunk>,
+    ids: &mut Vec<u32>,
+) -> Result<()> {
+    use rayon::prelude::*;
+
+    let keys = batch
+        .par_iter()
+        .map(|bytes| Ok((*blake3::hash(bytes).as_bytes(), u32::try_from(bytes.len())?)))
+        .collect::<Result<Vec<([u8; 32], u32)>>>()?;
+    // One encoding for each chunk that is new to the store, including one
+    // that repeats inside this batch.
+    let mut first_seen = std::collections::HashSet::new();
+    let fresh: Vec<_> = batch
+        .iter()
+        .zip(&keys)
+        .filter(|(_, key)| !known.contains_key(*key) && first_seen.insert(**key))
+        .collect();
+    let mut encoded = fresh
+        .par_iter()
+        .map(|(bytes, key)| Ok((**key, encode(bytes, options)?)))
+        .collect::<Result<HashMap<_, _>>>()?;
+    for (bytes, key) in batch.iter().zip(&keys) {
+        ids.push(intern_chunk(
+            index,
+            known,
+            bytes,
+            options,
+            encoded.remove(key),
+            store,
+        )?);
+    }
+    Ok(())
+}
+
 /// Packs small files into shared frames where that saves space, and returns
 /// the `Kind::SlicedFile` for each file it grouped. Files it leaves out are
 /// chunked on their own by the caller.
@@ -529,6 +573,7 @@ fn build_index(
     // Kind of each first-seen file, so a later hard-link alias can repeat it.
     let mut primary_files = HashMap::<PathBuf, Kind>::new();
     let mut buffer = Vec::with_capacity(CHUNK_BYTES);
+    let batch_chunks = rayon::current_num_threads().max(1) * 2;
     let mut files_done = 0u64;
     let mut bytes_done = 0u64;
     // Sources are in sorted walk order, which puts parents before children
@@ -571,13 +616,33 @@ fn build_index(
             let mut chunks = Vec::new();
             {
                 let mut reader = BufReader::with_capacity(MIN_CHUNK_BYTES, &mut file);
-                while read_content_chunk(&mut reader, &mut buffer)? {
+                // Chunks are read in order and handed over a batch at a time.
+                // A batch holds a couple of chunks for each thread, which
+                // bounds memory at a few MiB per thread.
+                let mut batch = Vec::with_capacity(batch_chunks);
+                loop {
+                    batch.clear();
+                    while batch.len() < batch_chunks
+                        && read_content_chunk(&mut reader, &mut buffer)?
+                    {
+                        batch.push(std::mem::replace(
+                            &mut buffer,
+                            Vec::with_capacity(CHUNK_BYTES),
+                        ));
+                    }
+                    if batch.is_empty() {
+                        break;
+                    }
                     observer.checkpoint()?;
                     ensure!(!cancel.load(Ordering::Relaxed), "Store creation cancelled");
-                    let bytes = buffer.as_slice();
-                    let id =
-                        intern_chunk(&mut index, &mut known, bytes, options, None, &mut store)?;
-                    chunks.push(id);
+                    intern_batch(
+                        &mut index,
+                        &mut known,
+                        &batch,
+                        options,
+                        &mut store,
+                        &mut chunks,
+                    )?;
                 }
             }
             ensure!(
@@ -1019,21 +1084,34 @@ fn encode(bytes: &[u8], options: Options) -> Result<(Codec, Vec<u8>)> {
     if bytes.iter().all(|byte| *byte == 0) {
         return Ok((Codec::Zero, Vec::new()));
     }
-    let mut encoded = zstd::bulk::compress(bytes, options.level)?;
-    let levels: &[i32] = if options.compare_level == Some(22) {
+    let compared: &[i32] = if options.compare_level == Some(22) {
         &[15, 19, 22]
     } else {
         &[]
     };
-    for level in levels
-        .iter()
-        .copied()
-        .chain(options.compare_level.filter(|level| *level != 22))
-        .filter(|level| *level != options.level)
-    {
-        let alternate = zstd::bulk::compress(bytes, level)?;
-        if alternate.len() < encoded.len() {
-            encoded = alternate;
+    let levels: Vec<i32> = std::iter::once(options.level)
+        .chain(
+            compared
+                .iter()
+                .copied()
+                .chain(options.compare_level.filter(|level| *level != 22))
+                .filter(|level| *level != options.level),
+        )
+        .collect();
+    // The levels are tried at once, since the slowest takes most of the time
+    // whatever the others do. The first smallest in level order is kept, which
+    // is what trying them one after another chose.
+    let attempts = {
+        use rayon::prelude::*;
+        levels
+            .par_iter()
+            .map(|level| zstd::bulk::compress(bytes, *level))
+            .collect::<std::io::Result<Vec<_>>>()?
+    };
+    let mut encoded = Vec::new();
+    for (position, attempt) in attempts.into_iter().enumerate() {
+        if position == 0 || attempt.len() < encoded.len() {
+            encoded = attempt;
         }
     }
     if encoded.len() < bytes.len() {
