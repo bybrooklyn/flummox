@@ -961,6 +961,14 @@ fn event(job: &mut Job, event: WorkerEvent, db: &Connection) -> Result<bool> {
             save(db, job)?;
             return Ok(true);
         }
+        // A job that found the operation lock taken goes back in the queue,
+        // since the process holding it will finish.
+        WorkerEvent::Failed(message) if message.contains(super::LOCK_BUSY) => {
+            job.phase = Phase::Queued;
+            job.message = "Waiting for another Flummox process to finish".into();
+            save(db, job)?;
+            return Ok(true);
+        }
         WorkerEvent::Failed(message) => {
             job.phase = Phase::Failed;
             job.message = message;
@@ -1371,8 +1379,15 @@ fn poll_pack(
             Ok(result) => {
                 snapshot.packs = result.packs;
                 *mounts = result.mounts;
+                let lock_busy = result
+                    .result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.to_string().contains(super::LOCK_BUSY));
                 job.phase = if result.result.is_ok() {
                     Phase::Completed
+                } else if lock_busy {
+                    Phase::Queued
                 } else if running.control.cancel.load(Ordering::SeqCst) {
                     Phase::Cancelled
                 } else {
@@ -2005,6 +2020,34 @@ mod tests {
             state: InstallState::Idle,
             is_tool: false,
         }
+    }
+
+    #[test]
+    fn a_job_that_finds_the_operation_lock_taken_goes_back_in_the_queue() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let (db, mut snapshot) = open_store(&temp.path().join("jobs.sqlite")).ctx("store")?;
+        enqueue(
+            &mut snapshot,
+            game(temp.path(), "game"),
+            Operation::Compress,
+            CompressOpts::default(),
+            &db,
+        )
+        .ctx("job")?;
+        let job = snapshot.jobs.first_mut().ctx("job")?;
+        job.phase = Phase::Running;
+        let ended = event(
+            job,
+            WorkerEvent::Failed(format!("{:#}", anyhow::anyhow!(super::super::LOCK_BUSY))),
+            &db,
+        )
+        .ctx("lock busy")?;
+        check(ended && job.phase == Phase::Queued, "requeued, not failed")?;
+        let ended = event(job, WorkerEvent::Failed("disk on fire".into()), &db).ctx("failure")?;
+        check(
+            ended && job.phase == Phase::Failed,
+            "control: another failure still fails",
+        )
     }
 
     #[test]

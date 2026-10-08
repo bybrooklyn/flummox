@@ -429,20 +429,39 @@ pub(crate) struct Work {
     pub job: Job,
 }
 
+/// Error text of [`operation_lock`] when another process kept the lock for
+/// the whole wait. The coordinator requeues a job that fails with it.
+pub(crate) const LOCK_BUSY: &str = "Another Flummox process is working. Retry when it finishes.";
+
+/// How long [`operation_lock`] waits for the lock before giving up.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Serializes filesystem operations across coordinator workers and legacy CLI jobs.
+/// Waits up to ten seconds for a previous holder to finish and exit.
 /// Keep the returned handle alive until the operation and recording finish.
 pub fn operation_lock() -> anyhow::Result<std::fs::File> {
+    lock_in(&state_dir()?, LOCK_WAIT)
+}
+
+/// Takes `operation.lock` in `dir`, polling for up to `wait`.
+fn lock_in(dir: &std::path::Path, wait: std::time::Duration) -> anyhow::Result<std::fs::File> {
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(state_dir()?.join("operation.lock"))?;
-    anyhow::ensure!(
-        lock.try_lock().is_ok(),
-        "Another Flummox process is working. Retry when it finishes."
-    );
-    Ok(lock)
+        .open(dir.join("operation.lock"))?;
+    let until = std::time::Instant::now() + wait;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                anyhow::ensure!(std::time::Instant::now() < until, LOCK_BUSY);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+    }
 }
 
 /// Invalidates desktop receipts before a CLI override rewrites a game.
@@ -669,7 +688,29 @@ pub fn space_plan(
 #[cfg(test)]
 mod folder_tests {
     use super::*;
-    use crate::testutil::{Ctx, TestResult, check_eq};
+    use crate::testutil::{Ctx, TestResult, check, check_eq};
+
+    #[test]
+    fn the_operation_lock_waits_for_a_holder_that_is_about_to_finish() -> TestResult {
+        let dir = tempfile::tempdir().ctx("state")?;
+        let held = lock_in(dir.path(), std::time::Duration::ZERO).ctx("first holder")?;
+        let busy = lock_in(dir.path(), std::time::Duration::from_millis(150));
+        check(
+            busy.is_err_and(|error| error.to_string() == LOCK_BUSY),
+            "control: a holder that stays makes the wait run out",
+        )?;
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+        });
+        let started = std::time::Instant::now();
+        lock_in(dir.path(), std::time::Duration::from_secs(5)).ctx("second holder")?;
+        check(
+            started.elapsed() >= std::time::Duration::from_millis(200),
+            "the second holder waited for the first",
+        )?;
+        release.join().map_err(|_| "release thread panicked".to_string())
+    }
 
     #[test]
     fn typed_locations_expand_home_spaces_and_preserve_literal_backslashes() -> TestResult {
