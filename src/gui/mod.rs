@@ -18,7 +18,10 @@ mod preview;
 mod preview_renderer;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod surface;
-mod theme;
+// The windows and macOS front end adopts these helpers in a later change, so
+// until then the ones only the Linux window calls would warn there.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) mod theme;
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod unsupported;
 #[cfg(target_os = "linux")]
@@ -127,6 +130,10 @@ fn animation_frames(state: &app::State) -> iced::Subscription<app::Message> {
 #[cfg(target_os = "linux")]
 const DEFAULT_LOG_FILTER: &str = "warn,wgpu_hal=error,wgpu_core=error";
 
+/// The smallest window size, below which the compact layout cannot fit a row.
+#[cfg(target_os = "linux")]
+const MIN_WINDOW: (f32, f32) = (640.0, 480.0);
+
 /// Opens the window and runs until it closes. Logs go to stderr at `warn`
 /// unless `RUST_LOG` says otherwise.
 #[cfg(target_os = "linux")]
@@ -158,7 +165,11 @@ pub fn run() -> Result<()> {
     .subscription(animation_frames)
     .theme(theme_of)
     .default_font(theme::BODY_FONT)
-    .window_size((1100.0, 720.0))
+    .window(iced::window::Settings {
+        size: iced::Size::new(1100.0, 720.0),
+        min_size: Some(iced::Size::new(MIN_WINDOW.0, MIN_WINDOW.1)),
+        ..iced::window::Settings::default()
+    })
     .run();
     // A picker is its own process and outlives the window unless closed.
     dialog::close_open_picker();
