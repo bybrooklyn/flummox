@@ -920,8 +920,14 @@ fn print_estimate(est: &estimate::Estimate, opts: &EstimateOpts) {
     );
     println!(
         "  skipped    : {} files (too small, already compressed, or not worth it)",
-        est.skipped_files
+        est.skipped_files.saturating_sub(est.unsampled_files)
     );
+    if est.unsampled_files > 0 {
+        println!(
+            "  not sampled: {} smaller files; the sizes here are scaled up from the {} that were",
+            est.unsampled_files, est.inspected_files
+        );
+    }
     println!("  on disk now: ~{} (those files)", size(est.disk_now));
     println!("  after      : ~{}", size(est.disk_after));
     let of_install = if est.install_bytes == 0 {

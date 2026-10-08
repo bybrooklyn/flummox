@@ -281,6 +281,10 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
         let mut budget = ANALYSIS_BUDGET.saturating_sub(summary.small_files.bytes);
         let mut candidates = Vec::new();
         let mut inspected_bytes = 0u64;
+        // Sizes of the files sampled and of those the budget did not reach,
+        // for scaling the totals once sampling ends.
+        let mut sampled_size = 0u64;
+        let mut unsampled_size = 0u64;
         for (index, entry) in inv.files.iter().enumerate() {
             if !ctx.wait_while_busy(&gate) {
                 break;
@@ -290,6 +294,7 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
                 continue;
             }
             if budget == 0 {
+                unsampled_size = unsampled_size.saturating_add(entry.size);
                 candidates.push(entry.clone());
                 continue;
             }
@@ -327,6 +332,7 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
                     summary.sampled = summary.sampled.saturating_add(sampled);
                     summary.inspected_files += 1;
                     summary.unsampled_files = summary.unsampled_files.saturating_sub(1);
+                    sampled_size = sampled_size.saturating_add(entry.size);
                     summary.format_evidence.observe(native.inspection);
                     // Small absolute wins still matter across many small files.
                     if native.worthwhile() || maximum.worthwhile() {
@@ -377,6 +383,18 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
         }
         summary.rewrite_files = candidates.len() as u64;
         inv.files = candidates;
+        // The totals cover the sampled files, which are the largest. Reporting
+        // them alone showed a fraction of what a pass frees on a game with
+        // thousands of files, so the rest is assumed to behave the same way.
+        // A cancelled analysis stays as measured.
+        if unsampled_size > 0 && sampled_size > 0 && !cancel.load(Ordering::Relaxed) {
+            let scale = unsampled_size as f64 / sampled_size as f64;
+            let grow = |value: u64| value.saturating_add((value as f64 * scale) as u64);
+            summary.bytes = grow(summary.bytes);
+            summary.disk_now = grow(summary.disk_now);
+            summary.disk_after = grow(summary.disk_after);
+            summary.maximum_after = summary.maximum_after.map(grow);
+        }
         output.send(WorkerEvent::Estimate(summary));
     }
     // Analysis ends here, and so does a job cancelled during sampling.

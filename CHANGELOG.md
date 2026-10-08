@@ -53,6 +53,10 @@ open items are listed there.
 
 ### Fixed
 
+- Estimates cover the whole game. They used to total only the files that were
+  sampled, which on a game with thousands of files showed a fraction of what a
+  pass frees.
+
 - A job that finished as a pause arrived no longer keeps the pause message.
 - A History row for one file reads "1 file".
 
