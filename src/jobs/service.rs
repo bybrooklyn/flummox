@@ -26,6 +26,28 @@ struct Active {
     paused: bool,
 }
 
+/// Logs a failed per-pass step and carries on, so that one bad write does
+/// not end the coordinator and unmount every game. The same message is
+/// logged at most once every ten seconds, because a pass repeats every 50 ms.
+fn survive<T>(what: &str, result: Result<T>) -> Option<T> {
+    static LAST: std::sync::Mutex<Option<(String, Instant)>> = std::sync::Mutex::new(None);
+    match result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            let line = format!("{what}: {error:#}");
+            if let Ok(mut last) = LAST.lock()
+                && last.as_ref().is_none_or(|(text, at)| {
+                    *text != line || at.elapsed() >= Duration::from_secs(10)
+                })
+            {
+                eprintln!("{line}");
+                *last = Some((line, Instant::now()));
+            }
+            None
+        }
+    }
+}
+
 /// Writes one control line to a worker's stdin and flushes it.
 fn send_control(input: &mut impl Write, control: Control) -> Result<()> {
     serde_json::to_writer(&mut *input, &control)?;
@@ -397,8 +419,9 @@ fn enqueue(
 }
 
 /// Validates a request and appends it to the queue and the database. Returns
-/// `Ok` without queueing when an active job already covers the same folder
-/// and operation. Refuses excluded games and a queue of 200 active jobs.
+/// `Ok` without queueing when an active job already covers the same folder,
+/// operation and storage task. Refuses excluded games, a folder that contains
+/// or lies inside another discovered game, and a queue of 200 active jobs.
 fn enqueue_job(
     snapshot: &mut Snapshot,
     game: Game,
@@ -425,12 +448,31 @@ fn enqueue_job(
             .any(|id| game.ids().any(|g| g.to_string() == *id)),
         "This game is excluded. Restore it in Drives first."
     );
-    if snapshot
+    if let Some(existing) = snapshot
         .jobs
         .iter()
-        .any(|j| j.phase.active() && j.game.install_dir == path && j.operation == operation)
+        .find(|j| j.phase.active() && j.game.install_dir == path && j.operation == operation)
     {
+        // A storage job for the same folder with another task is a different
+        // request, so it is refused rather than reported as queued.
+        ensure!(
+            existing.pack == pack,
+            "{} is already waiting or running for this game. Wait for it to finish first.",
+            existing.pack.as_ref().map_or("A storage task", PackTask::label)
+        );
         return Ok(());
+    }
+    if let Some(other) = snapshot.discovered.iter().find(|other| {
+        let theirs = other
+            .install_dir
+            .canonicalize()
+            .unwrap_or_else(|_| other.install_dir.clone());
+        theirs != path && (theirs.starts_with(&path) || path.starts_with(&theirs))
+    }) {
+        bail!(
+            "This folder overlaps {}. Choose that game's own folder instead.",
+            other.title
+        );
     }
     ensure!(
         snapshot.jobs.iter().filter(|j| j.phase.active()).count() < 200,
@@ -1441,7 +1483,10 @@ pub(super) fn run() -> Result<()> {
     // Startup: remount activated installs, reapply live compression, and
     // bring the login entry in line with the saved settings.
     let mut mounts: Vec<PackMount> = Vec::new();
-    recover_packs(&mut snapshot, &db, &mut mounts)?;
+    survive(
+        "recovering Maximum Space installs",
+        recover_packs(&mut snapshot, &db, &mut mounts),
+    );
     for library in &snapshot.libraries {
         if library.automatic
             && let Err(error) = update_live_compression(library)
@@ -1449,10 +1494,16 @@ pub(super) fn run() -> Result<()> {
             tracing::warn!(%error, path = %library.path.display(), "live compression was not enabled");
         }
     }
-    super::autostart::configure(
-        &binary()?,
-        snapshot.libraries.iter().any(|library| library.automatic) || !snapshot.packs.is_empty(),
-    )?;
+    survive(
+        "configuring login startup",
+        binary().and_then(|binary| {
+            super::autostart::configure(
+                &binary,
+                snapshot.libraries.iter().any(|library| library.automatic)
+                    || !snapshot.packs.is_empty(),
+            )
+        }),
+    );
     let history =
         crate::db::Db::open(&crate::db::Db::default_path().context("Cannot locate history")?)?;
     // Import exclusions from older CLI-only installations and share future edits.
@@ -1488,8 +1539,7 @@ pub(super) fn run() -> Result<()> {
             r.get::<_, String>(0)
         })
         .optional()?
-        .map(|json| serde_json::from_str(&json))
-        .transpose()?
+        .and_then(|json| serde_json::from_str(&json).ok())
         .unwrap_or_default();
     let mut initialized = !known.0.is_empty();
     let mut upkeep: std::collections::HashMap<String, Upkeep> = db
@@ -1497,8 +1547,7 @@ pub(super) fn run() -> Result<()> {
             r.get::<_, String>(0)
         })
         .optional()?
-        .map(|json| serde_json::from_str(&json))
-        .transpose()?
+        .and_then(|json| serde_json::from_str(&json).ok())
         .unwrap_or_default();
     let mut last_client = Instant::now();
     let mut games = Vec::new();
@@ -1637,7 +1686,7 @@ pub(super) fn run() -> Result<()> {
         // installs and settled updates in automatic libraries, and save the
         // observations when they changed.
         if completed_scan {
-            let before = serde_json::to_string(&known)?;
+            let before = serde_json::to_string(&known).unwrap_or_default();
             for game in &games {
                 if known.observe(game, &snapshot.libraries, initialized) {
                     match enqueue(
@@ -1655,22 +1704,30 @@ pub(super) fn run() -> Result<()> {
                 }
             }
             initialized = true;
-            let after = serde_json::to_string(&known)?;
+            let after = serde_json::to_string(&known).unwrap_or_default();
             if before != after {
-                db.execute(
-                    "INSERT OR REPLACE INTO settings(id,data) VALUES(2,?1)",
-                    [after],
-                )?;
+                survive(
+                    "saving maintenance observations",
+                    db.execute(
+                        "INSERT OR REPLACE INTO settings(id,data) VALUES(2,?1)",
+                        [after],
+                    )
+                    .map_err(Into::into),
+                );
             }
             // Store upkeep, on the same fresh game list.
-            let before = serde_json::to_string(&upkeep)?;
+            let before = serde_json::to_string(&upkeep).unwrap_or_default();
             run_upkeep(&mut snapshot, &games, &mut upkeep, &db);
-            let after = serde_json::to_string(&upkeep)?;
+            let after = serde_json::to_string(&upkeep).unwrap_or_default();
             if before != after {
-                db.execute(
-                    "INSERT OR REPLACE INTO settings(id,data) VALUES(7,?1)",
-                    [after],
-                )?;
+                survive(
+                    "saving store upkeep",
+                    db.execute(
+                        "INSERT OR REPLACE INTO settings(id,data) VALUES(7,?1)",
+                        [after],
+                    )
+                    .map_err(Into::into),
+                );
             }
         }
         // Accept at most one client per pass. The listener does not block,
@@ -1678,10 +1735,10 @@ pub(super) fn run() -> Result<()> {
         match listener.accept() {
             Ok((mut stream, _)) => {
                 last_client = Instant::now();
-                stream.set_read_timeout(Some(Duration::from_millis(500)))?;
-                stream.set_write_timeout(Some(Duration::from_secs(2)))?;
                 let mut restart = false;
                 let result = (|| -> Result<()> {
+                    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+                    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
                     let message: Request = read_message(&mut BufReader::new(Within {
                         inner: &mut stream,
                         until: Instant::now() + Duration::from_secs(2),
@@ -1806,12 +1863,17 @@ pub(super) fn run() -> Result<()> {
                     .map_err(std::io::Error::other)
                     .and_then(|_| stream.write_all(b"\n"));
                 if restart {
-                    std::fs::remove_file(&socket)?;
+                    survive(
+                        "removing the socket",
+                        std::fs::remove_file(&socket).map_err(Into::into),
+                    );
                     return Ok(());
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                survive("accepting a client", Err::<(), _>(e.into()));
+            }
         }
         // Drive the active worker. It should be paused while the user asked
         // for that, a game is running, or its own game is missing from
@@ -1830,7 +1892,7 @@ pub(super) fn run() -> Result<()> {
                     // Closing stdin also asks an orphaned worker to stop.
                     finished = true;
                     job.phase = Phase::Interrupted;
-                    save(&db, job)?;
+                    survive("saving a job", save(&db, job));
                 } else {
                     a.paused = paused;
                     job.phase = if paused {
@@ -1845,9 +1907,21 @@ pub(super) fn run() -> Result<()> {
             // Apply at most 256 queued events, so a busy worker cannot keep
             // the loop from reaching the next client.
             for update in a.events.try_iter().take(256) {
-                if event(job, update, &db)? {
-                    finished = true;
-                    break;
+                match event(job, update, &db) {
+                    Ok(true) => {
+                        finished = true;
+                        break;
+                    }
+                    Ok(false) => {}
+                    // Progress cannot be recorded, so the job stops. Closing
+                    // the worker's input asks it to cancel.
+                    Err(error) => {
+                        job.phase = Phase::Failed;
+                        job.message = format!("Could not record progress: {error:#}");
+                        survive("saving a job", save(&db, job));
+                        finished = true;
+                        break;
+                    }
                 }
             }
             if a.paused && !finished && job.phase != Phase::Cancelling {
@@ -1857,7 +1931,7 @@ pub(super) fn run() -> Result<()> {
             // Progress reaches the database at most once a second. `event`
             // has already saved a job that ended.
             if last_save.elapsed() >= Duration::from_secs(1) {
-                save(&db, job)?;
+                survive("saving a job", save(&db, job));
                 last_save = Instant::now();
             }
         }
@@ -1889,7 +1963,10 @@ pub(super) fn run() -> Result<()> {
                     .store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
-        poll_pack(&mut pack_active, &mut snapshot, &db, &mut mounts)?;
+        survive(
+            "driving the storage job",
+            poll_pack(&mut pack_active, &mut snapshot, &db, &mut mounts),
+        );
         note_waiting(
             &mut snapshot,
             active
@@ -1925,7 +2002,7 @@ pub(super) fn run() -> Result<()> {
                     Phase::Running
                 };
                 job.message = "Preparing files".into();
-                save(&db, job)?;
+                survive("saving a job", save(&db, job));
                 // A pack job runs on a storage thread in this process and
                 // takes every mount with it. Other jobs get a worker process.
                 if job.operation == Operation::Pack {
@@ -1940,7 +2017,7 @@ pub(super) fn run() -> Result<()> {
                         Err(error) => {
                             job.phase = Phase::Failed;
                             job.message = error.to_string();
-                            save(&db, job)?;
+                            survive("saving a job", save(&db, job));
                         }
                     }
                     continue;
@@ -1950,7 +2027,7 @@ pub(super) fn run() -> Result<()> {
                     Err(e) => {
                         job.phase = Phase::Failed;
                         job.message = e.to_string();
-                        save(&db, job)?;
+                        survive("saving a job", save(&db, job));
                     }
                 }
             }
@@ -1982,7 +2059,10 @@ pub(super) fn run() -> Result<()> {
             && mounts.len() < snapshot.packs.len()
             && last_pack_recovery.elapsed() >= Duration::from_secs(5)
         {
-            recover_packs(&mut snapshot, &db, &mut mounts)?;
+            survive(
+                "recovering Maximum Space installs",
+                recover_packs(&mut snapshot, &db, &mut mounts),
+            );
             last_pack_recovery = Instant::now();
         }
         // Idle exit: no running or active job, no automatic library, no
@@ -1994,7 +2074,10 @@ pub(super) fn run() -> Result<()> {
             && snapshot.packs.is_empty()
             && last_client.elapsed() >= Duration::from_secs(60)
         {
-            std::fs::remove_file(&socket)?;
+            survive(
+                "removing the socket",
+                std::fs::remove_file(&socket).map_err(Into::into),
+            );
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -2048,6 +2131,66 @@ mod tests {
             ended && job.phase == Phase::Failed,
             "control: another failure still fails",
         )
+    }
+
+
+    #[test]
+    fn a_different_storage_task_is_refused_and_the_same_one_is_not_duplicated() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let folder = temp.path().join("game");
+        std::fs::create_dir(&folder).ctx("game folder")?;
+        let (db, mut snapshot) = open_store(&temp.path().join("jobs.sqlite")).ctx("store")?;
+        let queue = |snapshot: &mut Snapshot, task: PackTask| {
+            enqueue_job(
+                snapshot,
+                game(&folder, "game"),
+                Operation::Pack,
+                CompressOpts::default(),
+                Some(task),
+                &db,
+            )
+        };
+        queue(&mut snapshot, PackTask::Compact).ctx("compact")?;
+        queue(&mut snapshot, PackTask::Compact).ctx("the same task again")?;
+        check_eq(snapshot.jobs.len(), 1, "the same task is not queued twice")?;
+        check(
+            queue(&mut snapshot, PackTask::Restore).is_err(),
+            "a restore is refused while a compaction waits",
+        )?;
+        check_eq(snapshot.jobs.len(), 1, "a refused task queues nothing")
+    }
+
+    #[test]
+    fn a_folder_overlapping_a_discovered_game_cannot_be_queued() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let library = temp.path().join("library");
+        let inside = library.join("game");
+        let nested = inside.join("bin");
+        let sibling = library.join("other");
+        for folder in [&nested, &sibling] {
+            std::fs::create_dir_all(folder).ctx("fixture folders")?;
+        }
+        let (db, mut snapshot) = open_store(&temp.path().join("jobs.sqlite")).ctx("store")?;
+        snapshot.discovered.push(game(&inside, "game"));
+        let queue = |snapshot: &mut Snapshot, folder: &Path| {
+            enqueue(
+                snapshot,
+                game(folder, "custom"),
+                Operation::Compress,
+                CompressOpts::default(),
+                &db,
+            )
+        };
+        check(
+            queue(&mut snapshot, &library).is_err(),
+            "a folder holding a discovered game is refused",
+        )?;
+        check(
+            queue(&mut snapshot, &nested).is_err(),
+            "a folder inside a discovered game is refused",
+        )?;
+        queue(&mut snapshot, &sibling).ctx("control: an unrelated sibling is accepted")?;
+        queue(&mut snapshot, &inside).ctx("control: the game's own folder is accepted")
     }
 
     #[test]
