@@ -655,10 +655,12 @@ mod tests {
         let native_opts = EstimateOpts {
             level: 3,
             mount_level: None,
+            floor: None,
         };
         let maximum_opts = EstimateOpts {
             level: 19,
             mount_level: None,
+            floor: None,
         };
         let (native, maximum) = spread_estimate(
             &file,
