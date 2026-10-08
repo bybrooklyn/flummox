@@ -429,20 +429,39 @@ pub(crate) struct Work {
     pub job: Job,
 }
 
+/// Error text of [`operation_lock`] when another process kept the lock for
+/// the whole wait. The coordinator requeues a job that fails with it.
+pub(crate) const LOCK_BUSY: &str = "Another Flummox process is working. Retry when it finishes.";
+
+/// How long [`operation_lock`] waits for the lock before giving up.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Serializes filesystem operations across coordinator workers and legacy CLI jobs.
+/// Waits up to ten seconds for a previous holder to finish and exit.
 /// Keep the returned handle alive until the operation and recording finish.
 pub fn operation_lock() -> anyhow::Result<std::fs::File> {
+    lock_in(&state_dir()?, LOCK_WAIT)
+}
+
+/// Takes `operation.lock` in `dir`, polling for up to `wait`.
+fn lock_in(dir: &std::path::Path, wait: std::time::Duration) -> anyhow::Result<std::fs::File> {
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(state_dir()?.join("operation.lock"))?;
-    anyhow::ensure!(
-        lock.try_lock().is_ok(),
-        "Another Flummox process is working. Retry when it finishes."
-    );
-    Ok(lock)
+        .open(dir.join("operation.lock"))?;
+    let until = std::time::Instant::now() + wait;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                anyhow::ensure!(std::time::Instant::now() < until, LOCK_BUSY);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+    }
 }
 
 /// Invalidates desktop receipts before a CLI override rewrites a game.
@@ -464,16 +483,17 @@ pub(crate) enum Control {
 
 /// Dispatches private process roles before the public CLI parser runs.
 pub fn entrypoint() -> anyhow::Result<bool> {
-    match std::env::args().nth(1).as_deref() {
-        Some("__coordinator") => {
-            service::run()?;
-            Ok(true)
-        }
-        Some("__worker") => {
-            worker::run()?;
-            Ok(true)
-        }
-        _ => Ok(false),
+    // `args_os`: `args` panics on an argument that is not valid UTF-8, and
+    // this runs before the command line parser sees the arguments.
+    let role = std::env::args_os().nth(1);
+    if role.as_deref() == Some(std::ffi::OsStr::new("__coordinator")) {
+        service::run()?;
+        Ok(true)
+    } else if role.as_deref() == Some(std::ffi::OsStr::new("__worker")) {
+        worker::run()?;
+        Ok(true)
+    } else {
+        Ok(false)
     }
 }
 
@@ -485,29 +505,63 @@ pub(crate) fn now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Refuses roots and application/system configuration directories.
+/// Refuses roots, the home folder and the folders above it, shared
+/// top-level folders such as `/mnt` and `/opt`, and application and system
+/// configuration directories.
 pub fn validate_folder(path: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let home = crate::launchers::Env::current().map(|env| env.home);
+    validate_folder_for(path, home.as_deref())
+}
+
+/// [`validate_folder`] for a given home folder.
+fn validate_folder_for(
+    path: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> anyhow::Result<PathBuf> {
+    use std::path::Path;
     let path = path.canonicalize()?;
     anyhow::ensure!(
         path.is_dir() && path.parent().is_some(),
         "Choose a game folder, not an entire drive."
     );
-    let home = crate::launchers::Env::current().map(|env| env.home);
-    anyhow::ensure!(
-        home.as_ref() != Some(&path),
-        "Choose a game folder, not your home folder."
-    );
+    // The folder is canonical, so the home it is compared with must be too.
+    let home = home.map(|home| home.canonicalize().unwrap_or_else(|_| home.to_path_buf()));
     if let Some(home) = &home {
+        anyhow::ensure!(
+            !home.starts_with(&path),
+            "Choose a game folder, not your home folder or one that contains it."
+        );
         for private in [".ssh", ".gnupg", ".config", ".cache"] {
             anyhow::ensure!(
                 !path.starts_with(home.join(private)),
                 "Choose an installed game folder, not application settings."
             );
         }
+        for shared in [".local", ".local/share", ".var", ".steam", "Documents"] {
+            anyhow::ensure!(
+                path != home.join(shared),
+                "Choose a game folder, not a general folder in your home."
+            );
+        }
     }
+    let media_root = path.starts_with("/run/media") && path.components().count() <= 4;
     anyhow::ensure!(
-        path != std::path::Path::new("/home") && path != std::path::Path::new("/var"),
-        "Choose a game folder, not a system folder."
+        !media_root
+            && [
+                "/home",
+                "/var",
+                "/var/home",
+                "/mnt",
+                "/media",
+                "/run",
+                "/opt",
+                "/srv",
+                "/root",
+                "/tmp"
+            ]
+            .iter()
+            .all(|shared| path != Path::new(shared)),
+        "Choose a game folder, not a system or shared folder."
     );
     if let Some(state) =
         crate::db::Db::default_path().and_then(|p| p.parent().map(|p| p.to_path_buf()))
@@ -669,7 +723,66 @@ pub fn space_plan(
 #[cfg(test)]
 mod folder_tests {
     use super::*;
-    use crate::testutil::{Ctx, TestResult, check_eq};
+    use crate::testutil::{Ctx, TestResult, check, check_eq};
+
+    #[test]
+    fn folders_that_hold_the_home_or_other_users_data_are_refused() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let real = temp.path().join("real-home");
+        let link = temp.path().join("home-link");
+        let steam = real.join(".local/share/Steam/steamapps/common/Game");
+        std::fs::create_dir_all(&steam).ctx("game folder")?;
+        std::os::unix::fs::symlink(&real, &link).ctx("home symlink")?;
+        let refuses = |path: &std::path::Path, home: &std::path::Path| {
+            validate_folder_for(path, Some(home)).is_err()
+        };
+        check(refuses(&real, &link), "a symlinked home is still the home")?;
+        check(
+            refuses(temp.path(), &real),
+            "a folder that contains the home is refused",
+        )?;
+        check(refuses(&real.join(".local"), &real), "~/.local")?;
+        check(refuses(&real.join(".local/share"), &real), "~/.local/share")?;
+        check(
+            validate_folder_for(&steam, Some(&link)).is_ok(),
+            "control: a game folder deep in the home is accepted",
+        )?;
+        for shared in ["/tmp", "/mnt", "/opt", "/"] {
+            let shared = std::path::Path::new(shared);
+            check(
+                !shared.exists() || validate_folder_for(shared, None).is_err(),
+                format!("{} is refused", shared.display()),
+            )?;
+        }
+        check(
+            validate_folder_for(&steam, None).is_ok(),
+            "control: the same folder is accepted without a home",
+        )
+    }
+
+    #[test]
+    fn the_operation_lock_waits_for_a_holder_that_is_about_to_finish() -> TestResult {
+        let dir = tempfile::tempdir().ctx("state")?;
+        let held = lock_in(dir.path(), std::time::Duration::ZERO).ctx("first holder")?;
+        let busy = lock_in(dir.path(), std::time::Duration::from_millis(150));
+        check(
+            busy.is_err_and(|error| error.to_string() == LOCK_BUSY),
+            "control: a holder that stays makes the wait run out",
+        )?;
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+        });
+        let started = std::time::Instant::now();
+        lock_in(dir.path(), std::time::Duration::from_secs(5)).ctx("second holder")?;
+        check(
+            started.elapsed() >= std::time::Duration::from_millis(200),
+            "the second holder waited for the first",
+        )?;
+        release
+            .join()
+            .map_err(|_| "release thread panicked".to_string())
+    }
 
     #[test]
     fn typed_locations_expand_home_spaces_and_preserve_literal_backslashes() -> TestResult {
