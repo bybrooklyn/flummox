@@ -390,7 +390,7 @@ impl Overlay {
             .create_new(true)
             .mode(mode & 0o777)
             .open(self.checked_upper(path)?)?;
-        self.reveal(path);
+        self.reveal(reader, path);
         self.persist()?;
         Ok(file)
     }
@@ -407,7 +407,7 @@ impl Overlay {
             self.checked_upper(path)?,
             std::fs::Permissions::from_mode(mode & 0o777),
         )?;
-        self.reveal(path);
+        self.reveal(reader, path);
         self.persist()?;
         Ok(())
     }
@@ -425,7 +425,7 @@ impl Overlay {
         );
         self.ensure_parent(reader, path)?;
         symlink(target, self.checked_upper(path)?)?;
-        self.reveal(path);
+        self.reveal(reader, path);
         self.persist()?;
         Ok(())
     }
@@ -446,27 +446,38 @@ impl Overlay {
             );
         }
         let upper = self.checked_upper(path)?;
-        // Order: move the upper entry to trash, write the whiteout, then
-        // delete the trash copy as `staged` drops. Between the first two
-        // steps the store's version of the path is visible again.
+        // Order: write the whiteout, then move the upper entry to trash,
+        // which deletes it as `staged` drops. A crash between the two leaves
+        // a whiteout beside an upper entry, and `open` drops the whiteout, so
+        // the entry is still there. The other order would show the store's
+        // old version of the path after a crash.
+        let in_store = reader.entry(path).is_some();
+        // Made before the whiteout so that nothing after it can fail except
+        // the move itself, which is undone below.
         let staged = if std::fs::symlink_metadata(&upper).is_ok() {
-            let staged = tempfile::Builder::new()
-                .prefix("removed-")
-                .tempdir_in(self.root.join(TRASH))?;
-            std::fs::rename(&upper, staged.path().join("entry"))?;
-            Some(staged)
+            Some(
+                tempfile::Builder::new()
+                    .prefix("removed-")
+                    .tempdir_in(self.root.join(TRASH))?,
+            )
         } else {
             None
         };
-        if reader.entry(path).is_some() {
+        if in_store {
             self.deleted.insert(path.to_path_buf());
             if let Err(error) = self.persist() {
                 self.deleted.remove(path);
-                if let Some(staged) = &staged {
-                    let _restored = std::fs::rename(staged.path().join("entry"), &upper);
-                }
                 return Err(error);
             }
+        }
+        if let Some(staged) = &staged
+            && let Err(error) = std::fs::rename(&upper, staged.path().join("entry"))
+        {
+            if in_store {
+                self.deleted.remove(path);
+                self.persist()?;
+            }
+            return Err(error.into());
         }
         Ok(())
     }
@@ -544,7 +555,7 @@ impl Overlay {
             }
             return Err(error.into());
         }
-        self.reveal(to);
+        self.reveal(reader, to);
         self.persist()
     }
 
@@ -565,7 +576,7 @@ impl Overlay {
         );
         self.ensure_parent(reader, to)?;
         std::fs::hard_link(source, self.checked_upper(to)?)?;
-        self.reveal(to);
+        self.reveal(reader, to);
         self.persist()
     }
 
@@ -655,10 +666,25 @@ impl Overlay {
         Ok(())
     }
 
-    // Clears the whiteout at exactly `path`, in memory. Whiteouts on its
-    // ancestors and descendants stay. The caller persists afterwards.
-    fn reveal(&mut self, path: &Path) {
-        self.deleted.remove(path);
+    /// Makes `path` visible again after something was created or moved there.
+    ///
+    /// The whiteout on `path` also hid everything the store holds below it.
+    /// Those children get whiteouts of their own, so a folder recreated or
+    /// moved here starts with only what the update layer holds. Whiteouts
+    /// below `path` that now have an upper entry are dropped for the same
+    /// reason `open` drops them: the upper entry is current.
+    fn reveal(&mut self, reader: &Reader, path: &Path) {
+        if self.deleted.remove(path) {
+            for entry in reader.entries() {
+                if entry.path.parent() == Some(path) {
+                    self.deleted.insert(entry.path.clone());
+                }
+            }
+        }
+        let files = &self.files;
+        self.deleted.retain(|hidden| {
+            !hidden.starts_with(path) || std::fs::symlink_metadata(files.join(hidden)).is_err()
+        });
     }
 
     // Writes the whole whiteout set to the journal, sorted.

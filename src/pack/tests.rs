@@ -809,3 +809,66 @@ fn grouped_preview_measures_extra_saving_without_writing() -> TestResult {
         "preview writes nothing",
     )
 }
+
+// An updater that moves a folder aside and recreates it must get an empty
+// folder, and a folder moved onto an emptied one must keep its own files.
+#[cfg(feature = "pack-mount")]
+#[test]
+fn a_recreated_or_replaced_folder_shows_only_its_own_files() -> TestResult {
+    let temp = tempfile::tempdir().ctx("fixture")?;
+    let source = temp.path().join("game");
+    for folder in ["saves", "old", "new"] {
+        fs::create_dir_all(source.join(folder)).ctx("folder")?;
+    }
+    fs::write(source.join("saves/slot1.sav"), b"store save").ctx("save")?;
+    fs::write(source.join("old/data.bin"), b"old data").ctx("old")?;
+    fs::write(source.join("new/data.bin"), b"new data").ctx("new")?;
+    let store = temp.path().join("game.flumpack");
+    create(&source, &store, Options::default(), &AtomicBool::new(false)).ctx("create")?;
+    let reader = Reader::open(&store).ctx("reader")?;
+    let mut overlay = overlay::Overlay::open(&temp.path().join("updates")).ctx("layer")?;
+    let names = |overlay: &overlay::Overlay, folder: &str| -> Result<Vec<String>, String> {
+        Ok(overlay
+            .children(&reader, Path::new(folder))
+            .ctx("children")?
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect())
+    };
+
+    overlay
+        .rename(&reader, Path::new("saves"), Path::new("saves.bak"), true)
+        .ctx("move aside")?;
+    overlay
+        .mkdir(&reader, Path::new("saves"), 0o755)
+        .ctx("recreate")?;
+    check_eq(
+        names(&overlay, "saves")?,
+        Vec::<String>::new(),
+        "the recreated folder is empty",
+    )?;
+    check_eq(
+        names(&overlay, "saves.bak")?,
+        vec!["saves.bak/slot1.sav".to_owned()],
+        "the moved folder kept its file",
+    )?;
+
+    overlay
+        .remove(&reader, Path::new("old/data.bin"), false)
+        .ctx("empty the target")?;
+    overlay
+        .rename(&reader, Path::new("new"), Path::new("old"), false)
+        .ctx("replace the emptied folder")?;
+    check_eq(
+        names(&overlay, "old")?,
+        vec!["old/data.bin".to_owned()],
+        "the moved folder's file is visible at its new place",
+    )?;
+    drop(overlay);
+    let reopened = overlay::Overlay::open(&temp.path().join("updates")).ctx("reopen")?;
+    check_eq(
+        names(&reopened, "saves")?,
+        Vec::<String>::new(),
+        "the recreated folder is still empty after reopening",
+    )
+}
