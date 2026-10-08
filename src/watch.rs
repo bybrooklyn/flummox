@@ -50,10 +50,26 @@ pub fn appid_from_manifest(name: &str) -> Option<u32> {
         .ok()
 }
 
+/// What the watcher last saw of an app.
+struct Seen {
+    settled: bool,
+    build: Option<String>,
+}
+
+/// Whether an app is newly ready: settled now, and either it was not settled
+/// before or it settled on a different build.
+///
+/// An update that starts and finishes while a caller is busy with another
+/// game leaves the app settled at both readings, and only the build changes.
+fn newly_ready(before: Option<&Seen>, app: &App) -> bool {
+    is_settled(app) && before.is_none_or(|seen| !seen.settled || seen.build != app.build)
+}
+
 /// Watches each library's `steamapps` directory, reporting apps as they settle.
 ///
-/// Runs until `cancel` is set. `on_ready` is called once per app each time it
-/// becomes settled, not once per manifest write.
+/// Runs until `cancel` is set, or fails once every watched folder is gone.
+/// `on_ready` is called once per app each time it becomes settled or settles
+/// on a new build, not once per manifest write.
 pub fn run(
     libraries: &[PathBuf],
     cancel: &AtomicBool,
@@ -61,7 +77,7 @@ pub fn run(
 ) -> io::Result<()> {
     let fd = inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK)?;
 
-    let mut settled: HashMap<u32, bool> = HashMap::new();
+    let mut seen: HashMap<u32, Seen> = HashMap::new();
     let mut watched: Vec<PathBuf> = Vec::new();
     for library in libraries {
         let steamapps = library.join("steamapps");
@@ -78,7 +94,13 @@ pub fn run(
         // Seeded from what is installed now. Without this, starting the
         // watcher on a full library would report every finished game at once.
         for app in steam::apps_in_library(library).unwrap_or_default() {
-            settled.insert(app.appid, is_settled(&app));
+            seen.insert(
+                app.appid,
+                Seen {
+                    settled: is_settled(&app),
+                    build: app.build.clone(),
+                },
+            );
         }
         watched.push(library.clone());
     }
@@ -89,6 +111,7 @@ pub fn run(
         ));
     }
 
+    let mut alive = watched.len();
     let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); BUF_BYTES];
     while !cancel.load(Ordering::Relaxed) {
         let mut fds = [PollFd::new(&fd, PollFlags::IN)];
@@ -98,7 +121,15 @@ pub fn run(
             Err(rustix::io::Errno::INTR) => continue,
             Err(e) => return Err(e.into()),
         }
-        if !drain(&fd, &mut buf)? {
+        let drained = drain(&fd, &mut buf)?;
+        alive = alive.saturating_sub(drained.lost);
+        if alive == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "every watched Steam folder has gone away",
+            ));
+        }
+        if !drained.rescan {
             continue;
         }
         // One manifest changed, so every library is re-read. A library holds
@@ -106,9 +137,14 @@ pub fn run(
         // watch descriptor belongs to which directory.
         for library in &watched {
             for app in steam::apps_in_library(library).unwrap_or_default() {
-                let now = is_settled(&app);
-                let before = settled.insert(app.appid, now).unwrap_or(false);
-                if now && !before {
+                let before = seen.insert(
+                    app.appid,
+                    Seen {
+                        settled: is_settled(&app),
+                        build: app.build.clone(),
+                    },
+                );
+                if newly_ready(before.as_ref(), &app) {
                     on_ready(&app);
                 }
             }
@@ -117,9 +153,21 @@ pub fn run(
     Ok(())
 }
 
-/// Reads the pending events, reporting whether any named a manifest.
-fn drain(fd: &impl rustix::fd::AsFd, buf: &mut [std::mem::MaybeUninit<u8>]) -> io::Result<bool> {
-    let mut saw_manifest = false;
+/// What the pending events asked for.
+struct Drained {
+    /// A manifest changed, or the kernel dropped events and any might have.
+    rescan: bool,
+    /// Watches the kernel removed, because their folder went away.
+    lost: usize,
+}
+
+/// Reads the pending events.
+fn drain(fd: &impl rustix::fd::AsFd, buf: &mut [std::mem::MaybeUninit<u8>]) -> io::Result<Drained> {
+    use inotify::ReadFlags;
+    let mut drained = Drained {
+        rescan: false,
+        lost: 0,
+    };
     let mut reader = inotify::Reader::new(fd, buf);
     loop {
         match reader.next() {
@@ -129,11 +177,15 @@ fn drain(fd: &impl rustix::fd::AsFd, buf: &mut [std::mem::MaybeUninit<u8>]) -> i
                     .and_then(|name| name.to_str().ok())
                     .and_then(appid_from_manifest)
                     .is_some()
+                    || event.events().contains(ReadFlags::QUEUE_OVERFLOW)
                 {
-                    saw_manifest = true;
+                    drained.rescan = true;
+                }
+                if event.events().contains(ReadFlags::IGNORED) {
+                    drained.lost += 1;
                 }
             }
-            Err(rustix::io::Errno::WOULDBLOCK) => return Ok(saw_manifest),
+            Err(rustix::io::Errno::WOULDBLOCK) => return Ok(drained),
             Err(rustix::io::Errno::INTR) => {}
             Err(e) => return Err(e.into()),
         }
