@@ -78,8 +78,9 @@ Drives & libraries supports both a collection of immediate game subfolders and
 one individual game. Home shortcuts and escaped spaces are accepted. Tests cover
 legacy registrations, collection discovery, hidden/symlink filtering, overlapping
 locations, persistent registration, and removal without deleting game files.
-The coordinator protocol is version 7; the version 6 restart command supports
-upgrading the previous coordinator.
+The coordinator protocol is version 8. A version 8 client asks an older idle
+coordinator to restart and takes over; the restart command exists from
+version 6, which is what 0.0.1 shipped.
 
 Prioritized acceptance work and proposed product improvements are tracked in
 [next-steps.md](next-steps.md).

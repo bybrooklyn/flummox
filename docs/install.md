@@ -36,8 +36,13 @@ mounted installs require it.
 
 ## Upgrade a running installation
 
-Finish or cancel queued jobs and restore mounted Maximum Space games before
-replacing the binaries. After installation, use Settings > Restart worker or:
+From 0.0.2, a newer Flummox replaces an older background worker by itself the
+first time you open the window or run a command, as long as that worker is idle
+and no Maximum Space game is mounted. It never replaces a newer worker with an
+older one. If the worker is busy, the message says what to finish first.
+
+To restart it yourself, finish or cancel queued jobs and restore mounted
+Maximum Space games, then use Settings > Restart worker or:
 
 ```sh
 flummox jobs restart
@@ -153,14 +158,15 @@ flummox jobs add-folder '/mnt/games/One Game' --single-game
 flummox jobs remove-folder '~/My Games'
 ```
 
-The development coordinator protocol is version 8. After upgrading a running
-older coordinator, follow [the restart or logout procedure](#upgrade-a-running-installation)
-once it is idle and no managed games are mounted, before adding locations.
+The development coordinator protocol is version 8. An older idle coordinator
+is [replaced automatically](#upgrade-a-running-installation).
 
 ## Verify release signatures
 
 Starting with v0.0.2, download the release manifest and its `.minisig` signature.
-Install Minisign and verify with the stable public key shown in the notes and
-committed in `packaging/minisign.pub`. Pin that known key for later releases.
+Install Minisign and verify with the public key committed in
+`packaging/minisign.pub` in this repository. The release notes print the same
+key, but a key shown beside the downloads proves nothing about them, so take it
+from the repository and pin it for later releases.
 Compare the signed manifest's filename, size, and SHA-256 with your download.
 Publisher signing and notarization remain separate from these signatures.
