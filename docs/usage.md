@@ -58,8 +58,9 @@ reports checked items. File switches, restoration and reclaim finish without
 interruption, with controls hidden during those phases. Linux and Windows jobs
 survive closing the window because their coordinators keep running. Mac jobs
 currently run inside the app. Analysis and compression pause when a detected
-game is running. Current Linux filesystem operations finish before workers stop
-at 16 MiB range boundaries, including inside large files.
+game is running. A stop request, from the window or the command line, lets the
+current Linux filesystem operation finish: workers stop between files and at
+16 MiB range boundaries inside large files.
 
 Settings > Locations lets you add game folders. On Linux and Windows,
 Settings > Maintenance opts libraries into background work. Opting in
@@ -75,8 +76,9 @@ Settings > Appearance. Artwork comes from local launcher caches; no artwork or
 telemetry is sent to a server.
 
 On Linux, the command line shares ordinary compression and decompression jobs
-with the window. Interrupting the CLI disconnects the client and leaves its
-job running:
+with the window. A plain `compress` or `decompress` queues a job and follows
+it. Interrupting the command with Ctrl-C disconnects the client and leaves the
+job running in the background worker; `flummox jobs cancel` stops it:
 
 ```sh
 flummox jobs
@@ -86,8 +88,10 @@ flummox jobs cancel 12
 flummox jobs retry 12
 ```
 
-The advanced `--force` and `--no-pause` paths retain their direct execution
-behavior and share an operation lock with coordinator workers.
+The advanced `compress --force`, `compress --no-pause` and
+`decompress --force` paths run in the command's own process instead of the
+queue. They share an operation lock with coordinator workers and check free
+space before they start, as a queued job does.
 
 ## Use the command line
 
@@ -121,18 +125,43 @@ flummox exclude remove 105600
 ```
 
 A hidden entry stays out of scans and will not be compressed even if you name
-it directly.
+it directly. `exclude remove` takes an ID, a whole title or part of a title,
+tried in that order. It refuses a partial title that matches several hidden
+games, and an empty one, and lists the matches so you can choose.
 
 Name a game by its Steam app ID, by `steam:105600`, or by part of its title.
-Presets are `fast`, `balanced` and `max`. Every read-only command takes
-`--json`.
+Presets are `fast`, `balanced` and `max`. `--level` overrides the preset with
+a zstd level from -15 to 15, and 0 is refused. `--threads` takes 1 to 32.
+
+Every read-only command takes `--json`, with one exception: `flummox doctor`
+has no JSON output and returns an error when asked for it. `drives --json`,
+`watch status --json` and `compress --dry-run --json` work.
 
 Flummox will not start on a game that is running, updating or being verified.
-If you launch the game while it is working, it pauses and waits for you, then
-picks up where it left off. Pass `--no-pause` if you would rather it stop.
+If you launch the game while a job is working, the job pauses and waits for
+you, then picks up where it left off. `compress --no-pause` stops the job when
+the game is launched instead. Run the same command again to finish the rest.
 
-Ctrl-C stops between files, so a cancelled job leaves a game that is partly
-compressed, still playable, and safe to resume.
+Ctrl-C works in two steps. On the default queued path it only disconnects: the
+job continues in the background worker until you run `flummox jobs cancel`. On
+the direct path (`--force`, `--no-pause`) the first Ctrl-C asks the pass to stop
+at the next safe point, between files or at a 16 MiB boundary inside a large
+file, and a stopped pass leaves a game that is partly compressed, still
+playable, and safe to resume. A second Ctrl-C exits at once with status 130
+(143 for SIGTERM).
+
+A direct `compress`, or `decompress --force`, exits with a non-zero status when
+any file failed or the pass was cancelled. A failed `decompress --force` keeps
+the game's record, because the game is still partly compressed.
+
+Relative paths given to `jobs add-folder`, `jobs remove-folder` and the
+`pack` commands are resolved against the current directory before they reach
+the background worker.
+
+`flummox compatibility import` refuses a report larger than 1 MiB.
+
+Filesystems other than btrfs have no in-place compression. bcachefs is listed
+as unsupported: `scan` and `drives` report that it has no backend yet.
 
 ## Compress new downloads automatically
 
@@ -164,14 +193,33 @@ flummox watch enable     # collect the rest once it finishes
 ```
 
 `flummox watch enable` starts a small background service that runs at login.
-It reads Steam's own manifests and compresses a game once its download has
+It reads Steam's own manifests and queues a game once its download has
 settled, which picks up the files the filesystem skipped on the way past. It
-waits behind anything else using the disk, and it will not touch a game you
-are playing.
+waits behind anything else using the disk. It queues a finished download even
+if the game is already running; the queued job pauses until you close the
+game, so the watcher never touches a game you are playing.
+
+`watch enable` writes the unit to `~/.config/systemd/user/flummox-watch.service`
+with the preset, level, threads and dry-run setting you passed, for example
+`flummox watch enable --preset max --threads 4`. The unit carries the same
+hardening as the unit shipped in the packages. The user copy takes precedence
+over the packaged one, so the packaged unit is never the one that runs once you
+have enabled the watcher this way.
 
 `flummox watch status` says whether it is on, and `flummox watch disable`
 turns it off. Running `flummox watch` with no argument does the same work in
 the foreground, if you would rather watch it happen.
 
 `flummox hook off` stops it applying to future downloads and leaves everything
-already compressed exactly as it is.
+already compressed as it is.
+
+`flummox hook on` exits with a non-zero status when no library took the
+property, for example when none of your Steam libraries is on btrfs.
+
+## On macOS
+
+The macOS build takes a folder, not a game selector. Its commands are
+`scan`, `analyze FOLDER`, `compress FOLDER`, `decompress FOLDER`, `recovery`
+and `recover FOLDER`. `status`, `log`, `doctor`, the `--preset` option and
+`--json` do not exist there. Progress goes to stderr, and the result is printed
+to stdout.
