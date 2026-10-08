@@ -6,15 +6,24 @@
 /// A structural hint, separate from whether content actually compresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Format {
+    /// No recognized header.
     #[default]
     Unknown,
+    /// Uncompressed pixel data.
     RawTexture,
+    /// Uncompressed audio samples.
     RawMedia,
+    /// GPU block-compressed texture data, such as BC1 to BC7 or ASTC.
     BlockTexture,
+    /// A ZIP whose first entry is stored, neither compressed nor encrypted.
     StoredArchive,
+    /// The payload is already compressed or encoded by its own format.
     Encoded,
+    /// A container whose members may be raw or already encoded.
     MixedContainer,
+    /// A PE or ELF binary.
     Executable,
+    /// A recognized magic followed by a header too short or inconsistent to read.
     Malformed,
 }
 
@@ -128,7 +137,9 @@ impl Family {
 pub enum Protection {
     #[default]
     None,
+    /// The first ZIP entry has its encryption flag set.
     EncryptedMember,
+    /// The payload is compressed or encoded by its own format.
     EncodedPayload,
 }
 
@@ -143,6 +154,7 @@ pub struct Inspection {
 }
 
 impl Inspection {
+    /// Evidence with no protection and no member offset.
     fn new(format: Format, family: Family) -> Self {
         Self {
             format,
@@ -152,6 +164,7 @@ impl Inspection {
         }
     }
 
+    /// Evidence for a format whose payload is already encoded.
     fn encoded(family: Family) -> Self {
         Self {
             format: Format::Encoded,
@@ -162,23 +175,30 @@ impl Inspection {
     }
 }
 
+/// Little-endian `u16` at `offset`, or `None` when the slice is too short.
 fn u16_at(bytes: &[u8], offset: usize) -> Option<u16> {
     Some(u16::from_le_bytes(
         bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?,
     ))
 }
 
+/// Little-endian `u32` at `offset`, or `None` when the slice is too short.
 fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes(
         bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
     ))
 }
 
+/// Classifies a DDS file as raw or block-compressed from the pixel format in
+/// its 128-byte header and, for `DX10`, the DXGI format that follows it.
 fn dds(bytes: &[u8]) -> Inspection {
+    // Offset 4 is the header size, 76 the pixel-format size, 80 its flags.
     if bytes.len() < 128 || u32_at(bytes, 4) != Some(124) || u32_at(bytes, 76) != Some(32) {
         return Inspection::new(Format::Malformed, Family::Dds);
     }
     let flags = u32_at(bytes, 80).unwrap_or(0);
+    // Flag 4 marks a FourCC format. Without it the pixels are uncompressed
+    // when the RGB, luminance or alpha flag is set.
     if flags & 4 == 0 {
         return Inspection::new(
             if flags & (0x40 | 0x20000 | 2) != 0 {
@@ -205,6 +225,8 @@ fn dds(bytes: &[u8]) -> Inspection {
     Inspection::new(format, Family::Dds)
 }
 
+/// Reads the first local file header of a ZIP: flags at offset 6, method at
+/// 8, name and extra-field lengths at 26 and 28. Method 0 means stored.
 fn zip(bytes: &[u8]) -> Inspection {
     if bytes.len() < 30 {
         return Inspection::new(Format::Malformed, Family::Zip);
@@ -231,6 +253,9 @@ fn zip(bytes: &[u8]) -> Inspection {
     }
 }
 
+/// Classifies a RIFF file by its form type. For WAVE it walks the chunks
+/// inside `bytes` to `fmt ` and reads the codec: 1 (PCM) and 3 (float) are
+/// raw, any other codec is encoded.
 fn riff(bytes: &[u8]) -> Inspection {
     if bytes.len() < 12 {
         return Inspection::new(Format::Malformed, Family::Riff);
@@ -257,6 +282,7 @@ fn riff(bytes: &[u8]) -> Inspection {
                         Inspection::encoded(Family::Wav)
                     };
                 }
+                // Chunks are padded to an even length.
                 let Some(next) = payload
                     .checked_add(length)
                     .and_then(|end| end.checked_add(length % 2))
@@ -287,6 +313,7 @@ pub fn inspect(bytes: &[u8]) -> Inspection {
     if bytes.starts_with(b"RIFF") {
         return riff(bytes);
     }
+    // Containers whose members may be raw or already compressed.
     let mixed = [
         (b"UnityFS\0".as_slice(), Family::Unity),
         (b"UnityRaw\0".as_slice(), Family::Unity),
@@ -315,6 +342,7 @@ pub fn inspect(bytes: &[u8]) -> Inspection {
     if bytes.starts_with(b"\x7fELF") {
         return Inspection::new(Format::Executable, Family::Elf);
     }
+    // Formats whose payload is normally compressed or encoded already.
     let encoded = [
         (b"7z\xbc\xaf\x27\x1c".as_slice(), Family::SevenZip),
         (b"Rar!\x1a\x07".as_slice(), Family::Rar),
@@ -356,6 +384,7 @@ pub fn inspect(bytes: &[u8]) -> Inspection {
             _ => Inspection::encoded(*family),
         };
     }
+    // MP4 has no magic at offset 0. Its first box type sits at offset 4.
     if bytes.get(4..8) == Some(b"ftyp") {
         return Inspection::encoded(Family::Mp4);
     }

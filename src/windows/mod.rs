@@ -30,6 +30,8 @@ use windows_sys::Win32::{
     System::{IO::DeviceIoControl, Ioctl::FSCTL_DELETE_EXTERNAL_BACKING},
 };
 
+// The WOF file-provider algorithms. A doc comment on a `ValueEnum` variant becomes
+// its help text, so notes here stay plain comments.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Algorithm {
     Lzx,
@@ -78,6 +80,8 @@ enum Command {
     Decompress { folder: PathBuf },
 }
 
+/// Running totals for one pass. `bytes` is logical size. The two allocation fields
+/// sum the visited files' allocated size before and after each was processed.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Progress {
     pub files: u64,
@@ -88,10 +92,13 @@ pub(crate) struct Progress {
     pub allocation_after: u64,
 }
 
+/// The HRESULT that wraps a nonzero Win32 error code: failure bit, FACILITY_WIN32.
 fn hresult_from_win32(code: u32) -> i32 {
     (0x8007_0000u32 | code) as i32
 }
 
+/// Opens a file for read and write with no sharing. The open fails while any other
+/// handle to the file exists, such as one held by a running game.
 fn file_handle(path: &Path) -> Result<std::fs::File> {
     OpenOptions::new()
         .read(true)
@@ -101,6 +108,8 @@ fn file_handle(path: &Path) -> Result<std::fs::File> {
         .with_context(|| format!("Opening {}", path.display()))
 }
 
+/// Bytes the file occupies on disk, as opposed to its logical length. WOF
+/// compression lowers this number and leaves the length alone.
 pub(crate) fn allocation_size(path: &Path) -> Result<u64> {
     let file = OpenOptions::new()
         .read(true)
@@ -121,7 +130,11 @@ pub(crate) fn allocation_size(path: &Path) -> Result<u64> {
     u64::try_from(info.AllocationSize).context("Windows returned a negative allocation size")
 }
 
+/// Compresses one file with WOF. Returns false if it already uses this algorithm or
+/// Windows reports that compression would not shrink it.
 fn compress_file(path: &Path, algorithm: Algorithm) -> Result<bool> {
+    // Query by name before opening anything. Opening a WOF file for write expands
+    // it, so a file already in this algorithm must never reach `file_handle`.
     let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut external = 0;
     let mut provider = 0;
@@ -145,6 +158,7 @@ fn compress_file(path: &Path, algorithm: Algorithm) -> Result<bool> {
         "Windows could not query existing compression for {}",
         path.display()
     );
+    // A reply from the file provider must be exactly one WOF_FILE_COMPRESSION_INFO_V1.
     ensure!(
         external == 0
             || provider != WOF_PROVIDER_FILE
@@ -182,6 +196,7 @@ fn compress_file(path: &Path, algorithm: Algorithm) -> Result<bool> {
     )
 }
 
+/// Returns one file to ordinary storage. Returns false if it had no WOF backing.
 fn decompress_file(path: &Path) -> Result<bool> {
     let file = file_handle(path)?;
     let mut returned = 0u32;
@@ -205,6 +220,8 @@ fn decompress_file(path: &Path) -> Result<bool> {
     // A file without external backing is already restored.
     // SAFETY: GetLastError reads this thread's Win32 error slot and takes no pointers.
     let error = unsafe { GetLastError() };
+    // 1 is ERROR_INVALID_FUNCTION, 50 is ERROR_NOT_SUPPORTED and 4390 is
+    // ERROR_NOT_A_REPARSE_POINT.
     if matches!(error, 1 | 50 | 4390) {
         return Ok(false);
     }
@@ -215,6 +232,9 @@ fn decompress_file(path: &Path) -> Result<bool> {
     )
 }
 
+/// Journal of the one pass in progress, kept in `windows-job.json`. It is written
+/// before the first file is touched and removed after the last. One left on disk
+/// means a pass ended early, by error, stop or crash.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Recovery {
     #[serde(with = "crate::path_serde")]
@@ -227,6 +247,7 @@ fn journal_path() -> Result<PathBuf> {
     Ok(crate::libraries::data_dir()?.join("windows-job.json"))
 }
 
+/// The journal of an unfinished pass, if there is one. Never more than one record.
 pub fn recovery() -> Result<Vec<Recovery>> {
     match std::fs::read(journal_path()?) {
         Ok(bytes) => Ok(vec![serde_json::from_slice(&bytes)?]),
@@ -235,6 +256,8 @@ pub fn recovery() -> Result<Vec<Recovery>> {
     }
 }
 
+/// Resolves the journal for `folder` by restoring the whole folder to ordinary
+/// storage. `folder` must equal the journaled root exactly, on the same volume.
 pub fn recover_folder(folder: &Path) -> Result<()> {
     let record = recovery()?
         .into_iter()
@@ -248,6 +271,10 @@ pub fn recover_folder(folder: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Walks a folder and applies `operation` to every regular file over 4096 bytes,
+/// reporting running totals after each. Holds native.lock for the whole pass. An
+/// early return of any kind leaves the journal in place. `operation` returns
+/// whether it changed the file.
 fn visit_with(
     root: &Path,
     cancel: &AtomicBool,
@@ -272,6 +299,8 @@ fn visit_with(
         "Another Flummox process is working"
     );
     let volume = crate::storage::volume(&root)?;
+    // An existing journal blocks every folder except its own on its own volume.
+    // That folder may be run again, in either direction.
     for record in recovery()? {
         ensure!(
             record.root == root && record.volume.identity == volume.identity,
@@ -318,10 +347,12 @@ fn visit_with(
             .saturating_add(allocation_size(item.path())?);
         report(summary.clone());
     }
+    // Reached only when every file was processed.
     std::fs::remove_file(journal_path()?)?;
     Ok(summary)
 }
 
+/// `visit_with` for the command line: no stop flag and no progress reports.
 fn visit(
     root: &Path,
     restore: bool,
@@ -330,6 +361,8 @@ fn visit(
     visit_with(root, &AtomicBool::new(false), restore, operation, |_| {})
 }
 
+/// The one-line result of a pass. Allocation can rise as well as fall, since a
+/// restore gives space back to the files.
 fn describe(summary: &Progress) -> String {
     let change = if summary.allocation_after <= summary.allocation_before {
         format!(
@@ -386,6 +419,9 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+/// The coordinator's job entry: LZX compression or a restore, with a pause flag
+/// checked before each file. A paused job sleeps in 50 ms steps and still ends
+/// promptly when `cancel` is raised.
 pub(crate) fn folder_controlled(
     folder: &Path,
     restore: bool,

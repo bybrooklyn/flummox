@@ -11,6 +11,7 @@ use crate::{
     testutil::{Ctx, TestResult},
 };
 
+/// Draws the whole window for `state` at the given size into a PNG.
 fn render(state: &State, width: u32, height: u32, path: &std::path::Path) -> TestResult {
     super::preview_renderer::render(
         view::view(state),
@@ -24,12 +25,16 @@ fn render(state: &State, width: u32, height: u32, path: &std::path::Path) -> Tes
 #[test]
 fn desktop_workflows_render_without_a_display() -> TestResult {
     let temp = tempfile::tempdir().ctx("preview fixture")?;
+    // Set FLUMMOX_PREVIEW_DIR to keep the images. Otherwise they go to the
+    // temp directory and are removed with it.
     let output = std::env::var_os("FLUMMOX_PREVIEW_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| temp.path().join("previews"));
     std::fs::create_dir_all(&output).ctx("preview directory")?;
     let mut state = State::new(Env::from_home(temp.path()));
     state.reduced_motion = true;
+    // One supported game with its details open and a finished analysis, so
+    // every page has something to show.
     let game = Game {
         id: GameId::new(Launcher::Manual, "fixture"),
         also: vec![],
@@ -90,6 +95,8 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
         custom: true,
         folder_kind: FolderKind::Collection,
     });
+    // Each main page in dark at full width, dark at the narrow width that
+    // switches to the compact layout, and light at full width.
     for (page, name) in [
         (Page::Overview, "overview"),
         (Page::Games, "games"),
@@ -103,6 +110,7 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
         render(&state, 1100, 900, &output.join(format!("{name}-light.png")))?;
         state.theme = crate::jobs::ThemePreference::Dark;
     }
+    // The storage plan review that precedes a job.
     state.planned = Some((
         crate::jobs::Command::Enqueue {
             game: game.clone(),
@@ -142,6 +150,8 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
     ));
     render(&state, 720, 900, &output.join("qualification.png"))?;
     state.qualification = None;
+    // A running pack job, first interruptible with progress and then in the
+    // step that offers no pause or cancel and reports no totals.
     state.snapshot.jobs.push(Job {
         id: 2,
         game,
@@ -175,6 +185,7 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
     }
     render(&state, 720, 720, &output.join("queue-switching.png"))?;
 
+    // One job in each phase the Jobs section groups by.
     state.page = Page::Settings;
     state.snapshot_loaded = true;
     let mut job = state

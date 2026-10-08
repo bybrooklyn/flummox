@@ -9,14 +9,20 @@ use std::{
     time::SystemTime,
 };
 
+/// An image file plus the stamp it had when inspected.
+///
+/// The stamp is part of equality, so a file that changes on disk becomes a
+/// different cache key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Source {
     pub path: PathBuf,
     modified: Option<SystemTime>,
     bytes: u64,
+    /// Longest side of the decoded thumbnail, in pixels.
     edge: u32,
 }
 impl Source {
+    /// Stamps a regular file for a row icon. Returns `None` for anything else.
     pub fn inspect(path: PathBuf) -> Option<Self> {
         let metadata = std::fs::metadata(&path).ok()?;
         metadata.is_file().then(|| Self {
@@ -26,6 +32,11 @@ impl Source {
             edge: 128,
         })
     }
+    /// Decodes a thumbnail no larger than `edge` on either side.
+    ///
+    /// Blocks on file I/O, so call it off the window thread. Fails when the
+    /// file is over 32 MiB, exceeds the decoder limits, or changed since it
+    /// was inspected.
     pub fn decode(&self) -> Result<Handle> {
         ensure!(self.bytes <= 32 * 1024 * 1024, "Artwork exceeds 32 MiB");
         let mut reader = image::ImageReader::open(&self.path)?.with_guessed_format()?;
@@ -35,6 +46,8 @@ impl Source {
         limits.max_alloc = Some(128 * 1024 * 1024);
         reader.limits(limits);
         let pixels = reader.decode()?.thumbnail(self.edge, self.edge).to_rgba8();
+        // A file replaced during the decode would otherwise be cached under
+        // the old stamp.
         ensure!(
             Self::inspect(self.path.clone())
                 .is_some_and(|fresh| fresh.modified == self.modified && fresh.bytes == self.bytes),
@@ -47,12 +60,15 @@ impl Source {
         ))
     }
 }
+/// One user-chosen image, keyed by the game's id string.
 #[derive(Debug, Serialize, Deserialize)]
 struct Override {
     game: String,
     #[serde(with = "crate::path_serde")]
     path: PathBuf,
 }
+/// Reads `artwork.json` from the data directory. A missing file is an empty
+/// list; a file over 1 MiB is an error.
 fn overrides() -> Result<Vec<Override>> {
     let path = crate::libraries::data_dir()?.join("artwork.json");
     match std::fs::File::open(path) {
@@ -69,6 +85,10 @@ fn overrides() -> Result<Vec<Override>> {
         Err(error) => Err(error.into()),
     }
 }
+/// Records `path` as the artwork for `game`, replacing any earlier choice.
+///
+/// The image must decode within the usual limits before anything is written.
+/// Blocks on file I/O.
 pub fn save_override(game: String, path: PathBuf) -> Result<()> {
     Source::inspect(path.clone())
         .context("Artwork file unavailable")?
@@ -76,6 +96,8 @@ pub fn save_override(game: String, path: PathBuf) -> Result<()> {
     let mut items = overrides()?;
     items.retain(|item| item.game != game);
     items.push(Override { game, path });
+    // Write a temporary file in the same directory and rename it over the
+    // old one, so a reader never sees a partial list.
     let root = crate::libraries::data_dir()?;
     crate::libraries::private_dir(&root)?;
     let mut file = tempfile::NamedTempFile::new_in(&root)?;
@@ -85,12 +107,19 @@ pub fn save_override(game: String, path: PathBuf) -> Result<()> {
     file.persist(root.join("artwork.json"))?;
     Ok(())
 }
+/// Which image file each game uses, built once per scan.
 pub struct Index {
+    /// Row icon per Steam app id, with its priority. Lower wins.
     steam: HashMap<u32, (u8, Source)>,
+    /// User-chosen images by game id string. These beat Steam's.
     overrides: HashMap<String, Source>,
+    /// Detail-pane cover per Steam app id, with its priority. Lower wins.
     covers: HashMap<u32, (u8, Source)>,
 }
 impl Index {
+    /// Reads the saved overrides and lists `appcache/librarycache` under each
+    /// Steam root. Unreadable overrides or caches are skipped. Blocks on file
+    /// I/O.
     pub fn new(roots: Vec<PathBuf>) -> Result<Self> {
         let mut index = Self {
             steam: HashMap::new(),
@@ -114,6 +143,8 @@ impl Index {
                 .filter_map(|entry| entry.ok().map(|entry| entry.path()))
                 .collect();
             paths.sort();
+            // Two layouts are read: a directory named after the app id that
+            // holds the images, and flat files named `<appid>_<role>.<ext>`.
             for path in paths {
                 if let Some(app) = path
                     .file_name()
@@ -141,6 +172,11 @@ impl Index {
         }
         Ok(index)
     }
+    /// Offers one image for `app`. Files whose name is not an icon, header or
+    /// 600x900 library image are ignored.
+    ///
+    /// Row icons prefer icon, then header, then library image. Covers use the
+    /// reverse order. Among equal priorities the first one offered is kept.
     fn insert(&mut self, app: u32, path: PathBuf) {
         let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
             return;
@@ -170,6 +206,8 @@ impl Index {
             }
         }
     }
+    /// The 384-pixel image for the detail pane: the override if one exists,
+    /// otherwise the best Steam cover for any of the game's ids.
     pub fn cover(&self, game: &crate::model::Game) -> Option<Source> {
         self.overrides
             .get(&game.id.to_string())
@@ -185,6 +223,7 @@ impl Index {
                 })
             })
     }
+    /// The 128-pixel image for the game's row, chosen the same way as `cover`.
     pub fn source(&self, game: &crate::model::Game) -> Option<Source> {
         self.overrides
             .get(&game.id.to_string())
@@ -197,13 +236,23 @@ impl Index {
             })
     }
 }
+/// Decoded thumbnails plus the queue of sources still to decode.
+///
+/// The cache does no I/O. The caller takes work from `next`, decodes it in
+/// the background and reports back through `loaded`.
 #[derive(Default)]
 pub struct Cache {
+    /// Oldest first, capped at 256. `None` records a failed decode so it is
+    /// not retried.
     entries: VecDeque<(Source, Option<Handle>)>,
+    /// Handed out by `next` and not yet reported through `loaded`.
     pending: HashSet<Source>,
     waiting: VecDeque<Source>,
 }
 impl Cache {
+    /// The image for `source`. When this exact stamp has none, falls back to
+    /// the newest image decoded from the same path at the same size, so a
+    /// changed file keeps its old picture until the new one loads.
     pub fn get(&self, source: &Source) -> Option<&Handle> {
         self.entries
             .iter()
@@ -220,6 +269,7 @@ impl Cache {
                     .and_then(|(_, image)| image.as_ref())
             })
     }
+    /// Queues `source` for decoding unless it is cached, in flight or queued.
     pub fn request(&mut self, source: Source) {
         if self.entries.iter().any(|(key, _)| *key == source)
             || self.pending.contains(&source)
@@ -229,6 +279,8 @@ impl Cache {
         }
         self.waiting.push_back(source);
     }
+    /// Takes the next source to decode, or `None` while two are in flight.
+    /// The caller must report each one back through `loaded`.
     pub fn next(&mut self) -> Option<Source> {
         if self.pending.len() >= 2 {
             return None;
@@ -237,6 +289,8 @@ impl Cache {
         self.pending.insert(source.clone());
         Some(source)
     }
+    /// Stores a decode result, `None` for a failure, and evicts the oldest
+    /// entries beyond 256.
     pub fn loaded(&mut self, source: Source, image: Option<Handle>) {
         self.pending.remove(&source);
         self.entries.retain(|(key, _)| *key != source);

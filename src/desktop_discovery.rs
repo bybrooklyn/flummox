@@ -12,16 +12,23 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+/// What discovery found. Providers append to it, and a manifest that cannot be read
+/// becomes a warning while the other games are kept.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Catalog {
     pub games: Vec<Game>,
     pub warnings: Vec<String>,
+    /// The Steam roots given to `steam`, which the window's artwork index searches.
     pub artwork_roots: Vec<PathBuf>,
 }
+/// Parses a JSON file of at most 16 MiB.
 fn json(path: &Path) -> Result<Value> {
     serde_json::from_slice(&desktop::read_bounded(path, 16 * 1024 * 1024)?)
         .with_context(|| format!("Reading {}", path.display()))
 }
+/// Builds a launcher game. A relative path or a filesystem root is refused. A
+/// directory that is absent yields a `Broken` game, so a game on a disconnected
+/// drive stays listed.
 fn installed(
     launcher: Launcher,
     key: String,
@@ -52,8 +59,11 @@ fn installed(
     })
 }
 impl Catalog {
+    /// Adds every game in the Steam libraries reachable from these install roots.
+    /// Replaces `artwork_roots`.
     pub fn steam(&mut self, roots: Vec<PathBuf>) {
         self.artwork_roots = roots.clone();
+        // A set, so a library listed by two roots is read once and in a fixed order.
         let mut libraries = std::collections::BTreeSet::new();
         for root in roots {
             let steamapps = root.join("steamapps");
@@ -62,6 +72,8 @@ impl Catalog {
             if !manifest.exists() {
                 continue;
             }
+            // libraryfolders.vdf lists the other libraries. An entry is either the
+            // path itself or an object with a `path` key. Both forms are accepted.
             let result = (|| -> Result<()> {
                 let bytes = desktop::read_bounded(&manifest, 16 * 1024 * 1024)?;
                 let text = std::str::from_utf8(&bytes)?;
@@ -95,6 +107,7 @@ impl Catalog {
                     continue;
                 }
             };
+            // One appmanifest_<appid>.acf per installed game.
             let mut paths: Vec<_> = entries
                 .filter_map(|entry| entry.ok().map(|entry| entry.path()))
                 .filter(|path| {
@@ -116,6 +129,8 @@ impl Catalog {
             }
         }
     }
+    /// Adds the games described by the Epic launcher's `.item` manifests in one
+    /// directory. A directory that does not exist adds nothing.
     pub fn epic(&mut self, directory: &Path) {
         if !directory.exists() {
             return;
@@ -138,6 +153,7 @@ impl Catalog {
         for path in files {
             let result = (|| -> Result<Option<Game>> {
                 let value = json(&path)?;
+                // An entry that says it is not an application is not a game folder.
                 if value.get("bIsApplication").and_then(Value::as_bool) == Some(false) {
                     return Ok(None);
                 }
@@ -179,6 +195,8 @@ impl Catalog {
             }
         }
     }
+    /// Adds the games in Heroic's three `installed.json` files under its config
+    /// directory, one per store backend.
     pub fn heroic(&mut self, root: &Path) {
         for (relative, launcher) in [
             (
@@ -200,6 +218,9 @@ impl Catalog {
                     continue;
                 }
             };
+            // The list may sit under an `installed` key or be the document itself,
+            // and may be an array or an object keyed by app name. The array index or
+            // object key is the fallback id when an entry has no `app_name`.
             let installed = value.get("installed").unwrap_or(&value);
             let entries: Vec<_> = match installed {
                 Value::Array(entries) => entries
@@ -230,11 +251,13 @@ impl Catalog {
             }
         }
     }
+    /// Merges games that share an install directory. Call once, after every provider.
     pub fn finish(mut self) -> Self {
         self.games = desktop::merge(self.games);
         self
     }
 }
+/// Reads one `appmanifest_*.acf`. `library` is the `steamapps` directory holding it.
 fn steam_game(path: &Path, library: &Path) -> Result<Game> {
     let bytes = desktop::read_bounded(path, 4 * 1024 * 1024)?;
     let manifest = vdf::parse(std::str::from_utf8(&bytes)?)?;
@@ -243,6 +266,9 @@ fn steam_game(path: &Path, library: &Path) -> Result<Game> {
     let folder = manifest
         .get_str("installdir")
         .context("Missing Steam directory")?;
+    // `installdir` must be made of plain names only, so it cannot be absolute or
+    // contain `..`. If the folder exists it must also resolve inside `common` once
+    // links are followed.
     ensure!(
         Path::new(folder)
             .components()
@@ -264,6 +290,10 @@ fn steam_game(path: &Path, library: &Path) -> Result<Game> {
         install,
         manifest.get_str("buildid").map(str::to_owned),
     )?;
+    // `StateFlags` is a bit set from Steam's EAppState. A manifest without it is
+    // read as 4, fully installed. The first mask is update running (256), paused
+    // (512), started (1024), uninstalling (2048), 32768, reconfiguring (65536) and
+    // validating (131072). 2 is update required and 64 is app running.
     let flags = manifest.get_u32("StateFlags").unwrap_or(4);
     if flags & (256 | 512 | 1024 | 2048 | 32768 | 65536 | 131072) != 0 {
         game.state = InstallState::Busy(BusyReason::LauncherBusy(
@@ -279,6 +309,8 @@ fn steam_game(path: &Path, library: &Path) -> Result<Game> {
         .and_then(|value| value.parse().ok());
     Ok(game)
 }
+/// Reads one Heroic entry. Only `install_path` is required. The title falls back
+/// to the folder name, then to the id.
 fn heroic_game(key: String, item: &Value, launcher: Launcher) -> Result<Game> {
     let path = item
         .get("install_path")

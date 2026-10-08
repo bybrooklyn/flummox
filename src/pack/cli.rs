@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::Subcommand;
 use std::{path::PathBuf, sync::atomic::AtomicBool, time::Instant};
 
+// The `///` lines in this enum are the help text clap prints.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Build and verify a new store; keep every source file.
@@ -81,6 +82,7 @@ pub enum Command {
     Installs,
 }
 
+// `--maximum` replaces `--level`. clap rejects the two together.
 fn options(level: i32, maximum: bool) -> super::Options {
     if maximum {
         super::Options::maximum()
@@ -92,7 +94,13 @@ fn options(level: i32, maximum: bool) -> super::Options {
     }
 }
 
+/// Runs one `pack` subcommand. Create, info, verify, restore, commit,
+/// benchmark, mount and pool-prune work in this process. Activate, rollback,
+/// reclaim, compact, prune and installs are requests to the coordinator,
+/// which owns the mounts and the install records.
 pub fn run(command: Command, json: bool, cancel: &AtomicBool) -> Result<()> {
+    // Arms that produce a store summary fall through to the shared printing
+    // at the end. Every other arm prints its own output and returns.
     let summary = match command {
         Command::Create {
             folder,
@@ -173,6 +181,9 @@ pub fn run(command: Command, json: bool, cancel: &AtomicBool) -> Result<()> {
             let summary = super::create(&folder, &store, options(level, maximum), cancel)?;
             let build_and_verify_ns = start.elapsed().as_nanos();
             let reader = super::Reader::open(&store)?;
+            // Read probes: 64 KiB at the head, middle and tail of the first
+            // 256 files in index order. The reader is new, so its chunk cache
+            // starts empty.
             let start = Instant::now();
             let mut random_read_bytes = 0u64;
             for entry in reader
@@ -199,6 +210,7 @@ pub fn run(command: Command, json: bool, cancel: &AtomicBool) -> Result<()> {
                 }
             }
             let random_read_ns = start.elapsed().as_nanos();
+            // The store is one file, so its allocation rounds up once.
             let archive_allocated_bytes_4k = summary.archive_bytes.div_ceil(4096) * 4096;
             let wof_lzx = wof_lzx_helper
                 .as_deref()
@@ -295,6 +307,7 @@ pub fn run(command: Command, json: bool, cancel: &AtomicBool) -> Result<()> {
             folder,
             writes,
         } => {
+            // The default layer is a sibling of the store: its path plus `.writes`.
             let writes = writes.unwrap_or_else(|| {
                 let mut name = store.as_os_str().to_os_string();
                 name.push(".writes");
@@ -424,6 +437,7 @@ pub fn run(command: Command, json: bool, cancel: &AtomicBool) -> Result<()> {
     Ok(())
 }
 
+// Human-readable form of a store summary. All figures are serialized sizes.
 fn print(summary: &super::Summary) {
     println!(
         "{} files: {} source bytes, {} store bytes ({} metadata bytes).",

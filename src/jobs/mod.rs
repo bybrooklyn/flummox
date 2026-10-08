@@ -33,6 +33,7 @@ pub enum ThemePreference {
 }
 
 impl ThemePreference {
+    /// Name shown to the user; `Display` prints the same text.
     pub fn label(self) -> &'static str {
         match self {
             Self::System => "System",
@@ -59,6 +60,7 @@ pub enum MotionPreference {
 }
 
 impl MotionPreference {
+    /// Name shown to the user; `Display` prints the same text.
     pub fn label(self) -> &'static str {
         match self {
             Self::Expressive => "Expressive",
@@ -77,25 +79,40 @@ impl std::fmt::Display for MotionPreference {
 /// Operation requested for a game.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Operation {
+    /// Sample files and report an estimate. Rewrites nothing.
     Analyze,
+    /// Rewrite files through the native filesystem backend.
     Compress,
+    /// Undo native compression.
     Decompress,
+    /// Run a Maximum Space task. The job carries it in [`Job::pack`].
     Pack,
 }
 
 /// Durable lifecycle, including outcomes that need another attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
+    /// Waiting for the coordinator to start it.
     Queued,
+    /// An analysis worker is running.
     Analyzing,
+    /// A worker process or storage thread is running.
     Running,
+    /// A pause was sent to the worker, which has not confirmed it yet.
     Pausing,
+    /// Stopped at a checkpoint, or a queued job the user paused before it started.
     Paused,
+    /// A cancel was requested and the worker has not finished yet.
     Cancelling,
+    /// Stopped on request before finishing.
     Cancelled,
+    /// Finished with no errors.
     Completed,
+    /// Finished, but some files reported errors.
     Partial,
+    /// The coordinator restarted or lost contact with the worker mid-job.
     Interrupted,
+    /// The worker or storage task returned an error.
     Failed,
 }
 
@@ -133,26 +150,42 @@ impl Phase {
 /// One operation. Estimates and drive-wide deltas have distinct fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
+    /// Queue row id. Later requests get larger ids.
     pub id: i64,
+    /// The game as last discovered. `install_dir` is canonical.
     pub game: Game,
     pub operation: Operation,
     pub options: CompressOpts,
     pub phase: Phase,
+    /// Progress from the worker's latest event.
     pub files_done: u64,
     pub bytes_done: u64,
+    /// Totals from the worker's latest `Started` event. Zero until one arrives.
     pub files_total: u64,
     pub bytes_total: u64,
+    /// Latest sampled estimate. It is replaced as sampling proceeds.
     pub estimate: Option<Estimate>,
+    /// Status line for the user: the current file, a pause reason, or the outcome.
     pub message: String,
+    /// Warnings and per-file failures, capped at 20.
     pub errors: Vec<String>,
+    /// Unix seconds when the job was queued.
     pub created: u64,
+    /// Seconds since the worker or storage thread started, pauses included.
     pub elapsed: u64,
+    /// Free bytes on the drive after the job minus before. Other writers on
+    /// the same filesystem are included.
     pub drive_change: Option<i64>,
+    /// The user asked for the pause. A running game pauses work without setting this.
     pub user_paused: bool,
+    /// The storage task when `operation` is [`Operation::Pack`].
     #[serde(default)]
     pub pack: Option<PackTask>,
+    /// False once a storage task enters a step that must finish. Pause and
+    /// cancel are refused from then on.
     #[serde(default)]
     pub pack_interruptible: bool,
+    /// Free-space requirements the client reviewed or the worker computed.
     #[serde(default)]
     pub space_plan: Option<crate::storage::SpacePlan>,
 }
@@ -160,24 +193,35 @@ pub struct Job {
 /// Durable work for Maximum Space. Paths survive client disconnection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PackTask {
+    /// Build a verified store at `store`. The game folder is left as it is.
     Create {
         #[serde(with = "crate::path_serde")]
         store: PathBuf,
     },
+    /// Mount `store` at the game's path, keeping the original for rollback.
     Activate {
         #[serde(with = "crate::path_serde")]
         store: PathBuf,
+        /// Build the store first when it does not exist yet.
         create: bool,
+        /// A report the installed files must still match. `None` skips the check.
         qualification: Option<Box<crate::compatibility::Report>>,
     },
+    /// Build a new store from the mounted install and switch to it. The
+    /// previous store stays until `Prune`.
     Compact,
+    /// Put ordinary files back at the game's path and drop the install record.
     Restore,
+    /// Check restored files, then drop the install record. Nothing is deleted.
     VerifyRestored,
+    /// Verify the store, then delete the original kept at activation.
     Reclaim,
+    /// Delete the previous store and update layer kept by `Compact`.
     Prune,
 }
 
 impl PackTask {
+    /// Title of the queue entry for this task.
     pub fn label(&self) -> &'static str {
         match self {
             Self::Create { .. } => "Create verified store",
@@ -195,8 +239,10 @@ impl PackTask {
 /// How a manually added location maps to games.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FolderKind {
+    /// The folder is one game.
     #[default]
     Game,
+    /// Each visible subfolder is a game.
     Collection,
 }
 
@@ -214,8 +260,11 @@ impl std::fmt::Display for FolderKind {
 pub struct Library {
     #[serde(with = "crate::path_serde")]
     pub path: PathBuf,
+    /// Queue compression for new installs and settled updates under `path`.
     pub automatic: bool,
+    /// Added by the user. Only custom locations can be removed.
     pub custom: bool,
+    /// How a custom location maps to games.
     #[serde(default)]
     pub folder_kind: FolderKind,
 }
@@ -223,28 +272,40 @@ pub struct Library {
 /// Snapshot returned to clients; no database handle crosses the boundary.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// Coordinator start time in Unix nanoseconds. A new value means a new coordinator.
     #[serde(default)]
     pub worker_epoch: u64,
+    /// Requests this coordinator has answered, counting the one that returned this.
     #[serde(default)]
     pub revision: u64,
+    /// Oldest first. Finished jobs beyond the newest 300 are dropped.
     pub jobs: Vec<Job>,
     pub libraries: Vec<Library>,
+    /// Game ids in `launcher:key` form that no job may touch.
     pub excluded: Vec<String>,
+    /// Title of a game with a running process, or the reason processes cannot
+    /// be read. No job starts and active jobs pause while this is set.
     pub gaming: Option<String>,
+    /// Mirror of `motion == Reduced`, kept for clients that predate `motion`.
     #[serde(default)]
     pub reduced_motion: bool,
     #[serde(default)]
     pub theme: ThemePreference,
     #[serde(default)]
     pub motion: MotionPreference,
+    /// Activated Maximum Space installs.
     #[serde(default)]
     pub packs: Vec<crate::pack::Install>,
+    /// Games from discovery. A running scan updates this batch by batch.
     #[serde(default)]
     pub discovered: Vec<Game>,
+    /// What the running scan is reading. `None` when no scan is running.
     #[serde(default)]
     pub scan_source: Option<String>,
+    /// Scans started by this coordinator.
     #[serde(default)]
     pub scan_generation: u64,
+    /// Problems reported by the latest scan.
     #[serde(default)]
     pub scan_warnings: Vec<String>,
 }
@@ -252,39 +313,58 @@ pub struct Snapshot {
 /// Client requests operate on ids, never shell command strings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
+    /// Return the current state and change nothing.
     Snapshot,
+    /// Start a discovery scan without waiting for the periodic one. A scan
+    /// already running finishes first.
     RefreshDiscovery,
+    /// Stop the running scan and discard what it has not yet reported.
     CancelDiscovery,
     /// Restart an idle coordinator after replacing the executable.
     Restart,
+    /// Queue an analysis, compression or decompression job. A request that
+    /// duplicates an active job for the same folder and operation is ignored.
     Enqueue {
         game: Game,
         operation: Operation,
         options: CompressOpts,
     },
+    /// Queue a Maximum Space task. Needs a build with pack mounting.
     EnqueuePack {
         game: Game,
         task: PackTask,
     },
+    /// Queue `command` with the space plan the user reviewed. Refused when the
+    /// plan no longer fits the drives it names.
     EnqueuePlanned {
         command: Box<Command>,
         plan: crate::storage::SpacePlan,
     },
+    /// Pause or resume one active job.
     Pause {
         id: i64,
         paused: bool,
     },
+    /// Stop one job by id.
     Cancel(i64),
+    /// Queue a new job with the parameters of a finished one.
     Retry(i64),
+    /// Add a library policy, replacing any policy for the same path.
     Library(Library),
+    /// Remove a custom location that has no active jobs or activated stores.
     RemoveLibrary(#[serde(with = "crate::path_serde")] PathBuf),
+    /// Exclude a game id or restore it. Excluding cancels its active jobs.
     Exclude {
         id: String,
         excluded: bool,
     },
+    /// Older form of `Motion`: true selects Reduced, false Expressive.
     ReducedMotion(bool),
     Theme(ThemePreference),
     Motion(MotionPreference),
+    /// The five `Pack*` commands run a storage transaction inside the request
+    /// and are refused while any job is running. `EnqueuePack` queues the same
+    /// work as a job.
     PackActivate {
         #[serde(with = "crate::path_serde")]
         game_path: PathBuf,
@@ -311,11 +391,13 @@ pub enum Command {
     },
 }
 
+/// One client message: a single line of JSON on the control socket.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Request {
     pub version: u32,
     pub command: Command,
 }
+/// The coordinator's reply. Exactly one of `snapshot` and `error` is set.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Response {
     pub version: u32,
@@ -323,19 +405,24 @@ pub(crate) struct Response {
     pub error: Option<String>,
 }
 
+/// Lines a worker writes to stdout for the coordinator.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum WorkerEvent {
     Progress(Event),
+    /// The running estimate. Each one replaces the last.
     Estimate(Estimate),
     SpacePlan(crate::storage::SpacePlan),
+    /// The job ended in an orderly way. Nothing follows it.
     Done {
         cancelled: bool,
         errors: Vec<String>,
         drive_change: Option<i64>,
     },
+    /// The job could not run or stopped on an error. Nothing follows it.
     Failed(String),
 }
 
+/// The first line the coordinator writes to a worker's stdin.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Work {
     pub version: u32,
@@ -368,6 +455,7 @@ pub(crate) fn invalidate_for_cli(path: &std::path::Path) -> anyhow::Result<()> {
     )
 }
 
+/// Later lines on a worker's stdin. A closed stdin is treated as `Cancel`.
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Control {
     Pause(bool),
@@ -389,6 +477,7 @@ pub fn entrypoint() -> anyhow::Result<bool> {
     }
 }
 
+/// Unix time in seconds, or zero when the clock reads before the epoch.
 pub(crate) fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -480,6 +569,8 @@ pub fn space_plan(
         Command::EnqueuePack { game, task } => {
             let mut plan = SpacePlan::default();
             match task {
+                // A store that does not exist yet: budget its upper bound on
+                // the store's drive.
                 PackTask::Create { store }
                 | PackTask::Activate {
                     store,
@@ -529,6 +620,7 @@ pub fn space_plan(
                                 .clone(),
                         )
                     })?;
+                    // Compaction rebuilds the whole store beside the old one.
                     if matches!(task, PackTask::Compact) {
                         let footprint = storage::Footprint {
                             files: summary.files.saturating_add(updates.files),
@@ -544,6 +636,8 @@ pub fn space_plan(
                             "New compacted store; previous version retained",
                         )?;
                     } else {
+                        // With the original still on disk, restoring only adds
+                        // the update layer. Otherwise every file is rebuilt.
                         let bytes = if install.backup_path.is_some()
                             && !matches!(task, PackTask::VerifyRestored)
                         {

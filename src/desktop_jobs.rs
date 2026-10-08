@@ -7,18 +7,24 @@ use std::{
     io::Write,
     path::Path,
 };
+/// Where a job is in its life. The first three are active, the rest are history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Phase {
+    /// Queued and not yet started.
     Waiting,
     Running,
+    /// Started, then held. The job's message says why.
     Paused,
     Completed,
+    /// Stopped by the user, an exclusion or a worker shutdown. Displayed as "Stopped".
     Cancelled,
     Failed,
+    /// Was running or paused when the worker stopped. `Queue::load` assigns it.
     Interrupted,
 }
 impl Phase {
+    /// True while the job still occupies its game: waiting, running or paused.
     pub fn active(self) -> bool {
         matches!(self, Self::Waiting | Self::Running | Self::Paused)
     }
@@ -36,38 +42,58 @@ impl std::fmt::Display for Phase {
         })
     }
 }
+/// Running totals for one job. Each update replaces the previous one.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Progress {
+    /// Files visited so far.
     pub files: u64,
     pub changed: u64,
     pub skipped: u64,
+    /// Logical size of the visited files.
     pub bytes: u64,
+    /// Allocated size of the visited files before each was processed, and after.
     pub allocation_before: u64,
     pub allocation_after: u64,
 }
+/// One queued or finished storage operation on one game folder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
+    /// Unique within the queue and kept across restarts and retries.
     pub id: u64,
     pub game: Game,
+    /// True restores ordinary storage. False compresses.
     pub restore: bool,
+    /// Queued by maintenance. Such a job is cancelled when its location opts out.
     #[serde(default)]
     pub automatic: bool,
+    /// The volume the folder was on when queued. The job runs only while a volume
+    /// with the same identity is mounted there.
     #[serde(default)]
     pub volume: Option<crate::storage::Volume>,
     pub phase: Phase,
     pub user_paused: bool,
     pub progress: Progress,
+    /// The line shown under the job: its current wait reason or its final result.
     pub message: String,
 }
+/// Contents of `native-queue.json`: the job list and what maintenance has seen.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Queue {
     pub jobs: Vec<Job>,
+    /// Per game id: the build last recorded, and whether maintenance covered the
+    /// game at that time. `observe` compares new scans against it.
     pub baseline: HashMap<String, (Option<String>, bool)>,
+    /// The highest id handed out so far.
     pub next_id: u64,
+    /// Hashed paths of the automatic locations as of the last healthy scan. A game
+    /// first seen under one of them counts as a new install.
     pub initialized_locations: HashSet<String>,
 }
 impl Queue {
+    /// Loads the queue from `root`, or an empty one if the file does not exist. Jobs
+    /// saved as running or paused become `Interrupted`, as do waiting jobs saved
+    /// without a volume.
     pub fn load(root: &Path) -> Result<Self> {
         let path = root.join("native-queue.json");
         let mut queue: Self = match crate::desktop::read_bounded(&path, 16 * 1024 * 1024) {
@@ -93,6 +119,7 @@ impl Queue {
                 job.message = "Worker stopped. Review recovery before retrying.".into();
             }
         }
+        // Guards against a file whose `next_id` is behind its own jobs.
         queue.next_id = queue.next_id.max(
             queue
                 .jobs
@@ -103,6 +130,7 @@ impl Queue {
         );
         Ok(queue)
     }
+    /// Replaces the queue file atomically: temp file, fsync, rename, directory fsync.
     pub fn save(&self, root: &Path) -> Result<()> {
         crate::libraries::private_dir(root)?;
         let bytes = serde_json::to_vec(self)?;
@@ -118,6 +146,9 @@ impl Queue {
         std::fs::File::open(root)?.sync_all()?;
         Ok(())
     }
+    /// Adds a waiting job and returns its id. If the folder already has an active job
+    /// of the same kind, returns that job's id and adds nothing. Fails for a game
+    /// that is not idle, for the opposite kind of active job, and past 200 active jobs.
     pub fn enqueue(&mut self, game: Game, restore: bool) -> Result<u64> {
         ensure!(
             game.state.is_idle(),
@@ -138,6 +169,8 @@ impl Queue {
             self.jobs.iter().filter(|job| job.phase.active()).count() < 200,
             "The queue is full"
         );
+        // History is capped at 1000 jobs. Room is made by dropping the oldest completed
+        // or cancelled job. Failed and interrupted jobs are never dropped this way.
         while self.jobs.len() >= 1000 {
             if let Some(index) = self
                 .jobs
@@ -168,6 +201,8 @@ impl Queue {
         });
         Ok(id)
     }
+    /// Puts a finished job back to `Waiting` under the same id, with its progress
+    /// cleared. Fails if the game already has an active job.
     pub fn retry(&mut self, id: u64) -> Result<()> {
         let old = self
             .jobs
@@ -200,6 +235,8 @@ impl Queue {
         job.message = "Waiting to retry".into();
         Ok(())
     }
+    /// `enqueue` for a compression that maintenance asked for. Only a job this call
+    /// creates is marked automatic. A job the user already queued keeps its owner.
     pub fn enqueue_automatic(&mut self, game: Game) -> Result<u64> {
         let existing = self
             .jobs
@@ -211,10 +248,15 @@ impl Queue {
         }
         Ok(id)
     }
+    /// Records the game's current build as handled, so `observe` stops reporting it.
     pub fn acknowledge(&mut self, game: &Game) {
         self.baseline
             .insert(game.id.to_string(), (game.build.clone(), true));
     }
+    /// Returns the games maintenance should compress now: under an automatic
+    /// location, not excluded, idle, and either updated or newly installed. A due
+    /// game keeps its old baseline until `acknowledge`, so it is reported again on
+    /// the next scan. With `healthy` false nothing is returned and nothing recorded.
     pub fn observe(
         &mut self,
         games: &[Game],
@@ -233,6 +275,8 @@ impl Queue {
                     .ids()
                     .any(|id| preferences.excluded.contains(&id.to_string()));
             let key = game.id.to_string();
+            // Updated: the build differs from a baseline taken while the game was
+            // covered. A change made while it was not covered does not count.
             let previous = self.baseline.get(&key).cloned();
             let changed = previous
                 .as_ref()
@@ -254,6 +298,8 @@ impl Queue {
                 due.push(game.clone());
                 continue;
             }
+            // Due but blocked by a pause or a busy game. Leave the baseline alone so
+            // the game is still due on a later scan.
             if enabled && (changed || newly_installed) {
                 continue;
             }
@@ -268,6 +314,7 @@ impl Queue {
         due
     }
 }
+/// A fixed-length key for a location path, used in `initialized_locations`.
 fn location_key(path: &Path) -> String {
     blake3::hash(path.as_os_str().as_encoded_bytes())
         .to_hex()

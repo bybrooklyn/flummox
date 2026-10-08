@@ -77,6 +77,9 @@ pub fn scan_all(env: &Env) -> Scan {
     scan_with(env, &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap_or_default()
 }
 
+/// Runs the detectors in order: Steam, Heroic and Lutris, then custom
+/// locations. `emit` receives a `Source` before each and a `Batch` after the
+/// first two. Returns `None` when `cancel` is set at a check between sources.
 pub(crate) fn scan_with(
     env: &Env,
     cancel: &std::sync::atomic::AtomicBool,
@@ -115,6 +118,9 @@ pub(crate) fn scan_with(
     if cancel.load(Ordering::Relaxed) {
         return None;
     }
+    // Merge with the remembered-library cache, which keeps games on a
+    // missing drive listed as broken. Manual games are kept only while a
+    // configured location still covers them. Skipped for fixture homes.
     if Env::current().is_some_and(|current| current.home == env.home) {
         let libraries = crate::jobs::configured_libraries().unwrap_or_default();
         let keep = |game: &Game| {

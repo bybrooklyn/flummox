@@ -14,6 +14,10 @@ use iced::{Animation, Task, animation::Easing};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+/// A navigation destination.
+///
+/// Queue, Drives and Recovery are sections inside Settings. Going to one
+/// opens Settings scrolled to that section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Overview,
@@ -23,14 +27,18 @@ pub enum Page {
     Recovery,
     Settings,
 }
+/// The pages listed at the top of the sidebar. Settings is drawn apart from
+/// them, at the bottom.
 pub const PAGES: [Page; 2] = [Page::Overview, Page::Games];
 impl Page {
+    /// The page that is shown for this destination.
     pub fn main(self) -> Self {
         match self {
             Self::Overview | Self::Games => self,
             _ => Self::Settings,
         }
     }
+    /// Sidebar order, which decides the direction a page change slides in.
     pub fn rank(self) -> u8 {
         match self.main() {
             Self::Overview => 0,
@@ -38,6 +46,8 @@ impl Page {
             _ => 2,
         }
     }
+    /// The id of the Settings container to scroll to, for a destination that
+    /// is a section. `view::settings_page` must give a container this id.
     pub fn section(self) -> Option<&'static str> {
         match self {
             Self::Queue => Some("settings-jobs"),
@@ -60,24 +70,36 @@ impl Page {
     }
 }
 
+/// A discovered game plus what the scan learned about the drive it is on.
 #[derive(Debug, Clone)]
 pub struct GameRow {
     pub game: Game,
+    /// Filesystem type, or `Offline` or `Unavailable` when it was not probed.
     pub filesystem: String,
     pub mountpoint: Option<PathBuf>,
+    /// Either of the two flags below.
     pub supported: bool,
+    /// The filesystem compresses in place and a backend exists for it.
     pub native_supported: bool,
+    /// A Maximum Space store can be mounted over this game.
     pub pack_supported: bool,
+    /// Why the game cannot be compressed. Replaces the row's status line.
     pub note: Option<String>,
+    /// Image for the row icon.
     pub artwork: Option<super::artwork::Source>,
+    /// Larger image for the detail pane.
     pub cover: Option<super::artwork::Source>,
 }
 impl GameRow {
+    /// Probes the filesystem under the game's install directory. Blocks, so
+    /// it runs inside `scan`.
     fn probe(
         game: Game,
         artwork: Option<super::artwork::Source>,
         cover: Option<super::artwork::Source>,
     ) -> Self {
+        // `libraries` marks a game it could not rediscover with this detail
+        // prefix. Its directory may be gone, so it is not probed.
         if matches!(&game.state, crate::model::InstallState::Broken { detail } if detail.starts_with("Library unavailable:"))
         {
             return Self {
@@ -99,6 +121,7 @@ impl GameRow {
                     fsprobe::Tier::Native(kind) => crate::backend::for_kind(*kind).is_some(),
                     fsprobe::Tier::Pack | fsprobe::Tier::Unsupported(_) => false,
                 };
+                // Mounting a store needs the `pack-mount` feature and FUSE.
                 let pack_supported = cfg!(feature = "pack-mount")
                     && std::path::Path::new("/dev/fuse").exists()
                     && matches!(tier, fsprobe::Tier::Native(_) | fsprobe::Tier::Pack);
@@ -130,16 +153,22 @@ impl GameRow {
         }
     }
 }
+/// A mountpoint that holds at least one game.
 #[derive(Debug, Clone)]
 pub struct Drive {
     pub path: PathBuf,
+    /// Free bytes, or `None` when the drive could not be read.
     pub free: Option<u64>,
     pub games: usize,
 }
+/// Everything one background scan read. `update` swaps it into `State` whole.
 #[derive(Debug, Clone)]
 pub struct ScanResult {
+    /// The worker epoch and scan generation of the snapshot the scan started
+    /// from. `update` discards the result when the worker has moved on.
     pub worker_epoch: u64,
     pub generation: u64,
+    /// The worker's game list as scanned, tools included.
     pub discovered: Vec<Game>,
     pub reports: Vec<crate::compatibility::Report>,
     pub games: Vec<GameRow>,
@@ -148,6 +177,8 @@ pub struct ScanResult {
     pub activity: Vec<Activity>,
     pub warnings: Vec<String>,
 }
+/// The text of the toast. An error stays until dismissed; anything else
+/// leaves after four seconds.
 #[derive(Debug, Clone)]
 pub struct Status {
     pub is_error: bool,
@@ -167,6 +198,7 @@ impl Status {
         }
     }
 }
+/// Order of the Games list. Size and Saving put the largest first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sort {
     Name,
@@ -182,12 +214,16 @@ impl Sort {
         }
     }
 }
+/// Which games the Games list shows. `State::filtered` holds the tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Filter {
     All,
+    /// Supported, idle and not yet compressed.
     Ready,
     Compressed,
+    /// Unsupported, or the latest job failed, was partial or was interrupted.
     Attention,
+    /// The recorded build differs from the installed one.
     Updated,
 }
 impl Filter {
@@ -202,8 +238,13 @@ impl Filter {
     }
 }
 
+/// Everything the window draws from.
+///
+/// `update` is the only writer. Games are keyed by `GameId::to_string()` in
+/// every map and set below.
 pub struct State {
     pub env: Env,
+    /// Compatibility reports read by the last scan, plus any imported since.
     pub reports: Vec<crate::compatibility::Report>,
     pub page: Page,
     pub games: Vec<GameRow>,
@@ -212,49 +253,80 @@ pub struct State {
     pub records: Vec<GameRecord>,
     pub activity: Vec<Activity>,
     pub warnings: Vec<String>,
+    // The toast.
     pub status: Option<Status>,
     pub status_reveal: Animation<bool>,
+    /// When the toast leaves by itself. `None` for an error.
     pub status_deadline: Option<Instant>,
+    /// The newest state received from the worker.
     pub snapshot: Snapshot,
+    /// A command waiting for the user to accept its space plan.
     pub planned: Option<(Command, crate::storage::SpacePlan)>,
     pub qualification: Option<crate::qualification::Wizard>,
+    // Navigation and scrolling.
+    /// The highlight animation of each sidebar entry.
     pub nav: Vec<(Page, Animation<bool>)>,
     pub page_reveal: Animation<bool>,
+    /// Frames keep coming until this instant, after a scroll set from code.
     pub scroll_redraw_until: Option<Instant>,
+    /// 1.0 when the last page change went to a later page, -1.0 to an earlier.
     pub page_direction: f32,
+    /// The last scroll offset of each main page, by page label.
     pub scroll_positions: std::collections::HashMap<String, f32>,
+    /// True once any snapshot has arrived.
     pub snapshot_loaded: bool,
+    /// The error from the last failed snapshot request.
     pub connection_error: Option<String>,
+    // The Games list.
     pub query: String,
     pub selected: std::collections::HashSet<String>,
+    /// The game whose detail pane is open or closing.
     pub expanded: Option<String>,
     pub sort: Sort,
     pub filter: Filter,
+    /// A mountpoint to show games from.
     pub drive_filter: Option<PathBuf>,
+    /// A launcher label to show games from.
     pub launcher_filter: Option<String>,
+    /// Presets picked in this session. `preset_for` has the fallbacks.
     pub presets: std::collections::HashMap<String, crate::backend::Preset>,
     pub reduced_motion: bool,
     pub motion: MotionPreference,
     pub theme: ThemePreference,
     pub system_theme: iced::theme::Mode,
+    /// A scan is running in the background.
     pub scanning: bool,
+    // The "Add a location" form.
     pub folder: String,
     pub folder_error: Option<String>,
     pub folder_kind: FolderKind,
+    /// A native dialog is open. Buttons that open one are disabled meanwhile.
     pub picker_busy: bool,
+    /// How many rows of the Games list are built.
     pub shown: usize,
+    /// Opening and closing of the detail pane.
     pub detail: Animation<bool>,
+    /// Whether the once-a-second snapshot subscription runs.
     pub polling: bool,
+    /// The animated progress fraction of each job, by job id.
     pub progress: std::collections::HashMap<i64, Animation<f32>>,
+    /// Store paths the user typed or picked.
     pub pack_paths: std::collections::HashMap<String, String>,
+    /// Games whose reclaim or prune button is showing its confirm step.
     pub confirm_reclaim: std::collections::HashSet<String>,
     pub confirm_prune: std::collections::HashSet<String>,
+    /// Games with the advanced storage section open.
     pub advanced: std::collections::HashSet<String>,
+    /// Games with an active pack job. Their actions are disabled.
     pub pending: std::collections::HashSet<String>,
+    /// A batch of automatic analyses is being sent to the worker.
     analysis_queuing: bool,
+    /// Estimated saving per game, computed when the Saving sort is chosen.
     saving_order: std::collections::HashMap<String, u64>,
 }
 impl State {
+    /// An empty window state on Overview. Nothing is loaded until the first
+    /// `Message::Refresh`.
     pub fn new(env: Env) -> Self {
         Self {
             env,
@@ -324,6 +396,7 @@ impl State {
             saving_order: Default::default(),
         }
     }
+    /// Replaces the toast and restarts its reveal animation.
     pub fn show_status(&mut self, status: Status) {
         self.status_deadline = (!status.is_error).then(|| Instant::now() + Duration::from_secs(4));
         self.status = Some(status);
@@ -333,6 +406,8 @@ impl State {
             .go(true, Instant::now());
     }
 
+    /// An animation length in milliseconds for the current motion setting.
+    /// Reduced motion gives zero.
     fn motion_duration(&self, expressive: u64, subtle: u64) -> Duration {
         Duration::from_millis(match self.motion {
             MotionPreference::Expressive => expressive,
@@ -348,6 +423,8 @@ impl State {
         }
     }
 
+    /// Starts hiding the toast. With motion it stays in `status` until `Tick`
+    /// sees the animation end.
     fn dismiss_status(&mut self) {
         self.status_deadline = None;
         if self.reduced_motion {
@@ -356,6 +433,8 @@ impl State {
             self.status_reveal.go_mut(false, Instant::now());
         }
     }
+    /// The preset for a game: the one picked in this session, else the one
+    /// its newest compression job used, else Balanced.
     pub fn preset_for(&self, id: &str) -> crate::backend::Preset {
         self.presets
             .get(id)
@@ -372,9 +451,11 @@ impl State {
             })
             .unwrap_or(crate::backend::Preset::Balanced)
     }
+    /// Sum of the launchers' size hints. Games without one count as zero.
     pub fn total_bytes(&self) -> u64 {
         self.games.iter().filter_map(|g| g.game.size_hint).sum()
     }
+    /// The newest job of any kind for this install directory.
     pub fn latest(&self, game: &Game) -> Option<&Job> {
         self.snapshot
             .jobs
@@ -382,6 +463,11 @@ impl State {
             .rev()
             .find(|j| j.game.install_dir == game.install_dir)
     }
+    /// The estimate that still applies to this game at its installed build.
+    ///
+    /// Jobs are read newest first, and the search ends at the first job that
+    /// is neither an analysis nor still queued. So once a compression or
+    /// decompression has started, earlier estimates no longer count.
     pub fn estimate(&self, game: &Game) -> Option<&crate::estimate::Estimate> {
         self.snapshot
             .jobs
@@ -397,6 +483,9 @@ impl State {
             })
             .find_map(|j| j.estimate.as_ref())
     }
+    /// What to do with this game, from its estimate and what its drive
+    /// supports. `None` until an estimate exists. Maximum Space is offered
+    /// only when the estimate says a qualification matched.
     pub fn recommendation(&self, game: &Game) -> Option<crate::recommendation::Recommendation> {
         let row = self.games.iter().find(|row| row.game.id == game.id)?;
         self.estimate(game).map(|estimate| {
@@ -408,6 +497,9 @@ impl State {
             )
         })
     }
+    /// Where this game's Maximum Space store goes: the path the user entered,
+    /// else `.flummox/<hash>.store` beside the install directory. The hash is
+    /// the first 16 hex digits of the BLAKE3 of the install path.
     pub fn store_path(&self, game: &Game) -> PathBuf {
         if let Some(path) = self
             .pack_paths
@@ -429,6 +521,12 @@ impl State {
             .join(format!("{identity}.store"))
     }
 
+    /// Builds the command behind the main Compress action.
+    ///
+    /// A Maximum Space recommendation becomes a create-and-activate pack job
+    /// and needs a stored report matching the estimate's qualification.
+    /// Anything else becomes a native compression at the game's preset, which
+    /// fails when the drive has no native support.
     fn optimize_command(&self, game: Game) -> Result<Command, String> {
         if self
             .recommendation(&game)
@@ -482,6 +580,8 @@ impl State {
         }
     }
 
+    /// Predicted bytes the library could still save: the sum over supported,
+    /// uncompressed games whose recommendation is to do something.
     pub fn potential_saving(&self) -> u64 {
         self.games
             .iter()
@@ -492,7 +592,11 @@ impl State {
             .sum()
     }
 
+    /// Bytes saved so far. An estimate for natively compressed games.
     pub fn current_saving(&self) -> u64 {
+        // Recorded estimates count for games still installed at the recorded
+        // build. Packed games are left out here and counted from their store
+        // summaries below.
         let native = self
             .records
             .iter()
@@ -521,6 +625,11 @@ impl State {
     pub fn analysis_queuing(&self) -> bool {
         self.analysis_queuing
     }
+    /// Whether the game counts as compressed at its installed build.
+    ///
+    /// True with a pack install. Otherwise the newest started job that is
+    /// not an analysis decides: it must be a completed compression of this
+    /// build. With no such job, a database record of this build decides.
     pub fn compressed(&self, game: &Game) -> bool {
         if self
             .snapshot
@@ -547,6 +656,9 @@ impl State {
                 .any(|r| r.id == game.id && r.build == game.build),
         }
     }
+    /// The Games list: rows that are not excluded and pass the search, the
+    /// drive, launcher and status filters, in the chosen order. Ties sort by
+    /// title.
     pub fn filtered(&self) -> Vec<&GameRow> {
         let query = self.query.to_lowercase();
         let mut games: Vec<_> = self
@@ -605,6 +717,8 @@ impl State {
         });
         games
     }
+    /// The job for the bar under the page: the first one in progress, else
+    /// the first one queued.
     pub fn active(&self) -> Option<&Job> {
         self.snapshot
             .jobs
@@ -613,6 +727,8 @@ impl State {
             .or_else(|| self.snapshot.jobs.iter().find(|j| j.phase == Phase::Queued))
     }
 
+    /// Selected games a bulk action may queue: supported, idle and without
+    /// an active pack job.
     pub fn actionable_selection(&self) -> Vec<Game> {
         self.games
             .iter()
@@ -627,20 +743,31 @@ impl State {
     }
 }
 
+/// Everything `update` reacts to: user input, and the results of background
+/// work. Variants carrying a `Result` are results. A `String` naming a game
+/// is its `GameId::to_string()`.
 #[derive(Debug, Clone)]
 pub enum Message {
     GoTo(Page),
+    /// Open Settings and scroll to the container with this id.
     Jump(&'static str),
+    /// The measured position of a section, ready to scroll to.
     JumpOffset(f32),
+    /// The user scrolled a page to this offset.
     Scrolled(Page, f32),
+    /// An artwork tile came into view and wants its image decoded.
     ArtworkVisible(super::artwork::Source),
     ArtworkLoaded(super::artwork::Source, Option<iced::widget::image::Handle>),
     ArtworkSaved(Result<(), String>),
+    /// Rebuild the window's own data from the worker's current game list.
     Refresh,
+    /// Ask the worker to discover games again.
     Rescan,
     Scanned(Result<ScanResult, String>),
     Snapshot(Result<Snapshot, String>),
+    /// A space plan is ready for review, with the command it belongs to.
     Planned(Result<(Command, crate::storage::SpacePlan), String>),
+    /// The user accepted the plan in `State::planned`.
     StartPlanned,
     CancelPlanned,
     ExportDiagnostics,
@@ -657,23 +784,36 @@ pub enum Message {
     QualificationSaved(Result<PathBuf, String>),
     DiagnosticsExported(Result<PathBuf, String>),
     AnalysisQueued(Result<Snapshot, String>),
+    /// Hide the toast.
     Dismiss,
+    /// A frame passed, or a scroll set from code finished. Drives the toast's
+    /// deadline and removal.
     Tick,
     Query(String),
     Select(String, bool),
+    /// Open this game's detail pane, or toggle it when it is the open one.
     Expand(String),
+    /// Go to Games and open this game's detail pane.
     ReviewGame(String),
     Sort(Sort),
     Filter(Filter),
+    /// Build 40 more rows of the Games list.
     ShowMore,
+    /// Run this operation on every selected game that can take it.
     Queue(Operation),
+    /// Compress every game whose recommendation says it is worthwhile.
     OptimizeLibrary,
+    /// Run this operation on one game.
     One(String, Operation),
+    /// Send a command to the worker. Pack maintenance commands are queued as
+    /// pack jobs instead.
     Send(Command),
     Folder(String),
     AddFolder,
     FolderKind(FolderKind),
+    /// Open a native picker.
     Browse(super::dialog::Target),
+    /// The picker closed. `Ok(None)` is a cancel.
     Chosen(super::dialog::Target, Result<Option<PathBuf>, String>),
     ReportImported(Result<crate::compatibility::Report, String>),
     Preset(String, crate::backend::Preset),
@@ -683,15 +823,23 @@ pub enum Message {
     SystemTheme(iced::theme::Mode),
     DriveFilter(Option<PathBuf>),
     LauncherFilter(Option<String>),
+    /// The store path field of a game was edited.
     PackPath(String, String),
+    /// Mount a store over a game. The flag says whether to create it first.
     PackActivate(String, bool),
+    /// Create a store for a game without mounting it.
     PackCreate(String),
+    /// Show the confirm step for reclaiming the retained original.
     PackReclaimPrompt(String),
+    /// Show the confirm step for deleting the previous store.
     PackPrunePrompt(String),
     ToggleAdvanced(String),
 }
 
 /// Runs blocking work without occupying iced's executor or window thread.
+///
+/// Each call starts its own thread. The error is returned when that thread
+/// ends without sending a result.
 pub async fn background<T: Send + 'static>(
     f: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, String> {
@@ -703,6 +851,12 @@ pub async fn background<T: Send + 'static>(
         .await
         .map_err(|_| "The background task stopped unexpectedly.".into())
 }
+/// Sends a command to the worker, with a review step for the ones that need
+/// disk space.
+///
+/// Compression, decompression and pack jobs are not sent here. A space plan
+/// is computed and returned as `Message::Planned`, and the job is queued when
+/// the user accepts it. Every other command goes straight to the worker.
 fn send(command: Command) -> Task<Message> {
     if matches!(
         &command,
@@ -725,6 +879,8 @@ fn send(command: Command) -> Task<Message> {
     send_unchecked(command)
 }
 
+/// Sends a command with no space plan and delivers the worker's reply as
+/// `Message::Snapshot`.
 fn send_unchecked(command: Command) -> Task<Message> {
     Task::perform(
         background(move || jobs::request(command).map_err(|e| e.to_string())),
@@ -732,6 +888,9 @@ fn send_unchecked(command: Command) -> Task<Message> {
     )
 }
 
+/// Sends commands in order on one thread, with no space plan review, and
+/// delivers the last reply. The first failure stops the batch; commands
+/// already sent stay queued.
 fn send_many(commands: Vec<Command>) -> Task<Message> {
     Task::perform(
         background(move || {
@@ -745,6 +904,9 @@ fn send_many(commands: Vec<Command>) -> Task<Message> {
     )
 }
 
+/// Plans a job that mounts a store over the game, creating the store first
+/// when `create` is set, and shows the queue. Does nothing unless the game is
+/// idle and its drive supports stores.
 fn pack_activate(state: &mut State, id: &str, create: bool) -> Task<Message> {
     let Some(game) = state
         .games
@@ -767,6 +929,11 @@ fn pack_activate(state: &mut State, id: &str, create: bool) -> Task<Message> {
     Task::batch([navigation, send(command)])
 }
 
+/// Gathers everything the pages show that the worker does not send: drive
+/// probes, artwork, history and compatibility reports.
+///
+/// Blocks, so it runs through `background`. Only a failed worker request is
+/// an error. Unreadable history, reports or artwork become warnings.
 fn scan(env: Env) -> Result<ScanResult, String> {
     let snapshot = jobs::request(Command::Snapshot).map_err(|error| error.to_string())?;
     let worker_epoch = snapshot.worker_epoch;
@@ -787,6 +954,7 @@ fn scan(env: Env) -> Result<ScanResult, String> {
             GameRow::probe(g, source, cover)
         })
         .collect();
+    // One entry per distinct mountpoint, in the order games first use it.
     let mut drives: Vec<Drive> = vec![];
     for row in &games {
         if let Some(path) = &row.mountpoint {
@@ -840,6 +1008,8 @@ fn analyze_visible(state: &mut State) -> Task<Message> {
     if state.analysis_queuing || state.scanning {
         return Task::none();
     }
+    // A game with any job for its installed build, whatever the outcome, is
+    // left alone. At most 40 are queued per call.
     let games: Vec<_> = state
         .filtered()
         .into_iter()
@@ -875,8 +1045,14 @@ fn analyze_visible(state: &mut State) -> Task<Message> {
     )
 }
 
+/// Applies one message to the state and returns the work it starts.
+///
+/// Runs on the window thread, so anything that blocks goes through
+/// `background` and comes back as another message. Arms that do not return
+/// early fall through to `artwork_tasks`.
 pub fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
+        // Compatibility qualification wizard.
         Message::Qualify(id) => {
             if let Some(game) = state
                 .games
@@ -915,6 +1091,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             if let Some(wizard) = &mut state.qualification {
                 let game = &wizard.game.install_dir;
                 let pack = state.snapshot.packs.iter().find(|p| p.game_path == *game);
+                // A packed game is measured by its store and its updates
+                // directory. A native one is measured by its install directory.
                 let roots = match (pack, wizard.mode) {
                     (Some(pack), _) => vec![pack.store_path.clone(), pack.writes_path.clone()],
                     (None, crate::compatibility::StorageMode::MaximumSpace) => {
@@ -973,12 +1151,15 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             Err(error) => state.show_status(Status::error(error)),
         },
+        // Space plan review.
         Message::Planned(result) => match result {
             Ok(plan) => state.planned = Some(plan),
             Err(error) => state.show_status(Status::error(error)),
         },
         Message::StartPlanned => {
             if let Some((command, plan)) = state.planned.take() {
+                // The plan is checked again here. A plan that fails is dropped
+                // along with its command.
                 match plan.check() {
                     Ok(()) => {
                         return send_unchecked(Command::EnqueuePlanned {
@@ -993,6 +1174,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::CancelPlanned => state.planned = None,
         Message::ExportDiagnostics => {
             let snapshot = state.snapshot.clone();
+            // Writes the current snapshot as `diagnostics.json` in the data
+            // directory, through a temporary file renamed into place.
             return Task::perform(
                 background(move || {
                     let root = crate::libraries::data_dir().map_err(|error| error.to_string())?;
@@ -1018,18 +1201,22 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             ))),
             Err(error) => state.show_status(Status::error(error)),
         },
+        // Artwork. Decodes are started by `artwork_tasks` after the match.
         Message::ArtworkVisible(source) => state.artwork_cache.request(source),
         Message::ArtworkLoaded(source, image) => state.artwork_cache.loaded(source, image),
         Message::ArtworkSaved(result) => match result {
             Ok(()) => return update(state, Message::Refresh),
             Err(error) => state.show_status(Status::error(error)),
         },
+        // Navigation and scrolling.
         Message::Scrolled(page, offset) => {
             state
                 .scroll_positions
                 .insert(page.main().label().into(), offset);
         }
         Message::Jump(section) => {
+            // The task `GoTo` returns is dropped, so the saved Settings scroll
+            // offset is not restored before the jump.
             let _navigation = update(state, Message::GoTo(Page::Settings));
             return super::surface::jump(section, Message::JumpOffset);
         }
@@ -1047,6 +1234,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::GoTo(destination) => {
             let page = destination.main();
             let changed = state.page.main() != page;
+            // A real page change restarts the reveal animation, sliding in the
+            // direction of the move through the sidebar.
             if changed {
                 state.page_direction = if page.rank() < state.page.rank() {
                     -1.0
@@ -1064,6 +1253,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             for (target, animation) in &mut state.nav {
                 animation.go_mut(*target == page, Instant::now());
             }
+            // A section destination scrolls to its section. Any other page
+            // change returns to where that page was last scrolled.
             if let Some(section) = destination.section() {
                 return super::surface::jump(section, Message::JumpOffset);
             }
@@ -1083,6 +1274,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 .chain(Task::done(Message::Tick));
             }
         }
+        // Scanning and worker snapshots.
         Message::Rescan => return send(Command::RefreshDiscovery),
         Message::Refresh => {
             if state.scanning {
@@ -1098,6 +1290,9 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             state.scanning = false;
             match result {
                 Ok(scan) => {
+                    // The worker restarted, rescanned or changed its game list
+                    // while this scan ran, so the result describes an older
+                    // list. Scan again.
                     if scan.worker_epoch > 0
                         && state.snapshot_loaded
                         && (scan.worker_epoch != state.snapshot.worker_epoch
@@ -1112,6 +1307,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                     state.records = scan.records;
                     state.activity = scan.activity;
                     state.warnings = scan.warnings;
+                    // Drop per-game interface state for games that are gone.
+                    // A selected game must also still be supported.
                     let valid: std::collections::HashSet<_> = state
                         .games
                         .iter()
@@ -1147,6 +1344,9 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
 
         Message::Snapshot(result) => match result {
             Ok(snapshot) => {
+                // Replies can arrive out of order. One from an earlier worker,
+                // or from this worker at a revision no newer than the one
+                // shown, is ignored.
                 if snapshot.worker_epoch > 0
                     && state.snapshot.worker_epoch > 0
                     && (snapshot.worker_epoch < state.snapshot.worker_epoch
@@ -1159,6 +1359,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.connection_error = None;
                 let libraries_changed = state.snapshot.libraries != snapshot.libraries;
                 let discovery_changed = state.snapshot.discovered != snapshot.discovered;
+                // A job other than an analysis that was active in the old
+                // snapshot and has stopped in the new one.
                 let completed_work = snapshot.jobs.iter().any(|job| {
                     job.operation != Operation::Analyze
                         && !job.phase.active()
@@ -1168,6 +1370,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                             .iter()
                             .any(|old| old.id == job.id && old.phase.active())
                 });
+                // Progress bars ease towards each new fraction. A fraction
+                // lower than the one drawn is shown at once, with no animation.
                 for job in &snapshot.jobs {
                     let fraction = if job.bytes_total > 0 {
                         (job.bytes_done as f32 / job.bytes_total as f32).clamp(0., 1.)
@@ -1201,6 +1405,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                     .collect();
                 state.snapshot = snapshot;
                 state.polling = true;
+                // A changed library list, a changed game list or finished work
+                // all mean the scanned data is out of date.
                 if libraries_changed {
                     state.show_status(Status::info("Library settings saved."));
                     return update(state, Message::Refresh);
@@ -1216,6 +1422,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.show_status(Status::error(e));
             }
         },
+        // The Games list.
         Message::Query(query) => {
             state.query = query;
             state.shown = 40;
@@ -1251,6 +1458,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::Sort(sort) => {
+            // The savings are captured here and not refreshed until a sort is
+            // chosen again, so later estimates do not reorder the list.
             state.sort = sort;
             state.saving_order = state
                 .games
@@ -1265,6 +1474,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::Filter(filter) => state.filter = filter,
         Message::ShowMore => state.shown += 40,
+        // Queueing work.
         Message::One(id, operation) => {
             if state.pending.contains(&id) {
                 return Task::none();
@@ -1275,6 +1485,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 .find(|g| g.game.id.to_string() == id && g.supported)
                 .map(|row| row.game.clone())
             {
+                // Compress follows the recommendation, which may choose a pack
+                // job. Analyze and Decompress are queued as asked.
                 if operation == Operation::Compress {
                     match state.optimize_command(game) {
                         Ok(command) => {
@@ -1361,6 +1573,9 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::Send(command) => {
+            // Compact, prune, restore and reclaim are turned into pack jobs
+            // for the game at that path, so they pass through `send` and its
+            // space plan.
             let pack = match &command {
                 Command::PackCompact { game_path } => Some((game_path, PackTask::Compact)),
                 Command::PackPrune { game_path } => Some((game_path, PackTask::Prune)),
@@ -1383,6 +1598,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             return send(command);
         }
+        // Native pickers and what is done with the chosen path.
         Message::Browse(target) => {
             if state.picker_busy {
                 return Task::none();
@@ -1415,6 +1631,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                         else {
                             return Task::none();
                         };
+                        // Keep the store's file name and move it to the chosen
+                        // folder.
                         let name = state
                             .store_path(&game)
                             .file_name()
@@ -1437,6 +1655,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                         );
                     }
                     super::dialog::Target::Report => {
+                        // Read at most 1 MiB, parse it, and save it into the
+                        // local report store.
                         return Task::perform(
                             background(move || {
                                 let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
@@ -1482,6 +1702,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             Err(error) => state.show_status(Status::error(error)),
         },
+        // Locations and preferences.
         Message::Folder(folder) => {
             state.folder = folder;
             state.folder_error = None;
@@ -1511,6 +1732,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::Motion(motion) => {
             state.motion = motion;
             state.reduced_motion = motion == MotionPreference::Reduced;
+            // The sidebar animations are rebuilt at their current value with
+            // the new timing. The setting is also sent to the worker.
             let duration = state.motion_duration(220, 140);
             let easing = state.motion_easing();
             for (_, animation) in &mut state.nav {
@@ -1527,6 +1750,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::SystemTheme(theme) => state.system_theme = theme,
         Message::DriveFilter(path) => state.drive_filter = path,
         Message::LauncherFilter(launcher) => state.launcher_filter = launcher,
+        // Maximum Space storage.
         Message::PackPath(id, path) => {
             state.pack_paths.insert(id, path);
         }
@@ -1551,6 +1775,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 ]);
             }
         }
+        // Only one confirm step is open at a time, across both kinds.
         Message::PackReclaimPrompt(id) => {
             state.confirm_prune.clear();
             state.confirm_reclaim.clear();
@@ -1566,8 +1791,11 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.advanced.insert(id);
             }
         }
+        // The toast and the keyboard.
         Message::Dismiss => state.dismiss_status(),
         Message::Tick => {
+            // Start hiding at the deadline, then remove the toast once the
+            // hide animation has finished.
             if state
                 .status_deadline
                 .is_some_and(|deadline| Instant::now() >= deadline)
@@ -1583,6 +1811,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
             use iced::keyboard::{Key, key::Named};
+            // Tab moves focus, Escape closes the detail pane and clears the
+            // selection, and the command key with F or R searches or rescans.
             match key {
                 Key::Named(Named::Tab) => {
                     return if modifiers.shift() {
@@ -1613,6 +1843,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
     artwork_tasks(state)
 }
 
+/// Starts a background decode for each source the cache hands out. A failed
+/// decode is reported as `None`, which the cache records.
 fn artwork_tasks(state: &mut State) -> Task<Message> {
     let mut tasks = vec![];
     while let Some(source) = state.artwork_cache.next() {
@@ -1625,6 +1857,9 @@ fn artwork_tasks(state: &mut State) -> Task<Message> {
     Task::batch(tasks)
 }
 
+/// An endless stream of worker snapshots, each requested one second after
+/// the previous reply. A failed request is delivered as an error and the
+/// stream continues.
 pub fn polls() -> impl iced::futures::Stream<Item = Message> {
     iced::futures::stream::unfold((), |_| async {
         let result = background(|| {

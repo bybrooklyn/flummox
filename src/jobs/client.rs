@@ -14,8 +14,11 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+/// Largest IPC message in bytes, counting its terminating newline.
 pub(super) const LIMIT: u64 = 8 * 1024 * 1024;
 
+/// The owner-only folder holding the socket, queue and locks, created on
+/// first use. Fails unless it is a real directory owned by this user.
 pub fn state_dir() -> Result<PathBuf> {
     let path = crate::db::Db::default_path().context("Cannot locate Flummox's state folder")?;
     let dir = path
@@ -35,6 +38,8 @@ pub fn state_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// The executable to run as coordinator or worker: `flummox` beside the
+/// current executable when that file exists, otherwise the current executable.
 pub(super) fn binary() -> Result<PathBuf> {
     let current = std::env::current_exe()?;
     let sibling = current.with_file_name("flummox");
@@ -57,12 +62,16 @@ pub fn request(command: Command) -> Result<Snapshot> {
     exchange(command, true)
 }
 
+/// Sends one command and returns the coordinator's state after it.
+/// `may_replace` permits one restart of a coordinator from an older version.
 pub(super) fn exchange(command: Command, may_replace: bool) -> Result<Snapshot> {
     let restarting = matches!(&command, Command::Restart);
     let dir = state_dir()?;
     let socket = dir.join("control.sock");
     let mut stream = match UnixStream::connect(&socket) {
         Ok(stream) => stream,
+        // Nothing is listening. Start a coordinator in its own process group,
+        // so it outlives this client, and wait up to 5 seconds for its socket.
         Err(_) => {
             std::process::Command::new(binary()?)
                 .arg("__coordinator")
@@ -89,6 +98,8 @@ pub(super) fn exchange(command: Command, may_replace: bool) -> Result<Snapshot> 
             }
         }
     };
+    // The coordinator runs these inside the request and replies when the
+    // transaction ends, so they get a two-hour read timeout.
     let filesystem_transaction = matches!(
         &command,
         Command::PackActivate { .. }
@@ -133,6 +144,8 @@ pub(super) fn exchange(command: Command, may_replace: bool) -> Result<Snapshot> 
     if let Some(error) = response.get("error").and_then(serde_json::Value::as_str) {
         bail!("{error}");
     }
+    // The old coordinator replies before it exits. Wait until it releases
+    // owner.lock, then send a request that starts the installed executable.
     if restarting {
         let owner = std::fs::OpenOptions::new()
             .read(true)
@@ -160,6 +173,8 @@ pub(super) fn exchange(command: Command, may_replace: bool) -> Result<Snapshot> 
     .context("Invalid worker state")
 }
 
+/// Reads one newline-terminated JSON message of at most [`LIMIT`] bytes.
+/// A line without its newline is rejected as truncated.
 pub(super) fn read_message<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead) -> Result<T> {
     let mut line = String::new();
     reader.take(LIMIT + 1).read_line(&mut line)?;

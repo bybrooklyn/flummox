@@ -9,8 +9,10 @@ use serde_json::Value;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+/// Largest launcher manifest that is read, in bytes.
 const MANIFEST_LIMIT: u64 = 16 * 1024 * 1024;
 
+/// Parses a JSON manifest, refusing one larger than [`MANIFEST_LIMIT`].
 fn json(path: &Path) -> anyhow::Result<Value> {
     let file = std::fs::File::open(path)?;
     let mut bytes = Vec::new();
@@ -21,6 +23,9 @@ fn json(path: &Path) -> anyhow::Result<Value> {
     );
     Ok(serde_json::from_slice(&bytes)?)
 }
+/// Builds a game record for an absolute install path. A path that is not a
+/// directory now is kept and marked `Broken`, so a game on a disconnected
+/// drive stays listed. A relative path gives `None`.
 fn game(
     launcher: Launcher,
     key: String,
@@ -50,6 +55,9 @@ fn game(
         is_tool: false,
     })
 }
+/// Reads the games out of an `installed.json`. The list may be an array or
+/// an object keyed by app name, at the top level or under `installed`.
+/// Entries without an `install_path` are skipped.
 fn parse_installed(value: &Value, launcher: Launcher) -> Vec<Game> {
     let mut games = vec![];
     let entries: Vec<(String, &Value)> = match value.get("installed").unwrap_or(value) {
@@ -96,6 +104,8 @@ fn parse_installed(value: &Value, launcher: Launcher) -> Vec<Game> {
             build,
             item.get("install_size").and_then(Value::as_u64),
         ) {
+            // Either marker puts the game in `UpdatePending`, which keeps
+            // jobs from starting on it.
             if Path::new(path).join(".gogdl-resume").exists()
                 || Path::new(path).join(".egstore/bps").exists()
             {
@@ -106,6 +116,7 @@ fn parse_installed(value: &Value, launcher: Launcher) -> Vec<Game> {
     }
     games
 }
+/// Lists installed games from a Lutris `pga.db`, opened read-only.
 fn lutris(path: &Path) -> anyhow::Result<Vec<Game>> {
     let db =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -134,6 +145,8 @@ fn lutris(path: &Path) -> anyhow::Result<Vec<Game>> {
     Ok(games)
 }
 
+/// Adds Heroic and Lutris games from their native and Flatpak locations
+/// under `env.home`. A source that exists but cannot be read adds a warning.
 pub(super) fn discover(env: &Env, scan: &mut Scan) {
     let configs = [
         env.home.join(".config"),
@@ -180,6 +193,8 @@ pub(super) fn discover(env: &Env, scan: &mut Scan) {
     }
 }
 
+/// Adds games from the custom locations saved in the coordinator's queue
+/// database. Reads the real user's state, so fixture scans must not call it.
 pub(super) fn custom(scan: &mut Scan) {
     match crate::jobs::configured_libraries() {
         Ok(libraries) => {
@@ -194,6 +209,9 @@ pub(super) fn custom(scan: &mut Scan) {
     }
 }
 
+/// Adds one custom location as a `Manual` game keyed by its path. A
+/// collection adds each direct subdirectory instead, skipping hidden names,
+/// files and symlinks.
 fn add_custom(scan: &mut Scan, library: &crate::jobs::Library) {
     let paths = if library.folder_kind == crate::jobs::FolderKind::Collection {
         let entries = match std::fs::read_dir(&library.path) {
@@ -239,6 +257,9 @@ fn add_custom(scan: &mut Scan, library: &crate::jobs::Library) {
     }
 }
 
+/// Collapses games that share a canonical install folder into one record.
+/// The first one found keeps its id and the others' ids go into `also`. A
+/// state other than idle from any of them replaces the kept state.
 pub(super) fn merge(scan: &mut Scan) {
     let mut games: Vec<Game> = vec![];
     for mut game in scan.games.drain(..) {

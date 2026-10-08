@@ -4,6 +4,8 @@ use crate::testutil::{Ctx, TestResult, check, check_eq};
 #[test]
 fn native_pages_render_and_preferences_keep_motion_consistent() -> TestResult {
     let temp = tempfile::tempdir().ctx("native preview fixture")?;
+    // Set FLUMMOX_NATIVE_PREVIEW_DIR to keep the PNGs. Otherwise they go to the
+    // temp directory and are removed with it.
     let output = std::env::var_os("FLUMMOX_NATIVE_PREVIEW_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| temp.path().join("previews"));
@@ -39,6 +41,8 @@ fn native_pages_render_and_preferences_keep_motion_consistent() -> TestResult {
             message: "Compressing files".into(),
         });
     }
+    // Every page in both themes at 1100 px, then once at 740 px, which is under the
+    // 760 px threshold and so exercises the compact layout.
     for page in [Page::Overview, Page::Games, Page::Settings] {
         state.page = page;
         for choice in [ThemeChoice::Dark, ThemeChoice::Light] {
@@ -89,6 +93,7 @@ fn native_snapshots_keep_jobs_on_failure_and_reject_stale_discovery() -> TestRes
         ..Default::default()
     };
     let _task = update(&mut state, Message::Worker(Ok(current.clone())));
+    // Same epoch, lower revision, and no games: must be ignored.
     let stale = crate::windows::coordinator::Snapshot {
         epoch: 10,
         revision: 4,
@@ -106,6 +111,7 @@ fn native_snapshots_keep_jobs_on_failure_and_reject_stale_discovery() -> TestRes
         1,
         "poll failure retains the last valid library",
     )?;
+    // A scan stamped before the snapshot on screen, with a different game list.
     let _task = update(
         &mut state,
         Message::Scanned(Ok(Scan {
@@ -155,6 +161,7 @@ fn library_search_sort_and_updates_survive_navigation() -> TestResult {
         "Adventure".to_owned(),
         "default title ordering",
     )?;
+    // A second list with a new build for one game is what marks it updated.
     two.build = Some("2".into());
     replace_games(&mut state, vec![one, two]);
     let _task = update(&mut state, Message::Filter(GameFilter::Updated));

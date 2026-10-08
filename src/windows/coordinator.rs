@@ -15,29 +15,54 @@ use std::{
     },
     time::{Duration, Instant},
 };
+/// Protocol version sent in every frame. Either side rejects a mismatch.
 const VERSION: u32 = 1;
+/// A request to the worker. Every command, whether it succeeds or not, is answered
+/// with a full `Snapshot`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
+    /// Changes nothing.
     Snapshot,
-    Enqueue { game: Game, restore: bool },
-    Pause { id: u64, paused: bool },
+    /// Queue a compression, or a restore, of one game folder.
+    Enqueue {
+        game: Game,
+        restore: bool,
+    },
+    /// Set or clear the user's pause on one job.
+    Pause {
+        id: u64,
+        paused: bool,
+    },
+    /// The running job stops after its current file. A waiting one is cancelled at once.
     Cancel(u64),
     Retry(u64),
+    /// Rediscover games on the next loop pass.
     Refresh,
+    /// `true` pauses all background work, `false` resumes it.
     Maintenance(bool),
+    /// Replace the saved preferences. `maintenance_paused` in the payload is ignored.
     Settings(Preferences),
+    /// Cancel waiting jobs, stop the running one after its current file, then exit.
     Shutdown,
 }
+/// The worker's whole visible state at one moment.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// A shutdown was requested and the worker exits once its job stops.
     pub stopping: bool,
+    /// The worker's start time in nanoseconds since the Unix epoch. With `revision`
+    /// it orders snapshots, including across a worker restart.
     pub epoch: u64,
+    /// Incremented for every reply.
     pub revision: u64,
     pub jobs: Vec<Job>,
     pub games: Vec<Game>,
     pub warnings: Vec<String>,
     pub artwork_roots: Vec<PathBuf>,
+    /// Why every job is held, if one is: a running game, a launcher at work, or
+    /// preferences that cannot be read.
     pub busy: Option<String>,
+    /// A discovery pass is running. No job starts until it ends.
     pub discovering: bool,
     pub maintenance_paused: bool,
 }
@@ -52,6 +77,8 @@ struct Response {
     snapshot: Snapshot,
     error: Option<String>,
 }
+/// One exchange on an open pipe: request, response, acknowledgement. A command the
+/// worker refused comes back as an error.
 fn call_file(command: Command, mut file: std::fs::File) -> Result<Snapshot> {
     crate::windows::ipc::send(
         &mut file,
@@ -72,12 +99,15 @@ fn call_file(command: Command, mut file: std::fs::File) -> Result<Snapshot> {
     }
     Ok(response.snapshot)
 }
+/// A snapshot from the running worker. Fails if none is running, and never starts one.
 pub fn poll() -> Result<Snapshot> {
     call(Command::Snapshot)
 }
 fn call(command: Command) -> Result<Snapshot> {
     call_file(command, crate::windows::ipc::connect()?)
 }
+/// Sends a command, first starting a worker if none answers and waiting up to 5
+/// seconds for its pipe. `Shutdown` never starts one.
 pub fn request(command: Command) -> Result<Snapshot> {
     if let Ok(file) = crate::windows::ipc::connect() {
         return call_file(command, file);
@@ -85,6 +115,7 @@ pub fn request(command: Command) -> Result<Snapshot> {
     if matches!(command, Command::Shutdown) {
         return call(command);
     }
+    // The worker is this same executable with a flag that `entrypoint` recognises.
     use std::os::windows::process::CommandExt;
     std::process::Command::new(std::env::current_exe()?)
         .arg("--native-coordinator")
@@ -99,6 +130,10 @@ pub fn request(command: Command) -> Result<Snapshot> {
     }
     call(command)
 }
+/// Handles the worker flags. Both binaries call this first in `main` and must
+/// exit when it returns true. `--native-coordinator` runs the worker in this
+/// process. `--background` makes sure one is running. `--native-worker-exit` stops
+/// it and waits up to 30 seconds for it to finish its file.
 pub fn entrypoint() -> Result<bool> {
     let args: Vec<_> = std::env::args_os().collect();
     if args.iter().any(|arg| arg == "--native-coordinator") {
@@ -118,6 +153,7 @@ pub fn entrypoint() -> Result<bool> {
             .read(true)
             .write(true)
             .open(root.join("coordinator.lock"))?;
+        // A worker holds this lock for its whole life. Getting it means none is running.
         if lock.try_lock().is_ok() {
             cleanup_startup(&args, &root)?;
             return Ok(true);
@@ -136,6 +172,8 @@ pub fn entrypoint() -> Result<bool> {
     }
     Ok(false)
 }
+/// With `--remove-owned-startup`, deletes this installation's login entry and
+/// clears the matching preference.
 fn cleanup_startup(args: &[std::ffi::OsString], root: &std::path::Path) -> Result<()> {
     if args.iter().any(|arg| arg == "--remove-owned-startup") {
         crate::windows::launchers::startup(false)?;
@@ -145,12 +183,15 @@ fn cleanup_startup(args: &[std::ffi::OsString], root: &std::path::Path) -> Resul
     }
     Ok(())
 }
+/// The running job's thread and its controls. Dropping it raises `cancel`, clears
+/// `pause` and joins the thread, so the drop blocks until the current file is done.
 struct Active {
     id: u64,
     cancel: Arc<AtomicBool>,
     pause: Arc<AtomicBool>,
     events: mpsc::Receiver<Event>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// When the job's volume was last checked, and what the check found.
     drive_check: Instant,
     drive_online: bool,
 }
@@ -168,6 +209,8 @@ impl Drop for Active {
         }
     }
 }
+/// Stops and joins the pipe listener thread when the coordinator returns, on
+/// every path including an error.
 struct ListenerStop {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -180,10 +223,13 @@ impl Drop for ListenerStop {
         }
     }
 }
+/// What a job thread sends back. `Finished` is always its last event.
 enum Event {
     Progress(Progress),
     Finished(std::result::Result<String, String>),
 }
+/// Starts the job's thread. The channel is bounded, so a job thread that gets 256
+/// events ahead of the coordinator blocks until it catches up.
 fn start(job: &Job) -> Active {
     let (send, events) = mpsc::sync_channel(256);
     let cancel = Arc::new(AtomicBool::new(false));
@@ -223,6 +269,9 @@ fn start(job: &Job) -> Active {
         drive_online: true,
     }
 }
+/// The worker: one loop, about every 20 ms, that owns the queue, runs at most one
+/// job at a time and answers clients. Returns after a shutdown once no job is
+/// running, or at once if another worker already holds the lock.
 fn run() -> Result<()> {
     let root = crate::libraries::data_dir()?;
     crate::libraries::private_dir(&root)?;
@@ -235,6 +284,7 @@ fn run() -> Result<()> {
     if lock.try_lock().is_err() {
         return Ok(());
     }
+    // `load` marks jobs the last worker left mid-run as interrupted. Save that now.
     let mut queue = Queue::load(&root)?;
     queue.save(&root)?;
     let mut pipe = crate::windows::ipc::listener()?;
@@ -243,6 +293,9 @@ fn run() -> Result<()> {
     let listener_stop = stopped.clone();
     let listener_failed = Arc::new(AtomicBool::new(false));
     let pipe_failed = listener_failed.clone();
+    // The listener serves one client at a time: read a request, pass it to the main
+    // loop, wait up to 3 seconds for the reply, write it, wait for the client's
+    // acknowledgement, disconnect. Only the main loop touches the queue.
     let listener_thread = std::thread::spawn(move || {
         while !listener_stop.load(Ordering::Relaxed) {
             match crate::windows::ipc::accept(&pipe) {
@@ -290,6 +343,8 @@ fn run() -> Result<()> {
             error
         })
         .ok();
+    // The timers below start 60 seconds in the past so the first loop pass runs
+    // each periodic step.
     let mut active: Option<Active> = None;
     let mut shutdown = false;
     let mut queue_dirty = false;
@@ -305,6 +360,8 @@ fn run() -> Result<()> {
             !listener_failed.load(Ordering::Relaxed),
             "The coordinator pipe failed; work stopped safely"
         );
+        // Reread preferences every second. While they cannot be read the old copy
+        // stays in use and every job is held.
         if last_preferences.elapsed() >= Duration::from_secs(1) {
             last_preferences = Instant::now();
             match Preferences::load(&root) {
@@ -318,6 +375,8 @@ fn run() -> Result<()> {
                 }
             }
         }
+        // Discovery runs on its own thread, every 30 seconds, or every 3 while a job
+        // is running. Only one pass runs at a time.
         if !shutdown
             && discovery.is_none()
             && last_scan.elapsed() >= Duration::from_secs(if active.is_some() { 3 } else { 30 })
@@ -347,6 +406,9 @@ fn run() -> Result<()> {
                     snapshot.games = catalog.games;
                     snapshot.artwork_roots = catalog.artwork_roots;
                     snapshot.warnings = catalog.warnings;
+                    // Maintenance: queue what `observe` reports as due. A scan with
+                    // warnings counts as unhealthy and queues nothing. The baseline
+                    // moves only once the job for this folder is for this build.
                     for game in
                         queue.observe(&snapshot.games, &preferences, snapshot.warnings.is_empty())
                     {
@@ -370,6 +432,9 @@ fn run() -> Result<()> {
                 Err(error) => snapshot.warnings = vec![error],
             }
         }
+        // Every second, look for a running game or launcher tool. Folders of active
+        // jobs are included even if discovery no longer lists them. A failed check
+        // holds work, with the error as the reason.
         if last_activity.elapsed() >= Duration::from_secs(1) {
             last_activity = Instant::now();
             let mut games = snapshot.games.clone();
@@ -418,6 +483,8 @@ fn run() -> Result<()> {
                 }
             }
         }
+        // Answer clients. Each command runs in a closure so its error goes back to
+        // that client and does not end the loop.
         for (request, reply) in receive.try_iter().take(64) {
             let result = (|| -> Result<()> {
                 ensure!(
@@ -426,6 +493,7 @@ fn run() -> Result<()> {
                 );
                 match request.command {
                     Command::Snapshot => {}
+                    // Backdating the timer makes the discovery step above fire next pass.
                     Command::Refresh => last_scan = Instant::now() - Duration::from_secs(60),
                     Command::Enqueue { mut game, restore } => {
                         game.install_dir = game.install_dir.canonicalize()?;
@@ -477,6 +545,8 @@ fn run() -> Result<()> {
                         preferences.save(&root)?;
                     }
                     Command::Settings(mut settings) => {
+                        // The payload's pause flag is discarded in favour of the
+                        // worker's current one.
                         settings.maintenance_paused = preferences.maintenance_paused;
                         if settings.start_at_login != preferences.start_at_login {
                             crate::windows::launchers::startup(settings.start_at_login)?;
@@ -510,6 +580,8 @@ fn run() -> Result<()> {
                 error: result.err().map(|error| error.to_string()),
             });
         }
+        // Preferences may have changed under queued work. Cancel compression of a
+        // game that is now excluded, and automatic jobs whose location opted out.
         for job in &mut queue.jobs {
             let excluded = !job.restore
                 && job
@@ -532,6 +604,8 @@ fn run() -> Result<()> {
                 }
             }
         }
+        // The running job: decide whether it should be paused right now, set its
+        // message, then take the events its thread has sent.
         let mut finished = false;
         if let Some(running) = &mut active
             && let Some(job) = queue.jobs.iter_mut().find(|job| job.id == running.id)
@@ -545,6 +619,7 @@ fn run() -> Result<()> {
                     });
             }
             let before = (job.phase, job.message.clone());
+            // Discovery now reports this game as busy, updating or broken.
             let unavailable = snapshot
                 .games
                 .iter()
@@ -577,10 +652,12 @@ fn run() -> Result<()> {
                 "Processing files".into()
             };
             queue_dirty |= before != (job.phase, job.message.clone());
+            // At most 256 events per pass, so a fast job cannot starve the loop.
             for _ in 0..256 {
                 let event = match running.events.try_recv() {
                     Ok(event) => event,
                     Err(mpsc::TryRecvError::Empty) => break,
+                    // The thread ended without sending `Finished`.
                     Err(mpsc::TryRecvError::Disconnected) => {
                         if !finished {
                             finished = true;
@@ -613,6 +690,7 @@ fn run() -> Result<()> {
                 }
             }
         }
+        // Dropping `Active` joins the thread, which has already sent its last event.
         if finished {
             active = None;
             queue.save(&root)?;
@@ -621,12 +699,15 @@ fn run() -> Result<()> {
             stopped.store(true, Ordering::Relaxed);
             return Ok(());
         }
+        // An interrupted pass left its journal. Automatic jobs wait for the user to
+        // deal with it. The journal is read only when a job could start.
         let recovery_pending =
             if active.is_none() && queue.jobs.iter().any(|job| job.phase == Phase::Waiting) {
                 !crate::windows::recovery()?.is_empty()
             } else {
                 false
             };
+        // Give every waiting job a message naming the first thing it waits for.
         for job in queue
             .jobs
             .iter_mut()
@@ -662,6 +743,8 @@ fn run() -> Result<()> {
                 queue_dirty = true;
             }
         }
+        // Start the first waiting job that nothing holds: its folder exists on the
+        // volume it was queued on, and discovery does not report the game as busy.
         if !shutdown
             && active.is_none()
             && snapshot.busy.is_none()
@@ -683,6 +766,8 @@ fn run() -> Result<()> {
                         .is_none_or(|game| game.state.is_idle())
             })
         {
+            // Saved as running before the thread starts, so a crash from here on is
+            // loaded as an interrupted job.
             job.phase = Phase::Running;
             job.message = "Preparing files".into();
             queue.save(&root)?;
@@ -696,6 +781,7 @@ fn run() -> Result<()> {
         if let Some((tray, _)) = &tray {
             tray.set_paused(preferences.maintenance_paused);
         }
+        // Changes flagged through `queue_dirty` are written at most once a second.
         if queue_dirty && last_save.elapsed() >= Duration::from_secs(1) {
             last_save = Instant::now();
             queue.save(&root)?;
@@ -705,6 +791,9 @@ fn run() -> Result<()> {
     }
 }
 
+/// Discovery, with a seam for tests: a test build reads the catalog from the file
+/// named by FLUMMOX_TEST_CATALOG. The same variable disables the tray and the
+/// process check in the two functions below.
 fn discover() -> Result<crate::desktop_discovery::Catalog> {
     #[cfg(test)]
     if let Some(path) = std::env::var_os("FLUMMOX_TEST_CATALOG") {
@@ -745,6 +834,8 @@ mod tests {
             let _reaped = self.0.wait();
         }
     }
+    // Not a test of its own. `launch` runs the test binary filtered to this
+    // function, which becomes a real coordinator in a child process.
     #[test]
     #[ignore = "Subprocess entrypoint for the isolated coordinator test"]
     fn helper() -> TestResult {
@@ -753,6 +844,8 @@ mod tests {
         }
         run().map_err(|error| error.to_string())
     }
+    // LOCALAPPDATA moves the worker's state into the fixture, and the pipe suffix
+    // keeps it apart from any real worker on this machine.
     fn launch(
         base: &std::path::Path,
         catalog: &std::path::Path,
@@ -804,6 +897,7 @@ mod tests {
             .ctx("fixture catalog")?,
         )
         .ctx("save catalog")?;
+        // Seed the queue file with one user-paused job before the worker starts.
         let state = temp.path().join("flummox");
         let mut queue = Queue::default();
         let id = queue.enqueue(game.clone(), false).ctx("fixture job")?;

@@ -17,25 +17,36 @@ use std::{
     time::Instant,
 };
 
+// Frame size of the large-window candidates. Equal to the pack store's
+// largest chunk.
 const FRAME: usize = 4 * 1024 * 1024;
+// Size of each independently compressed chunk in the WOF/LZX proxy.
 const WOF_CHUNK: usize = 32 * 1024;
+// Sizes are rounded up to this cluster size before they are compared.
 const ALLOCATION_UNIT: u64 = 4096;
 
 /// Full-corpus estimate produced by a verified 32 KiB LZX chunk helper.
 #[derive(Debug, serde::Serialize)]
 pub struct WofLzxProxy {
     pub method: &'static str,
+    /// SHA-256 over each file's path, size and bytes, in sorted path order.
     pub corpus_sha256: String,
     pub files: u64,
+    /// Files whose compressed stream needs fewer 4 KiB clusters than the file.
     pub compressed_files: u64,
     pub input_bytes: u64,
+    /// Stream bytes for compressed files plus plain sizes for the rest.
     pub stored_stream_bytes: u64,
+    /// The same total with every file rounded up to 4 KiB.
     pub allocated_bytes_4k: u64,
     pub compressed_chunks: u64,
     pub raw_chunks: u64,
     pub benchmark_ns: u128,
 }
 
+// Helper protocol, little-endian. A request is a u32 length followed by
+// that many bytes. The reply is one u32, the stored size of the chunk. A
+// zero length is sent last, when the run ends.
 fn write_helper(input: &mut impl Write, bytes: &[u8]) -> Result<()> {
     input.write_all(&u32::try_from(bytes.len())?.to_le_bytes())?;
     input.write_all(bytes)?;
@@ -53,6 +64,9 @@ fn allocated(bytes: u64) -> u64 {
     bytes.div_ceil(ALLOCATION_UNIT) * ALLOCATION_UNIT
 }
 
+// Adds one path record to the corpus hash: a u64 little-endian byte length,
+// then the raw path bytes. The layout is pinned by the test
+// `corpus_fingerprint_has_a_portable_record_layout`.
 fn path_hash(hasher: &mut Sha256, path: &Path) -> Result<()> {
     let bytes = path.as_os_str().as_bytes();
     hasher.update(u64::try_from(bytes.len())?.to_le_bytes());
@@ -106,6 +120,8 @@ pub fn wof_lzx_proxy(
         )
     })?;
     let started = Instant::now();
+    // The measurement runs in a closure so that the helper is told to stop
+    // and is waited for on every path, including an error partway through.
     let measured = (|| -> Result<WofLzxProxy> {
         let mut report = WofLzxProxy {
             method: "wimlib LZX:50 WOF proxy",
@@ -163,6 +179,10 @@ pub fn wof_lzx_proxy(
                 "{} changed during the LZX benchmark",
                 entry.rel.display()
             );
+            // The stream is modelled as the chunk payloads plus an offset
+            // table with one entry per chunk after the first. Entries are 4
+            // bytes, or 8 once the file exceeds 4 GiB. A file counts as
+            // compressed only if that needs fewer clusters than the file.
             let table_width = if entry.size > u64::from(u32::MAX) {
                 8
             } else {
@@ -205,6 +225,8 @@ pub fn wof_lzx_proxy(
 pub struct Candidate {
     pub name: String,
     pub input_bytes: u64,
+    /// Modelled btrfs disk cost for a native row. For a frame row, the
+    /// compressed size capped at the input size.
     pub output_bytes: u64,
     pub compression_ns: u128,
     pub decompression_ns: u128,
@@ -217,11 +239,15 @@ pub struct Report {
     pub sampled_files: u64,
     pub eligible_files: u64,
     pub sampled_bytes: u64,
+    /// True when the run stopped early. The rows then cover fewer bytes.
     pub cancelled: bool,
     pub warnings: Vec<String>,
     pub candidates: Vec<Candidate>,
 }
 
+// Adds one sample to `row`. `native` cuts the input into btrfs-sized blocks
+// and charges the btrfs cost model. Otherwise it uses 4 MiB frames. Every
+// block is decoded again and compared before its size is counted.
 fn measure(input: &[u8], level: i32, native: bool, row: &mut Candidate) -> Result<()> {
     let block = if native {
         BtrfsModel::BLOCK as usize
@@ -260,6 +286,7 @@ pub fn run(root: &Path, budget_mib: u64, cancel: &AtomicBool) -> Result<Report> 
         "Safe path resolution is unavailable on this kernel"
     );
     let inv = inventory::walk_cancellable(&root, &inventory::WalkOpts::native(), Some(cancel))?;
+    // (zstd level, native). Each pair is one report row, in this order.
     let profiles = [
         (3, true),
         (9, true),
@@ -328,6 +355,8 @@ pub fn run(root: &Path, budget_mib: u64, cancel: &AtomicBool) -> Result<Report> 
                 break;
             }
             let length = left.min(FRAME as u64) as usize;
+            // One sample is taken from the middle of the file. Several are
+            // spaced evenly from the first byte towards the last.
             let offset = if samples <= 1 {
                 (entry.size.saturating_sub(length as u64)) / 2
             } else {

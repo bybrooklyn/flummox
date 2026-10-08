@@ -20,8 +20,14 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+// How long the kernel may cache an attribute or lookup reply before asking again.
 const TTL: Duration = Duration::from_secs(1);
 
+// Inode numbers for the life of one mount. A store entry's inode is its index
+// plus one, which makes the root inode 1 as FUSE expects. Hard-link aliases
+// share their target's number. Paths created later take numbers from `next`.
+// Nothing is ever removed: a deleted path keeps its number, and a new file at
+// the same path reuses it.
 struct Nodes {
     paths: HashMap<PathBuf, u64>,
     inodes: HashMap<u64, Vec<PathBuf>>,
@@ -29,6 +35,8 @@ struct Nodes {
 }
 
 impl Nodes {
+    // Relies on a hard-link target preceding its aliases, which
+    // `Index::validate` enforces. The target is therefore first in its list.
     fn new(entries: &[Entry]) -> Self {
         let mut paths = HashMap::new();
         let mut inodes: HashMap<u64, Vec<PathBuf>> = HashMap::new();
@@ -75,6 +83,8 @@ impl Nodes {
             .unwrap_or(1)
     }
 
+    // Moves `from` and every path beneath it to `to`, keeping their inode
+    // numbers. A path replaced at the target loses its mapping.
     fn rename(&mut self, from: &Path, to: &Path) {
         if from == to {
             return;
@@ -108,6 +118,9 @@ impl Nodes {
     }
 }
 
+/// The FUSE filesystem: a store, plus an update layer when writable. With no
+/// layer every mutating request fails. The overlay mutex serialises all
+/// reads and writes that touch the layer.
 pub struct StoreFs {
     reader: Reader,
     overlay: Option<Mutex<Overlay>>,
@@ -115,42 +128,56 @@ pub struct StoreFs {
     writes: Option<Arc<WriteControl>>,
 }
 
+// Shared between the filesystem and compaction. Every mutating handler holds
+// the read side of `gate` while it works and adds one to `generation` when it
+// succeeds. Compaction takes the write side to stop mutations.
 #[derive(Default)]
 struct WriteControl {
     gate: RwLock<()>,
     generation: AtomicU64,
 }
 
+// Held by a handler for the length of one mutation.
 struct Mutation<'a> {
     _gate: RwLockReadGuard<'a, ()>,
     generation: &'a AtomicU64,
 }
 
 impl Mutation<'_> {
+    // Records that the mutation took effect. A handler that returns an error
+    // drops the guard without calling this, so the counter does not move.
     fn committed(self) {
         self.generation.fetch_add(1, Ordering::Release);
     }
 }
 
+/// Handle on a writable mount's mutation counter and write gate.
 #[derive(Clone)]
 pub(crate) struct WriteController(Arc<WriteControl>);
 
+/// Proof that no mutation is in flight. While it lives, every mutating
+/// request on the mount fails with `EBUSY`. Reads are still served.
 pub(crate) struct FrozenWrites<'a> {
     _gate: RwLockWriteGuard<'a, ()>,
     generation: u64,
 }
 
 impl FrozenWrites<'_> {
+    /// The mutation count at the moment writes stopped.
     pub fn generation(&self) -> u64 {
         self.generation
     }
 }
 
 impl WriteController {
+    /// Number of mutations that have succeeded since the mount started.
     pub fn generation(&self) -> u64 {
         self.0.generation.load(Ordering::Acquire)
     }
 
+    /// Waits for mutations in flight to finish, then blocks new ones. A
+    /// caller compares `generation` with a value read earlier to learn
+    /// whether anything was written in between.
     pub fn freeze(&self) -> Result<FrozenWrites<'_>> {
         let gate = self
             .0
@@ -164,20 +191,24 @@ impl WriteController {
     }
 }
 
+/// A mounted store served by a background thread.
 pub struct Session {
     inner: fuser::BackgroundSession,
     writes: Option<WriteController>,
 }
 
 impl Session {
+    /// True once the serving thread has exited.
     pub fn is_finished(&self) -> bool {
         self.inner.guard.is_finished()
     }
 
+    /// Unmounts and waits for the serving thread.
     pub fn umount_and_join(self) -> std::io::Result<()> {
         self.inner.umount_and_join()
     }
 
+    /// The write controller of a writable mount. `None` when read-only.
     pub(crate) fn writes(&self) -> Option<WriteController> {
         self.writes.clone()
     }
@@ -200,6 +231,9 @@ impl StoreFs {
         })
     }
 
+    // Every handler that changes the layer calls this first and calls
+    // `committed` on the result once the change is made. It never waits:
+    // while writes are frozen it fails with EBUSY.
     fn mutation(&self) -> Result<Mutation<'_>> {
         let control = self.writes.as_ref().context("Read-only store")?;
         let gate = match control.gate.try_read() {
@@ -215,6 +249,9 @@ impl StoreFs {
         })
     }
 
+    // Resolves an inode to its first visible path, or to its first path when
+    // none is visible. For hard links that is the target while it exists, so
+    // a write through any alias copies up the target and its aliases together.
     fn path(&self, inode: INodeNo) -> Result<PathBuf> {
         let paths = self
             .nodes
@@ -251,6 +288,8 @@ impl StoreFs {
         }
     }
 
+    // Stat of the upper entry for `path`. `None` when the mount is read-only,
+    // the path is hidden, or nothing has been copied up or created there.
     fn upper_metadata(&self, path: &Path) -> Result<Option<std::fs::Metadata>> {
         let Some(overlay) = &self.overlay else {
             return Ok(None);
@@ -268,6 +307,9 @@ impl StoreFs {
         }
     }
 
+    // Attributes come from the upper entry when there is one, otherwise from
+    // the store entry. Store entries are reported as owned by the mounting
+    // user, and ctime is reported as mtime in both cases.
     fn attr_path(&self, path: &Path) -> Result<FileAttr> {
         ensure!(self.visible(path)?, "Missing path");
         let inode = self.inode(path)?;
@@ -333,6 +375,8 @@ impl StoreFs {
         })
     }
 
+    // Path of `name` under a parent inode. Refuses `.`, `..` and any name
+    // with more than one component.
     fn child(&self, parent: INodeNo, name: &OsStr) -> Result<PathBuf> {
         ensure!(
             name != "." && name != ".." && Path::new(name).components().count() == 1,
@@ -341,6 +385,8 @@ impl StoreFs {
         Ok(self.path(parent)?.join(name))
     }
 
+    // An I/O error keeps its own errno. Every other failure, including the
+    // `ensure!` checks in the overlay, is reported as EIO.
     fn errno(error: &anyhow::Error) -> Errno {
         error
             .downcast_ref::<std::io::Error>()
@@ -349,6 +395,7 @@ impl StoreFs {
             .unwrap_or(Errno::EIO)
     }
 
+    // Shared body of unlink and rmdir. The inode table is left alone.
     fn remove(&self, parent: INodeNo, name: &OsStr, directory: bool, reply: fuser::ReplyEmpty) {
         let result = self.child(parent, name).and_then(|path| {
             let mutation = self.mutation()?;
@@ -376,6 +423,10 @@ fn kind(entry: &Entry) -> FileType {
     }
 }
 
+// Handler rules. A handler that changes the layer takes `mutation()` before
+// touching it and calls `committed()` only after the change succeeded. It
+// never writes to the store. File handles carry no state: each request
+// resolves its inode to a path again and reopens the upper file.
 impl Filesystem for StoreFs {
     fn lookup(&self, _: &fuser::Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEntry) {
         let result = self
@@ -562,6 +613,8 @@ impl Filesystem for StoreFs {
         }
     }
 
+    // Opening for write or with O_TRUNC copies the file up at once, before
+    // any byte is written. A read-only open touches nothing.
     fn open(
         &self,
         _: &fuser::Request,
@@ -606,6 +659,9 @@ impl Filesystem for StoreFs {
         }
     }
 
+    // Takes no write gate, so reads continue while writes are frozen. Every
+    // failure, a chunk that fails its hash included, is logged and
+    // returned as EIO.
     fn read(
         &self,
         _: &fuser::Request,
@@ -668,6 +724,8 @@ impl Filesystem for StoreFs {
         }
     }
 
+    // Syncs the upper copy if there is one. A file still served from the
+    // store has nothing to flush. `fsync` shares this body.
     fn flush(
         &self,
         _: &fuser::Request,
@@ -708,6 +766,9 @@ impl Filesystem for StoreFs {
         self.flush(request, ino, handle, fuser::LockOwner(0), reply);
     }
 
+    // Applies size, mode and mtime to the upper copy. Owner, group and atime
+    // requests are accepted and ignored. Any call copies the entry up and
+    // counts as a mutation, even one that changes nothing.
     fn setattr(
         &self,
         _: &fuser::Request,
@@ -878,6 +939,8 @@ impl Filesystem for StoreFs {
             );
             let from = self.child(parent, name)?;
             let to = self.child(newparent, newname)?;
+            // The layer is renamed first. The inode table follows only on
+            // success, so the kernel's inodes keep naming the moved files.
             self.overlay
                 .as_ref()
                 .context("Read-only store")?
@@ -957,6 +1020,9 @@ impl Filesystem for StoreFs {
         }
     }
 
+    // `offset` is a position in the row list, which is rebuilt on every call:
+    // `.`, `..`, then the visible children. A listing that changes between
+    // two calls can therefore skip or repeat a name.
     fn readdir(
         &self,
         _: &fuser::Request,
@@ -1020,6 +1086,8 @@ impl Filesystem for StoreFs {
         reply.ok();
     }
 
+    // A writable mount reports the filesystem holding the update layer, since
+    // that is where new bytes land. A read-only mount reports no free space.
     fn statfs(&self, _: &fuser::Request, _: INodeNo, reply: fuser::ReplyStatfs) {
         if let Some(overlay) = &self.overlay
             && let Ok(overlay) = overlay.lock()
@@ -1063,6 +1131,10 @@ pub fn mount(store: &Path, target: &Path, writes: Option<&Path>) -> Result<Sessi
     );
     let control = writes.map(|_| Arc::new(WriteControl::default()));
     let fs = StoreFs::open(store, writes, control.clone())?;
+    // No allow_other, so only the mounting user can reach the files. With
+    // default_permissions the kernel enforces the reported mode bits. The
+    // filesystem name is how `clear_disconnected_mount` recognises a mount
+    // left behind by this tool.
     let mut config = fuser::Config::default();
     config.mount_options = vec![
         fuser::MountOption::NoSuid,

@@ -12,6 +12,8 @@ use iced::{Background, Color, Font, Theme, color};
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use iced::{Border, Element};
 
+/// The palette every style in this file draws from. Fields are gated to the
+/// platforms whose front end reads them.
 #[derive(Clone, Copy)]
 struct Colors {
     accent: Color,
@@ -32,6 +34,7 @@ struct Colors {
     warning: Color,
 }
 
+/// The dark or light palette, chosen by whether `theme` is a dark theme.
 fn colors(theme: &Theme) -> Colors {
     if theme.extended_palette().is_dark {
         Colors {

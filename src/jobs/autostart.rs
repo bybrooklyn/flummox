@@ -5,6 +5,7 @@ use std::{io::Write, path::Path};
 
 const MARKER: &str = "# Managed by Flummox library maintenance\n";
 
+/// Text of the desktop entry that starts the coordinator at login.
 fn entry(executable: &Path) -> Result<String> {
     let path = executable
         .to_str()
@@ -52,6 +53,8 @@ pub(super) fn update(config: &Path, executable: &Path, enabled: bool) -> Result<
         return Ok(());
     }
     std::fs::create_dir_all(&dir)?;
+    // Write a temporary file and rename it over the entry, so a crash leaves
+    // either the old entry or the new one.
     let temporary = dir.join(format!(".flummox-{}.tmp", std::process::id()));
     let mut file = std::fs::OpenOptions::new()
         .create_new(true)
@@ -69,6 +72,8 @@ pub(super) fn update(config: &Path, executable: &Path, enabled: bool) -> Result<
     result
 }
 
+/// Writes or removes the login entry under `$XDG_CONFIG_HOME/autostart`,
+/// falling back to `~/.config` when the variable is unset or relative.
 pub(super) fn configure(executable: &Path, enabled: bool) -> Result<()> {
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)

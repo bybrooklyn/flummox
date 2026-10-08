@@ -7,6 +7,7 @@ use windows_sys::Win32::{
     System::LibraryLoader::GetModuleHandleW,
     UI::{Shell::*, WindowsAndMessaging::*},
 };
+/// A choice the user made from the tray icon, sent to the coordinator loop.
 #[derive(Debug, Clone, Copy)]
 pub enum Action {
     Open,
@@ -14,19 +15,30 @@ pub enum Action {
     Resume,
     Exit,
 }
+// State of the tray's message thread. The window procedure is a plain function
+// with no context argument, so it reaches its state through these. They are set
+// and read on that thread only.
 thread_local! {
     static ACTIONS: RefCell<Option<mpsc::Sender<Action>>> = const { RefCell::new(None) };
     static PAUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static ICON: RefCell<Option<NOTIFYICONDATAW>> = const { RefCell::new(None) };
     static TASKBAR_CREATED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
+/// The message the shell posts for mouse events on the icon, with the event in `lparam`.
 const CALLBACK: u32 = WM_APP + 1;
+/// Posted by `Tray::set_paused`. `wparam` is nonzero when maintenance is paused.
 const PAUSE_STATE: u32 = WM_APP + 2;
+/// The coordinator's handle to the tray. Dropping it removes the icon and closes
+/// the window, which ends the message thread.
 pub struct Tray {
+    /// The hidden window's HWND as an integer, the form the tray thread sends it in.
     window: isize,
+    /// The state last posted. `None` until the first call.
     paused: std::cell::Cell<Option<bool>>,
 }
 impl Tray {
+    /// Tells the menu which of Pause and Resume to offer. Cheap to call every loop
+    /// pass: an unchanged state posts nothing.
     pub fn set_paused(&self, paused: bool) {
         if self.paused.replace(Some(paused)) == Some(paused) {
             return;
@@ -55,6 +67,7 @@ impl Drop for Tray {
         }
     }
 }
+/// Sends an action to the coordinator. A send after the receiver is gone is ignored.
 fn publish(action: Action) {
     ACTIONS.with(|slot| {
         if let Some(sender) = slot.borrow().as_ref() {
@@ -62,12 +75,15 @@ fn publish(action: Action) {
         }
     });
 }
+/// Window procedure of the hidden tray window. Runs on the tray thread.
 unsafe extern "system" fn procedure(
     window: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // Explorer broadcasts TaskbarCreated when it restarts, having lost every icon.
+    // Add ours again. The id is registered at run time, so it cannot be a match arm.
     if TASKBAR_CREATED.with(|slot| slot.get() == message && message != 0) {
         ICON.with(|slot| {
             if let Some(data) = slot.borrow().as_ref() {
@@ -84,6 +100,7 @@ unsafe extern "system" fn procedure(
             PAUSED.with(|slot| slot.set(wparam != 0));
             0
         }
+        // Double click opens the window. Right click shows the menu.
         CALLBACK => {
             if lparam as u32 == WM_LBUTTONDBLCLK {
                 publish(Action::Open);
@@ -114,6 +131,8 @@ unsafe extern "system" fn procedure(
         }
     }
 }
+/// Shows the tray menu at the cursor and publishes the chosen action. Blocks the
+/// tray thread until the menu closes.
 fn popup(window: HWND) -> Result<()> {
     // SAFETY: CreatePopupMenu creates a uniquely owned menu without pointers.
     let menu = unsafe { CreatePopupMenu() };
@@ -128,6 +147,8 @@ fn popup(window: HWND) -> Result<()> {
         }
     }
     let _owned = Menu(menu);
+    // The ids are matched against TrackPopupMenu's return value below. A dismissed
+    // menu returns 0, which matches none of them.
     for (id, label) in [
         (1, "Open Flummox"),
         if PAUSED.with(|slot| slot.get()) {
@@ -147,6 +168,8 @@ fn popup(window: HWND) -> Result<()> {
     unsafe {
         GetCursorPos(&mut point);
     }
+    // A tray menu closes on an outside click only if its owner is the foreground
+    // window first, and the WM_NULL posted afterwards completes that.
     // SAFETY: the hidden top-level window owns this popup on its message thread.
     unsafe {
         SetForegroundWindow(window);
@@ -176,6 +199,8 @@ fn popup(window: HWND) -> Result<()> {
     }
     Ok(())
 }
+/// Starts the tray thread and waits up to 5 seconds for its window. Returns the
+/// handle and the channel on which the user's choices arrive.
 pub fn spawn() -> Result<(Tray, mpsc::Receiver<Action>)> {
     let (sender, receiver) = mpsc::channel();
     let (ready, result) = mpsc::channel();
@@ -196,6 +221,8 @@ pub fn spawn() -> Result<(Tray, mpsc::Receiver<Action>)> {
         receiver,
     ))
 }
+/// Body of the tray thread: creates the hidden window and the icon, reports the
+/// window through `ready`, then pumps messages until the window is destroyed.
 fn run(
     sender: mpsc::Sender<Action>,
     ready: mpsc::Sender<std::result::Result<isize, String>>,
@@ -260,6 +287,7 @@ fn run(
     ICON.with(|slot| *slot.borrow_mut() = Some(data));
     let _sent = ready.send(Ok(window as isize));
     let mut message = MSG::default();
+    // GetMessageW returns 0 for WM_QUIT and -1 for an error. Both end the loop.
     loop {
         // SAFETY: message is writable and null selects all messages for this owning thread.
         let result = unsafe { GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) };

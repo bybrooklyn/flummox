@@ -6,6 +6,7 @@ use windows_sys::Win32::{
     Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS},
     System::Registry::*,
 };
+/// An open registry key, closed on drop.
 struct Key(HKEY);
 impl Drop for Key {
     fn drop(&mut self) {
@@ -15,9 +16,12 @@ impl Drop for Key {
         }
     }
 }
+/// UTF-16 with a terminating zero, as the wide Win32 calls expect.
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
 }
+/// Opens a key for reading. `view` is KEY_WOW64_32KEY, KEY_WOW64_64KEY or 0 for the
+/// caller's own view. A key that does not exist is `Ok(None)`.
 fn open(root: HKEY, path: &str, view: u32) -> Result<Option<Key>> {
     let path = wide(path);
     let mut key = std::ptr::null_mut();
@@ -33,8 +37,11 @@ fn open(root: HKEY, path: &str, view: u32) -> Result<Option<Key>> {
     Ok(Some(Key(key)))
 }
 impl Key {
+    /// Reads a REG_SZ value. A missing value is `Ok(None)`. A value of another
+    /// type, or one longer than the buffer, is an error.
     fn string(&self, name: &str) -> Result<Option<String>> {
         let name = wide(name);
+        // RegGetValueW takes and returns the size in bytes, hence the factor of two.
         let mut data = vec![0u16; 32768];
         let mut bytes = u32::try_from(data.len() * 2)?;
         // SAFETY: the key is live, name is terminated and data is writable for bytes bytes.
@@ -59,6 +66,7 @@ impl Key {
         let units = data
             .get(..usize::try_from(bytes / 2)?)
             .context("Registry value exceeds buffer")?;
+        // Cut at the first zero: the reported size includes the terminator.
         let end = units
             .iter()
             .position(|unit| *unit == 0)
@@ -67,9 +75,11 @@ impl Key {
             units.get(..end).context("Registry string bounds")?,
         )?))
     }
+    /// Names of the immediate subkeys. More than 20000 is an error.
     fn names(&self) -> Result<Vec<String>> {
         let mut names = vec![];
         for index in 0..20000 {
+            // A key name is at most 255 characters, so 256 units always fit one.
             let mut name = vec![0u16; 256];
             let mut length = u32::try_from(name.len())?;
             // SAFETY: the live key is enumerated into a writable buffer of length units.
@@ -100,6 +110,9 @@ impl Key {
         anyhow::bail!("Registry game count exceeds 20000")
     }
 }
+/// Candidate Steam install directories: `Steam` under both Program Files folders
+/// where it exists, then the paths the registry names. Also returns a warning for
+/// each registry read that failed.
 pub fn steam_roots() -> (Vec<PathBuf>, Vec<String>) {
     let mut roots: Vec<_> = [
         std::env::var_os("ProgramFiles(x86)"),
@@ -115,6 +128,8 @@ pub fn steam_roots() -> (Vec<PathBuf>, Vec<String>) {
         (HKEY_CURRENT_USER, "SteamPath"),
         (HKEY_LOCAL_MACHINE, "InstallPath"),
     ] {
+        // A 64-bit process sees only the 64-bit registry view by default, and a
+        // 32-bit installer writes to the other one. Both are read.
         for view in [KEY_WOW64_32KEY, KEY_WOW64_64KEY] {
             let result = (|| -> Result<Option<String>> {
                 let Some(key) = open(hive, "Software\\Valve\\Steam", view)? else {
@@ -136,6 +151,8 @@ pub fn steam_roots() -> (Vec<PathBuf>, Vec<String>) {
     }
     (roots, warnings)
 }
+/// Adds the games listed under `Software\GOG.com\Games`, one subkey per game, in
+/// both hives and both registry views. A bad entry becomes a warning.
 pub fn gog(catalog: &mut crate::desktop_discovery::Catalog) {
     for hive in [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
         for view in [KEY_WOW64_32KEY, KEY_WOW64_64KEY] {
@@ -157,6 +174,8 @@ pub fn gog(catalog: &mut crate::desktop_discovery::Catalog) {
                             path.is_absolute() && path.parent().is_some(),
                             "GOG install directory is invalid"
                         );
+                        // `manual_game` fills the common fields. Its id is then replaced
+                        // with a GOG id made from the subkey's name.
                         let mut game = crate::desktop::manual_game(title, path);
                         game.id =
                             crate::model::GameId::new(crate::model::Launcher::Gog, id.clone());
@@ -182,6 +201,8 @@ pub fn gog(catalog: &mut crate::desktop_discovery::Catalog) {
         }
     }
 }
+/// Runs every Windows launcher provider (Steam, Epic, GOG, Heroic) and merges
+/// games that share a folder. Failures are collected as warnings in the catalog.
 pub fn discover() -> crate::desktop_discovery::Catalog {
     let (roots, warnings) = steam_roots();
     let mut catalog = crate::desktop_discovery::Catalog {
@@ -200,6 +221,9 @@ pub fn discover() -> crate::desktop_discovery::Catalog {
 }
 
 /// Updates only the startup entry for this installation.
+/// The entry is the `Flummox` value under the current user's Run key, and it starts
+/// `flummox-gui.exe --background` from this executable's directory. Fails if the
+/// value exists and names a different command.
 pub fn startup(enabled: bool) -> Result<()> {
     let executable = std::env::current_exe()?.with_file_name("flummox-gui.exe");
     let command = format!(
@@ -236,6 +260,7 @@ pub fn startup(enabled: bool) -> Result<()> {
         );
     }
     let value = wide("Flummox");
+    // Disabling when no value exists is accepted below as ERROR_FILE_NOT_FOUND.
     let result = if enabled {
         ensure!(
             executable.is_file(),

@@ -11,6 +11,7 @@ use std::{
     sync::atomic::AtomicBool,
 };
 
+// Compaction builds with `Options::maximum()`, so this pins the levels it compares.
 #[test]
 fn maximum_policy_survives_update_compaction() -> TestResult {
     check_eq(
@@ -23,6 +24,7 @@ fn maximum_policy_survives_update_compaction() -> TestResult {
     )
 }
 
+// Deterministic xorshift bytes: the incompressible input for the tests below.
 fn noise(count: usize) -> Vec<u8> {
     let mut seed = 42u64;
     (0..count)
