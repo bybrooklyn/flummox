@@ -28,7 +28,7 @@ fn sid_string(sid: PSID) -> Result<String> {
     Ok(String::from_utf16(&units)?)
 }
 pub fn busy(games: &[crate::model::Game]) -> Result<Option<String>> {
-    let user = crate::windows_ipc::user_sid()?;
+    let user = crate::windows::ipc::user_sid()?;
     let mut pointer = std::ptr::null_mut();
     let mut count = 0;
     // SAFETY: WTS writes an allocated array and its element count into these slots.

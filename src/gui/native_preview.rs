@@ -82,14 +82,14 @@ fn native_snapshots_keep_jobs_on_failure_and_reject_stale_discovery() -> TestRes
         scanning: true,
         ..Default::default()
     };
-    let current = crate::windows_coordinator::Snapshot {
+    let current = crate::windows::coordinator::Snapshot {
         epoch: 10,
         revision: 5,
         games: vec![game.clone()],
         ..Default::default()
     };
     let _task = update(&mut state, Message::Worker(Ok(current.clone())));
-    let stale = crate::windows_coordinator::Snapshot {
+    let stale = crate::windows::coordinator::Snapshot {
         epoch: 10,
         revision: 4,
         ..Default::default()
@@ -123,7 +123,7 @@ fn native_snapshots_keep_jobs_on_failure_and_reject_stale_discovery() -> TestRes
     )?;
     let _task = update(
         &mut state,
-        Message::Worker(Ok(crate::windows_coordinator::Snapshot {
+        Message::Worker(Ok(crate::windows::coordinator::Snapshot {
             revision: 6,
             stopping: true,
             ..current

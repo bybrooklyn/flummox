@@ -60,6 +60,11 @@ prose:
 win:
     cargo xwin build --release --target x86_64-pc-windows-msvc --features gui --bins
 
+# Lint the Windows code and its tests from Linux. `win` builds without
+# deny-warnings and skips tests, so an import unused only on Windows passes it.
+win-lint:
+    cargo xwin clippy --target x86_64-pc-windows-msvc --all-features --all-targets -- -D warnings
+
 # Everything CI runs, in the order CI runs it.
 #
 # `prose` is in here because it was not, and a push went through with the

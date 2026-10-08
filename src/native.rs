@@ -24,7 +24,7 @@ pub fn add_folder(path: &Path) -> Result<()> {
 }
 pub fn discover_catalog() -> Result<crate::desktop_discovery::Catalog> {
     #[cfg(windows)]
-    let mut catalog = crate::windows_launchers::discover();
+    let mut catalog = crate::windows::launchers::discover();
     #[cfg(target_os = "macos")]
     let mut catalog = {
         let home = std::env::var_os("HOME")

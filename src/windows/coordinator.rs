@@ -53,16 +53,16 @@ struct Response {
     error: Option<String>,
 }
 fn call_file(command: Command, mut file: std::fs::File) -> Result<Snapshot> {
-    crate::windows_ipc::send(
+    crate::windows::ipc::send(
         &mut file,
         &Request {
             version: VERSION,
             command,
         },
     )?;
-    let response: Response = crate::windows_ipc::receive(&mut file)?;
+    let response: Response = crate::windows::ipc::receive(&mut file)?;
     // The server retains its buffers until the client has read the complete reply.
-    crate::windows_ipc::send(&mut file, &true)?;
+    crate::windows::ipc::send(&mut file, &true)?;
     ensure!(
         response.version == VERSION,
         "Worker protocol changed. Restart Flummox."
@@ -76,10 +76,10 @@ pub fn poll() -> Result<Snapshot> {
     call(Command::Snapshot)
 }
 fn call(command: Command) -> Result<Snapshot> {
-    call_file(command, crate::windows_ipc::connect()?)
+    call_file(command, crate::windows::ipc::connect()?)
 }
 pub fn request(command: Command) -> Result<Snapshot> {
-    if let Ok(file) = crate::windows_ipc::connect() {
+    if let Ok(file) = crate::windows::ipc::connect() {
         return call_file(command, file);
     }
     if matches!(command, Command::Shutdown) {
@@ -93,7 +93,7 @@ pub fn request(command: Command) -> Result<Snapshot> {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
-        if let Ok(file) = crate::windows_ipc::connect() {
+        if let Ok(file) = crate::windows::ipc::connect() {
             return call_file(command, file);
         }
     }
@@ -138,7 +138,7 @@ pub fn entrypoint() -> Result<bool> {
 }
 fn cleanup_startup(args: &[std::ffi::OsString], root: &std::path::Path) -> Result<()> {
     if args.iter().any(|arg| arg == "--remove-owned-startup") {
-        crate::windows_launchers::startup(false)?;
+        crate::windows::launchers::startup(false)?;
         let mut preferences = Preferences::load(root)?;
         preferences.start_at_login = false;
         preferences.save(root)?;
@@ -237,7 +237,7 @@ fn run() -> Result<()> {
     }
     let mut queue = Queue::load(&root)?;
     queue.save(&root)?;
-    let mut pipe = crate::windows_ipc::listener()?;
+    let mut pipe = crate::windows::ipc::listener()?;
     let (requests, receive) = mpsc::channel::<(Request, mpsc::Sender<Response>)>();
     let stopped = Arc::new(AtomicBool::new(false));
     let listener_stop = stopped.clone();
@@ -245,18 +245,18 @@ fn run() -> Result<()> {
     let pipe_failed = listener_failed.clone();
     let listener_thread = std::thread::spawn(move || {
         while !listener_stop.load(Ordering::Relaxed) {
-            match crate::windows_ipc::accept(&pipe) {
+            match crate::windows::ipc::accept(&pipe) {
                 Ok(true) => {
-                    if let Ok(request) = crate::windows_ipc::receive::<Request>(&mut pipe) {
+                    if let Ok(request) = crate::windows::ipc::receive::<Request>(&mut pipe) {
                         let (send, reply) = mpsc::channel();
                         if requests.send((request, send)).is_ok()
                             && let Ok(response) = reply.recv_timeout(Duration::from_secs(3))
-                            && crate::windows_ipc::send(&mut pipe, &response).is_ok()
+                            && crate::windows::ipc::send(&mut pipe, &response).is_ok()
                         {
-                            let _acknowledged = crate::windows_ipc::receive::<bool>(&mut pipe);
+                            let _acknowledged = crate::windows::ipc::receive::<bool>(&mut pipe);
                         }
                     }
-                    crate::windows_ipc::disconnect(&pipe);
+                    crate::windows::ipc::disconnect(&pipe);
                 }
                 Ok(false) => std::thread::sleep(Duration::from_millis(20)),
                 Err(error) => {
@@ -282,7 +282,7 @@ fn run() -> Result<()> {
     let mut preferences = Preferences::load(&root)?;
     let mut preferences_healthy = true;
     if preferences.start_at_login {
-        crate::windows_launchers::startup(true)?;
+        crate::windows::launchers::startup(true)?;
     }
     let tray = tray()
         .map_err(|error| {
@@ -389,21 +389,21 @@ fn run() -> Result<()> {
         if let Some((_, actions)) = &tray {
             for action in actions.try_iter() {
                 match action {
-                    crate::windows_tray::Action::Open => {
+                    crate::windows::tray::Action::Open => {
                         let executable = std::env::current_exe()?.with_file_name("flummox-gui.exe");
                         if let Err(error) = std::process::Command::new(executable).spawn() {
                             tracing::warn!(%error, "Flummox window could not open");
                         }
                     }
-                    crate::windows_tray::Action::Pause => {
+                    crate::windows::tray::Action::Pause => {
                         preferences.maintenance_paused = true;
                         preferences.save(&root)?;
                     }
-                    crate::windows_tray::Action::Resume => {
+                    crate::windows::tray::Action::Resume => {
                         preferences.maintenance_paused = false;
                         preferences.save(&root)?;
                     }
-                    crate::windows_tray::Action::Exit => {
+                    crate::windows::tray::Action::Exit => {
                         shutdown = true;
                         if let Some(running) = &active {
                             running.cancel.store(true, Ordering::Relaxed);
@@ -479,7 +479,7 @@ fn run() -> Result<()> {
                     Command::Settings(mut settings) => {
                         settings.maintenance_paused = preferences.maintenance_paused;
                         if settings.start_at_login != preferences.start_at_login {
-                            crate::windows_launchers::startup(settings.start_at_login)?;
+                            crate::windows::launchers::startup(settings.start_at_login)?;
                         }
                         settings.save(&root)?;
                         preferences = settings;
@@ -716,14 +716,14 @@ fn discover() -> Result<crate::desktop_discovery::Catalog> {
     crate::native::discover_catalog()
 }
 fn tray() -> Result<(
-    crate::windows_tray::Tray,
-    mpsc::Receiver<crate::windows_tray::Action>,
+    crate::windows::tray::Tray,
+    mpsc::Receiver<crate::windows::tray::Action>,
 )> {
     #[cfg(test)]
     if std::env::var_os("FLUMMOX_TEST_CATALOG").is_some() {
         anyhow::bail!("Tray disabled in the isolated coordinator fixture");
     }
-    crate::windows_tray::spawn()
+    crate::windows::tray::spawn()
 }
 
 fn activity(games: &[Game]) -> Result<Option<String>> {
@@ -731,7 +731,7 @@ fn activity(games: &[Game]) -> Result<Option<String>> {
     if std::env::var_os("FLUMMOX_TEST_CATALOG").is_some() {
         return Ok(None);
     }
-    crate::windows_activity::busy(games)
+    crate::windows::activity::busy(games)
 }
 
 #[cfg(test)]
@@ -761,7 +761,7 @@ mod tests {
         std::process::Command::new(std::env::current_exe().ctx("test executable")?)
             .args([
                 "--exact",
-                "windows_coordinator::tests::helper",
+                "windows::coordinator::tests::helper",
                 "--ignored",
                 "--nocapture",
             ])
@@ -773,7 +773,7 @@ mod tests {
             .ctx("spawn isolated coordinator")
     }
     fn fixture_call(suffix: &str, command: Command) -> Result<Snapshot> {
-        call_file(command, crate::windows_ipc::test_connect(suffix)?)
+        call_file(command, crate::windows::ipc::test_connect(suffix)?)
     }
     fn wait_exit(child: &mut Child) -> TestResult {
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -835,8 +835,8 @@ mod tests {
             "paused queue survives startup",
         )?;
         // A bad protocol cannot mutate the queue.
-        let mut pipe = crate::windows_ipc::test_connect(&suffix).ctx("version test")?;
-        crate::windows_ipc::send(
+        let mut pipe = crate::windows::ipc::test_connect(&suffix).ctx("version test")?;
+        crate::windows::ipc::send(
             &mut pipe,
             &Request {
                 version: VERSION + 1,
@@ -845,8 +845,8 @@ mod tests {
         )
         .ctx("bad version request")?;
         let response: Response =
-            crate::windows_ipc::receive(&mut pipe).ctx("bad version response")?;
-        crate::windows_ipc::send(&mut pipe, &true).ctx("rejected request acknowledgement")?;
+            crate::windows::ipc::receive(&mut pipe).ctx("bad version response")?;
+        crate::windows::ipc::send(&mut pipe, &true).ctx("rejected request acknowledgement")?;
         check(
             response.error.is_some(),
             "old or unknown protocol is rejected",
