@@ -17,6 +17,11 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+// Every staging directory starts with this prefix.
+const WORK_PREFIX: &str = ".flummox-work-";
+// How often a pass looks again for programs that opened files in the game folder.
+const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
+
 // A Steam game as the `scan` command lists it.
 #[derive(Debug, Clone)]
 pub struct InstalledGame {
@@ -76,7 +81,9 @@ pub struct Recovery {
     // The game file being replaced.
     #[serde(with = "crate::path_serde")]
     pub source: PathBuf,
-    // The new copy, at `<source's directory>/.flummox-work-*/candidate`.
+    // The new copy, at `<work parent>/.flummox-work-*/candidate`. The work parent is
+    // the source's directory, or the folder holding its outermost `.app`. Journals
+    // from earlier versions always used the source's directory.
     #[serde(with = "crate::path_serde")]
     pub staged: PathBuf,
     pub volume: crate::storage::Volume,
@@ -526,7 +533,7 @@ fn clear_record(record: &Recovery) -> Result<()> {
     ensure!(
         parent
             .file_name()
-            .is_some_and(|name| name.to_string_lossy().starts_with(".flummox-work-")),
+            .is_some_and(|name| name.to_string_lossy().starts_with(WORK_PREFIX)),
         "Unexpected staging directory"
     );
     ignore_missing(std::fs::remove_dir_all(parent))?;
@@ -611,7 +618,7 @@ fn stage(root: &Path, source: &Path, restore: bool, seals: &mut Seals) -> Result
     let parent = source.parent().context("File has no parent")?;
     let work = work_parent(source).context("File has no parent")?;
     let temporary = tempfile::Builder::new()
-        .prefix(".flummox-work-")
+        .prefix(WORK_PREFIX)
         .tempdir_in(&work)?;
     let staged = temporary.path().join("candidate");
     let before_hash = hash(source)?;
@@ -717,10 +724,11 @@ fn stage(root: &Path, source: &Path, restore: bool, seals: &mut Seals) -> Result
     Ok(true)
 }
 
-// Runs one pass over a game folder and returns a summary line. Holds native.lock
-// for the whole pass. Refuses to start while the folder has a journal, while any
-// file under it is open, or when the space plan does not fit. `cancel` is checked
-// before each file, and a raised flag ends the pass with an error.
+// Runs one pass over a game folder and returns a summary. Holds native.lock for
+// the whole pass. Refuses to start while the folder has a journal, while any file
+// under it is open, or when the space plan does not fit. A file that fails is
+// counted as skipped and listed in the summary. `cancel` is checked before each
+// file and ends the pass with an error. A program opening files ends it early.
 fn visit(
     root: &Path,
     restore: bool,
@@ -745,53 +753,176 @@ fn visit(
         "Review Recovery before processing this game"
     );
     idle(&root)?;
+    let found = survey(&root);
+    remove_orphans(&found.work_dirs, &recovery()?)?;
     crate::storage::native_plan(&root, restore)?.recheck()?;
-    let mut summary = Progress::default();
-    for entry in walkdir::WalkDir::new(&root)
-        .follow_links(false)
-        .into_iter()
-        // Do not descend into staging directories.
-        .filter_entry(|entry| {
-            !entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".flummox-work-")
-        })
-    {
-        ensure!(!cancel.load(Ordering::Relaxed), "Operation stopped");
-        let entry = entry?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let stat = entry.metadata()?;
-        summary.files += 1;
-        summary.bytes = summary.bytes.saturating_add(stat.len());
-        // `blocks()` counts 512-byte units whatever the filesystem's block size.
-        summary.allocation_before = summary
-            .allocation_before
-            .saturating_add(stat.blocks().saturating_mul(512));
-        if stat.nlink() == 1 && stage(&root, entry.path(), restore)? {
-            summary.changed += 1;
-        } else {
-            summary.skipped += 1;
-        }
-        summary.allocation_after = summary.allocation_after.saturating_add(
-            entry
-                .path()
-                .symlink_metadata()?
-                .blocks()
-                .saturating_mul(512),
-        );
-        report(summary.clone());
+    let mut summary = Progress {
+        skipped: found.unreadable,
+        ..Progress::default()
+    };
+    let mut seals = Seals::default();
+    let mut failures = Vec::new();
+    if found.unreadable > 0 {
+        failures.push(format!("{} entries could not be read", found.unreadable));
     }
-    Ok(format!(
+    let mut stopped = None;
+    let mut busy = false;
+    let mut last_idle = std::time::Instant::now();
+    for path in &found.files {
+        if cancel.load(Ordering::Relaxed) {
+            stopped = Some(anyhow::anyhow!("Operation stopped"));
+            break;
+        }
+        if last_idle.elapsed() >= IDLE_RECHECK {
+            if idle(&root).is_err() {
+                busy = true;
+                break;
+            }
+            last_idle = std::time::Instant::now();
+        }
+        let outcome = visit_file(&root, path, restore, &mut seals, &mut summary);
+        report(summary.clone());
+        if let Err(error) = outcome {
+            failures.push(format!("{}: {error:#}", path.display()));
+            // A journal left behind marks a swap that needs review. Stop there.
+            let review = match recovery() {
+                Ok(records) => records.iter().any(|record| record.root == root),
+                Err(_) => true,
+            };
+            if review {
+                stopped = Some(error);
+                break;
+            }
+        }
+    }
+    let sealed = seals.verify_after();
+    if let Some(error) = stopped {
+        return Err(match sealed {
+            Ok(()) => error,
+            Err(seal) => anyhow::anyhow!("{error:#}; {seal:#}"),
+        });
+    }
+    sealed?;
+    let mut lines = vec![format!(
         "{} files processed; {} changed, {} skipped. Allocated storage: {} before, {} after.",
         summary.files,
         summary.changed,
         summary.skipped,
         summary.allocation_before,
         summary.allocation_after
-    ))
+    )];
+    if !failures.is_empty() {
+        lines.push(format!("Skipped after an error ({}):", failures.len()));
+        lines.extend(failures.into_iter().take(5));
+    }
+    if busy {
+        lines.push(
+            "Stopped early: a program opened files in this game folder. Close it and run the pass again."
+                .to_owned(),
+        );
+    }
+    Ok(lines.join("\n"))
+}
+
+// What one walk of a game folder finds.
+struct Survey {
+    // Regular files, in walk order.
+    files: Vec<PathBuf>,
+    // Staging directories from earlier passes, here and beside an enclosing `.app`.
+    work_dirs: Vec<PathBuf>,
+    // Entries the walk could not read.
+    unreadable: u64,
+}
+fn is_work_name(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy().starts_with(WORK_PREFIX)
+}
+// Lists the folder's files up front, so no directory handle of ours is open while
+// the pass re-checks for other programs. Does not descend into staging directories.
+fn survey(root: &Path) -> Survey {
+    let mut found = Survey {
+        files: Vec::new(),
+        work_dirs: Vec::new(),
+        unreadable: 0,
+    };
+    let mut walker = walkdir::WalkDir::new(root).follow_links(false).into_iter();
+    while let Some(entry) = walker.next() {
+        let Ok(entry) = entry else {
+            found.unreadable += 1;
+            continue;
+        };
+        if is_work_name(entry.file_name()) {
+            if entry.file_type().is_dir() {
+                found.work_dirs.push(entry.path().to_path_buf());
+                walker.skip_current_dir();
+            }
+        } else if entry.file_type().is_file() {
+            found.files.push(entry.into_path());
+        }
+    }
+    // Files inside an enclosing bundle stage in the folder that holds it.
+    if let Some(outer) = outer_bundle(root)
+        && let Some(parent) = outer.parent()
+        && let Ok(entries) = std::fs::read_dir(parent)
+    {
+        for entry in entries.flatten() {
+            if is_work_name(&entry.file_name()) && entry.file_type().is_ok_and(|kind| kind.is_dir())
+            {
+                found.work_dirs.push(entry.path());
+            }
+        }
+    }
+    found
+}
+// Removes the staging directories that no journal names, which are left by a pass
+// that was killed or whose journal could not be saved. Returns how many it removed.
+fn remove_orphans(directories: &[PathBuf], journals: &[Recovery]) -> Result<u64> {
+    let mut removed = 0;
+    for directory in directories {
+        let named = directory.file_name().is_some_and(is_work_name);
+        let kept = journals
+            .iter()
+            .any(|record| record.staged.parent() == Some(directory.as_path()));
+        if named && !kept {
+            ignore_missing(std::fs::remove_dir_all(directory))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+// Processes one file and adds it to the running totals. A file that cannot be
+// processed counts as skipped and its error is returned.
+fn visit_file(
+    root: &Path,
+    path: &Path,
+    restore: bool,
+    seals: &mut Seals,
+    summary: &mut Progress,
+) -> Result<()> {
+    let before = std::fs::symlink_metadata(path);
+    summary.files += 1;
+    if let Ok(stat) = &before {
+        summary.bytes = summary.bytes.saturating_add(stat.len());
+        // `blocks()` counts 512-byte units whatever the filesystem's block size.
+        summary.allocation_before = summary
+            .allocation_before
+            .saturating_add(stat.blocks().saturating_mul(512));
+    }
+    let outcome = match &before {
+        Ok(stat) if stat.nlink() == 1 => stage(root, path, restore, seals),
+        Ok(_) => Ok(false),
+        Err(error) => Err(anyhow::anyhow!("{error}")),
+    };
+    if matches!(outcome, Ok(true)) {
+        summary.changed += 1;
+    } else {
+        summary.skipped += 1;
+    }
+    if let Ok(stat) = std::fs::symlink_metadata(path) {
+        summary.allocation_after = summary
+            .allocation_after
+            .saturating_add(stat.blocks().saturating_mul(512));
+    }
+    outcome.map(|_| ())
 }
 
 // Compresses the files under `root`. `report` receives running totals after each file.
@@ -995,7 +1126,7 @@ mod tests {
         let source = root.join("original");
         std::fs::write(&source, b"original bytes").ctx("source")?;
         let temporary = tempfile::Builder::new()
-            .prefix(".flummox-work-")
+            .prefix(WORK_PREFIX)
             .tempdir_in(&root)
             .ctx("staging")?;
         let staged = temporary.path().join("candidate");
