@@ -116,11 +116,12 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
             db.invalidate_compression(&path)?;
         }
     }
-    let sandbox = crate::sandbox::restrict(&crate::sandbox::SandboxPlan::for_job(
+    // Opening the report store creates its folder, which the sandbox will
+    // only let this process read.
+    let reports = crate::compatibility::Store::local()?;
+    let sandbox = crate::sandbox::restrict(&crate::sandbox::SandboxPlan::for_worker(
         &path,
-        Db::default_path()
-            .as_deref()
-            .and_then(std::path::Path::parent),
+        &Db::default_path().context("Cannot locate state database")?,
     ));
     if !sandbox.is_active() {
         output.event(Event::Warning(sandbox.describe()));
@@ -193,7 +194,7 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
     };
     let mut failures: Vec<_> = inv.warnings.iter().take(20).cloned().collect();
     if job.operation == Operation::Analyze {
-        let reports = crate::compatibility::Store::local()?.load()?;
+        let reports = reports.load()?;
         let candidates: Vec<_> = reports
             .iter()
             .filter(|report| {

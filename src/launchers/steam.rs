@@ -166,6 +166,28 @@ pub fn roots(env: &Env) -> Vec<PathBuf> {
     out
 }
 
+/// Largest manifest read. Steam's own are a few kilobytes.
+const MANIFEST_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// Reads a Steam text file, replacing bytes that are not UTF-8.
+///
+/// Older manifests hold game names in the system code page. Failing on those
+/// dropped the game, and an unbounded read let one huge file stall a scan.
+fn read_manifest_text(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MANIFEST_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MANIFEST_LIMIT {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "larger than any Steam manifest",
+        ));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// The library folders configured in a Steam root.
 ///
 /// The root itself is always a library. Both the current nested format and the
@@ -173,7 +195,7 @@ pub fn roots(env: &Env) -> Vec<PathBuf> {
 pub fn libraries(root: &Path) -> Result<Vec<PathBuf>, DetectError> {
     let mut out = vec![root.to_path_buf()];
     let path = root.join("steamapps/libraryfolders.vdf");
-    let text = match std::fs::read_to_string(&path) {
+    let text = match read_manifest_text(&path) {
         Ok(t) => t,
         // A fresh install may not have the file yet; the root still counts.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
@@ -202,7 +224,7 @@ pub fn libraries(root: &Path) -> Result<Vec<PathBuf>, DetectError> {
 /// Reads one `appmanifest_*.acf`.
 pub fn read_app_manifest(path: &Path, library: &Path) -> Result<App, DetectError> {
     let ctx = || path.display().to_string();
-    let text = std::fs::read_to_string(path).map_err(|e| DetectError::new(ctx(), e))?;
+    let text = read_manifest_text(path).map_err(|e| DetectError::new(ctx(), e))?;
     let obj = vdf::parse(&text).map_err(|e| DetectError::new(ctx(), e))?;
     let appid = obj
         .get_u32("appid")
@@ -241,6 +263,14 @@ pub fn read_app_manifest(path: &Path, library: &Path) -> Result<App, DetectError
 
 /// Every app manifest in a library folder.
 pub fn apps_in_library(library: &Path) -> Result<Vec<App>, DetectError> {
+    apps_in_library_noting(library, &mut Vec::new())
+}
+
+/// [`apps_in_library`], recording each manifest it could not read.
+fn apps_in_library_noting(
+    library: &Path,
+    skipped: &mut Vec<DetectError>,
+) -> Result<Vec<App>, DetectError> {
     let steamapps = library.join("steamapps");
     let entries = std::fs::read_dir(&steamapps)
         .map_err(|e| DetectError::new(steamapps.display().to_string(), e))?;
@@ -252,8 +282,9 @@ pub fn apps_in_library(library: &Path) -> Result<Vec<App>, DetectError> {
             continue;
         }
         // One unreadable manifest must not hide the rest of the library.
-        if let Ok(app) = read_app_manifest(&entry.path(), library) {
-            out.push(app);
+        match read_app_manifest(&entry.path(), library) {
+            Ok(app) => out.push(app),
+            Err(error) => skipped.push(error),
         }
     }
     out.sort_by_key(|a| a.appid);
@@ -343,18 +374,33 @@ pub fn group_state(apps: &[App], running: Option<u32>) -> InstallState {
 /// Apps sharing an install directory (Half-Life 2 and its episodes, say) are
 /// returned as one game whose `also` lists the other appids.
 pub fn discover(env: &Env) -> Result<Vec<Game>, DetectError> {
+    Ok(discover_noting(env, &mut Vec::new()))
+}
+
+/// [`discover`], recording every root, library and manifest it had to skip.
+///
+/// Nothing here ends the scan. A malformed `libraryfolders.vdf` in the native
+/// root used to hide the Flatpak root behind it, and a skipped library or
+/// manifest reached only the log.
+pub fn discover_noting(env: &Env, skipped: &mut Vec<DetectError>) -> Vec<Game> {
     let mut groups: BTreeMap<PathBuf, Vec<App>> = BTreeMap::new();
     let mut running = None;
     for root in roots(env) {
         running = running.or_else(|| running_app_id(&root));
-        for library in libraries(&root)? {
+        let found = libraries(&root).unwrap_or_else(|error| {
+            skipped.push(error);
+            // The root is a library whatever its list of others says.
+            vec![root.clone()]
+        });
+        for library in found {
             // A library that cannot be read is a whole drive of games missing
             // from the list, so it has to reach the caller. Returning here
             // instead would let one unplugged drive hide every other library.
-            let apps = match apps_in_library(&library) {
+            let apps = match apps_in_library_noting(&library, skipped) {
                 Ok(apps) => apps,
                 Err(e) => {
                     tracing::warn!(library = %library.display(), error = %e, "skipped a library");
+                    skipped.push(e);
                     continue;
                 }
             };
@@ -401,7 +447,7 @@ pub fn discover(env: &Env) -> Result<Vec<Game>, DetectError> {
         });
     }
     games.sort_by_key(|g| g.title.to_lowercase());
-    Ok(games)
+    games
 }
 
 #[cfg(test)]
@@ -485,6 +531,53 @@ mod tests {
             )?;
         let env = Env::from_home(tmp.path());
         Ok((tmp, env))
+    }
+
+    #[test]
+    fn bad_manifests_are_reported_and_do_not_hide_the_rest() -> TestResult {
+        let (tmp, env) = fixture()?;
+        let steamapps = tmp.path().join(".local/share/Steam/steamapps");
+        check(steamapps.is_dir(), "fixture layout")?;
+        let manifest = |appid: u32, name: &[u8], dir: &str| {
+            let mut text =
+                format!("\"AppState\"\n{{\n\"appid\" \"{appid}\"\n\"name\" \"").into_bytes();
+            text.extend_from_slice(name);
+            text.extend_from_slice(
+                format!("\"\n\"StateFlags\" \"4\"\n\"installdir\" \"{dir}\"\n}}\n").as_bytes(),
+            );
+            std::fs::write(steamapps.join(format!("appmanifest_{appid}.acf")), text)
+        };
+        // A Latin-1 name, which is not UTF-8.
+        manifest(900, b"Caf\xe9 Racer", "Cafe").ctx("latin-1 manifest")?;
+        std::fs::create_dir_all(steamapps.join("common/Cafe")).ctx("game folder")?;
+        manifest(901, b"Escape", "../../../../..").ctx("escaping manifest")?;
+        std::fs::write(steamapps.join("appmanifest_902.acf"), b"\"AppState\" {")
+            .ctx("truncated manifest")?;
+
+        let mut skipped = Vec::new();
+        let games = discover_noting(&env, &mut skipped);
+        check(
+            games
+                .iter()
+                .any(|g| g.title.starts_with("Caf") && g.title.ends_with(" Racer")),
+            format!(
+                "the Latin-1 game is listed: {:?}",
+                games.iter().map(|g| &g.title).collect::<Vec<_>>()
+            ),
+        )?;
+        check(
+            games.iter().any(|g| g.title == "Terraria"),
+            "games with good manifests are still listed",
+        )?;
+        check(
+            !games.iter().any(|g| g.title == "Escape"),
+            "a manifest that leaves its library names no game",
+        )?;
+        check_eq(
+            skipped.len(),
+            2,
+            format!("both bad manifests are reported: {skipped:?}"),
+        )
     }
 
     #[test]

@@ -664,8 +664,38 @@ fn pool_dir(path: &Path) -> Result<PathBuf> {
         std::fs::symlink_metadata(&path)?.uid() == nix::unistd::geteuid().as_raw(),
         "The shared chunk pool must belong to the current user"
     );
+    ensure_only_pool_entries(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
     Ok(path)
+}
+
+/// Fails unless everything in `pool` is something a pool holds.
+///
+/// A store records its pool's path, and that record can be edited. Without
+/// this, compaction would change the mode of whatever folder it named and
+/// pruning would delete that folder's `.tmp` files.
+fn ensure_only_pool_entries(pool: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    for entry in std::fs::read_dir(pool)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        ensure!(
+            std::fs::symlink_metadata(entry.path())?.is_file(),
+            "{} holds something other than chunk files, so it is not a shared chunk pool",
+            pool.display()
+        );
+        if name.as_bytes() == b".lock" || name.as_bytes().starts_with(b".tmp") {
+            continue;
+        }
+        validate_pool_object(&entry.path()).with_context(|| {
+            format!(
+                "{} holds other files, so it is not a shared chunk pool",
+                pool.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn lock_pool(pool: &Path) -> Result<File> {
@@ -868,6 +898,7 @@ pub fn prune_shared_pool(pool: &Path) -> Result<PoolPruneSummary> {
         std::fs::symlink_metadata(&pool)?.uid() == nix::unistd::geteuid().as_raw(),
         "The shared chunk pool must belong to the current user"
     );
+    ensure_only_pool_entries(&pool)?;
     let _pool_lock = lock_pool(&pool)?;
     let mut summary = PoolPruneSummary {
         objects: 0,

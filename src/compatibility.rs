@@ -233,26 +233,35 @@ impl Store {
         Ok(path)
     }
 
+    /// Every valid report in the store.
+    ///
+    /// A file that is oversized, unreadable or malformed is skipped. Failing
+    /// here made one bad file stop every analysis job, which loads reports.
     pub fn load(&self) -> Result<Vec<Report>> {
         let mut reports = Vec::new();
         for entry in std::fs::read_dir(&self.root)? {
-            let entry = entry?;
-            let path = entry.path();
+            let path = entry?.path();
             if path.extension().is_none_or(|extension| extension != "json") {
                 continue;
             }
-            ensure!(
-                std::fs::metadata(&path)?.len() <= 1024 * 1024,
-                "Compatibility report exceeds 1 MiB"
-            );
-            let bytes =
-                std::fs::read(&path).with_context(|| format!("Reading {}", path.display()))?;
-            let report: Report = serde_json::from_slice(&bytes)
-                .with_context(|| format!("Parsing {}", path.display()))?;
-            report.validate()?;
-            reports.push(report);
+            match Self::read(&path) {
+                Ok(report) => reports.push(report),
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "skipped a compatibility report");
+                }
+            }
         }
         Ok(reports)
+    }
+
+    fn read(path: &Path) -> Result<Report> {
+        ensure!(
+            std::fs::metadata(path)?.len() <= 1024 * 1024,
+            "Compatibility report exceeds 1 MiB"
+        );
+        let report: Report = serde_json::from_slice(&std::fs::read(path)?)?;
+        report.validate()?;
+        Ok(report)
     }
 }
 
@@ -496,7 +505,14 @@ mod tests {
         check(!json.contains("Private title"), "title is absent")?;
         check(!json.contains("/home/person"), "install path is absent")?;
         let loaded = store.load().ctx("load reports")?;
-        check_eq(loaded, vec![report()], "stored report round trip")
+        check_eq(loaded, vec![report()], "stored report round trip")?;
+        std::fs::write(
+            dir.path().join("compatibility/broken.json"),
+            b"{ not a report",
+        )
+        .ctx("malformed file")?;
+        let loaded = store.load().ctx("load beside a malformed file")?;
+        check_eq(loaded, vec![report()], "a malformed file hides nothing")
     }
 }
 

@@ -122,6 +122,35 @@ impl SandboxPlan {
         .collect();
         Self::for_paths(writable, readable)
     }
+
+    /// The plan for a coordinator's worker on one game.
+    ///
+    /// The worker records its pass in `database`, so it gets that file and
+    /// SQLite's two companions, and may read saved compatibility reports. It
+    /// gets nothing else in the state folder: the coordinator's socket and
+    /// queue live there, and a worker that could write them could direct the
+    /// coordinator at other folders. The companions must already exist, so
+    /// open the database before restricting.
+    pub fn for_worker(install_dir: &Path, database: &Path) -> Self {
+        let mut plan = Self::for_job(install_dir, None);
+        let companion = |suffix: &str| {
+            let mut name = database.as_os_str().to_owned();
+            name.push(suffix);
+            PathBuf::from(name)
+        };
+        plan.writable.extend(
+            [database.to_path_buf(), companion("-wal"), companion("-shm")]
+                .into_iter()
+                .filter(|path| path.exists()),
+        );
+        plan.readable.extend(
+            database
+                .parent()
+                .map(|state| state.join("compatibility"))
+                .filter(|reports| reports.exists()),
+        );
+        plan
+    }
 }
 
 /// Restricts this process to the paths in `plan`, permanently.

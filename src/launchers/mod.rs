@@ -88,10 +88,7 @@ pub(crate) fn scan_with(
     }
     emit(scan_job::Event::Source("Steam"));
     let mut scan = Scan::default();
-    match steam::discover(env) {
-        Ok(mut games) => scan.games.append(&mut games),
-        Err(e) => scan.warnings.push(e),
-    }
+    scan.games = steam::discover_noting(env, &mut scan.warnings);
     emit(scan_job::Event::Batch(scan.games.clone()));
     if cancel.load(Ordering::Relaxed) {
         return None;
@@ -108,6 +105,13 @@ pub(crate) fn scan_with(
         desktop::custom(&mut scan);
     }
     desktop::merge(&mut scan);
+    // Titles come from launcher files and are printed to terminals, where a
+    // control character could rewrite the lines around it.
+    for game in &mut scan.games {
+        if game.title.chars().any(char::is_control) {
+            game.title = game.title.replace(char::is_control, " ");
+        }
+    }
     if cancel.load(Ordering::Relaxed) {
         return None;
     }

@@ -493,6 +493,29 @@ fn version_one_fixed_chunk_stores_remain_readable() -> TestResult {
 }
 
 #[test]
+fn a_folder_of_other_files_is_not_pruned_as_a_pool() -> TestResult {
+    let temp = tempfile::tempdir().ctx("fixture")?;
+    let documents = temp.path().join("documents");
+    fs::create_dir(&documents).ctx("folder")?;
+    fs::write(documents.join(".tmp-draft"), b"unsaved work").ctx("temporary file")?;
+    fs::write(documents.join("notes.txt"), b"notes").ctx("ordinary file")?;
+    check(
+        prune_shared_pool(&documents).is_err(),
+        "a folder holding other files is refused",
+    )?;
+    check(
+        documents.join(".tmp-draft").exists(),
+        "nothing was deleted from it",
+    )?;
+    // Control: the same temporary file is pruned from a folder that holds
+    // nothing a pool would not.
+    fs::remove_file(documents.join("notes.txt")).ctx("remove ordinary file")?;
+    let pruned = prune_shared_pool(&documents).ctx("prune a bare pool")?;
+    check_eq(pruned.objects, 1, "a stale temporary file is reclaimed")?;
+    check(!documents.join(".tmp-draft").exists(), "and removed")
+}
+
+#[test]
 fn shared_stores_reuse_pool_objects_and_remain_self_contained() -> TestResult {
     let temp = tempfile::tempdir().ctx("fixture")?;
     let first = temp.path().join("first");
