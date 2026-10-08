@@ -10,7 +10,7 @@ use std::path::Path;
 use {
     super::{client::*, service::PackControl},
     anyhow::{Context, ensure},
-    std::{os::unix::ffi::OsStrExt, path::PathBuf},
+    std::path::PathBuf,
 };
 
 /// The live mount session of one activated install.
@@ -246,12 +246,9 @@ pub(super) fn pack_reclaim(
 #[cfg(feature = "pack-mount")]
 pub(super) fn compact_path(path: &Path, identity: &Path, label: &str) -> Result<PathBuf> {
     let parent = path.parent().context("The managed path has no parent")?;
-    let identity = blake3::hash(identity.as_os_str().as_bytes()).to_hex();
+    let prefix = crate::pack::compaction_prefix(identity, label);
     for attempt in 0..100u32 {
-        let candidate = parent.join(format!(
-            ".flummox-{identity}-{label}-{}-{attempt}",
-            std::process::id()
-        ));
+        let candidate = parent.join(format!("{prefix}{}-{attempt}", std::process::id()));
         match std::fs::symlink_metadata(&candidate) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
@@ -368,6 +365,13 @@ pub(super) fn pack_compact_observed(
         bail!("The game changed while compaction finished; retry when launcher updates settle")
     }
 
+    // Unmounting under a running game detaches the folder from it, and the
+    // frozen mount rejects its writes until it exits.
+    if let Some(user) = crate::busy::process_using(&canonical, &crate::busy::ProcFs::new()) {
+        let _removed = remove_store(&new_store);
+        bail!("{user} is using the game folder; close it and retry")
+    }
+
     // From here the switch runs to the end. A record left in `Compacting` is
     // recovered onto the previous store.
     let install = snapshot
@@ -378,7 +382,10 @@ pub(super) fn pack_compact_observed(
     install.message = "Switching to the compacted store".into();
     save_packs(db, snapshot)?;
     let mounted = take_mount(mounts, &canonical).context("The writable install is not mounted")?;
-    mounted.stop().context("Unmounting the previous store")?;
+    if let Err(error) = mounted.stop() {
+        let _removed = remove_store(&new_store);
+        return Err(error).context("Unmounting the previous store");
+    }
 
     let install = snapshot
         .packs
@@ -483,7 +490,16 @@ pub(super) fn recover_packs(
             Ok(Some(mounted)) => mounts.push(mounted),
             Ok(None) => {}
             Err(error) => {
-                install.phase = crate::pack::InstallPhase::Attention;
+                // These phases name a step still to be finished. Keeping them
+                // makes the next attempt resume it instead of mounting past it.
+                if !matches!(
+                    install.phase,
+                    crate::pack::InstallPhase::Reclaiming
+                        | crate::pack::InstallPhase::Pruning
+                        | crate::pack::InstallPhase::Switching
+                ) {
+                    install.phase = crate::pack::InstallPhase::Attention;
+                }
                 install.message = format!("Could not mount automatically: {error}");
             }
         }
@@ -505,4 +521,123 @@ pub(super) fn recover_packs(
         install.message = "This build cannot mount pack stores".into();
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "pack-mount"))]
+mod tests {
+    use super::*;
+    use crate::testutil::{Ctx, TestResult, check, check_eq};
+    use std::sync::atomic::AtomicBool;
+
+    fn database() -> Result<Connection, String> {
+        let db = Connection::open_in_memory().ctx("database")?;
+        db.execute_batch("CREATE TABLE settings(id INTEGER PRIMARY KEY, data TEXT NOT NULL);")
+            .ctx("settings table")?;
+        Ok(db)
+    }
+
+    #[test]
+    fn a_failed_recovery_keeps_the_phase_of_an_unfinished_step() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let record = |phase| crate::pack::Install {
+            game_path: temp.path().join("game"),
+            store_path: temp.path().join("missing.flumpack"),
+            writes_path: temp.path().join("updates"),
+            backup_path: Some(temp.path().join(".game.flummox-original")),
+            previous_store_path: None,
+            previous_writes_path: None,
+            summary: None,
+            phase,
+            message: String::new(),
+        };
+        let mut snapshot = Snapshot::default();
+        snapshot.packs = vec![
+            record(crate::pack::InstallPhase::Reclaiming),
+            record(crate::pack::InstallPhase::Mounted),
+        ];
+        let db = database()?;
+        let mut mounts = Vec::new();
+        recover_packs(&mut snapshot, &db, &mut mounts).ctx("recover")?;
+        let phases: Vec<_> = snapshot.packs.iter().map(|install| install.phase).collect();
+        check_eq(
+            phases,
+            vec![
+                crate::pack::InstallPhase::Reclaiming,
+                // Control: a plain failure to mount still needs attention.
+                crate::pack::InstallPhase::Attention,
+            ],
+            "an interrupted reclaim stays an interrupted reclaim",
+        )?;
+        check(
+            snapshot
+                .packs
+                .first()
+                .is_some_and(|install| install.backup_path.is_some()),
+            "the retained original is still recorded",
+        )
+    }
+
+    #[test]
+    fn compaction_refuses_to_unmount_under_a_running_process() -> TestResult {
+        if !std::path::Path::new("/dev/fuse").exists() {
+            check(
+                std::env::var_os("FLUMMOX_REQUIRE_FUSE").is_none(),
+                "FUSE is required for this test run",
+            )?;
+            eprintln!("skipped: compaction requires /dev/fuse");
+            return Ok(());
+        }
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let game = temp.path().join("game");
+        std::fs::create_dir(&game).ctx("game")?;
+        std::fs::write(game.join("data"), b"bytes").ctx("source")?;
+        let store = temp.path().join("game.flumpack");
+        crate::pack::create(
+            &game,
+            &store,
+            crate::pack::Options::default(),
+            &AtomicBool::new(false),
+        )
+        .ctx("store")?;
+        let install = crate::pack::prepare(
+            &game,
+            &store,
+            &temp.path().join("updates"),
+            &AtomicBool::new(false),
+        )
+        .ctx("prepare")?;
+        let canonical = install.game_path.clone();
+        let db = database()?;
+        let mut snapshot = Snapshot::default();
+        let mut mounts = Vec::new();
+        activate_prepared(&mut snapshot, &db, &mut mounts, install).ctx("activate")?;
+        pack_reclaim(&mut snapshot, &db, &canonical).ctx("reclaim the original")?;
+        // Control: with nothing using the folder the same call works, below.
+        let mut child = std::process::Command::new("sleep")
+            .arg("20")
+            .current_dir(&canonical)
+            .spawn()
+            .ctx("process in the game folder")?;
+        let refused = pack_compact(&mut snapshot, &db, &mut mounts, &canonical);
+        let _killed = child.kill();
+        let _waited = child.wait();
+        check(
+            refused.is_err(),
+            "compaction is refused while a process uses the folder",
+        )?;
+        check_eq(
+            mounts.len(),
+            1,
+            "the mount is still held after the refusal",
+        )?;
+        check_eq(
+            std::fs::read(canonical.join("data")).ctx("read through the mount")?,
+            b"bytes".to_vec(),
+            "the folder still serves its files",
+        )?;
+        pack_compact(&mut snapshot, &db, &mut mounts, &canonical)
+            .ctx("compaction with the folder idle")?;
+        let mounted = take_mount(&mut mounts, &canonical).ctx("mount after compaction")?;
+        mounted.stop().ctx("unmount")
+    }
 }
