@@ -1,6 +1,6 @@
 //! Explicit commands for verified Maximum Space stores.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Subcommand;
 use std::{path::PathBuf, sync::atomic::AtomicBool, time::Instant};
 
@@ -80,6 +80,14 @@ pub enum Command {
     PoolPrune { pool: PathBuf },
     /// List durable launcher-path activations.
     Installs,
+}
+
+/// Resolves a path against this process's working directory.
+///
+/// The coordinator keeps the working directory of whichever client started
+/// it, so a relative path sent as typed would name a different folder there.
+fn absolute(path: PathBuf) -> Result<PathBuf> {
+    std::path::absolute(&path).with_context(|| format!("resolving {}", path.display()))
 }
 
 // `--maximum` replaces `--level`. clap rejects the two together.
@@ -308,11 +316,15 @@ pub fn run(command: Command, json: bool, cancel: &AtomicBool) -> Result<()> {
             writes,
         } => {
             // The default layer is a sibling of the store: its path plus `.writes`.
-            let writes = writes.unwrap_or_else(|| {
-                let mut name = store.as_os_str().to_os_string();
-                name.push(".writes");
-                PathBuf::from(name)
-            });
+            let (store, folder) = (absolute(store)?, absolute(folder)?);
+            let writes = writes.map_or_else(
+                || {
+                    let mut name = store.as_os_str().to_os_string();
+                    name.push(".writes");
+                    Ok(PathBuf::from(name))
+                },
+                absolute,
+            )?;
             let snapshot = crate::jobs::request(crate::jobs::Command::PackActivate {
                 game_path: folder.clone(),
                 store_path: store,
@@ -338,6 +350,7 @@ pub fn run(command: Command, json: bool, cancel: &AtomicBool) -> Result<()> {
             return Ok(());
         }
         Command::Rollback { folder } => {
+            let folder = absolute(folder)?;
             let snapshot = crate::jobs::request(crate::jobs::Command::PackRollback {
                 game_path: folder.clone(),
             })?;
@@ -349,6 +362,7 @@ pub fn run(command: Command, json: bool, cancel: &AtomicBool) -> Result<()> {
             return Ok(());
         }
         Command::Reclaim { folder } => {
+            let folder = absolute(folder)?;
             let snapshot = crate::jobs::request(crate::jobs::Command::PackReclaim {
                 game_path: folder.clone(),
             })?;
@@ -363,6 +377,7 @@ pub fn run(command: Command, json: bool, cancel: &AtomicBool) -> Result<()> {
             return Ok(());
         }
         Command::Compact { folder } => {
+            let folder = absolute(folder)?;
             let snapshot = crate::jobs::request(crate::jobs::Command::PackCompact {
                 game_path: folder.clone(),
             })?;
@@ -385,6 +400,7 @@ pub fn run(command: Command, json: bool, cancel: &AtomicBool) -> Result<()> {
             return Ok(());
         }
         Command::Prune { folder } => {
+            let folder = absolute(folder)?;
             let snapshot = crate::jobs::request(crate::jobs::Command::PackPrune {
                 game_path: folder.clone(),
             })?;
@@ -469,5 +485,26 @@ fn print(summary: &super::Summary) {
             "{:.2}% retained as serialized store bytes. This is not a drive free-space measurement.",
             summary.archive_bytes as f64 / summary.logical_bytes as f64 * 100.
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{Ctx, TestResult, check, check_eq};
+
+    #[test]
+    fn coordinator_requests_carry_absolute_paths() -> TestResult {
+        let relative = absolute(PathBuf::from("games/Portal")).ctx("relative path")?;
+        check(
+            relative.is_absolute(),
+            "a relative path gains its directory",
+        )?;
+        check(relative.ends_with("games/Portal"), "and keeps its tail")?;
+        check_eq(
+            absolute(PathBuf::from("/mnt/games/Portal")).ctx("absolute path")?,
+            PathBuf::from("/mnt/games/Portal"),
+            "an absolute path is unchanged",
+        )
     }
 }

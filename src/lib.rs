@@ -7,10 +7,11 @@
 //! `flummox-gui` is a window that runs jobs as child processes. Everything
 //! here is synchronous and free of UI concerns.
 
-// Three modules need `unsafe`: the btrfs ioctls, the anchored opens, and the
-// Landlock call. Each opts out by name, so a reviewer knows where to look and
-// new `unsafe` cannot appear anywhere else. `deny` rather than `forbid`,
-// because `forbid` cannot be opted out of at all.
+// Eleven files carry `#![allow(unsafe_code)]`: `backend/btrfs.rs`, `busy.rs`,
+// `fsprobe.rs`, `macos.rs`, `safeio.rs`, `storage.rs` and five under
+// `windows/`. Each opts out by name, so new `unsafe` cannot appear anywhere
+// else unnoticed. `deny` rather than `forbid`, because `forbid` cannot be
+// opted out of at all.
 #![deny(unsafe_code)]
 
 pub mod allocation;
