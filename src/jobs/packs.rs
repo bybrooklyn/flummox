@@ -1,0 +1,467 @@
+//! Maximum Space transactions the coordinator runs: activation, rollback,
+//! reclaim, compaction, pruning and recovery at start.
+
+use super::*;
+use anyhow::{Result, bail};
+use rusqlite::Connection;
+use std::path::Path;
+// Without mounting, each transaction below is a stub that needs none of these.
+#[cfg(feature = "pack-mount")]
+use {
+    super::{client::*, service::PackControl},
+    anyhow::{Context, ensure},
+    std::{os::unix::ffi::OsStrExt, path::PathBuf},
+};
+
+#[cfg(feature = "pack-mount")]
+pub(super) type PackMount = crate::pack::MountedInstall;
+
+#[cfg(not(feature = "pack-mount"))]
+pub(super) struct PackMount;
+
+#[cfg(feature = "pack-mount")]
+pub(super) fn save_packs(db: &Connection, snapshot: &Snapshot) -> Result<()> {
+    db.execute(
+        "INSERT OR REPLACE INTO settings(id,data) VALUES(4,?1)",
+        [serde_json::to_string(&snapshot.packs)?],
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "pack-mount")]
+pub(super) fn refresh_pack_summaries(snapshot: &mut Snapshot) {
+    // Shared-byte accounting depends on how many stores currently link each
+    // pool object. Refresh every readable store after that population changes.
+    // A broken install keeps its last useful summary and is handled by the
+    // normal recovery path instead of failing an otherwise successful action.
+    for install in &mut snapshot.packs {
+        if let Ok(reader) = crate::pack::Reader::open(&install.store_path) {
+            install.summary = Some(reader.summary().clone());
+        }
+    }
+}
+
+#[cfg(feature = "pack-mount")]
+pub(super) fn take_mount(mounts: &mut Vec<PackMount>, path: &Path) -> Option<PackMount> {
+    mounts
+        .iter()
+        .position(|mounted| mounted.path == path)
+        .map(|position| mounts.remove(position))
+}
+
+#[cfg(feature = "pack-mount")]
+pub(super) fn pack_activate(
+    snapshot: &mut Snapshot,
+    db: &Connection,
+    mounts: &mut Vec<PackMount>,
+    game_path: &Path,
+    store_path: &Path,
+    writes_path: &Path,
+) -> Result<()> {
+    // Activation moves this folder aside and mounts over it, so it gets the
+    // same refusals as any other job target.
+    let game_path = &super::validate_folder(game_path)?;
+    ensure!(
+        crate::busy::process_using(game_path, &crate::busy::ProcFs::new()).is_none(),
+        "Close the game and launcher activity before activating its store"
+    );
+    let install = crate::pack::prepare(
+        game_path,
+        store_path,
+        writes_path,
+        &std::sync::atomic::AtomicBool::new(false),
+    )?;
+    activate_prepared(snapshot, db, mounts, install)
+}
+
+#[cfg(feature = "pack-mount")]
+pub(super) fn activate_prepared(
+    snapshot: &mut Snapshot,
+    db: &Connection,
+    mounts: &mut Vec<PackMount>,
+    install: crate::pack::Install,
+) -> Result<()> {
+    let game_path = &install.game_path;
+    ensure!(
+        crate::busy::process_using(game_path, &crate::busy::ProcFs::new()).is_none(),
+        "The game or launcher became active while its store was being verified"
+    );
+    ensure!(
+        !snapshot
+            .packs
+            .iter()
+            .any(|current| current.game_path == install.game_path),
+        "This game already has an activated store"
+    );
+    snapshot.packs.push(install);
+    save_packs(db, snapshot)?;
+    let install = snapshot
+        .packs
+        .last_mut()
+        .context("The activated install record is missing")?;
+    match crate::pack::activate(install) {
+        Ok(mounted) => mounts.push(mounted),
+        Err(error) => {
+            install.message = format!("Activation needs recovery: {error}");
+            save_packs(db, snapshot)?;
+            return Err(error);
+        }
+    }
+    refresh_pack_summaries(snapshot);
+    save_packs(db, snapshot)
+}
+
+#[cfg(not(feature = "pack-mount"))]
+pub(super) fn pack_activate(
+    _snapshot: &mut Snapshot,
+    _db: &Connection,
+    _mounts: &mut Vec<PackMount>,
+    _game_path: &Path,
+    _store_path: &Path,
+    _writes_path: &Path,
+) -> Result<()> {
+    bail!("Build Flummox with --features pack-mount to activate a store")
+}
+
+#[cfg(feature = "pack-mount")]
+pub(super) fn pack_rollback(
+    snapshot: &mut Snapshot,
+    db: &Connection,
+    mounts: &mut Vec<PackMount>,
+    game_path: &Path,
+) -> Result<()> {
+    let canonical = game_path
+        .canonicalize()
+        .context("Finding the launcher path")?;
+    ensure!(
+        crate::busy::process_using(&canonical, &crate::busy::ProcFs::new()).is_none(),
+        "Close the game and launcher activity before restoring its files"
+    );
+    let position = snapshot
+        .packs
+        .iter()
+        .position(|install| install.game_path == canonical)
+        .context("This game has no activated store")?;
+    let install = snapshot
+        .packs
+        .get_mut(position)
+        .context("The activated install record is missing")?;
+    install.phase = crate::pack::InstallPhase::Restoring;
+    install.message = "Restoring ordinary files at the launcher path".into();
+    save_packs(db, snapshot)?;
+    let install = snapshot
+        .packs
+        .get(position)
+        .cloned()
+        .context("The activated install record is missing")?;
+    let mounted = take_mount(mounts, &canonical);
+    crate::pack::rollback(
+        &install,
+        mounted,
+        &std::sync::atomic::AtomicBool::new(false),
+    )?;
+    snapshot.packs.remove(position);
+    save_packs(db, snapshot)?;
+    super::autostart::configure(
+        &binary()?,
+        snapshot.libraries.iter().any(|library| library.automatic) || !snapshot.packs.is_empty(),
+    )?;
+    Ok(())
+}
+
+#[cfg(not(feature = "pack-mount"))]
+pub(super) fn pack_rollback(
+    _snapshot: &mut Snapshot,
+    _db: &Connection,
+    _mounts: &mut Vec<PackMount>,
+    _game_path: &Path,
+) -> Result<()> {
+    bail!("Build Flummox with --features pack-mount to restore an activated store")
+}
+
+#[cfg(feature = "pack-mount")]
+pub(super) fn pack_reclaim(
+    snapshot: &mut Snapshot,
+    db: &Connection,
+    game_path: &Path,
+) -> Result<()> {
+    let canonical = game_path
+        .canonicalize()
+        .context("Finding the launcher path")?;
+    ensure!(
+        crate::busy::process_using(&canonical, &crate::busy::ProcFs::new()).is_none(),
+        "Close the game and launcher activity before reclaiming space"
+    );
+    let install = snapshot
+        .packs
+        .iter_mut()
+        .find(|install| install.game_path == canonical)
+        .context("This game has no activated store")?;
+    // Chunks are otherwise checked only as the game reads them, and the store
+    // may have been activated weeks ago. This is the last moment a damaged
+    // store can still be replaced from the original.
+    crate::pack::Reader::open(&install.store_path)
+        .and_then(|store| store.verify(&std::sync::atomic::AtomicBool::new(false)))
+        .context("The store failed verification, so the original was kept")?;
+    crate::pack::reclaim(install)?;
+    save_packs(db, snapshot)?;
+    let install = snapshot
+        .packs
+        .iter_mut()
+        .find(|install| install.game_path == canonical)
+        .context("The activated install record is missing")?;
+    crate::pack::finish_reclaim(install)?;
+    save_packs(db, snapshot)
+}
+
+#[cfg(not(feature = "pack-mount"))]
+pub(super) fn pack_reclaim(
+    _snapshot: &mut Snapshot,
+    _db: &Connection,
+    _game_path: &Path,
+) -> Result<()> {
+    bail!("Build Flummox with --features pack-mount to reclaim a rollback copy")
+}
+
+#[cfg(feature = "pack-mount")]
+pub(super) fn compact_path(path: &Path, identity: &Path, label: &str) -> Result<PathBuf> {
+    let parent = path.parent().context("The managed path has no parent")?;
+    let identity = blake3::hash(identity.as_os_str().as_bytes()).to_hex();
+    for attempt in 0..100u32 {
+        let candidate = parent.join(format!(
+            ".flummox-{identity}-{label}-{}-{attempt}",
+            std::process::id()
+        ));
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+            Err(error) => return Err(error).context("Checking the compaction destination"),
+        }
+    }
+    bail!("Could not reserve a path for the compacted install")
+}
+
+#[cfg(feature = "pack-mount")]
+pub(super) fn remove_store(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
+#[cfg(feature = "pack-mount")]
+pub(super) fn pack_compact(
+    snapshot: &mut Snapshot,
+    db: &Connection,
+    mounts: &mut Vec<PackMount>,
+    game_path: &Path,
+) -> Result<()> {
+    pack_compact_observed(snapshot, db, mounts, game_path, &PackControl::default())
+}
+
+#[cfg(feature = "pack-mount")]
+pub(super) fn pack_compact_observed(
+    snapshot: &mut Snapshot,
+    db: &Connection,
+    mounts: &mut Vec<PackMount>,
+    game_path: &Path,
+    control: &PackControl,
+) -> Result<()> {
+    let canonical = game_path
+        .canonicalize()
+        .context("Finding the launcher path")?;
+    let position = snapshot
+        .packs
+        .iter()
+        .position(|install| install.game_path == canonical)
+        .context("This game has no activated store")?;
+    let install = snapshot
+        .packs
+        .get(position)
+        .context("The activated install record is missing")?;
+    ensure!(
+        install.phase == crate::pack::InstallPhase::Mounted,
+        "Install is not ready"
+    );
+    ensure!(
+        install.previous_store_path.is_none() && install.previous_writes_path.is_none(),
+        "Reclaim the previous compacted version before compacting again"
+    );
+    // Restoring from the retained original replays the update layer onto it.
+    // Compaction empties that layer, so the original would come back without
+    // the updates the new store absorbed.
+    ensure!(
+        install.backup_path.is_none(),
+        "Reclaim the retained original before compacting updates"
+    );
+    let old_store = install.store_path.clone();
+    let old_writes = install.writes_path.clone();
+    let pool = crate::pack::Reader::open(&old_store)?
+        .pool_path()
+        .map(Path::to_path_buf);
+    let new_store = compact_path(&old_store, &canonical, "compact-store")?;
+    let new_writes = compact_path(&old_writes, &canonical, "compact-updates")?;
+    let controller = mounts
+        .iter()
+        .find(|mounted| mounted.path == canonical)
+        .and_then(PackMount::writes)
+        .context("The writable install is not mounted")?;
+    let baseline = controller.generation();
+
+    let options = crate::pack::Options::maximum();
+    let summary = if let Some(pool) = pool {
+        crate::pack::create_shared_observed(
+            &canonical,
+            &new_store,
+            &pool,
+            options,
+            &control.cancel,
+            control,
+        )
+    } else {
+        crate::pack::create_observed(&canonical, &new_store, options, &control.cancel, control)
+    }
+    .context("Building the compacted store from the live install")?;
+    if let Err(error) = control.transaction("Switching stores; this step finishes before stopping")
+    {
+        let _removed = remove_store(&new_store);
+        return Err(error);
+    }
+    let frozen = controller.freeze()?;
+    if frozen.generation() != baseline {
+        let _removed = remove_store(&new_store);
+        bail!("The game changed while compaction finished; retry when launcher updates settle")
+    }
+
+    let install = snapshot
+        .packs
+        .get_mut(position)
+        .context("The activated install record is missing")?;
+    install.phase = crate::pack::InstallPhase::Compacting;
+    install.message = "Switching to the compacted store".into();
+    save_packs(db, snapshot)?;
+    let mounted = take_mount(mounts, &canonical).context("The writable install is not mounted")?;
+    mounted.stop().context("Unmounting the previous store")?;
+
+    let install = snapshot
+        .packs
+        .get_mut(position)
+        .context("The activated install record is missing")?;
+    install.previous_store_path = Some(old_store);
+    install.previous_writes_path = Some(old_writes);
+    install.store_path = new_store;
+    install.writes_path = new_writes;
+    install.summary = Some(summary);
+    install.phase = crate::pack::InstallPhase::Mounted;
+    install.message = "Updates compacted; previous version retained for recovery".into();
+    save_packs(db, snapshot)?;
+    let install = snapshot
+        .packs
+        .get_mut(position)
+        .context("The activated install record is missing")?;
+    let mounted = crate::pack::recover(install)?.context("The compacted store did not remount")?;
+    mounts.push(mounted);
+    refresh_pack_summaries(snapshot);
+    save_packs(db, snapshot)
+}
+
+#[cfg(not(feature = "pack-mount"))]
+pub(super) fn pack_compact(
+    _snapshot: &mut Snapshot,
+    _db: &Connection,
+    _mounts: &mut Vec<PackMount>,
+    _game_path: &Path,
+) -> Result<()> {
+    bail!("Build Flummox with --features pack-mount to compact an activated store")
+}
+
+#[cfg(feature = "pack-mount")]
+pub(super) fn pack_prune(snapshot: &mut Snapshot, db: &Connection, game_path: &Path) -> Result<()> {
+    let canonical = game_path
+        .canonicalize()
+        .context("Finding the launcher path")?;
+    let position = snapshot
+        .packs
+        .iter()
+        .position(|install| install.game_path == canonical)
+        .context("This game has no activated store")?;
+    let install = snapshot
+        .packs
+        .get_mut(position)
+        .context("The activated install record is missing")?;
+    let pool = crate::pack::Reader::open(&install.store_path)?
+        .pool_path()
+        .map(Path::to_path_buf);
+    crate::pack::begin_prune(install)?;
+    save_packs(db, snapshot)?;
+    let install = snapshot
+        .packs
+        .get_mut(position)
+        .context("The activated install record is missing")?;
+    crate::pack::finish_prune(install)?;
+    save_packs(db, snapshot)?;
+    if let Some(pool) = pool {
+        let _pruned = crate::pack::prune_shared_pool(&pool)?;
+    }
+    refresh_pack_summaries(snapshot);
+    save_packs(db, snapshot)
+}
+
+#[cfg(not(feature = "pack-mount"))]
+pub(super) fn pack_prune(
+    _snapshot: &mut Snapshot,
+    _db: &Connection,
+    _game_path: &Path,
+) -> Result<()> {
+    bail!("Build Flummox with --features pack-mount to reclaim a previous store")
+}
+
+#[cfg(feature = "pack-mount")]
+pub(super) fn recover_packs(
+    snapshot: &mut Snapshot,
+    db: &Connection,
+    mounts: &mut Vec<PackMount>,
+) -> Result<()> {
+    let mut recovered = Vec::with_capacity(snapshot.packs.len());
+    for mut install in std::mem::take(&mut snapshot.packs) {
+        if install.phase == crate::pack::InstallPhase::Restoring {
+            install.phase = crate::pack::InstallPhase::Attention;
+            install.message = "Restoration was interrupted. Retained copies are unchanged; verify the ordinary folder before any cleanup.".into();
+            recovered.push(install);
+            continue;
+        }
+        if mounts
+            .iter()
+            .any(|mounted| mounted.path == install.game_path)
+        {
+            recovered.push(install);
+            continue;
+        }
+        match crate::pack::recover(&mut install) {
+            Ok(Some(mounted)) => mounts.push(mounted),
+            Ok(None) => {}
+            Err(error) => {
+                install.phase = crate::pack::InstallPhase::Attention;
+                install.message = format!("Could not mount automatically: {error}");
+            }
+        }
+        recovered.push(install);
+    }
+    snapshot.packs = recovered;
+    refresh_pack_summaries(snapshot);
+    save_packs(db, snapshot)
+}
+
+#[cfg(not(feature = "pack-mount"))]
+pub(super) fn recover_packs(
+    snapshot: &mut Snapshot,
+    _db: &Connection,
+    _mounts: &mut Vec<PackMount>,
+) -> Result<()> {
+    for install in &mut snapshot.packs {
+        install.phase = crate::pack::InstallPhase::Attention;
+        install.message = "This build cannot mount pack stores".into();
+    }
+    Ok(())
+}
