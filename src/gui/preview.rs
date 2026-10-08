@@ -1,7 +1,7 @@
 //! Render fixture desktop states without a window or a game library.
 
 use super::{
-    app::{GameRow, Page, State},
+    app::{Filter, GameRow, Page, State, Status},
     view,
 };
 use crate::{
@@ -267,7 +267,7 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
     // step that offers no pause or cancel and reports no totals.
     state.snapshot.jobs.push(Job {
         id: 2,
-        game,
+        game: game.clone(),
         operation: Operation::Pack,
         pack: Some(PackTask::Compact),
         phase: Phase::Running,
@@ -351,7 +351,94 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
     render(&state, 1100, 1800, &output.join("jobs-phases.png"))?;
     render(&state, 720, 1800, &output.join("jobs-phases-narrow.png"))?;
     state.connection_error = Some("Worker disconnected; reconnecting".into());
-    render(&state, 1100, 1800, &output.join("jobs-disconnected.png"))
+    render(&state, 1100, 1800, &output.join("jobs-disconnected.png"))?;
+    state.connection_error = None;
+
+    // Notices and failures that sit over or inside the pages: a toast of each
+    // kind, the scan banner, a failed job with its errors, and the storage
+    // plan that failed its check.
+    state.page = Page::Overview;
+    state.show_status(Status::info(
+        "Diagnostics saved to /home/player/.local/share/flummox/diagnostics.json. They include local folder paths.",
+    ));
+    render(&state, 1100, 720, &output.join("toast.png"))?;
+    state.show_status(Status::error(
+        "This game is excluded. Restore it in Drives first.",
+    ));
+    render(&state, 720, 720, &output.join("toast-error-narrow.png"))?;
+    state.status = None;
+    state.status_deadline = None;
+    state.page = Page::Games;
+    state.expanded = None;
+    state.snapshot.scan_source = Some("Steam".into());
+    render(&state, 1100, 720, &output.join("scan-banner.png"))?;
+    state.snapshot.scan_source = None;
+    if let Some(job) = state.snapshot.jobs.iter_mut().find(|job| job.id == 6) {
+        job.errors = vec![
+            "Could not rewrite data/pak1.pak: the file is in use".into(),
+            "Could not rewrite data/pak2.pak: permission denied".into(),
+        ];
+    }
+    state.page = Page::Queue;
+    render(&state, 1100, 1800, &output.join("jobs-errors.png"))?;
+    state.page = Page::Games;
+    // Selection bar, and the bar that offers to sort again.
+    state.selected.insert("manual:native".into());
+    render(&state, 1100, 720, &output.join("games-selection.png"))?;
+    state.order_stale = true;
+    render(&state, 1100, 720, &output.join("games-stale-order.png"))?;
+    state.selected.clear();
+    state.order_stale = false;
+    // The three reasons the list can be empty.
+    state.query = "no such game".into();
+    render(&state, 1100, 720, &output.join("games-empty-search.png"))?;
+    state.query.clear();
+    state.filter = Filter::Compressed;
+    state.drive_filter = Some("/nonexistent".into());
+    render(
+        &state,
+        720,
+        720,
+        &output.join("games-empty-filters-narrow.png"),
+    )?;
+    state.filter = Filter::All;
+    state.drive_filter = None;
+    let rows = std::mem::take(&mut state.games);
+    render(&state, 1100, 720, &output.join("games-empty-library.png"))?;
+    state.scanning = true;
+    render(&state, 1100, 720, &output.join("games-empty-scanning.png"))?;
+    state.scanning = false;
+    state.games = rows;
+    // A plan that failed its check shows what is short, and checks again.
+    state.planned = Some((
+        crate::jobs::Command::Enqueue {
+            game: game.clone(),
+            operation: Operation::Compress,
+            options: Default::default(),
+        },
+        crate::storage::SpacePlan {
+            retained_original: false,
+            requirements: vec![crate::storage::Requirement {
+                volume: crate::storage::Volume {
+                    identity: "fixture".into(),
+                    path: "/Games".into(),
+                    available: 1_200_000_000,
+                },
+                additional: 4_000_000_000,
+                headroom: 200_000_000,
+                reasons: vec!["Compression rewrites each file once".into()],
+            }],
+        },
+    ));
+    render(&state, 1100, 720, &output.join("space-plan-short.png"))?;
+    state.planned = None;
+    // Warnings from the scan, with the attention count.
+    state.warnings = vec![
+        "Artwork preferences unavailable: permission denied".into(),
+        "History is unavailable: database is locked".into(),
+    ];
+    state.page = Page::Overview;
+    render(&state, 1100, 900, &output.join("overview-warnings.png"))
 }
 
 /// A toast or the scan banner changes which widgets the window holds. The

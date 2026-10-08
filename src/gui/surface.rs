@@ -437,15 +437,17 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
 /// Finds the container with id `section` and reports how far down it sits.
 ///
 /// The distance is measured from the top of the content of the scrollable
-/// whose id is `Settings`. No message is produced when the container is not
+/// whose id is `scrollable`. No message is produced when the container is not
 /// in the current view.
 pub fn jump<Message: Send + 'static>(
-    section: &'static str,
+    scrollable: &'static str,
+    section: impl Into<widget::Id>,
     message: impl Fn(f32) -> Message + Send + 'static,
 ) -> iced::Task<Message> {
     // The scrollable is visited before the containers inside it, so `origin`
     // is set by the time a section is found.
     struct Anchor {
+        scrollable: widget::Id,
         section: widget::Id,
         origin: f32,
         y: Option<f32>,
@@ -462,7 +464,7 @@ pub fn jump<Message: Send + 'static>(
             _: Vector,
             _: &mut dyn widget::operation::Scrollable,
         ) {
-            if id == Some(&widget::Id::new("Settings")) {
+            if id == Some(&self.scrollable) {
                 self.origin = content.y;
             }
         }
@@ -478,7 +480,8 @@ pub fn jump<Message: Send + 'static>(
         }
     }
     widget::operate(Anchor {
-        section: widget::Id::new(section),
+        scrollable: widget::Id::new(scrollable),
+        section: section.into(),
         origin: 0.0,
         y: None,
     })
@@ -671,7 +674,10 @@ mod tests {
             position.current > 0.0 && position.current < 60.0,
             "the frame moved the content part of the way",
         )?;
-        check(!captured, "the redraw event reaches later widgets uncaptured")
+        check(
+            !captured,
+            "the redraw event reaches later widgets uncaptured",
+        )
     }
     #[test]
     fn wheel_retargets_reverses_and_stops_at_its_clamped_target() -> TestResult {
