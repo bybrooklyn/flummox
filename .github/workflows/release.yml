@@ -15,8 +15,16 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # Release binaries are built with one named compiler so a new stable
+  # release cannot change what a tag produces. rustup reads this variable.
+  RUSTUP_TOOLCHAIN: 1.99.0
 
 jobs:
+  # The btrfs and FUSE tests run only in this workflow, so a tag waits for them.
+  fs-tests:
+    name: Filesystem tests
+    uses: ./.github/workflows/fs-tests.yml
+
   prepare:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -38,12 +46,27 @@ jobs:
           else
             echo 'tag=' >> "$GITHUB_OUTPUT"
           fi
+      # A tag on a commit that never reached main would publish and sign code
+      # that no branch review saw.
+      - name: Require the tagged commit to be on main
+        if: github.ref_type == 'tag'
+        run: |
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "$GITHUB_SHA is on main"
+          else
+            status=$?
+            echo "merge-base exited with $status: $GITHUB_SHA is not an ancestor of origin/main" >&2
+            exit 1
+          fi
       - id: version
         env:
           TAG: ${{ steps.tag.outputs.tag }}
         run: python packaging/prepare-release.py --tag "$TAG"
-      - name: Require recorded game acceptance for 0.0.2 publication
-        if: startsWith(github.ref, 'refs/tags/') && steps.version.outputs.version == '0.0.2'
+      # Every stable tag needs docs/validation/<version>.json. A missing
+      # record fails the step.
+      - name: Require recorded game acceptance for stable publication
+        if: startsWith(github.ref, 'refs/tags/') && steps.version.outputs.prerelease == 'false'
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: python packaging/check-acceptance.py --version "$VERSION"
@@ -54,7 +77,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.platform }} ${{ matrix.arch }}
-    needs: prepare
+    needs: [prepare, fs-tests]
     strategy:
       fail-fast: false
       matrix:
@@ -98,10 +121,7 @@ jobs:
       - name: Install Rust
         env:
           TARGET: ${{ matrix.target }}
-        run: rustup toolchain install stable --profile minimal --component clippy --target "$TARGET"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: release-${{ matrix.target }}
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy --target "$TARGET"
       - name: Lint
         env:
           TARGET: ${{ matrix.target }}
@@ -113,7 +133,7 @@ jobs:
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         if: matrix.platform == 'linux' && matrix.arch == 'x86_64'
         with:
-          tool: just,cargo-deny
+          tool: just@1.58.0,cargo-deny@0.20.2
       - name: Dependency and prose policy
         if: matrix.platform == 'linux' && matrix.arch == 'x86_64'
         run: |
@@ -146,12 +166,22 @@ jobs:
           if (!$compiler) { throw 'ISCC.exe is missing' }
           & $compiler.FullName "/DAppVersion=$env:VERSION" "/DAppNumericVersion=$($env:VERSION.Split('-')[0])" "/DSourceDir=$env:GITHUB_WORKSPACE\target\$env:TARGET\release" packaging/windows/flummox.iss
           if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed' }
+      # The archives redistribute statically linked crates whose licences
+      # require their notices to travel with the binary.
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-about
+      - name: Generate third-party licence notices
+        run: |
+          cargo about generate --locked --all-features --config packaging/about.toml --output-file THIRD-PARTY-LICENSES.txt packaging/about.hbs
+          test -s THIRD-PARTY-LICENSES.txt
+          grep -q 'zstd' THIRD-PARTY-LICENSES.txt
       - name: Bundle release files
         env:
           TARGET: ${{ matrix.target }}
           PLATFORM: ${{ matrix.platform }}
           ARCH: ${{ matrix.arch }}
-        run: python packaging/package-release.py --platform "$PLATFORM" --arch "$ARCH" --binaries "target/$TARGET/release"
+        run: python packaging/package-release.py --require-notices --platform "$PLATFORM" --arch "$ARCH" --binaries "target/$TARGET/release"
       - name: Check Linux desktop entry
         if: matrix.platform == 'linux'
         run: desktop-file-validate packaging/flummox.desktop
@@ -195,7 +225,10 @@ jobs:
         with:
           name: debug-${{ matrix.platform }}-${{ matrix.arch }}
           path: release-debug/
-          retention-days: 14
+          # 90 days is the longest GitHub keeps an artifact. The symbols are
+          # not release assets because the signed manifest names the exact
+          # download set.
+          retention-days: 90
           if-no-files-found: error
 
   arch:
@@ -239,6 +272,13 @@ jobs:
         run: |
           mkdir -p /validation
           bash packaging/smoke-arch.sh dist/flummox-bin-*-x86_64.pkg.tar.zst
+      # Named so the flummox-* download pattern does not pick it up.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: arch-smoke-screenshot
+          path: /validation
+          if-no-files-found: warn
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: flummox-packages
@@ -302,8 +342,11 @@ jobs:
       (needs.homebrew-check.result == 'success' || needs.homebrew-check.result == 'skipped')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    # This environment accepts only v* tags. Secrets stored in it cannot be
-    # read by a workflow edited on a branch.
+    # The release environment is meant to accept only v* tags and hold the
+    # signing and channel secrets. Until the repository owner moves the three
+    # secrets into it and deletes the repository-level copies, they are
+    # repository secrets that a workflow edited on a branch can read. See the
+    # owner checklist in docs/release-automation.md.
     environment: release
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -387,9 +430,23 @@ jobs:
           args=()
           if [ "$PRERELEASE" = true ]; then args+=(--prerelease --latest=false); fi
           mapfile -t assets < <(find dist -maxdepth 1 -type f \( -name '*.tar.xz' -o -name '*.zip' -o -name '*-setup.exe' -o -name '*.pkg.tar.zst' -o -name '*-manifest.json' -o -name '*-manifest.json.minisig' \) | sort)
-          # Create as draft so an interrupted upload never exposes a partial release.
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
+          # Upload only into a release this workflow can still change: none
+          # yet, or a draft left by an interrupted run. A published release
+          # is never overwritten. gh's own error text separates "no such
+          # release" from any other failure, which stops the job.
+          errors=$(mktemp)
+          if draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2> "$errors"); then
+            if [ "$draft" != true ]; then
+              echo "Release $TAG is already published; refusing to replace its assets" >&2
+              exit 1
+            fi
+          elif grep -q 'release not found' "$errors"; then
+            # Create as draft so an interrupted upload never exposes a partial release.
             gh release create "$TAG" --verify-tag --draft --title "Flummox $VERSION" --notes-file notes/RELEASE-NOTES.md
+          else
+            cat "$errors" >&2
+            echo "Could not read release $TAG" >&2
+            exit 1
           fi
           gh release upload "$TAG" "${assets[@]}" --clobber
           gh release edit "$TAG" --draft=false --title "Flummox $VERSION" --notes-file notes/RELEASE-NOTES.md "${args[@]}"

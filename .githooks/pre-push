@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Runs the checks CI runs, before the push. Install with `just hooks`.
+#
+# CI failing is a slower, noisier way to learn something this catches in a
+# minute. Skip with: git push --no-verify
+set -uo pipefail
+
+if ! command -v just >/dev/null 2>&1; then
+    echo "pre-push: just is not installed, so the checks did not run" >&2
+    exit 1
+fi
+
+echo "pre-push: just ci"
+if ! just ci; then
+    echo >&2
+    echo "pre-push: refused. Fix the above, or push with --no-verify." >&2
+    exit 1
+fi

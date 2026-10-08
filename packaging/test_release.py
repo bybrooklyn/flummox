@@ -2,8 +2,10 @@
 """Check tag versions, checksums, and release architecture validation."""
 import importlib.util
 import copy
+import hashlib
 import json
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import tomllib
@@ -33,7 +35,7 @@ class ReleaseTests(unittest.TestCase):
                 reports[kind] = {
                     'version': 1,
                     'game': {'launcher': 'manual', 'key': 'fixture', 'build': '1'},
-                    'corpus': {'sha256': 'a' * 64, 'files': 1, 'bytes': 1024},
+                    'corpus': {'sha256': hashlib.sha256(kind.encode()).hexdigest(), 'files': 1, 'bytes': 1024},
                     'platform': 'linux' if linux else kind,
                     'mode': 'maximum-space' if linux else 'native',
                     'flummox_version': '0.0.2',
@@ -45,7 +47,7 @@ class ReleaseTests(unittest.TestCase):
                         'baseline_load_ms': 1000, 'candidate_load_ms': 1050,
                     },
                 }
-                runs.append({'kind': kind, 'game': 'Fixture', 'tester': 'Fixture', 'date': '2026-10-05', 'report': f'{kind}.json', 'restart_verified': True, 'launcher_verification_passed': True})
+                runs.append({'kind': kind, 'game': 'Fixture', 'tester': 'Fixture', 'date': '2026-10-05', 'report': f'{kind}.json', 'game_key': 'fixture', 'game_build': '1', 'restart_verified': True, 'launcher_verification_passed': True})
             manifest = {'version': '0.0.2', 'status': 'passed', 'runs': runs}
 
             def write_evidence(data, evidence):
@@ -109,6 +111,166 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'escaped'):
                 acceptance.check(root, '0.0.2')
 
+    def acceptance_fixture(self, root, version, report_version):
+        acceptance = module('check-acceptance.py')
+        directory = root / 'docs/validation'
+        directory.mkdir(parents=True, exist_ok=True)
+        runs = []
+        reports = {}
+        for kind in sorted(acceptance.REQUIRED):
+            linux = kind in {'native-linux', 'proton'}
+            reports[kind] = {
+                'version': 1,
+                'game': {'launcher': 'manual', 'key': f'fixture-{kind}', 'build': '1'},
+                'corpus': {'sha256': hashlib.sha256(kind.encode()).hexdigest(), 'files': 1, 'bytes': 1024},
+                'platform': 'linux' if linux else kind,
+                'mode': 'maximum-space' if linux else 'native',
+                'flummox_version': report_version,
+                'storage': {'logical_bytes': 1024, 'allocated_before': 4096, 'allocated_after': 2048, 'random_read_p95_ns': None},
+                'checks': {
+                    'bytes_verified': True, 'metadata_verified': True,
+                    'writable_update_verified': True, 'rollback_verified': True,
+                    'launched': True, 'anti_cheat_issue': False, 'gameplay_issue': False,
+                    'baseline_load_ms': 1000, 'candidate_load_ms': 1050,
+                },
+            }
+            runs.append({'kind': kind, 'game': 'Fixture', 'game_key': f'fixture-{kind}', 'game_build': '1', 'tester': 'Fixture', 'date': '2026-10-05', 'report': f'{kind}.json', 'restart_verified': True, 'launcher_verification_passed': True})
+        manifest = {'version': version, 'status': 'passed', 'runs': runs}
+
+        def write(data, evidence):
+            (directory / f'{version}.json').write_text(json.dumps(data))
+            for kind, report in evidence.items():
+                (directory / f'{kind}.json').write_text(json.dumps(report))
+
+        write(manifest, reports)
+        return acceptance, manifest, reports, write
+
+    def test_acceptance_ties_each_run_to_its_own_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            acceptance, manifest, reports, write = self.acceptance_fixture(root, '0.0.2', '0.0.2')
+            acceptance.check(root, '0.0.2')
+            # Two kinds naming one report file.
+            changed = copy.deepcopy(manifest)
+            changed['runs'][1]['report'] = changed['runs'][0]['report']
+            changed['runs'][1]['game_key'] = changed['runs'][0]['game_key']
+            write(changed, reports)
+            with self.assertRaisesRegex(ValueError, 'same report'):
+                acceptance.check(root, '0.0.2')
+            # Two reports with one corpus hash.
+            changed = copy.deepcopy(reports)
+            first, second = sorted(changed)[:2]
+            changed[second]['corpus']['sha256'] = changed[first]['corpus']['sha256'].upper()
+            write(manifest, changed)
+            with self.assertRaisesRegex(ValueError, 'corpus hash'):
+                acceptance.check(root, '0.0.2')
+            # Compression that allocated more than the original.
+            changed = copy.deepcopy(reports)
+            changed['proton']['storage']['allocated_after'] = 8192
+            write(manifest, changed)
+            with self.assertRaisesRegex(ValueError, 'allocated more'):
+                acceptance.check(root, '0.0.2')
+            # A run that names a different game than its report.
+            for field, value in [('game_key', 'another-game'), ('game_build', '2'), ('game', ' ')]:
+                changed = copy.deepcopy(manifest)
+                changed['runs'][0][field] = value
+                write(changed, reports)
+                with self.subTest(field=field), self.assertRaises(ValueError):
+                    acceptance.check(root, '0.0.2')
+
+    def test_acceptance_takes_the_version_it_is_given(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            # A candidate report counts for its release.
+            for recorded in ['0.0.3', '0.0.3-rc.1', '0.0.3-rc.12']:
+                acceptance, manifest, reports, write = self.acceptance_fixture(root, '0.0.3', recorded)
+                with self.subTest(recorded=recorded):
+                    acceptance.check(root, '0.0.3')
+            for recorded in ['0.0.2', '0.0.30', '0.0.3-rc', '0.0.3-beta.1', '0.0.3-rc.1.2', None]:
+                acceptance, manifest, reports, write = self.acceptance_fixture(root, '0.0.3', recorded)
+                with self.subTest(recorded=recorded), self.assertRaises(ValueError):
+                    acceptance.check(root, '0.0.3')
+            # No record for the version fails closed.
+            with self.assertRaises(FileNotFoundError):
+                acceptance.check(root, '0.0.4')
+            record = root / 'docs/validation/0.0.4.json'
+            record.write_text('')
+            with self.assertRaises(ValueError):
+                acceptance.check(root, '0.0.4')
+
+    def test_acceptance_gate_applies_to_every_stable_tag(self):
+        workflow = (HERE.parent / '.github/workflows/release.yml').read_text()
+        self.assertNotIn("== '0.0.2'", workflow)
+        self.assertRegex(workflow, r"check-acceptance\.py")
+        gate = workflow.split('check-acceptance.py')[0].rsplit('- name:', 1)[1]
+        self.assertIn("prerelease == 'false'", gate)
+        self.assertIn("startsWith(github.ref, 'refs/tags/')", gate)
+
+    def test_btrfs_runs_must_report_enough_passing_tests(self):
+        runner = module('btrfs-tests.py')
+        ok = 'running 12 tests\n\ntest result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.1s\n'
+        self.assertEqual(runner.passed(ok), 12)
+        self.assertEqual(runner.require(ok, 12), 12)
+        # Controls: a filter matching nothing, a floor above the count,
+        # a failure, and no summary at all must each be refused.
+        empty = 'running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 300 filtered out; finished in 0.0s\n'
+        with self.assertRaisesRegex(ValueError, 'Only 0'):
+            runner.require(empty, 1)
+        with self.assertRaisesRegex(ValueError, 'Only 12'):
+            runner.require(ok, 13)
+        with self.assertRaises(ValueError):
+            runner.passed('test result: FAILED. 11 passed; 1 failed; 0 ignored;\n')
+        with self.assertRaises(ValueError):
+            runner.passed('')
+        with self.assertRaises(ValueError):
+            runner.passed(ok + ok)
+        build = '\n'.join([
+            json.dumps({'reason': 'compiler-artifact', 'profile': {'test': True}, 'executable': '/t/lib-abc', 'target': {'kind': ['lib'], 'name': 'flummox'}}),
+            json.dumps({'reason': 'compiler-artifact', 'profile': {'test': True}, 'executable': '/t/jobs-abc', 'target': {'kind': ['test'], 'name': 'jobs_lifecycle'}}),
+            json.dumps({'reason': 'compiler-artifact', 'profile': {'test': False}, 'executable': '/t/other', 'target': {'kind': ['bin'], 'name': 'flummox'}}),
+            'not json',
+        ])
+        self.assertEqual(runner.executables(build), {'lib': '/t/lib-abc', 'jobs_lifecycle': '/t/jobs-abc'})
+
+    def test_release_archives_carry_the_third_party_notices(self):
+        bundle = module('package-release.py')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            missing = root / bundle.NOTICES
+            self.assertIsNone(bundle.notices_input(missing, False))
+            with self.assertRaisesRegex(RuntimeError, 'third-party licence notices'):
+                bundle.notices_input(missing, True)
+            missing.write_text('MIT: example 1.0\n')
+            self.assertEqual(bundle.notices_input(missing, True), missing)
+            self.assertIn('share/licenses/flummox/' + bundle.NOTICES, bundle.linux_inputs(root, missing))
+            self.assertNotIn('share/licenses/flummox/' + bundle.NOTICES, bundle.linux_inputs(root, None))
+            # A release build with no notices stops before it reads any binary.
+            result = subprocess.run(['python3', str(HERE / 'package-release.py'), '--require-notices', '--notices', str(root / 'absent.txt'), '--binaries', str(root), '--output', str(root / 'dist')], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('third-party licence notices', result.stderr)
+
+    def test_installed_docs_are_the_ones_users_need(self):
+        bundle = module('package-release.py')
+        inputs = bundle.linux_inputs(HERE, None)
+        for name in ['usage.md', 'status.md', 'install.md']:
+            self.assertIn('share/doc/flummox/' + name, inputs)
+        for name in ['release-readiness.md', 'next-steps.md']:
+            self.assertNotIn('share/doc/flummox/' + name, inputs)
+        for source in inputs.values():
+            if source.suffix == '.md':
+                self.assertTrue(source.is_file(), source)
+
+    def test_release_workflow_guards(self):
+        workflow = (HERE.parent / '.github/workflows/release.yml').read_text()
+        self.assertNotIn('rust-cache', workflow)
+        self.assertNotIn('2>/dev/null', workflow)
+        self.assertNotIn('|| true', workflow)
+        self.assertIn('merge-base --is-ancestor', workflow)
+        self.assertIn('--json isDraft', workflow)
+        self.assertIn('--require-notices', workflow)
+        self.assertIn('fs-tests.yml', workflow)
+        self.assertNotIn('toolchain install stable', workflow)
+
     def test_curated_notes_override_the_commit_changelog(self):
         prepare = module('prepare-release.py')
         with tempfile.TemporaryDirectory() as temporary:
@@ -139,15 +301,42 @@ class ReleaseTests(unittest.TestCase):
         prepare = module('prepare-release.py')
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (root / 'Cargo.toml').write_text('[package]\nname = "flummox"\nversion = "0.1.0"\n\n[dependencies]\nexample = "1.2.3"\n')
-            (root / 'Cargo.lock').write_text('version = 4\n\n[[package]]\nname = "flummox"\nversion = "0.1.0"\n\n[[package]]\nname = "example"\nversion = "1.2.3"\n')
-            self.assertEqual(prepare.prepare(root, 'v0.0.1'), '0.0.1')
-            self.assertEqual(tomllib.loads((root / 'Cargo.toml').read_text())['package']['version'], '0.0.1')
+            (root / 'Cargo.toml').write_text('[package]\nname = "flummox"\nversion = "0.0.1"\n\n[dependencies]\nexample = "1.2.3"\n')
+            (root / 'Cargo.lock').write_text('version = 4\n\n[[package]]\nname = "flummox"\nversion = "0.0.1"\n\n[[package]]\nname = "example"\nversion = "1.2.3"\n')
+            self.assertEqual(prepare.prepare(root, 'v0.0.1-rc.2'), '0.0.1-rc.2')
+            self.assertEqual(tomllib.loads((root / 'Cargo.toml').read_text())['package']['version'], '0.0.1-rc.2')
             packages = tomllib.loads((root / 'Cargo.lock').read_text())['package']
-            self.assertEqual({entry['name']: entry['version'] for entry in packages}, {'flummox': '0.0.1', 'example': '1.2.3'})
+            self.assertEqual({entry['name']: entry['version'] for entry in packages}, {'flummox': '0.0.1-rc.2', 'example': '1.2.3'})
             for tag in ['v1', '1.0.0', 'v01.0.0', 'v1.0.0/unsafe', 'v1.0.0\nextra']:
                 with self.assertRaises(ValueError):
                     prepare.prepare(root, tag)
+
+    def test_tag_must_match_the_source_version_and_stable_tags_need_notes(self):
+        prepare = module('prepare-release.py')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = '[package]\nname = "flummox"\nversion = "0.0.1"\n'
+            lock = 'version = 4\n\n[[package]]\nname = "flummox"\nversion = "0.0.1"\n'
+            (root / 'Cargo.toml').write_text(manifest)
+            (root / 'Cargo.lock').write_text(lock)
+            for tag in ['v0.2.0', 'v0.0.2', 'v0.2.0-rc.1']:
+                with self.subTest(tag=tag), self.assertRaisesRegex(ValueError, 'Cargo.toml'):
+                    prepare.prepare(root, tag)
+                self.assertEqual((root / 'Cargo.toml').read_text(), manifest)
+                self.assertEqual((root / 'Cargo.lock').read_text(), lock)
+            with self.assertRaisesRegex(ValueError, 'docs/releases/0.0.1.md'):
+                prepare.prepare(root, 'v0.0.1')
+            self.assertEqual((root / 'Cargo.toml').read_text(), manifest)
+            (root / 'docs/releases').mkdir(parents=True)
+            (root / 'docs/releases/0.0.1.md').write_text('# Flummox 0.0.1\n')
+            self.assertEqual(prepare.prepare(root, 'v0.0.1'), '0.0.1')
+
+    def test_packaged_recipe_version_matches_cargo(self):
+        cargo = tomllib.loads((HERE.parent / 'Cargo.toml').read_text())['package']['version']
+        pkgbuild = (HERE / 'PKGBUILD').read_text()
+        match = re.search(r'^pkgver=(\S+)$', pkgbuild, flags=re.M)
+        self.assertIsNotNone(match)
+        self.assertEqual(match[1], cargo)
 
     def test_distribution_checksums_match_release_bytes(self):
         distributions = module('distributions.py')
@@ -158,7 +347,6 @@ class ReleaseTests(unittest.TestCase):
             output = root / 'recipes'
             distributions.generate('0.0.1', root, output)
             cask = (output / 'homebrew/Casks/flummox.rb').read_text()
-            import hashlib
             digest = hashlib.sha256(b'release fixture').hexdigest()
             self.assertIn(digest, cask)
             self.assertIn(digest, (output / 'aur/flummox-bin/PKGBUILD').read_text())

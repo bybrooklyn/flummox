@@ -11,7 +11,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # A warning that only appears in CI is a warning nobody reads.
+  # A warning that only appears in CI goes unread.
   RUSTFLAGS: -D warnings
 
 jobs:
@@ -111,96 +111,52 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libxrandr-dev \
             libxi-dev libxcursor-dev libgl1-mesa-dev libfontconfig1-dev minisign
 
-      # CI runs the same recipes the pre-push hook runs. While CI called cargo
-      # directly the two drifted, and a licence failure reached main because
-      # the local checks and the remote ones were not the same checks.
+      # CI runs the same recipe as the pre-push hook in .githooks/, which
+      # `just hooks` installs. While CI called cargo directly the two drifted,
+      # and a licence failure reached main because the local checks and the
+      # remote ones were not the same checks.
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: just,cargo-deny
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      # lint, then test, then the dependency policy.
+      # lint, then test, then the dependency policy. The Landlock tests fail
+      # instead of skipping when the runner kernel has no Landlock.
       - name: just ci
+        env:
+          FLUMMOX_REQUIRE_LANDLOCK: '1'
         run: just ci
 
-  fs-matrix:
-    name: Filesystem matrix (btrfs)
+  # The btrfs and FUSE jobs live in a reusable workflow so a release can
+  # require them too.
+  fs-tests:
+    name: Filesystem tests
+    uses: ./.github/workflows/fs-tests.yml
+
+  msrv:
+    name: Minimum supported Rust version
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # An older compiler can warn differently, and the stable jobs already deny
+    # warnings. This job answers only whether the declared version compiles.
+    env:
+      RUSTFLAGS: ''
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install the toolchain
-        run: rustup toolchain install stable --profile minimal
-
-      # A loop-mounted image is the only way to exercise the real defrag ioctl
-      # and the FIEMAP reader on a runner. Mounting needs root, which is why
-      # this is a separate job.
-      - name: Make a btrfs filesystem to test against
+      - name: Install the declared rust-version
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          test -n "$msrv"
+          echo "Checking with Rust $msrv"
+          echo "RUSTUP_TOOLCHAIN=$msrv" >> "$GITHUB_ENV"
+          rustup toolchain install "$msrv" --profile minimal
+      - name: Install the GUI's system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends btrfs-progs
-          truncate -s 2G /tmp/btrfs.img
-          mkfs.btrfs -q /tmp/btrfs.img
-          mkdir -p /tmp/btrfs
-          sudo mount -o loop,compress=zstd:1 /tmp/btrfs.img /tmp/btrfs
-          sudo chown "$(id -u):$(id -g)" /tmp/btrfs
-
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libxrandr-dev \
+            libxi-dev libxcursor-dev libgl1-mesa-dev libfontconfig1-dev
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-
-      # These tests create their temporary directories inside the current
-      # directory, so running from the mount is what selects them. Anywhere
-      # else they skip themselves, which would make a green run misleading.
-      - name: Run the backend tests on btrfs
-        run: |
-          cargo test --no-run --message-format=json > /tmp/flummox-test-build.jsonl
-          python3 - <<'PY'
-          import json
-          import os
-          import subprocess
-
-          with open('/tmp/flummox-test-build.jsonl') as build:
-              artifacts = [json.loads(line) for line in build]
-          tests = [item for item in artifacts
-                   if item.get('reason') == 'compiler-artifact'
-                   and item.get('profile', {}).get('test')
-                   and item.get('executable')
-                   and (item['target']['kind'] == ['lib']
-                        or item['target']['name'] == 'jobs_lifecycle')]
-          if len(tests) != 2:
-              raise RuntimeError('Expected library and coordinator lifecycle test executables')
-          # Cargo sets test cwd to the package root. Invoke the artifacts directly
-          # so their temporary files actually live on the mounted filesystem.
-          os.chdir('/tmp/btrfs')
-          for test in tests:
-              args = [test['executable']]
-              if test['target']['kind'] == ['lib']:
-                  args.append('backend::btrfs')
-              result = subprocess.run(args + ['--nocapture'], text=True,
-                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-              print(result.stdout)
-              result.check_returncode()
-              if 'skipped:' in result.stdout:
-                  raise RuntimeError('A required native filesystem test was skipped')
-          PY
-
-  pack-mount:
-    name: Compressed store mount and executable reads
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install the toolchain
-        run: rustup toolchain install stable --profile minimal
-      - name: Enable unprivileged FUSE mounts
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends fuse3
-          sudo modprobe fuse
-          test -c /dev/fuse
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Require mounted reads and fixture execution
-        env:
-          FLUMMOX_REQUIRE_FUSE: '1'
-        run: cargo test --features pack-mount --test pack_mount --test jobs_lifecycle -- --nocapture
+      - name: Check every target
+        run: cargo check --locked --all-features --all-targets
