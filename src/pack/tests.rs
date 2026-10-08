@@ -987,3 +987,52 @@ fn a_setuid_file_is_not_stored_and_not_accepted() -> TestResult {
         "an index naming a setuid file is rejected",
     )
 }
+
+// Setting a user attribute needs write permission, so the mode goes on last.
+#[test]
+fn read_only_files_and_folders_keep_their_attributes_through_restore() -> TestResult {
+    let temp = tempfile::tempdir().ctx("fixture")?;
+    let source = temp.path().join("source");
+    fs::create_dir_all(source.join("ro-dir")).ctx("directories")?;
+    fs::write(source.join("ro-dir/ro-file"), b"read only").ctx("file")?;
+    fs::write(source.join("sliced"), b"tiny").ctx("small file")?;
+    for path in ["ro-dir/ro-file", "sliced", "ro-dir"] {
+        xattr::set(source.join(path), "user.flummox-test", b"kept").ctx("source xattr")?;
+    }
+    fs::set_permissions(
+        source.join("ro-dir/ro-file"),
+        fs::Permissions::from_mode(0o444),
+    )
+    .ctx("file mode")?;
+    fs::set_permissions(source.join("sliced"), fs::Permissions::from_mode(0o444))
+        .ctx("small file mode")?;
+    fs::set_permissions(source.join("ro-dir"), fs::Permissions::from_mode(0o555))
+        .ctx("directory mode")?;
+    let store = temp.path().join("game.flumpack");
+    let cancel = AtomicBool::new(false);
+    let created = create(&source, &store, Options::default(), &cancel);
+    let restored = temp.path().join("restored");
+    let result = restore(&store, &restored, &cancel);
+    // Put write access back so the temporary folder can be removed.
+    for root in [&source, &restored] {
+        let _ = fs::set_permissions(root.join("ro-dir"), fs::Permissions::from_mode(0o755));
+    }
+    created.ctx("create")?;
+    result.ctx("restore")?;
+    for path in ["ro-dir/ro-file", "sliced", "ro-dir"] {
+        check_eq(
+            xattr::get(restored.join(path), "user.flummox-test").ctx("restored xattr")?,
+            Some(b"kept".to_vec()),
+            format!("{path} keeps its attribute"),
+        )?;
+    }
+    check_eq(
+        fs::metadata(restored.join("ro-dir/ro-file"))
+            .ctx("restored mode")?
+            .permissions()
+            .mode()
+            & 0o777,
+        0o444,
+        "the file is read-only again",
+    )
+}
