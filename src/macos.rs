@@ -226,8 +226,9 @@ pub fn recover_folder(folder: &Path) -> Result<()> {
 }
 
 // Canonicalises a game folder and refuses one that is too broad (a filesystem
-// root, the home directory, /Applications, /Users), one inside a system or
-// Flummox-owned directory, and one that is not on APFS.
+// root, a volume's mount point, the home directory, /Applications, /Users, any
+// folder holding Flummox's state), one inside a system or Flummox-owned
+// directory, and one that is not on APFS.
 fn validate(root: &Path) -> Result<PathBuf> {
     let root = root.canonicalize()?;
     ensure!(
@@ -256,11 +257,28 @@ fn validate(root: &Path) -> Result<PathBuf> {
         ensure!(!root.starts_with(protected), "This location is protected");
     }
     let volume = crate::storage::volume(&root)?;
+    let state = crate::libraries::data_dir()?;
+    let state = state.canonicalize().unwrap_or_else(|_| state.clone());
+    if let Some(reason) = too_broad(&root, &volume.path, &state) {
+        anyhow::bail!(reason);
+    }
     ensure!(
         volume.identity.starts_with("apfs:"),
         "Native Mac compression requires APFS"
     );
     Ok(root)
+}
+
+// Why `root` cannot be a game folder: it is its volume's mount point, or it
+// contains Flummox's state directory.
+fn too_broad(root: &Path, mount: &Path, state: &Path) -> Option<&'static str> {
+    if root == mount {
+        Some("Choose a game folder, not a drive")
+    } else if state.starts_with(root) {
+        Some("This folder contains Flummox's own data")
+    } else {
+        None
+    }
 }
 
 // Fails if any process has a file open under `root`. The check passes only when
@@ -295,12 +313,24 @@ fn hash(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-// The file's extended attributes, leaving out the two that a compressed file gains
-// or loses: `com.apple.decmpfs` and the resource fork.
+// Attributes the kernel or the compressor sets and that may differ between two
+// copies of one file: compression state, the resource fork and the provenance
+// tag that macOS 13 and later attaches to files written by tracked apps.
+fn kernel_managed(name: &std::ffi::OsStr) -> bool {
+    [
+        "com.apple.decmpfs",
+        "com.apple.ResourceFork",
+        "com.apple.provenance",
+    ]
+    .iter()
+    .any(|managed| name == *managed)
+}
+
+// The file's extended attributes, leaving out the kernel-managed ones.
 fn attributes(path: &Path) -> Result<std::collections::BTreeMap<std::ffi::OsString, Vec<u8>>> {
     let mut attributes = std::collections::BTreeMap::new();
     for name in xattr::list(path)? {
-        if name == "com.apple.decmpfs" || name == "com.apple.ResourceFork" {
+        if kernel_managed(&name) {
             continue;
         }
         attributes.insert(
@@ -505,7 +535,7 @@ fn stage(root: &Path, source: &Path, restore: bool) -> Result<bool> {
                 xattr::remove(&staged, attribute)?;
             }
         }
-        // SAFETY: stage_c names our private staging file; compression metadata was removed.
+        // SAFETY: stage_c is a terminated path string that outlives the call.
         let result =
             unsafe { libc::chflags(stage_c.as_ptr(), stat.st_flags() & !libc::UF_COMPRESSED) };
         ensure!(result == 0, "Cannot restore ordinary file flags");
@@ -787,13 +817,7 @@ pub fn run() -> Result<()> {
             restore_folder_with(&folder, &AtomicBool::new(false), |_| {})?
         ),
         Command::Recovery => println!("{}", serde_json::to_string_pretty(&recovery()?)?),
-        // Same loop as `recover_folder`, without taking native.lock.
-        Command::Recover { folder } => {
-            let folder = validate(&folder)?;
-            for record in recovery()?.iter().filter(|record| record.root == folder) {
-                recover_original(record)?;
-            }
-        }
+        Command::Recover { folder } => recover_folder(&folder)?,
     }
     Ok(())
 }
