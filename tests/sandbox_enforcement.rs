@@ -3,7 +3,7 @@
 #![cfg(target_os = "linux")]
 
 use flummox::{
-    sandbox::{SandboxPlan, restrict},
+    sandbox::{SandboxPlan, deny_sockets, restrict},
     testutil::{Ctx, TestResult, check},
 };
 
@@ -133,6 +133,51 @@ fn a_worker_reaches_its_database_and_not_the_coordinator() -> TestResult {
         result.status.success(),
         format!(
             "sandbox child failed: {} {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        ),
+    )
+}
+
+#[test]
+fn a_worker_cannot_reach_a_socket_by_path() -> TestResult {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    if let Some(socket) = std::env::var_os("FLUMMOX_SOCKET_FIXTURE") {
+        check(
+            UnixStream::connect(&socket).is_ok(),
+            "control: the socket accepts a connection before the filter",
+        )?;
+        deny_sockets().ctx("socket filter")?;
+        let refused = UnixStream::connect(&socket);
+        check(
+            refused
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied),
+            format!("a connection after the filter is refused: {refused:?}"),
+        )?;
+        // Threads started afterwards inherit the filter.
+        let from_thread = std::thread::spawn(move || UnixStream::connect(&socket).is_err())
+            .join()
+            .map_err(|_| "thread panicked")?;
+        return check(from_thread, "a new thread is refused too");
+    }
+    let temp = tempfile::tempdir().ctx("socket fixture")?;
+    let socket = temp.path().join("control.sock");
+    let _listener = UnixListener::bind(&socket).ctx("listen")?;
+    let result = std::process::Command::new(std::env::current_exe().ctx("test executable")?)
+        .args([
+            "--exact",
+            "a_worker_cannot_reach_a_socket_by_path",
+            "--nocapture",
+        ])
+        .env("FLUMMOX_SOCKET_FIXTURE", &socket)
+        .output()
+        .ctx("isolated socket test")?;
+    check(
+        result.status.success(),
+        format!(
+            "socket child failed: {} {}",
             String::from_utf8_lossy(&result.stdout),
             String::from_utf8_lossy(&result.stderr)
         ),

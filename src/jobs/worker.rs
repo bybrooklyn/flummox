@@ -142,6 +142,13 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
     if !sandbox.is_active() {
         output.event(Event::Warning(sandbox.describe()));
     }
+    // The control socket is reachable by path whatever Landlock allows, and
+    // this process never needs a socket.
+    if let Err(error) = crate::sandbox::deny_sockets() {
+        output.event(Event::Warning(format!(
+            "this job can still open sockets: {error}"
+        )));
+    }
     let cancel = Arc::new(AtomicBool::new(false));
     let paused = Arc::new(AtomicBool::new(false));
     let control_cancel = cancel.clone();

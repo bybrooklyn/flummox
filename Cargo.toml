@@ -60,6 +60,7 @@ rustix = { version = "1.1.5", features = ["fs", "event"] }
 # Landlock lets an unprivileged process drop its own filesystem rights.
 landlock = "0.4.7"
 xattr = "1.6.1"
+seccompiler = "0.5.0"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
