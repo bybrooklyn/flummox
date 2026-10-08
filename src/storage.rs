@@ -90,7 +90,7 @@ pub fn volume(path: &Path) -> Result<Volume> {
 #[cfg(target_os = "linux")]
 fn volume_existing(path: &Path) -> Result<Volume> {
     let fs = crate::fsprobe::probe(path)?;
-    if fs.magic == crate::fsprobe::magic::FUSE && fs.source == "flummox-pack" {
+    if fs.is_pack_mount() {
         // Managed mounts receive a new filesystem ID after each remount.
         // Library identity and capacity belong to the underlying drive.
         let parent = fs
@@ -100,25 +100,42 @@ fn volume_existing(path: &Path) -> Result<Volume> {
         return volume_existing(parent);
     }
     ensure!(!fs.read_only, "Storage volume is read-only");
-    let source = Path::new(&fs.source).canonicalize().ok();
-    let uuid = std::fs::read_dir("/dev/disk/by-uuid")
-        .ok()
-        .and_then(|entries| {
-            entries.flatten().find_map(|entry| {
-                (source.is_some() && entry.path().canonicalize().ok() == source)
-                    .then(|| entry.file_name().to_string_lossy().into_owned())
-            })
-        });
-    let fallback = format!(
-        "{}:{:?}",
-        fs.source,
-        nix::sys::statfs::statfs(path)?.filesystem_id()
-    );
     Ok(Volume {
-        identity: format!("{}:{}", fs.fstype, uuid.unwrap_or(fallback)),
+        identity: linux_identity(&fs, path, Path::new("/dev/disk/by-uuid"))?,
         path: fs.mountpoint,
         available: crate::backend::free_bytes(path)?,
     })
+}
+
+/// A btrfs asks the filesystem for its UUID, because `statfs` ids differ
+/// between subvolumes of one filesystem. Others look their device up in
+/// `by_uuid`, and fall back to the source and `statfs` id.
+#[cfg(target_os = "linux")]
+fn linux_identity(fs: &crate::fsprobe::FsInfo, path: &Path, by_uuid: &Path) -> Result<String> {
+    let own = (fs.fstype == "btrfs")
+        .then(|| crate::backend::btrfs::filesystem_uuid(path).ok())
+        .flatten();
+    let uuid = match own {
+        Some(uuid) => Some(uuid),
+        None => {
+            let source = Path::new(&fs.source).canonicalize().ok();
+            std::fs::read_dir(by_uuid).ok().and_then(|entries| {
+                entries.flatten().find_map(|entry| {
+                    (source.is_some() && entry.path().canonicalize().ok() == source)
+                        .then(|| entry.file_name().to_string_lossy().into_owned())
+                })
+            })
+        }
+    };
+    let uuid = match uuid {
+        Some(uuid) => uuid,
+        None => format!(
+            "{}:{:?}",
+            fs.source,
+            nix::sys::statfs::statfs(path)?.filesystem_id()
+        ),
+    };
+    Ok(format!("{}:{uuid}", fs.fstype))
 }
 
 #[cfg(target_os = "macos")]
@@ -364,6 +381,35 @@ pub fn native_plan(root: &Path, restore: bool) -> Result<SpacePlan> {
     Ok(plan)
 }
 
+/// Plan for a backend that rewrites one file at a time and keeps no copy of the
+/// rest: Windows compression and macOS compressed files.
+///
+/// Compressing needs room for the largest file while it is rewritten. A
+/// restore needs room for the whole install, since every file grows back. Use
+/// [`native_plan`] for btrfs, where snapshots can pin the old blocks.
+pub fn per_file_plan(root: &Path, restore: bool) -> Result<SpacePlan> {
+    let footprint = inventory(root)?;
+    let mut plan = SpacePlan::default();
+    let (additional, reason) = per_file_requirement(&footprint, restore);
+    plan.add(volume(root)?, additional, reason)?;
+    Ok(plan)
+}
+
+/// The bytes and the reason behind [`per_file_plan`].
+fn per_file_requirement(footprint: &Footprint, restore: bool) -> (u64, &'static str) {
+    if restore {
+        (
+            footprint.bytes,
+            "Every file returns to its full size when the compression is removed",
+        )
+    } else {
+        (
+            footprint.largest,
+            "Room for the largest file while it is rewritten",
+        )
+    }
+}
+
 /// Upper bound on a new store's size: the content, plus 1/32 of it, plus the
 /// metadata allowance, plus 16 MiB.
 pub fn pack_bound(footprint: &Footprint) -> Result<u64> {
@@ -397,6 +443,85 @@ mod tests {
             "shared volume must include both allocations and headroom",
         )
     }
+    #[test]
+    fn per_file_plans_need_the_largest_file_or_the_whole_install() -> TestResult {
+        let footprint = Footprint {
+            files: 3,
+            bytes: 100,
+            largest: 60,
+            metadata_bytes: 0,
+        };
+        check_eq(per_file_requirement(&footprint, false).0, 60, "compress")?;
+        check_eq(per_file_requirement(&footprint, true).0, 100, "restore")?;
+        let root = tempfile::tempdir().ctx("fixture")?;
+        std::fs::write(root.path().join("big"), vec![0u8; 4096]).ctx("big")?;
+        std::fs::write(root.path().join("small"), vec![0u8; 16]).ctx("small")?;
+        let plan = per_file_plan(root.path(), false).ctx("per-file plan")?;
+        let native = native_plan(root.path(), false).ctx("native plan")?;
+        let wanted = |plan: &SpacePlan| plan.requirements.first().map(|row| row.additional);
+        check_eq(wanted(&plan), Some(4096), "the largest file only")?;
+        check_eq(
+            wanted(&native),
+            Some(4096 + 16 + 4096),
+            "control: the native plan still wants the whole install and more",
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn subvolumes_of_one_btrfs_are_one_volume_without_by_uuid() -> TestResult {
+        let here = std::env::current_dir().ctx("working directory")?;
+        let tmp = tempfile::TempDir::new_in(here).ctx("temp directory")?;
+        let fs = crate::fsprobe::probe(tmp.path()).ctx("probe")?;
+        if fs.fstype != "btrfs" {
+            check(
+                std::env::var_os("FLUMMOX_REQUIRE_BTRFS").is_none(),
+                "the test directory is not btrfs, and FLUMMOX_REQUIRE_BTRFS is set",
+            )?;
+            eprintln!("skipped: subvolume identity requires btrfs");
+            return Ok(());
+        }
+        let mut paths = Vec::new();
+        for name in ["a", "b"] {
+            let path = tmp.path().join(name);
+            let made = std::process::Command::new("btrfs")
+                .args(["subvolume", "create"])
+                .arg(&path)
+                .output()
+                .ctx("run btrfs subvolume create")?;
+            check(
+                made.status.success(),
+                format!(
+                    "btrfs subvolume create: {}",
+                    String::from_utf8_lossy(&made.stderr)
+                ),
+            )?;
+            paths.push(path);
+        }
+        let ids: Vec<_> = paths
+            .iter()
+            .map(|path| nix::sys::statfs::statfs(path).map(|s| format!("{:?}", s.filesystem_id())))
+            .collect::<Result<_, _>>()
+            .ctx("statfs")?;
+        check(
+            ids.first() != ids.get(1),
+            "control: statfs gives the two subvolumes different ids",
+        )?;
+        let missing = tmp.path().join("no-by-uuid");
+        let identity = |path: &Path| -> Result<String, String> {
+            let fs = crate::fsprobe::probe(path).ctx("probe a subvolume")?;
+            linux_identity(&fs, path, &missing).ctx("identity")
+        };
+        let first = identity(paths.first().ctx("first subvolume")?)?;
+        let second = identity(paths.get(1).ctx("second subvolume")?)?;
+        check_eq(first.clone(), second, "one filesystem, one identity")?;
+        let uuid = first.strip_prefix("btrfs:").ctx("a btrfs identity")?;
+        check(
+            Path::new("/sys/fs/btrfs").join(uuid).is_dir(),
+            format!("{uuid} is the UUID sysfs knows"),
+        )
+    }
+
     #[test]
     fn inventory_does_not_follow_external_symlinks() -> TestResult {
         let root = tempfile::tempdir().ctx("fixture")?;

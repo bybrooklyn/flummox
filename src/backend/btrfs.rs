@@ -442,6 +442,63 @@ impl crate::estimate::DiskProbe for FiemapProbe {
     }
 }
 
+/// Mirrors `struct btrfs_ioctl_fs_info_args`. The kernel fills every field and
+/// only `fsid` is read back.
+#[repr(C)]
+#[allow(dead_code)]
+struct FsInfoArgs {
+    max_id: u64,
+    num_devices: u64,
+    fsid: [u8; 16],
+    nodesize: u32,
+    sectorsize: u32,
+    clone_alignment: u32,
+    csum_type: u16,
+    csum_size: u16,
+    flags: u64,
+    generation: u64,
+    metadata_uuid: [u8; 16],
+    reserved: [u8; 944],
+}
+
+nix::ioctl_read!(btrfs_fs_info, 0x94, 31, FsInfoArgs);
+
+/// The UUID of the btrfs filesystem holding `path`, in the usual dashed form.
+///
+/// Every subvolume and device of one filesystem gives the same answer, which
+/// `statfs` does not: its filesystem id mixes in the subvolume.
+pub fn filesystem_uuid(path: &Path) -> io::Result<String> {
+    let dir = File::open(path)?;
+    let mut args = FsInfoArgs {
+        max_id: 0,
+        num_devices: 0,
+        fsid: [0; 16],
+        nodesize: 0,
+        sectorsize: 0,
+        clone_alignment: 0,
+        csum_type: 0,
+        csum_size: 0,
+        flags: 0,
+        generation: 0,
+        metadata_uuid: [0; 16],
+        reserved: [0; 944],
+    };
+    // SAFETY: `dir` is open and `args` is a correctly laid out
+    // `btrfs_ioctl_fs_info_args` that the kernel fills in. A path on another
+    // filesystem makes the kernel return ENOTTY.
+    unsafe { btrfs_fs_info(dir.as_raw_fd(), &mut args) }.map_err(errno_to_io)?;
+    let hex: Vec<String> = args.fsid.iter().map(|b| format!("{b:02x}")).collect();
+    let part = |from: usize, to: usize| hex.get(from..to).unwrap_or_default().concat();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        part(0, 4),
+        part(4, 6),
+        part(6, 8),
+        part(8, 10),
+        part(10, 16)
+    ))
+}
+
 nix::ioctl_read!(fs_ioc_getflags, b'f', 1, libc::c_long);
 
 /// `FS_NOCOW_FL`: the inode is excluded from copy-on-write, and so from
