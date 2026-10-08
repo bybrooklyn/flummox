@@ -54,9 +54,6 @@ pub struct Progress {
     /// Allocated size of the visited files before each was processed, and after.
     pub allocation_before: u64,
     pub allocation_after: u64,
-    /// Files that could not be processed. The pass went on without them.
-    #[serde(default)]
-    pub failed: u64,
 }
 /// One queued or finished storage operation on one game folder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,7 +279,7 @@ impl Queue {
     /// Records the build of a finished automatic compression as handled, so
     /// `observe` stops reporting it. A job that was stopped by a shutdown, or that
     /// is still waiting or running, leaves the game due. A failed job counts as
-    /// handled, because the user can retry it and a loop of retries helps nobody.
+    /// handled, because the user can retry it and an automatic retry loop would not end.
     pub fn settle(&mut self, id: u64, shutting_down: bool) {
         let Some(job) = self.jobs.iter().find(|job| job.id == id) else {
             return;
@@ -348,8 +345,7 @@ impl Queue {
                 continue;
             }
             for key in keys {
-                self.baseline
-                    .insert(key, (game.build.clone(), enabled));
+                self.baseline.insert(key, (game.build.clone(), enabled));
             }
         }
         self.initialized_locations = preferences
@@ -380,10 +376,7 @@ fn location_key(path: &Path) -> String {
 pub fn native_space_plan(root: &Path, restore: bool) -> Result<crate::storage::SpacePlan> {
     let footprint = crate::storage::inventory(root)?;
     let (bytes, reason) = if restore {
-        (
-            footprint.bytes,
-            "Restored files return to their full size",
-        )
+        (footprint.bytes, "Restored files return to their full size")
     } else {
         (
             footprint.largest,
@@ -640,27 +633,35 @@ mod tests {
     fn only_a_finished_or_user_stopped_job_settles_the_update() -> TestResult {
         let (preferences, game, mut queue) = automatic_fixture();
         check_eq(
-            queue.observe(&[game.clone()], &preferences, true).len(),
+            queue
+                .observe(std::slice::from_ref(&game), &preferences, true)
+                .len(),
             1,
             "control: the updated build is due",
         )?;
         queue_job(&mut queue, &game, Phase::Waiting)?;
         queue.settle(queue.next_id, false);
         check_eq(
-            queue.observe(&[game.clone()], &preferences, true).len(),
+            queue
+                .observe(std::slice::from_ref(&game), &preferences, true)
+                .len(),
             1,
             "a waiting job leaves the update due",
         )?;
         queue.jobs.last_mut().ctx("job")?.phase = Phase::Cancelled;
         queue.settle(queue.next_id, true);
         check_eq(
-            queue.observe(&[game.clone()], &preferences, true).len(),
+            queue
+                .observe(std::slice::from_ref(&game), &preferences, true)
+                .len(),
             1,
             "a job stopped by a shutdown leaves the update due",
         )?;
         queue.settle(queue.next_id, false);
         check(
-            queue.observe(&[game.clone()], &preferences, true).is_empty(),
+            queue
+                .observe(std::slice::from_ref(&game), &preferences, true)
+                .is_empty(),
             "a job the user cancelled settles the update",
         )?;
         let (preferences, game, mut queue) = automatic_fixture();
@@ -722,7 +723,10 @@ mod tests {
         )?;
         check(!path.exists(), "the name is free for a new queue")?;
         let (_, note) = Queue::load_or_quarantine(temp.path()).ctx("second load")?;
-        check(note.is_none(), "a missing file is an empty queue, not damage")
+        check(
+            note.is_none(),
+            "a missing file is an empty queue, not damage",
+        )
     }
     #[test]
     fn rejected_files_match_only_at_the_same_size_and_time() -> TestResult {
