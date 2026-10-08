@@ -347,6 +347,7 @@ fn visit_in(
         .canonicalize()
         .with_context(|| format!("Opening {}", root.display()))?;
     ensure!(root.is_dir(), "Choose an installed game folder");
+    crate::desktop::ProtectedFolders::from_environment().check(&root)?;
     crate::libraries::private_dir(state)?;
     let lock = OpenOptions::new()
         .create(true)
