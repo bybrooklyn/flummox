@@ -10,7 +10,7 @@ use crate::{
     launchers::Env,
     model::{Game, GameId},
 };
-use iced::{Animation, Task, animation::Easing};
+use iced::{Animation, Task};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -24,8 +24,7 @@ mod timing {
     pub const DETAIL: (u64, u64) = (260, 150);
     pub const TOAST: (u64, u64) = (240, 150);
 }
-/// The easing of every transition.
-const EASING: Easing = Easing::EaseOutCubic;
+use super::shell::EASING;
 
 /// A navigation destination.
 ///
@@ -210,27 +209,7 @@ pub struct ScanResult {
     pub activity: Vec<Activity>,
     pub warnings: Vec<String>,
 }
-/// The text of the toast. An error stays until dismissed; anything else
-/// leaves after four seconds.
-#[derive(Debug, Clone)]
-pub struct Status {
-    pub is_error: bool,
-    pub text: String,
-}
-impl Status {
-    pub fn info(text: impl Into<String>) -> Self {
-        Self {
-            is_error: false,
-            text: text.into(),
-        }
-    }
-    pub fn error(text: impl Into<String>) -> Self {
-        Self {
-            is_error: true,
-            text: text.into(),
-        }
-    }
-}
+pub use super::shell::Status;
 /// Order of the Games list. Size and Saving put the largest first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sort {
@@ -330,11 +309,7 @@ pub struct State {
     pub records: Vec<GameRecord>,
     pub activity: Vec<Activity>,
     pub warnings: Vec<String>,
-    // The toast.
-    pub status: Option<Status>,
-    pub status_reveal: Animation<bool>,
-    /// When the toast leaves by itself. `None` for an error.
-    pub status_deadline: Option<Instant>,
+    pub toast: super::shell::Toast,
     /// The newest state received from the worker.
     pub snapshot: Snapshot,
     /// A command waiting for the user to accept its space plan.
@@ -425,8 +400,6 @@ pub struct State {
     remembered: HashMap<(PathBuf, Option<String>), crate::estimate::Estimate>,
     /// Lookups over the job list, the rows and the records.
     index: Index,
-    /// The toast deadline a timer was started for.
-    scheduled_deadline: Option<Instant>,
 }
 
 /// Lookups built when a snapshot or a scan is applied, so rebuilding the page
@@ -462,11 +435,7 @@ impl State {
             records: vec![],
             activity: vec![],
             warnings: vec![],
-            status: None,
-            status_reveal: Animation::new(false)
-                .duration(Duration::from_millis(timing::TOAST.0))
-                .easing(EASING),
-            status_deadline: None,
+            toast: Default::default(),
             snapshot: Snapshot::default(),
             planned: None,
             qualification: None,
@@ -529,7 +498,6 @@ impl State {
             analysis_refused: Default::default(),
             remembered: Default::default(),
             index: Default::default(),
-            scheduled_deadline: None,
         }
     }
     /// Rebuilds the lookups over the snapshot, the rows and the records.
@@ -708,12 +676,8 @@ impl State {
     }
     /// Replaces the toast and restarts its reveal animation.
     pub fn show_status(&mut self, status: Status) {
-        self.status_deadline = (!status.is_error).then(|| Instant::now() + Duration::from_secs(4));
-        self.status = Some(status);
-        self.status_reveal = Animation::new(false)
-            .duration(self.motion_duration(timing::TOAST))
-            .easing(EASING)
-            .go(true, Instant::now());
+        let fade = self.motion_duration(timing::TOAST);
+        self.toast.show(status, fade);
     }
 
     /// An animation length for the current motion setting, from one of the
@@ -729,19 +693,13 @@ impl State {
     /// Shows the worker's refusal of something the user asked for. It leaves
     /// after a few seconds and is not a lost connection.
     fn show_refusal(&mut self, text: String) {
-        self.show_status(Status::error(text));
-        self.status_deadline = Some(Instant::now() + Duration::from_secs(8));
+        let fade = self.motion_duration(timing::TOAST);
+        self.toast.show_refusal(text, fade);
     }
 
-    /// Starts hiding the toast. With motion it stays in `status` until `Tick`
-    /// sees the animation end.
+    /// Starts hiding the toast.
     fn dismiss_status(&mut self) {
-        self.status_deadline = None;
-        if self.reduced_motion {
-            self.status = None;
-        } else {
-            self.status_reveal.go_mut(false, Instant::now());
-        }
+        self.toast.dismiss(self.reduced_motion);
     }
     /// The preset for a game: the one picked in this session, else the one
     /// its newest compression job used, else Balanced.
@@ -1365,21 +1323,8 @@ pub enum Message {
     ToggleAdvanced(String),
 }
 
-/// Runs blocking work without occupying iced's executor or window thread.
-///
-/// Each call starts its own thread. The error is returned when that thread
-/// ends without sending a result.
-pub async fn background<T: Send + 'static>(
-    f: impl FnOnce() -> T + Send + 'static,
-) -> Result<T, String> {
-    let (send, receive) = iced::futures::channel::oneshot::channel();
-    std::thread::spawn(move || {
-        let _sent = send.send(f());
-    });
-    receive
-        .await
-        .map_err(|_| "The background task stopped unexpectedly.".into())
-}
+use super::shell::background;
+
 /// Sends a command to the worker, with a review step for the ones that need
 /// disk space.
 ///
@@ -1666,24 +1611,7 @@ fn analyze_pending(state: &mut State) -> Task<Message> {
 /// early fall through to `artwork_tasks`.
 pub fn update(state: &mut State, message: Message) -> Task<Message> {
     let task = apply(state, message);
-    Task::batch([task, toast_timer(state)])
-}
-
-/// A timer that sends `Tick` when the toast is due to leave, started once per
-/// deadline. The window needs no frames for it, so a toast on screen does not
-/// rebuild the page sixty times a second.
-fn toast_timer(state: &mut State) -> Task<Message> {
-    let Some(deadline) = state.status_deadline else {
-        return Task::none();
-    };
-    if state.scheduled_deadline == Some(deadline) {
-        return Task::none();
-    }
-    state.scheduled_deadline = Some(deadline);
-    let wait = deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(30);
-    Task::perform(background(move || std::thread::sleep(wait)), |_| {
-        Message::Tick
-    })
+    Task::batch([task, state.toast.timer(Message::Tick)])
 }
 
 /// The body of `update`, before the toast timer is attached.
@@ -1887,26 +1815,20 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
             ));
         }
         Message::JumpOffset(offset) => {
-            state.scroll_redraw_until = Some(Instant::now() + Duration::from_millis(150));
-            return iced::widget::operation::scroll_to(
+            return super::surface::scroll_to_offset(
+                &mut state.scroll_redraw_until,
                 "Settings",
-                iced::widget::operation::AbsoluteOffset {
-                    x: None,
-                    y: Some(offset),
-                },
-            )
-            .chain(Task::done(Message::Tick));
+                offset,
+                Message::Tick,
+            );
         }
         Message::RowOffset(offset) => {
-            state.scroll_redraw_until = Some(Instant::now() + Duration::from_millis(150));
-            return iced::widget::operation::scroll_to(
+            return super::surface::scroll_to_offset(
+                &mut state.scroll_redraw_until,
                 Page::Games.label(),
-                iced::widget::operation::AbsoluteOffset {
-                    x: None,
-                    y: Some(offset),
-                },
-            )
-            .chain(Task::done(Message::Tick));
+                offset,
+                Message::Tick,
+            );
         }
         Message::ClearFilters => {
             state.query.clear();
@@ -1956,14 +1878,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
             }
             if changed {
                 let offset = super::surface::recorded(&state.scroll_positions, page.label());
-                return iced::widget::operation::scroll_to(
-                    page.label(),
-                    iced::widget::operation::AbsoluteOffset {
-                        x: None,
-                        y: Some(offset),
-                    },
-                )
-                .chain(Task::done(Message::Tick));
+                return super::surface::restore_offset(page.label(), offset, Message::Tick);
             }
         }
         // Scanning and worker snapshots.
@@ -2128,7 +2043,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                     let animation = state.progress.entry(job.id).or_insert_with(|| {
                         Animation::new(fraction)
                             .duration(Duration::from_millis(250))
-                            .easing(Easing::EaseOutCubic)
+                            .easing(EASING)
                     });
                     if fraction < animation.value() {
                         *animation = Animation::new(fraction).duration(Duration::from_millis(250));
@@ -2537,20 +2452,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
         // The toast and the keyboard.
         Message::Dismiss => state.dismiss_status(),
         Message::Tick => {
-            // Start hiding at the deadline, then remove the toast once the
-            // hide animation has finished.
-            if state
-                .status_deadline
-                .is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                state.dismiss_status();
-            }
-            if state.status.is_some()
-                && !state.status_reveal.value()
-                && !state.status_reveal.is_animating(Instant::now())
-            {
-                state.status = None;
-            }
+            state.toast.tick(state.reduced_motion);
             // The row of a closed pane stays in `expanded` while the pane
             // animates out, and is released when the animation ends.
             if state.expanded.is_some()
@@ -2561,34 +2463,29 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+            use super::shell::Shortcut;
             use iced::keyboard::{Key, key::Named};
             // Tab moves focus, Escape closes the storage plan, else the detail
             // pane and the selection, and the command key with F or R searches or rescans.
-            match key {
-                Key::Named(Named::Tab) => {
-                    return if modifiers.shift() {
-                        iced::widget::operation::focus_previous()
-                    } else {
-                        iced::widget::operation::focus_next()
-                    };
-                }
-                Key::Named(Named::Escape) => {
-                    // An open storage plan is closed first and nothing else.
-                    if state.planned.take().is_some() {
-                        return Task::none();
-                    }
-                    state.close_detail();
-                    state.selected.clear();
-                }
-                Key::Character(key) if modifiers.command() && key.as_str() == "f" => {
+            if let Some(focus) = super::shell::tab_focus(&key, modifiers) {
+                return focus;
+            }
+            match (&key, super::shell::shortcut(&key, modifiers)) {
+                (_, Some(Shortcut::Search)) => {
                     let navigation = update(state, Message::GoTo(Page::Games));
                     return Task::batch([
                         navigation,
                         iced::widget::operation::focus(iced::widget::Id::new("game-search")),
                     ]);
                 }
-                Key::Character(key) if modifiers.command() && key.as_str() == "r" => {
-                    return update(state, Message::Rescan);
+                (_, Some(Shortcut::Rescan)) => return update(state, Message::Rescan),
+                (Key::Named(Named::Escape), None) => {
+                    // An open storage plan is closed first and nothing else.
+                    if state.planned.take().is_some() {
+                        return Task::none();
+                    }
+                    state.close_detail();
+                    state.selected.clear();
                 }
                 _ => {}
             }
@@ -2598,18 +2495,9 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
     artwork_tasks(state)
 }
 
-/// Starts a background decode for each source the cache hands out. A failed
-/// decode is reported as `None`, which the cache records.
+/// Starts a background decode for each source the cache hands out.
 fn artwork_tasks(state: &mut State) -> Task<Message> {
-    let mut tasks = vec![];
-    while let Some(source) = state.artwork_cache.next() {
-        let key = source.clone();
-        tasks.push(Task::perform(
-            background(move || source.decode().ok()),
-            move |result| Message::ArtworkLoaded(key.clone(), result.ok().flatten()),
-        ));
-    }
-    Task::batch(tasks)
+    super::shell::artwork_tasks(&mut state.artwork_cache, Message::ArtworkLoaded)
 }
 
 /// An endless stream of worker snapshots, each requested one second after
@@ -3012,12 +2900,13 @@ mod tests {
         let _task = update(&mut state, Message::Queue(Operation::Compress));
         check(
             state
+                .toast
                 .status
                 .as_ref()
                 .is_some_and(|status| status.text.contains("1 game was left out")),
             format!(
                 "the skipped game is reported: {:?}",
-                state.status.as_ref().map(|s| &s.text)
+                state.toast.status.as_ref().map(|s| &s.text)
             ),
         )
     }
@@ -3251,12 +3140,18 @@ mod tests {
         let mut state = State::new(Env::from_home("/fixture"));
         state.reduced_motion = true;
         let _task = update(&mut state, Message::Snapshot(Err("offline".into())));
-        check(state.status.is_some(), "the first failure is announced")?;
+        check(
+            state.toast.status.is_some(),
+            "the first failure is announced",
+        )?;
         let _task = update(&mut state, Message::Dismiss);
-        check(state.status.is_none(), "control: dismissal hides the toast")?;
+        check(
+            state.toast.status.is_none(),
+            "control: dismissal hides the toast",
+        )?;
         let _task = update(&mut state, Message::Snapshot(Err("offline".into())));
         check(
-            state.status.is_none(),
+            state.toast.status.is_none(),
             "a later failed poll does not undo the dismissal",
         )
     }
@@ -3272,7 +3167,7 @@ mod tests {
             "the plan stays on screen while it is checked again",
         )?;
         check(
-            state.status.is_none(),
+            state.toast.status.is_none(),
             "checking again does not report the old numbers as a new error",
         )
     }
@@ -3511,7 +3406,10 @@ mod tests {
             folder_kind: jobs::FolderKind::Collection,
         });
         let _task = update(&mut state, Message::Snapshot(Ok(first)));
-        check(state.status.is_none(), "launch is not a settings change")
+        check(
+            state.toast.status.is_none(),
+            "launch is not a settings change",
+        )
     }
 
     #[test]
@@ -3668,14 +3566,22 @@ mod tests {
             state.snapshot_loaded,
             "the commands that went through were applied",
         )?;
-        let text = state.status.as_ref().map(|status| status.text.clone());
+        let text = state
+            .toast
+            .status
+            .as_ref()
+            .map(|status| status.text.clone());
         check(
             text.as_deref()
                 .is_some_and(|text| text.starts_with("2 jobs could not be queued")),
             format!("the refusals are counted: {text:?}"),
         )?;
         check(
-            state.status.as_ref().is_some_and(|status| status.is_error),
+            state
+                .toast
+                .status
+                .as_ref()
+                .is_some_and(|status| status.is_error),
             "and shown as an error",
         )
     }
@@ -3711,7 +3617,7 @@ mod tests {
             state.folder_error.is_some(),
             "a missing folder is a form error",
         )?;
-        check(state.status.is_none(), "and not a toast")?;
+        check(state.toast.status.is_none(), "and not a toast")?;
         state.folder_error = None;
         let _task = update(
             &mut state,
@@ -3721,7 +3627,7 @@ mod tests {
             state.folder_error.is_none(),
             "a refusal is not a form error",
         )?;
-        check(state.status.is_some(), "it is a toast")?;
+        check(state.toast.status.is_some(), "it is a toast")?;
         check(state.connection_error.is_none(), "and not a lost worker")
     }
 
@@ -3742,15 +3648,15 @@ mod tests {
     #[test]
     fn a_toast_gets_one_timer_for_its_deadline() -> TestResult {
         let mut state = State::new(Env::from_home("/fixture"));
-        check(state.scheduled_deadline.is_none(), "control: none at first")?;
+        check(state.toast.scheduled.is_none(), "control: none at first")?;
         let _task = update(
             &mut state,
             Message::DiagnosticsExported(Ok("/fixture/diagnostics.json".into())),
         );
-        check(state.status_deadline.is_some(), "the toast has a deadline")?;
+        check(state.toast.deadline.is_some(), "the toast has a deadline")?;
         check_eq(
-            state.scheduled_deadline,
-            state.status_deadline,
+            state.toast.scheduled,
+            state.toast.deadline,
             "a timer was started for it",
         )
     }
@@ -3868,7 +3774,7 @@ mod tests {
             Message::QualificationReady(Err("Compatibility verification stopped".into())),
         );
         check(
-            state.status.is_none(),
+            state.toast.status.is_none(),
             "a result that arrives after cancelling shows nothing",
         )
     }

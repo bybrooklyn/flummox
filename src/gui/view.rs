@@ -2,6 +2,7 @@
 
 use super::{
     app::{Filter, GameRow, Message, PAGES, Page, Sort, State, StorageChoice},
+    shell::{self, games_count, size},
     theme,
 };
 use crate::{
@@ -10,19 +11,14 @@ use crate::{
         Command, FolderKind, Job, Library, MotionPreference, Operation, Phase, ThemePreference,
     },
 };
-use humansize::{DECIMAL, format_size};
 use iced::widget::{
-    Space, button, checkbox, column, container, image, pick_list, progress_bar, responsive, row,
-    scrollable, stack, text, text_input, tooltip,
+    Space, button, checkbox, column, container, pick_list, progress_bar, responsive, row, text,
+    text_input,
 };
 use iced::{Alignment, Element, Length};
 
 // Shared pieces: byte formatting, the two button styles and the two cards.
 
-/// Bytes formatted in decimal units (kB, MB, GB).
-fn size(bytes: u64) -> String {
-    format_size(bytes, DECIMAL)
-}
 /// The filled button for the main action of a row or page.
 fn action(label: impl Into<String>, message: Message) -> Element<'static, Message> {
     theme::action(label, message)
@@ -78,7 +74,7 @@ fn input<'a>(placeholder: &str, value: &str) -> iced::widget::TextInput<'a, Mess
 /// outer wrapper keeps frames coming while anything animates.
 pub fn view(state: &State) -> Element<'_, Message> {
     super::surface::animate(
-        responsive(move |size| layout(state, size.width < 880.0)),
+        responsive(move |size| layout(state, size.width < shell::COMPACT_BELOW)),
         super::animation_pending(state)
             || state
                 .scroll_redraw_until
@@ -93,20 +89,6 @@ pub fn view(state: &State) -> Element<'_, Message> {
 fn layout(state: &State, compact: bool) -> Element<'_, Message> {
     // Sidebar. Entries in `PAGES` animate their highlight. Settings sits at
     // the bottom and switches without animation.
-    let mut nav = column![
-        if compact {
-            Element::from(
-                container(text("F").size(24))
-                    .width(Length::Fill)
-                    .center_x(Length::Fill),
-            )
-        } else {
-            Element::from(text("Flummox").size(23))
-        },
-        Space::new().height(16)
-    ]
-    .spacing(6)
-    .padding(if compact { 10 } else { 16 });
     // Every entry, Settings included, eases its highlight the same way.
     let highlight_of = |page: Page| {
         if state.reduced_motion {
@@ -121,47 +103,19 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         }
     };
     let nav_entry = |page: Page| -> Element<'_, Message> {
-        let highlight = highlight_of(page);
-        // The icon sits in a box of one width so every label starts at the
-        // same x, and alone it is centred in the compact button.
-        let icon = text(page_icon(page))
-            .size(if compact { 20 } else { 18 })
-            .style(theme::nav_icon(highlight));
-        let label: Element<'_, Message> = if compact {
-            container(icon)
-                .width(Length::Fill)
-                .center_x(Length::Fill)
-                .into()
-        } else {
-            row![
-                container(icon).width(22).center_x(22),
-                text(page.label()).size(15)
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center)
-            .into()
-        };
-        let item = button(label)
-            .width(Length::Fill)
-            .padding(if compact { 11 } else { 12 })
-            .style(theme::nav_button(highlight))
-            .on_press(Message::GoTo(page));
-        if compact {
-            tooltip(item, page.label(), tooltip::Position::Right).into()
-        } else {
-            item.into()
-        }
+        shell::nav_entry(
+            page.label(),
+            page_icon(page),
+            highlight_of(page),
+            compact,
+            Message::GoTo(page),
+        )
     };
-    for page in PAGES {
-        nav = nav.push(nav_entry(page));
-    }
-    nav = nav
-        .push(Space::new().height(Length::Fill))
-        .push(nav_entry(Page::Settings));
-    let sidebar = container(nav)
-        .width(if compact { 72 } else { 208 })
-        .height(Length::Fill)
-        .style(theme::sidebar);
+    let sidebar = shell::sidebar(
+        compact,
+        PAGES.into_iter().map(nav_entry).collect(),
+        nav_entry(Page::Settings),
+    );
     // The scan banner, the wizard and the plan each keep a slot while absent.
     // Widget state is matched by position, so a child that came and went would
     // shift the page and reset its scrolling and focus.
@@ -208,55 +162,12 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
     // Space plan review. "Start job" is disabled while the plan's own check
     // fails, and the failure is shown above it.
     let plan_slot = if let Some((command, plan)) = &state.planned {
-        let mut review = column![theme::section_title("Storage plan")].spacing(8);
-        if let Some((work, title)) = command_words(command) {
-            review = review.push(theme::muted(format!("{work} · {title}")));
-        }
-        for requirement in &plan.requirements {
-            review = review.push(
-                text(format!(
-                    "{}: {} needed including headroom · {} available",
-                    requirement.volume.path.display(),
-                    size(requirement.additional.saturating_add(requirement.headroom)),
-                    size(requirement.volume.available)
-                ))
-                .size(13),
-            );
-            review = review.push(theme::muted(requirement.reasons.join(" · ")));
-        }
-        if plan.retained_original {
-            review = review.push(theme::muted(
-                "The original is retained until you explicitly reclaim it.",
-            ));
-        }
-        let failed = plan.check().is_err();
-        if let Err(error) = plan.check() {
-            let short = shortfall(plan);
-            review = review.push(theme::danger_text(if short > 0 {
-                format!(
-                    "Not enough free space. Free about {} and check again.",
-                    size(short)
-                )
-            } else {
-                error.to_string()
-            }));
-        }
-        // The panel appears only when the plan failed, and the numbers in it
-        // do not change by themselves. The button plans the job again from
-        // the drive's current free space and starts it when it now fits.
-        review = review.push(
-            row![
-                action("Check again", Message::StartPlanned),
-                secondary("Cancel", Message::CancelPlanned)
-            ]
-            .spacing(8)
-            .wrap(),
-        );
-        below(if failed {
-            theme::attention_card(review, true)
-        } else {
-            panel(review)
-        })
+        below(shell::plan_review(
+            command_words(command).map(|(work, title)| format!("{work} · {title}")),
+            plan,
+            Message::StartPlanned,
+            Message::CancelPlanned,
+        ))
     } else {
         absent()
     };
@@ -279,18 +190,12 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         12.0
     };
     let offset = state.page_direction * distance * (1.0 - page_reveal);
-    body = body.push(super::surface::tracked_surface(
-        scrollable(
-            container(page)
-                .padding(theme::page_gutter(compact))
-                .width(Length::Fill),
-        )
-        .id(iced::widget::Id::new(page_key.label()))
-        .style(theme::scrollable)
-        .height(Length::Fill),
+    body = body.push(shell::page_surface(
+        page.into(),
+        page_key.label(),
+        compact,
         offset,
         !state.reduced_motion && state.motion != MotionPreference::Reduced,
-        page_key.label(),
         state.scroll_positions.clone(),
     ));
     // The bar for the job in progress, on every page but Jobs, which already
@@ -315,57 +220,8 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
             .padding(theme::page_gutter(compact).top(0)),
         );
     }
-    let base: Element<'_, Message> = container(row![sidebar, body])
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .style(theme::app_background)
-        .into();
-    // The toast is stacked over the window so it does not move the page. It
-    // fades in and moves 14 pixels into place. The stack is there without a
-    // toast too, for the reason the column above keeps its slots.
-    let Some(status) = &state.status else {
-        return stack([base, Space::new().into()])
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
-    };
-    let reveal = if state.reduced_motion {
-        1.0
-    } else {
-        state
-            .status_reveal
-            .interpolate(0.0, 1.0, std::time::Instant::now())
-    };
-    let toast = container(
-        row![
-            text("●").size(12).style(theme::toast_mark(status.is_error)),
-            text(&status.text).size(14).width(Length::Fill),
-            button(text("×").size(18))
-                .style(button::text)
-                .padding([3, 6])
-                .on_press(Message::Dismiss)
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center),
-    )
-    .padding(14)
-    .width(Length::Fill)
-    .max_width(380)
-    .style(theme::toast(status.is_error, reveal));
-    let overlay = container(toast)
-        .padding(
-            iced::Padding::default()
-                .right(20)
-                .bottom(20.0 + 14.0 * (1.0 - reveal)),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_x(Alignment::End)
-        .align_y(Alignment::End);
-    stack([base, overlay.into()])
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+    let base = shell::frame(sidebar, body.into());
+    shell::with_toast(base, &state.toast, state.reduced_motion, Message::Dismiss)
 }
 
 /// The body of the page `state.page` names.
@@ -400,19 +256,6 @@ fn command_words(command: &Command) -> Option<(&'static str, &str)> {
     }
 }
 
-/// How many bytes the plan's volumes are short by, summed.
-fn shortfall(plan: &crate::storage::SpacePlan) -> u64 {
-    plan.requirements
-        .iter()
-        .map(|requirement| {
-            requirement
-                .additional
-                .saturating_add(requirement.headroom)
-                .saturating_sub(requirement.volume.available)
-        })
-        .fold(0, u64::saturating_add)
-}
-
 /// The Overview headline: the saving so far, else what the library could
 /// save, else what the window is doing.
 fn headline(current: u64, potential: u64, scanning: bool, queuing: bool) -> String {
@@ -427,20 +270,6 @@ fn headline(current: u64, potential: u64, scanning: bool, queuing: bool) -> Stri
     } else {
         "Analyze your games".into()
     }
-}
-
-/// "1 item needs attention" or "N items need attention".
-fn attention_title(count: usize) -> String {
-    if count == 1 {
-        "1 item needs attention".into()
-    } else {
-        format!("{count} items need attention")
-    }
-}
-
-/// "1 game" or "N games".
-fn games_count(count: usize) -> String {
-    format!("{count} game{}", if count == 1 { "" } else { "s" })
 }
 
 /// The Games page when nothing is listed: a title, a hint, and the button
@@ -476,12 +305,12 @@ fn empty_games(state: &State) -> (&'static str, &'static str, Option<(&'static s
 /// The symbol drawn for a page in the sidebar.
 fn page_icon(page: Page) -> &'static str {
     match page {
-        Page::Overview => "⌂",
-        Page::Games => "◈",
-        Page::Queue => "☷",
+        Page::Overview => shell::icons::OVERVIEW,
+        Page::Games => shell::icons::GAMES,
+        Page::Queue => shell::icons::JOBS,
         Page::Drives => "▰",
         Page::Recovery => "⟲",
-        Page::Settings => "⚙",
+        Page::Settings => shell::icons::SETTINGS,
     }
 }
 
@@ -588,28 +417,11 @@ fn overview(state: &State) -> Element<'_, Message> {
     .spacing(theme::PAGE_GAP);
     if attention > 0 || !state.warnings.is_empty() {
         // Scan warnings are listed here, since no game row carries them.
-        let mut notes = column![theme::section_text(attention_title(
-            attention + state.warnings.len()
-        ))]
-        .spacing(4)
-        .width(Length::Fill);
-        for warning in state.warnings.iter().take(5) {
-            notes = notes.push(theme::warning_text(warning));
-        }
-        if state.warnings.len() > 5 {
-            notes = notes.push(theme::muted(format!(
-                "and {} more",
-                state.warnings.len() - 5
-            )));
-        }
-        if attention > 0 {
-            notes = notes.push(theme::muted("Review lists the games"));
-        }
-        let mut card = row![notes].spacing(12).align_y(Alignment::Center);
-        if attention > 0 {
-            card = card.push(secondary("Review", Message::ReviewAttention));
-        }
-        content = content.push(theme::attention_card(card, false));
+        content = content.push(shell::attention_notes(
+            attention,
+            &state.warnings,
+            Some(Message::ReviewAttention),
+        ));
     }
     if !state.drives.is_empty() {
         content = content.push(theme::section_title("Drives"));
@@ -793,11 +605,9 @@ fn games(state: &State, compact: bool) -> Element<'_, Message> {
     }
     if filtered.is_empty() {
         let (title, hint, way_out) = empty_games(state);
-        let mut message = column![theme::section_text(title), theme::muted(hint)].spacing(10);
-        if let Some((label, press)) = way_out {
-            message = message.push(secondary(label, press));
-        }
-        return content.push(panel(message)).into();
+        return content
+            .push(shell::empty_panel(title, hint, way_out))
+            .into();
     }
     if state.order_stale {
         content = content.push(panel(
@@ -897,37 +707,14 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
     let game = &item.game;
     let id = game.id.to_string();
     let compressed = state.compressed(game);
-    // Artwork tile. The sensor asks for a decode when the tile is first
-    // shown, and the title's first letter stands in until an image arrives.
-    // Clicking the tile opens the row like the rest of the header does.
-    let artwork_size = if compact { 44 } else { 52 };
-    let fallback = || {
-        container(text(game.title.chars().next().unwrap_or('F').to_string()).size(23))
-            .center(artwork_size)
-            .style(theme::panel)
-    };
-    let icon: Element<'_, Message> = match &item.artwork {
-        Some(source) => {
-            let cached = state.artwork_cache.get(source);
-            let has_image = cached.is_some();
-            let tile: Element<'_, Message> = match cached {
-                Some(handle) => image(handle.clone())
-                    .width(artwork_size)
-                    .height(artwork_size)
-                    .content_fit(iced::ContentFit::Cover)
-                    .into(),
-                None => fallback().into(),
-            };
-            let source = source.clone();
-            // The key changes when the image is evicted from the cache, which
-            // makes the sensor ask for it again.
-            iced::widget::sensor(tile)
-                .key((source.clone(), has_image))
-                .on_show(move |_| Message::ArtworkVisible(source.clone()))
-                .into()
-        }
-        None => fallback().into(),
-    };
+    // Artwork tile. Clicking it opens the row like the rest of the header does.
+    let icon = shell::artwork_tile(
+        &state.artwork_cache,
+        item.artwork.as_ref(),
+        &game.title,
+        shell::Tile::Row(if compact { 44 } else { 52 }),
+        Message::ArtworkVisible,
+    );
     let icon = button(icon)
         .style(button::text)
         .padding(0)
@@ -1070,27 +857,15 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
         .spacing(12);
         // The cover sits to the left of everything else in the pane. On a
         // narrow window there is no room for it.
-        let mut cover_tile: Option<Element<'_, Message>> = None;
-        if let Some(source) = item.cover.as_ref().filter(|_| !compact) {
-            let cover: Element<'_, Message> = match state.artwork_cache.get(source) {
-                Some(handle) => image(handle.clone())
-                    .width(128)
-                    .height(192)
-                    .content_fit(iced::ContentFit::Contain)
-                    .into(),
-                None => container(theme::muted("Local artwork"))
-                    .center_x(128)
-                    .center_y(192)
-                    .into(),
-            };
-            let source = source.clone();
-            cover_tile = Some(
-                iced::widget::sensor(cover)
-                    .key(source.clone())
-                    .on_show(move |_| Message::ArtworkVisible(source.clone()))
-                    .into(),
-            );
-        }
+        let cover_tile = item.cover.as_ref().filter(|_| !compact).map(|source| {
+            shell::artwork_tile(
+                &state.artwork_cache,
+                Some(source),
+                &game.title,
+                shell::Tile::Cover,
+                Message::ArtworkVisible,
+            )
+        });
         // The one choice that matters: how this game is compressed. Each mode
         // shows what it is predicted to save once the game is analyzed.
         let stored = state
@@ -1799,12 +1574,7 @@ fn queue(state: &State) -> Element<'_, Message> {
     if let Some(game) = &state.snapshot.gaming {
         content = content.push(panel(text(format!("Paused while you play {game}"))));
     }
-    for (title, group) in [
-        ("Running", 0),
-        ("Waiting", 1),
-        ("Needs attention", 2),
-        ("History", 3),
-    ] {
+    for (group, (title, empty)) in shell::JOB_GROUPS.into_iter().enumerate() {
         let jobs: Vec<_> = state
             .snapshot
             .jobs
@@ -1824,17 +1594,12 @@ fn queue(state: &State) -> Element<'_, Message> {
             .collect();
         content = content.push(theme::section_text(format!("{title} · {}", jobs.len())));
         if jobs.is_empty() {
-            content = content.push(theme::muted(match group {
-                0 => "No jobs running",
-                1 => "No games waiting",
-                2 => "No jobs need attention",
-                _ => "Finished jobs will appear here",
-            }));
+            content = content.push(theme::muted(empty));
         }
         let rows: Vec<_> = if group == 3 {
             jobs.into_iter()
                 .rev()
-                .take(20)
+                .take(shell::HISTORY_LIMIT)
                 .map(|job| (job.id, completed_job_row(job)))
                 .collect()
         } else {
@@ -2072,10 +1837,9 @@ fn preferences(state: &State) -> Element<'_, Message> {
         container(panel(
             column![
                 theme::section_title("Appearance"),
-                row![
-                    column![text("Theme"), theme::muted("Use the desktop theme")]
-                        .spacing(3)
-                        .width(Length::Fill),
+                shell::setting_row(
+                    "Theme",
+                    "Use the desktop theme",
                     picker(
                         [
                             ThemePreference::System,
@@ -2085,24 +1849,14 @@ fn preferences(state: &State) -> Element<'_, Message> {
                         Some(state.theme),
                         Message::Theme
                     )
-                ]
-                .spacing(16)
-                .align_y(Alignment::Center),
-                row![
-                    column![
-                        text("Motion"),
-                        theme::muted(match state.motion {
-                            MotionPreference::Expressive => {
-                                "Smooth transitions"
-                            }
-                            MotionPreference::Subtle => "Short transitions",
-                            MotionPreference::Reduced => {
-                                "No transitions"
-                            }
-                        })
-                    ]
-                    .spacing(3)
-                    .width(Length::Fill),
+                ),
+                shell::setting_row(
+                    "Motion",
+                    match state.motion {
+                        MotionPreference::Expressive => "Smooth transitions",
+                        MotionPreference::Subtle => "Short transitions",
+                        MotionPreference::Reduced => "No transitions",
+                    },
                     picker(
                         [
                             MotionPreference::Expressive,
@@ -2112,9 +1866,7 @@ fn preferences(state: &State) -> Element<'_, Message> {
                         Some(state.motion),
                         Message::Motion
                     )
-                ]
-                .spacing(16)
-                .align_y(Alignment::Center)
+                )
             ]
             .spacing(18)
         )).id("settings-appearance"),
@@ -2125,15 +1877,11 @@ fn preferences(state: &State) -> Element<'_, Message> {
                 secondary_maybe("Import report…", (!state.picker_busy).then_some(Message::Browse(super::dialog::Target::Report)))
             ].spacing(8)
         )).id("settings-reports"),
-        container(panel(
-            column![
-                theme::section_title("About Flummox"),
-                theme::muted(format!("Version {}", env!("CARGO_PKG_VERSION"))),
-                secondary("What changed", Message::OpenChangelog),
-                theme::muted(super::CHANGELOG_URL)
-            ]
-            .spacing(8)
-        )).id("settings-about")
+        container(shell::about_card(
+            format!("Version {}", env!("CARGO_PKG_VERSION")),
+            Message::OpenChangelog
+        ))
+        .id("settings-about")
     ]
     .spacing(theme::PAGE_GAP)
     .into()
@@ -2234,22 +1982,6 @@ mod tests {
     }
 
     #[test]
-    fn counts_agree_with_their_nouns() -> TestResult {
-        check_eq(
-            attention_title(1),
-            "1 item needs attention".to_owned(),
-            "one",
-        )?;
-        check_eq(
-            attention_title(3),
-            "3 items need attention".to_owned(),
-            "many",
-        )?;
-        check_eq(games_count(1), "1 game".to_owned(), "one game")?;
-        check_eq(games_count(0), "0 games".to_owned(), "no games")
-    }
-
-    #[test]
     fn an_empty_games_page_says_why() -> TestResult {
         let mut state = State::new(Env::from_home("/fixture"));
         state.scanning = true;
@@ -2297,25 +2029,5 @@ mod tests {
             matches!(way_out, Some((_, Message::ClearFilters))),
             "offers to clear them",
         )
-    }
-
-    #[test]
-    fn a_plan_reports_how_far_short_it_is() -> TestResult {
-        let requirement = |available| crate::storage::Requirement {
-            volume: crate::storage::Volume {
-                identity: "fixture".into(),
-                path: "/Games".into(),
-                available,
-            },
-            additional: 4_000,
-            headroom: 200,
-            reasons: vec![],
-        };
-        let plan = |available| crate::storage::SpacePlan {
-            retained_original: false,
-            requirements: vec![requirement(available)],
-        };
-        check_eq(shortfall(&plan(1_200)), 3_000, "needed minus available")?;
-        check_eq(shortfall(&plan(10_000)), 0, "control: room to spare")
     }
 }

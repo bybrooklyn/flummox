@@ -367,8 +367,8 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
         "This game is excluded. Restore it in Drives first.",
     ));
     render(&state, 720, 720, &output.join("toast-error-narrow.png"))?;
-    state.status = None;
-    state.status_deadline = None;
+    state.toast.status = None;
+    state.toast.deadline = None;
     state.page = Page::Games;
     state.expanded = None;
     state.snapshot.scan_source = Some("Steam".into());
@@ -548,7 +548,7 @@ fn a_toast_or_scan_banner_leaves_the_page_where_it_was_scrolled() -> TestResult 
         Some(300.0),
         "a toast appearing keeps the offset",
     )?;
-    state.status = None;
+    state.toast.status = None;
     crate::testutil::check_eq(
         offset(&state, &mut tree, None),
         Some(300.0),
