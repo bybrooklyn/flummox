@@ -489,7 +489,12 @@ fn apply(
                 .iter_mut()
                 .find(|j| j.id == id)
                 .context("Job no longer exists")?;
-            ensure!(job.phase.active(), "This job has finished");
+            // The window redraws once a second, so a Pause can arrive for a
+            // job that has just finished. That is not an error to report: the
+            // reply carries the snapshot that shows the job as done.
+            if !job.phase.active() {
+                return Ok(());
+            }
             job.user_paused = paused;
             if job.phase == Phase::Queued
                 || (job.phase == Phase::Paused
@@ -663,6 +668,27 @@ pub(super) fn invalidate_receipts(store: &Path, game: &Path, keep: Option<&str>)
         params![game.as_os_str().as_bytes(), keep],
     )?;
     Ok(())
+}
+
+/// Tells queued jobs what they are behind when the running job is one the
+/// user paused. That job keeps the only slot, and without this the queue
+/// looks stuck for no reason.
+fn note_waiting(snapshot: &mut Snapshot, running: Option<i64>) {
+    let holder = running
+        .and_then(|id| snapshot.jobs.iter().find(|job| job.id == id))
+        .filter(|job| job.user_paused)
+        .map(|job| format!("Waiting for {}, which is paused", job.game.title));
+    for job in snapshot
+        .jobs
+        .iter_mut()
+        .filter(|job| job.phase == Phase::Queued)
+    {
+        match &holder {
+            Some(reason) => job.message.clone_from(reason),
+            None if job.message.starts_with("Waiting for ") => job.message = "Queued".into(),
+            None => {}
+        }
+    }
 }
 
 /// Why a job is held, in the order a user can act on it.
@@ -1677,6 +1703,13 @@ pub(super) fn run() -> Result<()> {
             }
         }
         poll_pack(&mut pack_active, &mut snapshot, &db, &mut mounts)?;
+        note_waiting(
+            &mut snapshot,
+            active
+                .as_ref()
+                .map(|a| a.id)
+                .or(pack_active.as_ref().map(|p| p.id)),
+        );
         // Choose the next job, only when nothing is running and no game is
         // being played. Candidates are queued, not paused by the user, not
         // excluded, and their game is discovered and idle. Requested work
@@ -2078,6 +2111,77 @@ mod tests {
             "interrupted undo cannot revive old compression receipts",
         )
     }
+    #[test]
+    fn a_late_pause_is_harmless_and_waiting_jobs_say_what_holds_them() -> TestResult {
+        let temp = tempfile::tempdir().ctx("queue fixture")?;
+        let database = temp.path().join("queue.sqlite");
+        let (db, mut snapshot) = open_store(&database).ctx("queue")?;
+        for name in ["First", "Second"] {
+            let folder = temp.path().join(name);
+            std::fs::create_dir(&folder).ctx("fixture game")?;
+            enqueue_job(
+                &mut snapshot,
+                Game {
+                    id: crate::model::GameId::new(crate::model::Launcher::Manual, name),
+                    also: vec![],
+                    title: name.into(),
+                    install_dir: folder,
+                    build: None,
+                    size_hint: None,
+                    state: crate::model::InstallState::Idle,
+                    is_tool: false,
+                },
+                Operation::Compress,
+                CompressOpts::default(),
+                None,
+                &db,
+            )
+            .ctx("enqueue")?;
+        }
+        let first = snapshot.jobs.first().ctx("first job")?.id;
+        let message = |snapshot: &Snapshot| -> Result<String, String> {
+            Ok(snapshot.jobs.last().ctx("second job")?.message.clone())
+        };
+        // The first job is running and the user has paused it.
+        {
+            let job = snapshot.jobs.first_mut().ctx("first job")?;
+            job.phase = Phase::Paused;
+            job.user_paused = true;
+        }
+        note_waiting(&mut snapshot, Some(first));
+        check_eq(
+            message(&snapshot)?.as_str(),
+            "Waiting for First, which is paused",
+            "the queued job names what it is behind",
+        )?;
+        snapshot.jobs.first_mut().ctx("first job")?.user_paused = false;
+        note_waiting(&mut snapshot, Some(first));
+        check_eq(
+            message(&snapshot)?.as_str(),
+            "Queued",
+            "control: the note goes when the pause does",
+        )?;
+        // A Pause that arrives after the job finished changes nothing and is
+        // not an error.
+        snapshot.jobs.first_mut().ctx("first job")?.phase = Phase::Completed;
+        apply(
+            Command::Pause {
+                id: first,
+                paused: true,
+            },
+            &mut snapshot,
+            &db,
+            &mut None,
+            &mut Vec::new(),
+            None,
+        )
+        .ctx("pause a finished job")?;
+        check(
+            !snapshot.jobs.first().ctx("first job")?.user_paused,
+            "a finished job is not marked paused",
+        )
+    }
+
     #[test]
     fn pack_controls_and_retries_preserve_durable_task_parameters() -> TestResult {
         use crate::pack::Observer;

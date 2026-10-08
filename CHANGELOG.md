@@ -26,6 +26,16 @@ version has no download yet. [Full notes](docs/releases/0.0.2.md).
 
 ### Changed
 
+- Each game has one choice of how to compress it: Standard or Maximum, each
+  with what it is predicted to save. The preset list and store controls moved
+  under Advanced. Maximum can be chosen for a game without a compatibility
+  report; the original is kept until you confirm the game runs.
+- Compress starts straight away when the drive has room and leaves you on the
+  page you were on. It used to open a storage plan to confirm and jump to
+  Settings.
+- Jobs have their own page in the sidebar.
+- Queued jobs behind a job you paused say what they are waiting for.
+
 - The Games page opens with the games worth compressing at the top, grouped
   as Worth compressing, Not analyzed yet, Compressed and Little to gain.
 - A compressed game says what it gained, on its row and in History. Native
@@ -62,6 +72,11 @@ open items are listed there.
   to skip appear as scan warnings.
 
 ### Fixed
+
+- Pressing Pause just as a job finished showed a lost-connection error that
+  stayed on screen. It is now ignored.
+- Compressing several games no longer fails entirely when one of them cannot
+  be compressed that way; that game is left out and counted.
 
 - The saved-space total no longer shrinks after a game update. A second pass
   analyses only the changed files, and its figure used to replace the first.
