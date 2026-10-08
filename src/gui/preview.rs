@@ -200,6 +200,11 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
         render(&state, 1100, 900, &output.join(format!("{name}-light.png")))?;
         state.theme = crate::jobs::ThemePreference::Dark;
     }
+    // The details pane as it first opens, with Advanced closed.
+    let advanced = std::mem::take(&mut state.advanced);
+    state.page = Page::Games;
+    render(&state, 1100, 700, &output.join("games-details.png"))?;
+    state.advanced = advanced;
     // The Games list with no row open, so every group heading is in view,
     // then with the last group expanded.
     let open = state.expanded.take();

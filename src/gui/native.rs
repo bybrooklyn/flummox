@@ -198,7 +198,7 @@ struct State {
     /// Sign of the transition offset: -1.0 towards an earlier page, 1.0 otherwise.
     direction: f32,
     /// Last scroll offset per page label, restored on navigation.
-    scroll_positions: std::collections::HashMap<&'static str, f32>,
+    scroll_positions: super::surface::Positions,
     games: Vec<crate::model::Game>,
     /// Text of the selected-folder field. Every action targets this path.
     folder: String,
@@ -307,7 +307,6 @@ enum Message {
     BrowseArtwork(String),
     ArtworkPicked(String, std::result::Result<Option<PathBuf>, String>),
     ArtworkSaved(std::result::Result<(), String>),
-    Scrolled(Page, f32),
     /// Carries nothing. Its arrival makes iced redraw.
     Tick,
     /// The selected-folder field was edited.
@@ -702,20 +701,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     page.label(),
                     iced::widget::operation::AbsoluteOffset {
                         x: None,
-                        y: Some(
-                            state
-                                .scroll_positions
-                                .get(page.label())
-                                .copied()
-                                .unwrap_or_default(),
-                        ),
+                        y: Some(super::surface::recorded(
+                            &state.scroll_positions,
+                            page.label(),
+                        )),
                     },
                 )
                 .chain(Task::done(Message::Tick));
             }
-        }
-        Message::Scrolled(page, offset) => {
-            state.scroll_positions.insert(page.label(), offset);
         }
         Message::Tick => {}
 
@@ -1384,15 +1377,15 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
     } else {
         state.reveal.interpolate(0.0, 1.0, Instant::now())
     };
-    let body = super::surface::surface(
+    let body = super::surface::tracked_surface(
         scrollable(container(content).padding(24).width(Length::Fill))
             // The scrollable's id is the page label. `scroll_to` in `update` targets it.
             .id(page.label())
-            .on_scroll(move |viewport| Message::Scrolled(page, viewport.absolute_offset().y))
             .height(Length::Fill),
         state.direction * state.preferences.motion.distance() * (1.0 - reveal),
         state.preferences.motion != MotionChoice::Reduced,
         page.label(),
+        state.scroll_positions.clone(),
     );
     let mut navigation = column![text("Flummox").size(23), Space::new().height(16)]
         .spacing(10)

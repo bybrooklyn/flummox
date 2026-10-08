@@ -280,19 +280,19 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         12.0
     };
     let offset = state.page_direction * distance * (1.0 - page_reveal);
-    body = body.push(super::surface::surface(
+    body = body.push(super::surface::tracked_surface(
         scrollable(
             container(page)
                 .padding(if compact { 16 } else { 24 })
                 .width(Length::Fill),
         )
         .id(iced::widget::Id::new(page_key.label()))
-        .on_scroll(move |viewport| Message::Scrolled(page_key, viewport.absolute_offset().y))
         .style(theme::scrollable)
         .height(Length::Fill),
         offset,
         !state.reduced_motion && state.motion != MotionPreference::Reduced,
         page_key.label(),
+        state.scroll_positions.clone(),
     ));
     // The bar for the job in progress, on every page but Jobs, which already
     // shows it.
@@ -941,8 +941,11 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
             item.filesystem,
             game.install_dir.display()
         ))]
-        .spacing(10);
-        if let Some(source) = &item.cover {
+        .spacing(12);
+        // The cover sits to the left of everything else in the pane. On a
+        // narrow window there is no room for it.
+        let mut cover_tile: Option<Element<'_, Message>> = None;
+        if let Some(source) = item.cover.as_ref().filter(|_| !compact) {
             let cover: Element<'_, Message> = match state.artwork_cache.get(source) {
                 Some(handle) => image(handle.clone())
                     .width(128)
@@ -955,10 +958,11 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                     .into(),
             };
             let source = source.clone();
-            details = details.push(
+            cover_tile = Some(
                 iced::widget::sensor(cover)
                     .key(source.clone())
-                    .on_show(move |_| Message::ArtworkVisible(source.clone())),
+                    .on_show(move |_| Message::ArtworkVisible(source.clone()))
+                    .into(),
             );
         }
         // The one choice that matters: how this game is compressed. Each mode
@@ -986,11 +990,13 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                     Some(saving) => format!("{name} · about {}", size(saving)),
                     None => name.to_owned(),
                 };
-                let pick = (choice != chosen).then(|| Message::Choice(id.clone(), choice));
+                // The chosen mode is the filled button. Pressing it again
+                // changes nothing, which keeps it from looking disabled.
+                let pick = Message::Choice(id.clone(), choice);
                 modes = modes.push(if choice == chosen {
-                    action_maybe(label, pick)
+                    action(label, pick)
                 } else {
-                    secondary_maybe(label, pick)
+                    secondary(label, pick)
                 });
             }
             details = details
@@ -1010,18 +1016,20 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                         secondary(
                             "Decompress",
                             Message::One(id.clone(), Operation::Decompress)
-                        )
+                        ),
+                        Space::new().width(Length::Fill),
+                        button(text(if state.advanced.contains(&id) {
+                            "Hide advanced"
+                        } else {
+                            "Advanced"
+                        }))
+                        .style(button::text)
+                        .padding([9, 4])
+                        .on_press(Message::ToggleAdvanced(id.clone()))
                     ]
-                    .spacing(8),
-                )
-                .push(secondary(
-                    if state.advanced.contains(&id) {
-                        "Hide advanced"
-                    } else {
-                        "Advanced"
-                    },
-                    Message::ToggleAdvanced(id.clone()),
-                ));
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                );
         }
         // Advanced: the native preset, then the store controls.
         let preset_id = id.clone();
@@ -1199,80 +1207,99 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
         if let Some(note) = &item.note {
             details = details.push(theme::muted(note));
         }
-        if state.advanced.contains(&id) {
-            details = details.push(secondary_maybe(
-                "Qualify compatibility",
-                item.game
-                    .state
-                    .is_idle()
-                    .then(|| Message::Qualify(id.clone())),
-            ));
+        // One plain line about how far to trust the figures.
+        if let Some(est) = state.estimate(game)
+            && let Some(choice) = state.recommendation(game)
+        {
+            details = details.push(theme::muted(if est.unsampled_files > 0 {
+                format!(
+                    "{}. The largest files were sampled and the rest scaled in.",
+                    choice.confidence.label()
+                )
+            } else {
+                format!("{}.", choice.confidence.label())
+            }));
         }
-        details = details.push(secondary(
-            "Exclude",
-            Message::Send(Command::Exclude {
-                id: id.clone(),
-                excluded: true,
-            }),
-        ));
-        // What the analysis found: the recommendation and its reasons, the
-        // qualification state, and how much was sampled.
-        if let Some(est) = state.estimate(game) {
-            if let Some(choice) = state.recommendation(game) {
-                details = details
-                    .push(text(choice.mode.label()).size(16))
-                    .push(theme::muted(format!(
-                        "{} · native ~{}{}",
-                        choice.confidence.label(),
+        // Advanced, continued: reports, exclusion, and what the analysis saw.
+        if state.advanced.contains(&id) {
+            details = details.push(
+                row![
+                    secondary_maybe(
+                        "Qualify compatibility",
+                        item.game
+                            .state
+                            .is_idle()
+                            .then(|| Message::Qualify(id.clone())),
+                    ),
+                    secondary_maybe(
+                        "Import compatibility report…",
+                        (!state.picker_busy)
+                            .then_some(Message::Browse(super::dialog::Target::Report)),
+                    ),
+                    secondary(
+                        "Exclude this game",
+                        Message::Send(Command::Exclude {
+                            id: id.clone(),
+                            excluded: true,
+                        }),
+                    )
+                ]
+                .spacing(8)
+                .wrap(),
+            );
+            if let Some(est) = state.estimate(game) {
+                let mut facts = Vec::new();
+                if let Some(choice) = state.recommendation(game) {
+                    facts.push(format!(
+                        "Standard about {}{}",
                         size(choice.native_saving),
                         choice
                             .maximum_saving
-                            .map(|saving| format!(" · Maximum Space sample ~{}", size(saving)))
+                            .map(|saving| format!(" · Maximum sample about {}", size(saving)))
                             .unwrap_or_default()
-                    )))
-                    .push(theme::muted(choice.reasons.join("\n")));
-            }
-            details = details.push(theme::muted(if est.maximum_qualified { "Maximum Space qualification matches this build and its installed files" } else { "Automatic Maximum Space requires an imported qualification and matching installed files" }));
-            details = details.push(secondary_maybe(
-                "Import compatibility report…",
-                (!state.picker_busy).then_some(Message::Browse(super::dialog::Target::Report)),
-            ));
-            details = details.push(theme::muted(format!(
-                "Sampled {} · {} inspected · {} skipped. Estimated saving{}.",
-                size(est.sampled),
-                est.inspected_files,
-                est.skipped_files,
-                if est.already_compressed_mount {
-                    " of additional space on an already compressed drive"
-                } else {
-                    ""
+                    ));
                 }
-            )));
-            if est.small_files.files > 0 {
-                details = details.push(theme::muted(format!("Small-file sample: {} across {} files · grouping saved an extra {} in {} files. This is separate from the estimate above.", size(est.small_files.bytes), est.small_files.files, size(est.small_files.extra_payload_saving), est.small_files.grouped_files)));
-            }
-            let evidence = est.format_evidence;
-            details = details.push(theme::muted(format!(
-                "Formats: {} known · {} unknown · {} encoded · {} containers · {} raw{}",
-                evidence.recognized_files,
-                evidence.unknown_files,
-                evidence.encoded_files,
-                evidence.container_files,
-                evidence.raw_media_files,
-                if evidence.encrypted_files > 0 {
-                    format!(" · {} encrypted", evidence.encrypted_files)
-                } else {
-                    String::new()
+                facts.push(format!(
+                    "Sampled {} from {} files · {} skipped · {} not sampled{}",
+                    size(est.sampled),
+                    est.inspected_files,
+                    est.skipped_files,
+                    est.unsampled_files,
+                    if est.already_compressed_mount {
+                        " · savings are on top of the drive's own compression"
+                    } else {
+                        ""
+                    }
+                ));
+                let evidence = est.format_evidence;
+                facts.push(format!(
+                    "Formats: {} known · {} unknown · {} encoded · {} containers · {} raw{}",
+                    evidence.recognized_files,
+                    evidence.unknown_files,
+                    evidence.encoded_files,
+                    evidence.container_files,
+                    evidence.raw_media_files,
+                    if evidence.encrypted_files > 0 {
+                        format!(" · {} encrypted", evidence.encrypted_files)
+                    } else {
+                        String::new()
+                    }
+                ));
+                if est.small_files.files > 0 {
+                    facts.push(format!(
+                        "Small files: {} in {} files · grouping would save {} more",
+                        size(est.small_files.bytes),
+                        est.small_files.files,
+                        size(est.small_files.extra_payload_saving)
+                    ));
                 }
-            )));
-        }
-        if let Some(est) = state.estimate(game)
-            && est.unsampled_files > 0
-        {
-            details = details.push(theme::muted(format!(
-                "{} files were not sampled",
-                est.unsampled_files
-            )));
+                facts.push(if est.maximum_qualified {
+                    "A compatibility report matches this build and its files".into()
+                } else {
+                    "No compatibility report matches this build".into()
+                });
+                details = details.push(theme::muted(facts.join("\n")));
+            }
         }
         if let Some(job) = state.latest(game)
             && !job.errors.is_empty()
@@ -1286,8 +1313,12 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                 .detail
                 .interpolate(0.0, 1.0, std::time::Instant::now())
         };
+        let pane: Element<'_, Message> = match cover_tile {
+            Some(cover) => row![cover, details.width(Length::Fill)].spacing(18).into(),
+            None => details.into(),
+        };
         contents = contents.push(super::surface::surface(
-            container(details),
+            container(pane),
             6.0 * (1.0 - reveal),
             false,
             "game-details",

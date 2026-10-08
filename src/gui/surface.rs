@@ -4,12 +4,30 @@ use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, overlay, r
 use iced::{Element, Event, Length, Rectangle, Size, Vector};
 use std::time::{Duration, Instant};
 
+/// Where each page's scrollable is scrolled to, by scrollable id.
+///
+/// The surface wrapping a scrollable writes here on every frame. The
+/// application reads it when it returns to a page. A message for each scroll
+/// step would do the same job, but every message rebuilds the page, which made
+/// an eased wheel step rebuild it on every frame.
+pub type Positions = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<&'static str, f32>>>;
+
+/// The offset last recorded for the scrollable with this id, or the top.
+pub fn recorded(positions: &Positions, key: &str) -> f32 {
+    positions
+        .lock()
+        .ok()
+        .and_then(|offsets| offsets.get(key).copied())
+        .unwrap_or_default()
+}
+
 /// Wraps `content`, drawing it `offset` pixels lower and clipped to its own
 /// bounds.
 ///
 /// With `smooth`, line-based wheel steps over the first scrollable inside are
 /// eased. `key` must be that scrollable's widget id, and a changed `key`
 /// resets the easing state.
+#[cfg(target_os = "linux")]
 pub fn surface<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
     offset: f32,
@@ -22,6 +40,24 @@ pub fn surface<'a, Message: 'a>(
         smooth,
         key,
         animating: false,
+        positions: None,
+    })
+}
+/// [`surface`], also recording the scrollable's offset under `key`.
+pub fn tracked_surface<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    offset: f32,
+    smooth: bool,
+    key: &'static str,
+    positions: Positions,
+) -> Element<'a, Message> {
+    Element::new(Surface {
+        content: content.into(),
+        offset,
+        smooth,
+        key,
+        animating: false,
+        positions: Some(positions),
     })
 }
 /// Requests future redraws while application animations are active.
@@ -35,6 +71,7 @@ pub fn animate<'a, Message: 'a>(
         smooth: false,
         key: "animation-driver",
         animating,
+        positions: None,
     })
 }
 /// The widget behind both `surface` and `animate`.
@@ -46,6 +83,8 @@ struct Surface<'a, Message> {
     key: &'static str,
     /// Ask for another frame after each redraw.
     animating: bool,
+    /// Where to record the scrollable's offset, if anywhere.
+    positions: Option<Positions>,
 }
 /// One eased wheel movement, kept in the widget tree between frames.
 #[derive(Default)]
@@ -277,6 +316,23 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
         self.content.as_widget_mut().update(
             child, event, bounds, cursor, renderer, clipboard, shell, viewport,
         );
+        // Record where the scrollable ended up, once a frame.
+        if let Some(positions) = &self.positions
+            && matches!(
+                event,
+                Event::Window(iced::window::Event::RedrawRequested(_))
+            )
+        {
+            let mut position = Position::default();
+            self.content
+                .as_widget_mut()
+                .operate(child, bounds, renderer, &mut position);
+            if position.found
+                && let Ok(mut offsets) = positions.lock()
+            {
+                offsets.insert(self.key, position.current);
+            }
+        }
         // Page Up and Page Down move 90 percent of the visible height. Home
         // and End go to the edges.
         // Inputs and open menus get first refusal, so Home/End still edit text.

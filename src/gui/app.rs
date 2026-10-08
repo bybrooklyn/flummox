@@ -316,7 +316,7 @@ pub struct State {
     /// 1.0 when the last page change went to a later page, -1.0 to an earlier.
     pub page_direction: f32,
     /// The last scroll offset of each main page, by page label.
-    pub scroll_positions: std::collections::HashMap<String, f32>,
+    pub scroll_positions: super::surface::Positions,
     /// True once any snapshot has arrived.
     pub snapshot_loaded: bool,
     /// The error from the last failed snapshot request.
@@ -929,8 +929,6 @@ pub enum Message {
     Jump(&'static str),
     /// The measured position of a section, ready to scroll to.
     JumpOffset(f32),
-    /// The user scrolled a page to this offset.
-    Scrolled(Page, f32),
     /// An artwork tile came into view and wants its image decoded.
     ArtworkVisible(super::artwork::Source),
     ArtworkLoaded(super::artwork::Source, Option<iced::widget::image::Handle>),
@@ -1434,11 +1432,6 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             Err(error) => state.show_status(Status::error(error)),
         },
         // Navigation and scrolling.
-        Message::Scrolled(page, offset) => {
-            state
-                .scroll_positions
-                .insert(page.main().label().into(), offset);
-        }
         Message::Jump(section) => {
             // `GoTo` can return artwork decodes it has already marked as
             // pending. Dropping that task left them pending for good, and
@@ -1487,11 +1480,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 return super::surface::jump(section, Message::JumpOffset);
             }
             if changed {
-                let offset = state
-                    .scroll_positions
-                    .get(page.label())
-                    .copied()
-                    .unwrap_or_default();
+                let offset = super::surface::recorded(&state.scroll_positions, page.label());
                 return iced::widget::operation::scroll_to(
                     page.label(),
                     iced::widget::operation::AbsoluteOffset {
