@@ -1033,6 +1033,29 @@ enum Command {
     Recovery,
     Recover { folder: PathBuf },
 }
+// A flag that SIGINT and SIGTERM raise, so a pass stops between files and its
+// current work directory is removed.
+fn interrupt_flag() -> Result<std::sync::Arc<AtomicBool>> {
+    let flag = std::sync::Arc::new(AtomicBool::new(false));
+    for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+        let _id = signal_hook::flag::register(signal, std::sync::Arc::clone(&flag))
+            .with_context(|| format!("installing the handler for signal {signal}"))?;
+    }
+    Ok(flag)
+}
+// A progress reporter that writes running totals to stderr, at most once a second.
+fn stderr_progress() -> impl FnMut(Progress) {
+    let mut last = std::time::Instant::now();
+    move |progress| {
+        if last.elapsed() >= std::time::Duration::from_secs(1) {
+            last = std::time::Instant::now();
+            eprintln!(
+                "{} files, {} changed, {} skipped",
+                progress.files, progress.changed, progress.skipped
+            );
+        }
+    }
+}
 // Runs the macOS command line tool.
 pub fn run() -> Result<()> {
     match Args::parse().command {
@@ -1050,11 +1073,11 @@ pub fn run() -> Result<()> {
         ),
         Command::Compress { folder } => println!(
             "{}",
-            optimize_folder_with(&folder, &AtomicBool::new(false), |_| {})?
+            optimize_folder_with(&folder, &interrupt_flag()?, stderr_progress())?
         ),
         Command::Decompress { folder } => println!(
             "{}",
-            restore_folder_with(&folder, &AtomicBool::new(false), |_| {})?
+            restore_folder_with(&folder, &interrupt_flag()?, stderr_progress())?
         ),
         Command::Recovery => println!("{}", serde_json::to_string_pretty(&recovery()?)?),
         Command::Recover { folder } => recover_folder(&folder)?,
