@@ -64,8 +64,8 @@ enum Command {
         selector: String,
         #[command(flatten)]
         level: LevelArgs,
-        /// Files to work on at once.
-        #[arg(long, default_value_t = 2)]
+        /// Files to work on at once (1 to 32).
+        #[arg(long, default_value_t = 2, value_parser = thread_count)]
         threads: usize,
         /// Compress even when the game looks busy.
         #[arg(long)]
@@ -114,8 +114,8 @@ enum Command {
         action: Option<WatchAction>,
         #[command(flatten)]
         level: LevelArgs,
-        /// Files to work on at once.
-        #[arg(long, default_value_t = 2)]
+        /// Files to work on at once (1 to 32).
+        #[arg(long, default_value_t = 2, value_parser = thread_count)]
         threads: usize,
         /// Report what would be compressed, without writing anything.
         #[arg(long)]
@@ -234,9 +234,32 @@ struct LevelArgs {
     /// Compression preset.
     #[arg(long, value_enum, default_value_t = PresetArg::Balanced)]
     preset: PresetArg,
-    /// Explicit zstd level, overriding the preset (-15 to 15 on btrfs).
-    #[arg(long)]
+    /// Explicit zstd level, overriding the preset (-15 to 15, not 0).
+    #[arg(long, value_parser = zstd_level)]
     level: Option<i32>,
+}
+
+/// Accepts the levels btrfs can apply. Zero is refused because the database
+/// reads a recorded level of 0 as "not compressed".
+fn zstd_level(text: &str) -> Result<i32, String> {
+    let level: i32 = text
+        .parse()
+        .map_err(|_| format!("{text:?} is not a whole number"))?;
+    if level == 0 || !(-15..=15).contains(&level) {
+        return Err("choose a level from -15 to 15, other than 0".to_owned());
+    }
+    Ok(level)
+}
+
+/// Accepts the worker counts the coordinator accepts.
+fn thread_count(text: &str) -> Result<usize, String> {
+    let threads: usize = text
+        .parse()
+        .map_err(|_| format!("{text:?} is not a whole number"))?;
+    if !(1..=32).contains(&threads) {
+        return Err("choose between 1 and 32 threads".to_owned());
+    }
+    Ok(threads)
 }
 
 impl LevelArgs {
@@ -288,7 +311,7 @@ pub fn run() -> Result<()> {
             no_pause,
             dry_run,
         } => cmd_compress(
-            &env, &selector, &level, threads, force, no_pause, dry_run, &cancel,
+            &env, &selector, &level, threads, force, no_pause, dry_run, false, out, &cancel,
         ),
         Command::Decompress { selector, force } => cmd_decompress(&env, &selector, force, &cancel),
         Command::Status { selector } => cmd_status(&env, out, &selector, &cancel),
@@ -299,7 +322,7 @@ pub fn run() -> Result<()> {
             level,
             threads,
             dry_run,
-        } => cmd_watch(&env, action, &level, threads, dry_run, &cancel),
+        } => cmd_watch(&env, out, action, &level, threads, dry_run, &cancel),
         Command::Exclude { action } => cmd_exclude(&env, out, action),
         Command::Plan {
             folder,
@@ -323,8 +346,11 @@ pub fn run() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&plan)?);
             plan.check()
         }
-        Command::Drives => cmd_drives(&env),
-        Command::Doctor => cmd_doctor(&env),
+        Command::Drives => cmd_drives(&env, out),
+        Command::Doctor => {
+            ensure!(!out.json, "doctor has no JSON output yet");
+            cmd_doctor(&env)
+        }
         Command::Pack { action } => crate::pack::cli::run(action, cli.json, &cancel),
         Command::Benchmark { folder, budget_mib } => {
             let report = crate::benchmark::run(&folder, budget_mib, &cancel)?;
@@ -346,7 +372,7 @@ pub fn run() -> Result<()> {
                 Some(JobAction::Restart) => JobCommand::Restart,
                 Some(JobAction::AddFolder { path, single_game }) => {
                     JobCommand::Library(crate::jobs::Library {
-                        path: crate::jobs::folder_path(&path, &env.home),
+                        path: client_path(&path, &env.home)?,
                         automatic: false,
                         custom: true,
                         folder_kind: if single_game {
@@ -357,7 +383,7 @@ pub fn run() -> Result<()> {
                     })
                 }
                 Some(JobAction::RemoveFolder { path }) => {
-                    JobCommand::RemoveLibrary(crate::jobs::folder_path(&path, &env.home))
+                    JobCommand::RemoveLibrary(client_path(&path, &env.home)?)
                 }
                 Some(JobAction::Pause { id }) => JobCommand::Pause { id, paused: true },
                 Some(JobAction::Resume { id }) => JobCommand::Pause { id, paused: false },
@@ -380,6 +406,34 @@ pub fn run() -> Result<()> {
     }
 }
 
+/// The largest report `compatibility import` reads, as in the window's import.
+const MAX_REPORT_BYTES: u64 = 1024 * 1024;
+
+/// Reads a report file, refusing one larger than [`MAX_REPORT_BYTES`].
+fn read_report(path: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_REPORT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {}", path.display()))?;
+    ensure!(
+        bytes.len() as u64 <= MAX_REPORT_BYTES,
+        "{} is larger than 1 MiB, so it is not a compatibility report",
+        path.display()
+    );
+    Ok(bytes)
+}
+
+/// Resolves a typed location against this process's working directory.
+///
+/// The coordinator keeps the working directory of whichever client started
+/// it, so a relative path sent as typed would mean a different folder there.
+fn client_path(input: &str, home: &Path) -> Result<PathBuf> {
+    let path = crate::jobs::folder_path(input, home);
+    std::path::absolute(&path).with_context(|| format!("resolving {}", path.display()))
+}
+
 fn compatibility_store() -> Result<crate::compatibility::Store> {
     let database = Db::default_path().context("Cannot locate Flummox's state folder")?;
     let parent = database.parent().context("Invalid Flummox state path")?;
@@ -399,8 +453,7 @@ fn cmd_compatibility(out: Output, action: CompatibilityAction) -> Result<()> {
     let store = compatibility_store()?;
     match action {
         CompatibilityAction::Import { report } => {
-            let bytes =
-                std::fs::read(&report).with_context(|| format!("reading {}", report.display()))?;
+            let bytes = read_report(&report)?;
             let report: crate::compatibility::Report = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parsing {}", report.display()))?;
             report.validate()?;
@@ -455,15 +508,21 @@ fn init_logging(verbose: u8) {
 
 /// Makes Ctrl-C stop a job cleanly instead of killing it mid-file.
 ///
-/// The flag is polled between files, so the current file always finishes:
-/// btrfs rewrites a file's extents atomically, and stopping between files
-/// leaves the game in a state that is simply "partly compressed", which is
-/// valid and can be resumed by running the command again. Killing the process
-/// outright would be safe too, but the user would lose the summary of what
-/// had already been done.
+/// The flag is polled between files, so the current file finishes and a
+/// partly compressed game can be resumed by running the command again. A
+/// second signal exits at once, which stops a command that never polls it.
 fn install_signal_handler() -> Result<Arc<AtomicBool>> {
     let flag = Arc::new(AtomicBool::new(false));
     for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+        // Registered first, so it sees the flag as it was before this signal.
+        // A second signal ends the process with the usual 128 + signal code,
+        // for the commands that never poll the flag.
+        let _exit = signal_hook::flag::register_conditional_shutdown(
+            signal,
+            128 + signal,
+            Arc::clone(&flag),
+        )
+        .with_context(|| format!("installing the exit handler for signal {signal}"))?;
         let _id = signal_hook::flag::register(signal, Arc::clone(&flag))
             .with_context(|| format!("installing the handler for signal {signal}"))?;
     }
@@ -516,18 +575,98 @@ struct ScanRow {
     note: Option<String>,
 }
 
-/// Pauses a job while the game is being played.
+/// Watches for a process using the game from a thread of its own.
 ///
-/// Scans this user's processes for anything with a file open inside the
-/// install directory, which is the same check that decides whether a job may
-/// start at all.
-struct GameInUse {
-    install_dir: PathBuf,
+/// Landlock denies the reads of `/proc/<pid>/{exe,cwd,fd}` that detection
+/// needs, for the thread that restricts itself and every thread started
+/// after. This thread is started before [`sandbox::restrict`], so it keeps
+/// seeing `/proc`. Drop the watch to stop the thread.
+struct GameWatch {
+    who: Arc<std::sync::Mutex<Option<String>>>,
+    done: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
-impl backend::BusyCheck for GameInUse {
+impl GameWatch {
+    /// Scans once on the calling thread, then again every `interval`.
+    fn start<S>(install_dir: PathBuf, source: S, interval: std::time::Duration) -> Self
+    where
+        S: busy::ProcSource + Send + 'static,
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let who = Arc::new(std::sync::Mutex::new(busy::process_using(
+            &install_dir,
+            &source,
+        )));
+        let done = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (who, done) = (Arc::clone(&who), Arc::clone(&done));
+            std::thread::Builder::new()
+                .name("game-watch".to_owned())
+                .spawn(move || {
+                    let step = std::time::Duration::from_millis(20);
+                    let mut waited = std::time::Duration::ZERO;
+                    while !done.load(Relaxed) {
+                        std::thread::sleep(step);
+                        waited += step;
+                        if waited < interval {
+                            continue;
+                        }
+                        waited = std::time::Duration::ZERO;
+                        let found = busy::process_using(&install_dir, &source);
+                        if let Ok(mut slot) = who.lock() {
+                            *slot = found;
+                        }
+                    }
+                })
+                .ok()
+        };
+        Self { who, done, thread }
+    }
+
+    /// Who was using the game at the last scan.
+    ///
+    /// If the thread could not be started this stays at the first scan's
+    /// answer, so a launch after the start goes unseen.
+    fn current(&self) -> Option<String> {
+        self.who.lock().ok().and_then(|slot| slot.clone())
+    }
+}
+
+impl Drop for GameWatch {
+    fn drop(&mut self) {
+        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            // A panicked watch thread has nothing left to report.
+            let _joined = thread.join();
+        }
+    }
+}
+
+/// What a running job does when the game is launched.
+///
+/// Pausing waits for the game to close. Stopping sets the cancel flag, which
+/// ends the job at the next file boundary.
+struct LaunchGuard<'a> {
+    watch: &'a GameWatch,
+    stop: Option<&'a AtomicBool>,
+}
+
+impl backend::BusyCheck for LaunchGuard<'_> {
     fn in_use_by(&self) -> Option<String> {
-        busy::process_using(&self.install_dir, &ProcFs::new())
+        let who = self.watch.current()?;
+        let Some(stop) = self.stop else {
+            return Some(who);
+        };
+        if !stop.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("\nstopping: {who} is using the game");
+        }
+        None
+    }
+
+    // The answer is already in memory.
+    fn check_interval(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
     }
 }
 
@@ -733,6 +872,56 @@ fn check_idle(game: &Game, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// Checks the settings the coordinator accepts for a queued job.
+fn check_job_opts(opts: &CompressOpts) -> Result<()> {
+    ensure!(
+        (1..=32).contains(&opts.threads),
+        "Choose between 1 and 32 worker threads."
+    );
+    if let Some(level) = opts.level {
+        zstd_level(&level.to_string()).map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
+}
+
+/// What the worker checks before a job, for the paths that run in this
+/// process: settings in range, enough free space, and a kernel that can keep
+/// every path inside the install.
+fn preflight(install_dir: &Path, opts: Option<&CompressOpts>, restore: bool) -> Result<()> {
+    if let Some(opts) = opts {
+        check_job_opts(opts)?;
+    }
+    crate::storage::native_plan(install_dir, restore)?.recheck()?;
+    let anchor = crate::safeio::Anchor::open(install_dir)
+        .with_context(|| format!("opening {}", install_dir.display()))?;
+    ensure!(
+        anchor.fully_resolved(),
+        "This kernel cannot safely resolve game paths. Update Linux before using --force."
+    );
+    Ok(())
+}
+
+/// Applies the sandbox a worker applies: the game folder and the database
+/// files writable, and no new sockets.
+///
+/// Call before any thread that touches game files exists, with the database
+/// already open so its companion files exist.
+fn confine(install_dir: &Path) {
+    let database = Db::default_path();
+    let plan = match &database {
+        Some(database) => SandboxPlan::for_worker(install_dir, database),
+        None => SandboxPlan::for_job(install_dir, None),
+    };
+    let status = sandbox::restrict(&plan);
+    tracing::info!(status = %status.describe(), "sandbox");
+    if !status.is_active() {
+        eprintln!("warning: {}", status.describe());
+    }
+    if let Err(error) = sandbox::deny_sockets() {
+        eprintln!("warning: this job can still open sockets: {error}");
+    }
+}
+
 fn walk(game: &Game, backend: &dyn Backend, cancel: Option<&AtomicBool>) -> Result<Inventory> {
     let inv = inventory::walk_cancellable(&game.install_dir, &backend.walk_opts(), cancel)
         .with_context(|| format!("reading {}", game.install_dir.display()))?;
@@ -763,7 +952,13 @@ fn cmd_scan(env: &Env, out: Output, tools: bool) -> Result<()> {
             let fs = fsprobe::probe(&game.install_dir).ok();
             let tier = fs.as_ref().map(fsprobe::tier_for);
             let (backend, supported, note) = match &tier {
-                Some(Tier::Native(kind)) => (Some(kind.label()), true, None),
+                Some(Tier::Native(kind)) => (
+                    Some(kind.label()),
+                    backend::for_kind(*kind).is_some(),
+                    backend::for_kind(*kind)
+                        .is_none()
+                        .then(|| format!("{} has no backend yet", kind.label())),
+                ),
                 Some(Tier::Pack) => (
                     Some("Maximum Space"),
                     cfg!(feature = "pack-mount") && Path::new("/dev/fuse").exists(),
@@ -873,23 +1068,32 @@ fn cmd_estimate(
         eprintln!("Stopped early, so this estimate covers only part of the game.");
     }
 
-    #[derive(serde::Serialize)]
-    struct EstimateOut<'a> {
-        game: &'a str,
-        id: String,
-        level: i32,
-        mount_level: Option<i32>,
-        #[serde(flatten)]
-        estimate: estimate::Estimate,
+    out.emit(&EstimateOut::new(&game, &est, &est_opts), || {
+        print_estimate(&est, &est_opts)
+    })
+}
+
+/// One game's estimate in `estimate --json` and `compress --dry-run --json`.
+#[derive(serde::Serialize)]
+struct EstimateOut<'a> {
+    game: &'a str,
+    id: String,
+    level: i32,
+    mount_level: Option<i32>,
+    #[serde(flatten)]
+    estimate: estimate::Estimate,
+}
+
+impl<'a> EstimateOut<'a> {
+    fn new(game: &'a Game, estimate: &estimate::Estimate, opts: &EstimateOpts) -> Self {
+        Self {
+            game: &game.title,
+            id: game.id.to_string(),
+            level: opts.level,
+            mount_level: opts.mount_level,
+            estimate: *estimate,
+        }
     }
-    let payload = EstimateOut {
-        game: &game.title,
-        id: game.id.to_string(),
-        level: est_opts.level,
-        mount_level: est_opts.mount_level,
-        estimate: est,
-    };
-    out.emit(&payload, || print_estimate(&est, &est_opts))
 }
 
 fn print_estimate(est: &estimate::Estimate, opts: &EstimateOpts) {
@@ -1046,13 +1250,21 @@ fn cmd_compress(
     force: bool,
     no_pause: bool,
     dry_run: bool,
+    wait_for_idle: bool,
+    out: Output,
     cancel: &Arc<AtomicBool>,
 ) -> Result<()> {
     let game = find_game(env, selector)?;
-    crate::jobs::validate_folder(&game.install_dir)?;
+    let install = crate::jobs::validate_folder(&game.install_dir)?;
     let opts = level.opts(threads);
+    check_job_opts(&opts)?;
     let (fs, backend) = backend_for(&game.install_dir)?;
-    check_idle(&game, force)?;
+    let queued = !force && !no_pause && !dry_run;
+    // A queued job waits behind the game, so a caller that can retry later
+    // (the watcher) leaves the check to the coordinator.
+    if !(queued && wait_for_idle) {
+        check_idle(&game, force)?;
+    }
     // Open the database before the sandbox goes up: creating its directory is
     // simpler to do now than to grant a sandboxed process.
     let mut db = open_db();
@@ -1066,7 +1278,7 @@ fn cmd_compress(
             game.id
         );
     }
-    if !force && !no_pause && !dry_run {
+    if queued {
         return queued_job(game, crate::jobs::Operation::Compress, opts, cancel);
     }
     let _operation = if dry_run {
@@ -1074,6 +1286,9 @@ fn cmd_compress(
     } else {
         Some(crate::jobs::operation_lock()?)
     };
+    if !dry_run {
+        preflight(&game.install_dir, Some(&opts), false)?;
+    }
     if let Some(why) = fsprobe::snapshot_risk(&fs) {
         eprintln!(
             "warning: {why}.\n         Compressing rewrites every extent, which unshares it \
@@ -1092,25 +1307,38 @@ fn cmd_compress(
     let previous = db.as_ref().and_then(|db| db.game(&game.id).ok().flatten());
     let reuse = previous
         .as_ref()
-        .is_some_and(|prev| prev.level >= opts.btrfs_level());
+        .is_some_and(|prev| prev.level >= opts.level_plan().floor());
     let mut unchanged = 0usize;
     let inv = match (reuse, db.as_ref()) {
-        (true, Some(open)) => match open.changed_since(&game.id, &full_inv) {
-            Ok(changed) => {
-                unchanged = full_inv.files.len().saturating_sub(changed.len());
-                Inventory {
-                    files: changed,
-                    warnings: Vec::new(),
+        (true, Some(open)) => {
+            match open
+                .changed_since(&game.id, &full_inv)
+                .and_then(|mut changed| {
+                    // A file an earlier pass left below this pass's floor keeps its
+                    // fingerprint, so the change test alone would never pick it up.
+                    changed.extend(below_floor(
+                        &open.fingerprints(&game.id)?,
+                        &full_inv,
+                        opts.level_plan().floor(),
+                    ));
+                    Ok(changed)
+                }) {
+                Ok(changed) => {
+                    unchanged = full_inv.files.len().saturating_sub(changed.len());
+                    Inventory {
+                        files: changed,
+                        warnings: Vec::new(),
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not tell which files changed; doing all of them");
+                    full_inv.clone()
                 }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "could not tell which files changed; doing all of them");
-                full_inv.clone()
-            }
-        },
+        }
         _ => full_inv.clone(),
     };
-    if unchanged > 0 {
+    if unchanged > 0 && !out.json {
         println!(
             "{unchanged} files are unchanged since the last pass at level {}; skipping them.",
             previous.as_ref().map_or(0, |p| p.level)
@@ -1142,14 +1370,30 @@ fn cmd_compress(
             &probe,
             Some(cancel.as_ref()),
         );
-        println!("{} (dry run, nothing written)", game.title);
-        print_estimate(&est, &est_opts);
-        return Ok(());
+        return out.emit(&EstimateOut::new(&game, &est, &est_opts), || {
+            println!("{} (dry run, nothing written)", game.title);
+            print_estimate(&est, &est_opts);
+        });
     }
+
+    crate::jobs::invalidate_for_cli(&game.install_dir)?;
+
+    // The scan that spots a launch has to start before the sandbox goes up,
+    // because Landlock then denies the reads it makes.
+    let watch = GameWatch::start(
+        game.install_dir.clone(),
+        ProcFs::new(),
+        std::time::Duration::from_secs(2),
+    );
+    // Drop this process's access to everything except the game itself, before
+    // any worker thread exists. Discovery is already finished, so nothing
+    // further needs to read Steam's configuration.
+    confine(&game.install_dir);
 
     // Sampled before the pass runs. Compressing changes what the probe sees,
     // so an estimate taken afterwards reports a saving that has already been
-    // taken, which is why this cannot be deferred to the end.
+    // taken, which is why this cannot be deferred to the end. It runs after
+    // the sandbox so the sampling threads are confined too.
     let pass_saving = {
         let model = backend.model(&opts);
         let est_opts = EstimateOpts::new(opts.btrfs_level(), &fs);
@@ -1169,7 +1413,6 @@ fn cmd_compress(
         .saving()
     };
     println!("Estimated saving: {}", size(pass_saving));
-    crate::jobs::invalidate_for_cli(&game.install_dir)?;
 
     println!(
         "Compressing {} with {} at zstd level {}",
@@ -1177,29 +1420,16 @@ fn cmd_compress(
         backend.kind().label(),
         opts.btrfs_level()
     );
-    // Drop this process's access to everything except the game itself, before
-    // any worker thread exists. Discovery is already finished, so nothing
-    // further needs to read Steam's configuration.
-    let plan = SandboxPlan::for_job(
-        &game.install_dir,
-        Db::default_path().as_deref().and_then(Path::parent),
-    );
-    let sandboxed = sandbox::restrict(&plan);
-    tracing::info!(status = %sandboxed.describe(), "sandbox");
-    if !sandboxed.is_active() {
-        tracing::warn!("{}", sandboxed.describe());
-    }
 
     let progress = Progress::new();
-    // Pausing needs somewhere to look, so it is built here and borrowed
-    // for the length of the job.
-    let in_use = GameInUse {
-        install_dir: game.install_dir.clone(),
+    let guard = LaunchGuard {
+        watch: &watch,
+        stop: no_pause.then_some(cancel.as_ref()),
     };
     let ctx = JobCtx {
         events: &progress,
         cancel: cancel.as_ref(),
-        busy: (!no_pause).then_some(&in_use as &dyn backend::BusyCheck),
+        busy: Some(&guard as &dyn backend::BusyCheck),
     };
     tracing::info!(game = %game.title, level = opts.btrfs_level(), files = inv.files.len(), "compressing");
     let outcome = backend
@@ -1236,18 +1466,13 @@ fn cmd_compress(
              most of the gain was already there."
         ),
     }
-    if !outcome.errors.is_empty() {
-        println!("{} files failed; the first few:", outcome.errors.len());
-        for e in outcome.errors.iter().take(5) {
-            println!("  {e}");
-        }
-    }
+    report_failures(&outcome);
 
     if let Some(open) = db.as_mut() {
         let mut record = GameRecord::new(
             game.id.clone(),
             game.title.clone(),
-            game.install_dir.clone(),
+            install.clone(),
             backend.kind(),
             &opts,
         );
@@ -1258,27 +1483,28 @@ fn cmd_compress(
         // Added to what earlier passes predicted. A later pass over the same
         // game only has whatever is left to take, so replacing the figure
         // would make a game's saving fall every time it is recompressed.
+        // Only the share of the plan this pass got through counts, or a
+        // cancelled pass followed by a rerun would count the saving twice.
+        let planned: u64 = inv.to_compress().map(|f| f.size).sum();
+        let pass_saving = scaled_saving(pass_saving, outcome.bytes, planned);
         record.est_saving = previous
             .as_ref()
             .map_or(0, |p| p.est_saving)
             .saturating_add(i64::try_from(pass_saving).unwrap_or(i64::MAX));
-        // When files were skipped as unchanged, they are still compressed at
-        // whatever the earlier, higher level was; recording the lower level of
-        // this pass would make a later run redo them for nothing.
-        // The level the kernel applied, which is lower than the one asked for
-        // on a kernel too old to accept a level at all.
-        record.level = outcome.effective_level.unwrap_or(record.level);
-        record.level = previous
-            .as_ref()
-            .map_or(record.level, |p| p.level.max(record.level));
+        record.level = level_to_record(
+            opts.level_plan(),
+            outcome.effective_level,
+            previous.as_ref().map(|p| p.level),
+            record.level,
+        );
+        let floor = opts.level_plan().floor();
         if outcome
             .effective_level
-            .is_some_and(|applied| applied < opts.btrfs_level())
+            .is_some_and(|applied| applied < floor)
         {
             println!(
                 "Note: this kernel does not accept a compression level, so the files were \
-                 compressed at the filesystem default rather than {}.",
-                opts.btrfs_level()
+                 compressed at the filesystem default rather than {floor}."
             );
         }
         // Fingerprints are stored for the whole install, not just the files
@@ -1305,7 +1531,84 @@ fn cmd_compress(
             tracing::warn!(error = %e, "could not write to the activity log");
         }
     }
+    ensure!(
+        !outcome.cancelled && outcome.errors.is_empty(),
+        "{} was not fully compressed: {}",
+        game.title,
+        pass_problem(&outcome)
+    );
     Ok(())
+}
+
+/// Unchanged files whose last pass applied a level under `floor`.
+///
+/// Files never attempted are left to the change test.
+fn below_floor(
+    stored: &HashMap<PathBuf, crate::db::FileFingerprint>,
+    inv: &Inventory,
+    floor: i32,
+) -> Vec<inventory::FileEntry> {
+    inv.files
+        .iter()
+        .filter(|entry| {
+            entry.action.is_compress()
+                && stored.get(&entry.rel).is_some_and(|fp| {
+                    fp.matches(entry)
+                        && fp.level_applied != crate::db::NOT_ATTEMPTED
+                        && fp.level_applied < floor
+                })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Prints the first few per-file failures to stderr.
+fn report_failures(outcome: &backend::Outcome) {
+    if outcome.errors.is_empty() {
+        return;
+    }
+    eprintln!("{} files failed; the first few:", outcome.errors.len());
+    for e in outcome.errors.iter().take(5) {
+        eprintln!("  {e}");
+    }
+}
+
+/// Why a pass counts as unfinished, for the error that sets the exit status.
+fn pass_problem(outcome: &backend::Outcome) -> String {
+    match (outcome.cancelled, outcome.errors.len()) {
+        (true, 0) => "it was stopped early".to_owned(),
+        (true, n) => format!("it was stopped early and {n} files failed"),
+        (false, n) => format!("{n} files failed"),
+    }
+}
+
+/// The share of `saving` that `done` of `planned` bytes account for.
+fn scaled_saving(saving: u64, done: u64, planned: u64) -> u64 {
+    if planned == 0 || done >= planned {
+        return saving;
+    }
+    let scaled = u128::from(saving) * u128::from(done) / u128::from(planned);
+    u64::try_from(scaled).unwrap_or(saving)
+}
+
+/// The level to keep for a game after a pass.
+///
+/// `applied` is the lowest level any file got. Once it reaches the plan's
+/// floor the plan is done, so the ceiling is kept; a per-file plan leaves
+/// some files at its floor. A higher level from an earlier pass stays, since
+/// files skipped as unchanged still sit there.
+fn level_to_record(
+    plan: backend::LevelPlan,
+    applied: Option<i32>,
+    previous: Option<i32>,
+    requested: i32,
+) -> i32 {
+    let level = match applied {
+        Some(level) if level >= plan.floor() => plan.ceiling(),
+        Some(level) => level,
+        None => requested,
+    };
+    previous.map_or(level, |p| p.max(level))
 }
 
 fn cmd_decompress(env: &Env, selector: &str, force: bool, cancel: &Arc<AtomicBool>) -> Result<()> {
@@ -1322,6 +1625,7 @@ fn cmd_decompress(env: &Env, selector: &str, force: bool, cancel: &Arc<AtomicBoo
     let _operation = crate::jobs::operation_lock()?;
     let (_fs, backend) = backend_for(&game.install_dir)?;
     check_idle(&game, force)?;
+    preflight(&game.install_dir, None, true)?;
     let mut db = open_db();
     let inv = walk(&game, backend.as_ref(), Some(cancel.as_ref()))?;
     println!("Decompressing {}", game.title);
@@ -1331,11 +1635,7 @@ fn cmd_decompress(env: &Env, selector: &str, force: bool, cancel: &Arc<AtomicBoo
     }
     // Same restriction as a compress job: by this point every path the work
     // needs is known, so the process has no business reaching anything else.
-    let plan = SandboxPlan::for_job(
-        &game.install_dir,
-        Db::default_path().as_deref().and_then(Path::parent),
-    );
-    tracing::info!(status = %sandbox::restrict(&plan).describe(), "sandbox");
+    confine(&game.install_dir);
     let progress = Progress::new();
     // No pause on the way back out. Decompress is what someone runs to
     // undo, and it should not sit waiting on a game.
@@ -1348,6 +1648,7 @@ fn cmd_decompress(env: &Env, selector: &str, force: bool, cancel: &Arc<AtomicBoo
         .decompress(&game.install_dir, &inv, &ctx)
         .with_context(|| format!("decompressing {}", game.title))?;
     println!("Done: {} files rewritten", outcome.files);
+    report_failures(&outcome);
     let freed = outcome.freed();
     if let Some(n) = freed
         && n < 0
@@ -1355,23 +1656,38 @@ fn cmd_decompress(env: &Env, selector: &str, force: bool, cancel: &Arc<AtomicBoo
         println!("Uses about {} more space now.", size(n.unsigned_abs()));
     }
 
+    let complete = !outcome.cancelled && outcome.errors.is_empty();
     if let Some(open) = db.as_mut() {
         // Forget first: the stored fingerprints describe a compressed install
         // that no longer exists, and `forget` also clears this game's log
-        // entries, so the entry below has to come after it.
-        if let Err(e) = open.forget(&game.id) {
+        // entries, so the entry below has to come after it. An unfinished
+        // pass leaves the record, since the game is still partly compressed.
+        if complete && let Err(e) = open.forget(&game.id) {
             eprintln!(
                 "warning: could not clear the record for {}: {e}",
                 game.title
             );
         }
         let entry = Activity::new(
-            ActivityLevel::Info,
+            if complete {
+                ActivityLevel::Info
+            } else {
+                ActivityLevel::Warn
+            },
             "decompress",
-            format!(
-                "{} back to uncompressed ({} files)",
-                game.title, outcome.files
-            ),
+            if complete {
+                format!(
+                    "{} back to uncompressed ({} files)",
+                    game.title, outcome.files
+                )
+            } else {
+                format!(
+                    "{} only partly uncompressed ({} files): {}",
+                    game.title,
+                    outcome.files,
+                    pass_problem(&outcome)
+                )
+            },
         )
         .for_game(&game.id)
         // Zero when free space could not be read, so the log records "no
@@ -1381,6 +1697,12 @@ fn cmd_decompress(env: &Env, selector: &str, force: bool, cancel: &Arc<AtomicBoo
             tracing::warn!(error = %e, "could not write to the activity log");
         }
     }
+    ensure!(
+        complete,
+        "{} was not fully decompressed: {}",
+        game.title,
+        pass_problem(&outcome)
+    );
     Ok(())
 }
 
@@ -1581,6 +1903,11 @@ fn hook_dirs(library: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Whether a tier can be worked on in place: a backend exists for it.
+fn native_supported(tier: &Tier) -> bool {
+    matches!(tier, Tier::Native(kind) if backend::for_kind(*kind).is_some())
+}
+
 /// Every Steam library on this machine, with duplicates removed.
 fn steam_libraries(env: &Env) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
@@ -1670,8 +1997,53 @@ fn unit_exec(exe: &Path) -> Result<String> {
     Ok(quoted)
 }
 
+/// The text of the unit, running `exe watch` with the given settings.
+///
+/// The hardening directives match `packaging/flummox-watch.service`, so the
+/// unit this tool writes in the user's own directory, which takes precedence
+/// over the packaged one, is no weaker than it.
+fn unit_text(exe: &Path, level: &LevelArgs, threads: usize, dry_run: bool) -> Result<String> {
+    let mut args = String::from("watch");
+    if let Some(name) = level.preset.to_possible_value() {
+        args.push_str(&format!(" --preset {}", name.get_name()));
+    }
+    if let Some(value) = level.level {
+        args.push_str(&format!(" --level {value}"));
+    }
+    args.push_str(&format!(" --threads {threads}"));
+    if dry_run {
+        args.push_str(" --dry-run");
+    }
+    // The running binary's own path is written in, so a build started from a
+    // working tree runs that build rather than one installed elsewhere.
+    Ok(format!(
+        "{UNIT_MARKER}\n\
+         [Unit]\n\
+         Description=Compress Steam downloads as they finish\n\
+         After=default.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={} {args}\n\
+         Restart=on-failure\n\
+         RestartSec=30\n\
+         NoNewPrivileges=true\n\
+         PrivateTmp=true\n\
+         RestrictSUIDSGID=true\n\
+         RestrictNamespaces=true\n\
+         MemoryDenyWriteExecute=true\n\
+         Nice=10\n\
+         IOSchedulingClass=idle\n\
+         CPUSchedulingPolicy=idle\n\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n",
+        unit_exec(exe)?
+    ))
+}
+
 /// Installs the user unit and starts it.
-fn service_enable() -> Result<()> {
+fn service_enable(level: &LevelArgs, threads: usize, dry_run: bool) -> Result<()> {
     let dir = unit_dir().context("neither XDG_CONFIG_HOME nor HOME is set")?;
     let exe = std::env::current_exe().context("finding this executable")?;
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -1683,27 +2055,7 @@ fn service_enable() -> Result<()> {
             path.display()
         );
     }
-    // The running binary's own path is written in, so a build started from a
-    // working tree runs that build rather than one installed elsewhere.
-    let unit = format!(
-        "{UNIT_MARKER}\n\
-         [Unit]\n\
-         Description=Compress Steam downloads as they finish\n\
-         After=default.target\n\
-         \n\
-         [Service]\n\
-         Type=simple\n\
-         ExecStart={} watch\n\
-         Restart=on-failure\n\
-         RestartSec=30\n\
-         NoNewPrivileges=true\n\
-         Nice=10\n\
-         IOSchedulingClass=idle\n\
-         \n\
-         [Install]\n\
-         WantedBy=default.target\n",
-        unit_exec(&exe)?
-    );
+    let unit = unit_text(&exe, level, threads, dry_run)?;
     std::fs::write(&path, unit).with_context(|| format!("writing {}", path.display()))?;
     systemctl(&["daemon-reload"])?;
     if !systemctl(&["enable", "--now", UNIT_NAME])? {
@@ -1736,15 +2088,25 @@ fn service_disable() -> Result<()> {
 }
 
 /// Reports whether the background service is installed and running.
-fn service_status() -> Result<()> {
+fn service_status(out: Output) -> Result<()> {
+    #[derive(serde::Serialize)]
+    struct ServiceRow {
+        starts_at_login: bool,
+        running: bool,
+    }
     let enabled = systemctl(&["is-enabled", "--quiet", UNIT_NAME])?;
     let active = systemctl(&["is-active", "--quiet", UNIT_NAME])?;
-    println!("Starts at login : {}", if enabled { "yes" } else { "no" });
-    println!("Running now     : {}", if active { "yes" } else { "no" });
-    if !enabled {
-        println!("\nTurn it on with `flummox watch enable`.");
-    }
-    Ok(())
+    let row = ServiceRow {
+        starts_at_login: enabled,
+        running: active,
+    };
+    out.emit(&row, || {
+        println!("Starts at login : {}", if enabled { "yes" } else { "no" });
+        println!("Running now     : {}", if active { "yes" } else { "no" });
+        if !enabled {
+            println!("\nTurn it on with `flummox watch enable`.");
+        }
+    })
 }
 
 /// Watches Steam and compresses each download once it finishes.
@@ -1754,6 +2116,7 @@ fn service_status() -> Result<()> {
 /// ones it guesses will not pay. A pass afterwards recovers those.
 fn cmd_watch(
     env: &Env,
+    out: Output,
     action: Option<WatchAction>,
     level: &LevelArgs,
     threads: usize,
@@ -1761,11 +2124,15 @@ fn cmd_watch(
     cancel: &Arc<AtomicBool>,
 ) -> Result<()> {
     match action {
-        Some(WatchAction::Enable) => return service_enable(),
+        Some(WatchAction::Enable) => return service_enable(level, threads, dry_run),
         Some(WatchAction::Disable) => return service_disable(),
-        Some(WatchAction::Status) => return service_status(),
+        Some(WatchAction::Status) => return service_status(out),
         None => {}
     }
+    ensure!(
+        !out.json,
+        "watch has no JSON output; only `watch status` takes --json"
+    );
     let libraries = steam_libraries(env);
     if libraries.is_empty() {
         bail!("no Steam libraries found; try `flummox doctor`");
@@ -1786,7 +2153,12 @@ fn cmd_watch(
         // The full id, so a missing Steam folder cannot fall through to
         // another launcher's game with this number in its title.
         let selector = format!("steam:{}", app.appid);
-        if let Err(e) = cmd_compress(env, &selector, level, threads, false, false, false, cancel) {
+        // The coordinator pauses a queued job while the game runs, so a
+        // download that finishes as the player presses Play is still queued.
+        let text = Output { json: false };
+        if let Err(e) = cmd_compress(
+            env, &selector, level, threads, false, false, false, true, text, cancel,
+        ) {
             eprintln!("warning: could not compress {}: {e:#}", app.name);
         }
     })
@@ -1809,12 +2181,13 @@ fn cmd_hook(env: &Env, out: Output, action: HookAction) -> Result<()> {
     }
 
     let mut rows = Vec::new();
+    let mut applied = 0usize;
     for library in libraries {
         let fs = fsprobe::probe(&library).ok();
         // The property only means anything on a filesystem that compresses.
         let supported = fs
             .as_ref()
-            .is_some_and(|f| matches!(fsprobe::tier_for(f), Tier::Native(_)));
+            .is_some_and(|f| native_supported(&fsprobe::tier_for(f)));
         let dirs = hook_dirs(&library);
 
         if supported {
@@ -1824,8 +2197,9 @@ fn cmd_hook(env: &Env, out: Output, action: HookAction) -> Result<()> {
                     HookAction::Off => backend::btrfs::set_dir_property(dir, false),
                     HookAction::Status => Ok(()),
                 };
-                if let Err(e) = result {
-                    eprintln!("warning: {}: {e}", dir.display());
+                match result {
+                    Ok(()) => applied += 1,
+                    Err(e) => eprintln!("warning: {}: {e}", dir.display()),
                 }
             }
         }
@@ -1842,6 +2216,7 @@ fn cmd_hook(env: &Env, out: Output, action: HookAction) -> Result<()> {
         });
     }
 
+    let changed = matches!(action, HookAction::On);
     out.emit(&rows, || {
         for row in &rows {
             let state = match (&row.compression, row.supported) {
@@ -1852,10 +2227,13 @@ fn cmd_hook(env: &Env, out: Output, action: HookAction) -> Result<()> {
             println!("{:<52}  {state}", row.library.display());
         }
         match action {
+            HookAction::On if applied == 0 => {
+                println!("\nNo library took the setting, so new downloads are not compressed.");
+            }
             HookAction::On => println!(
-                "\nNew downloads and patches in these libraries will be compressed as they \
-                 are written. Games already installed are untouched; run `flummox compress` \
-                 for those."
+                "\nNew downloads and patches in the libraries marked on will be compressed as \
+                 they are written. Games already installed are untouched; run \
+                 `flummox compress` for those."
             ),
             HookAction::Off => {
                 println!(
@@ -1864,7 +2242,12 @@ fn cmd_hook(env: &Env, out: Output, action: HookAction) -> Result<()> {
             }
             HookAction::Status => {}
         }
-    })
+    })?;
+    ensure!(
+        !changed || applied > 0,
+        "no library took the setting; `flummox doctor` shows why"
+    );
+    Ok(())
 }
 
 /// The games hidden by the exclusion list.
@@ -1877,6 +2260,49 @@ fn excluded_ids(db: Option<&Db>) -> Vec<crate::model::GameId> {
         .into_iter()
         .map(|(id, _)| id)
         .collect()
+}
+
+/// The one hidden game a selector names.
+///
+/// An id beats a title, a whole title beats part of one, and part of a title
+/// must match exactly one entry, as in [`select_games`].
+fn pick_hidden<'a>(
+    hidden: &'a [(crate::model::GameId, String)],
+    selector: &str,
+) -> Result<&'a (crate::model::GameId, String)> {
+    let wanted = selector.trim();
+    ensure!(
+        !wanted.is_empty(),
+        "name a hidden game; try `flummox exclude list`"
+    );
+    let by_id = |entry: &&(crate::model::GameId, String)| {
+        entry.0.to_string().eq_ignore_ascii_case(wanted) || entry.0.key == wanted
+    };
+    let by_title = |entry: &&(crate::model::GameId, String)| entry.1.eq_ignore_ascii_case(wanted);
+    let lowered = wanted.to_lowercase();
+    let by_part =
+        |entry: &&(crate::model::GameId, String)| entry.1.to_lowercase().contains(&lowered);
+    let mut found: Vec<_> = hidden.iter().filter(by_id).collect();
+    if found.is_empty() {
+        found = hidden.iter().filter(by_title).collect();
+    }
+    if found.is_empty() {
+        found = hidden.iter().filter(by_part).collect();
+    }
+    match found.as_slice() {
+        [] => bail!("{selector:?} is not on the exclusion list; try `flummox exclude list`"),
+        [one] => Ok(one),
+        many => {
+            let titles: Vec<String> = many
+                .iter()
+                .map(|(id, title)| format!("{title} ({id})"))
+                .collect();
+            bail!(
+                "{selector:?} matches several hidden games:\n  {}",
+                titles.join("\n  ")
+            )
+        }
+    }
 }
 
 fn cmd_exclude(env: &Env, out: Output, action: ExcludeAction) -> Result<()> {
@@ -1902,16 +2328,7 @@ fn cmd_exclude(env: &Env, out: Output, action: ExcludeAction) -> Result<()> {
             // Matched against the list rather than a scan, because an excluded
             // game no longer turns up in one.
             let hidden = db.excluded().context("reading the exclusion list")?;
-            let found = hidden.iter().find(|(id, title)| {
-                id.to_string().eq_ignore_ascii_case(selector.trim())
-                    || id.key == selector.trim()
-                    || title
-                        .to_lowercase()
-                        .contains(&selector.trim().to_lowercase())
-            });
-            let Some((id, title)) = found else {
-                bail!("{selector:?} is not on the exclusion list; try `flummox exclude list`");
-            };
+            let (id, title) = pick_hidden(&hidden, &selector)?;
             db.unexclude(id).context("removing the exclusion")?;
             crate::jobs::request(crate::jobs::Command::Exclude {
                 id: id.to_string(),
@@ -1947,7 +2364,19 @@ fn cmd_exclude(env: &Env, out: Output, action: ExcludeAction) -> Result<()> {
     }
 }
 
-fn cmd_drives(env: &Env) -> Result<()> {
+/// One drive in `drives --json`.
+#[derive(serde::Serialize)]
+struct DriveRow {
+    mountpoint: PathBuf,
+    filesystem: String,
+    games: usize,
+    game_bytes: u64,
+    free_bytes: u64,
+    support: String,
+    mounted_compression: Option<String>,
+}
+
+fn cmd_drives(env: &Env, out: Output) -> Result<()> {
     let scan = scan(env);
     let mut seen: Vec<(PathBuf, FsInfo, u64, usize)> = Vec::new();
     for game in &scan.games {
@@ -1962,33 +2391,50 @@ fn cmd_drives(env: &Env) -> Result<()> {
             None => seen.push((fs.mountpoint.clone(), fs, game.size_hint.unwrap_or(0), 1)),
         }
     }
-    if seen.is_empty() {
+    if seen.is_empty() && !out.json {
         println!("No game drives found.");
         return Ok(());
     }
-    for (mountpoint, fs, bytes, games) in seen {
-        let free = backend::free_bytes(&mountpoint).unwrap_or(0);
-        println!("{} ({})", mountpoint.display(), fs.fstype);
-        println!("  games      : {games}, {}", size(bytes));
-        println!("  free       : {}", size(free));
-        match fsprobe::tier_for(&fs) {
-            Tier::Native(kind) => println!("  support    : {} compression, in place", kind.label()),
-            Tier::Pack if cfg!(feature = "pack-mount") && Path::new("/dev/fuse").exists() => {
-                println!("  support    : Maximum Space through a writable FUSE store")
+    let rows: Vec<DriveRow> = seen
+        .into_iter()
+        .map(|(mountpoint, fs, game_bytes, games)| {
+            let support = match fsprobe::tier_for(&fs) {
+                Tier::Native(kind) if native_supported(&Tier::Native(kind)) => {
+                    format!("{} compression, in place", kind.label())
+                }
+                Tier::Native(kind) => format!("none ({} has no backend yet)", kind.label()),
+                Tier::Pack if cfg!(feature = "pack-mount") && Path::new("/dev/fuse").exists() => {
+                    "Maximum Space through a writable FUSE store".to_owned()
+                }
+                Tier::Pack => {
+                    "Maximum Space needs the pack-mount feature and working FUSE".to_owned()
+                }
+                Tier::Unsupported(why) => format!("none ({why})"),
+            };
+            DriveRow {
+                free_bytes: backend::free_bytes(&mountpoint).unwrap_or(0),
+                filesystem: fs.fstype.clone(),
+                mounted_compression: fs.mount_compression().map(|(algo, level)| {
+                    level.map_or_else(|| algo.clone(), |l| format!("{algo}:{l}"))
+                }),
+                mountpoint,
+                games,
+                game_bytes,
+                support,
             }
-            Tier::Pack => println!(
-                "  support    : Maximum Space needs the pack-mount feature and working FUSE"
-            ),
-            Tier::Unsupported(why) => println!("  support    : none ({why})"),
+        })
+        .collect();
+    out.emit(&rows, || {
+        for row in &rows {
+            println!("{} ({})", row.mountpoint.display(), row.filesystem);
+            println!("  games      : {}, {}", row.games, size(row.game_bytes));
+            println!("  free       : {}", size(row.free_bytes));
+            println!("  support    : {}", row.support);
+            if let Some(mounted) = &row.mounted_compression {
+                println!("  mounted    : compress={mounted}");
+            }
         }
-        if let Some((algo, level)) = fs.mount_compression() {
-            println!(
-                "  mounted    : compress={algo}{}",
-                level.map(|l| format!(":{l}")).unwrap_or_default()
-            );
-        }
-    }
-    Ok(())
+    })
 }
 
 fn cmd_doctor(env: &Env) -> Result<()> {
@@ -2213,6 +2659,367 @@ mod tests {
             recorded_levels(Some(&db), &game, &inv).len(),
             0,
             "patched file is sampled again",
+        )
+    }
+
+    struct FakeProcs(Arc<std::sync::Mutex<Vec<busy::ProcInfo>>>);
+
+    impl busy::ProcSource for FakeProcs {
+        fn processes(&self) -> Vec<busy::ProcInfo> {
+            self.0.lock().map(|list| list.clone()).unwrap_or_default()
+        }
+    }
+
+    fn player(dir: &str) -> busy::ProcInfo {
+        busy::ProcInfo {
+            pid: 4242,
+            name: "game".to_owned(),
+            exe: Some(PathBuf::from(dir).join("game.bin")),
+            ..busy::ProcInfo::default()
+        }
+    }
+
+    fn fake_watch(
+        procs: Vec<busy::ProcInfo>,
+    ) -> (GameWatch, Arc<std::sync::Mutex<Vec<busy::ProcInfo>>>) {
+        let shared = Arc::new(std::sync::Mutex::new(procs));
+        let watch = GameWatch::start(
+            PathBuf::from("/games/Portal"),
+            FakeProcs(Arc::clone(&shared)),
+            std::time::Duration::from_millis(20),
+        );
+        (watch, shared)
+    }
+
+    #[test]
+    fn no_pause_stops_the_job_when_the_game_is_launched() -> TestResult {
+        use backend::BusyCheck;
+        let (watch, _procs) = fake_watch(vec![player("/games/Portal")]);
+        let stop = AtomicBool::new(false);
+        let guard = LaunchGuard {
+            watch: &watch,
+            stop: Some(&stop),
+        };
+        check_eq(
+            guard.in_use_by(),
+            None,
+            "a stopping check never asks the backend to wait",
+        )?;
+        check(
+            stop.load(std::sync::atomic::Ordering::Relaxed),
+            "the launch should set the cancel flag",
+        )
+    }
+
+    #[test]
+    fn the_default_check_pauses_instead_of_stopping() -> TestResult {
+        use backend::BusyCheck;
+        let (watch, _procs) = fake_watch(vec![player("/games/Portal")]);
+        let guard = LaunchGuard {
+            watch: &watch,
+            stop: None,
+        };
+        check_eq(
+            guard.in_use_by(),
+            Some("game (pid 4242)".to_owned()),
+            "the pause check names who is playing",
+        )?;
+        let (idle, _procs) = fake_watch(vec![player("/games/Terraria")]);
+        let guard = LaunchGuard {
+            watch: &idle,
+            stop: None,
+        };
+        check_eq(
+            guard.in_use_by(),
+            None,
+            "another game's process is not a launch",
+        )
+    }
+
+    #[test]
+    fn the_watch_thread_notices_a_launch_after_it_started() -> TestResult {
+        let (watch, procs) = fake_watch(Vec::new());
+        check_eq(watch.current(), None, "nothing is running at the start")?;
+        procs
+            .lock()
+            .ctx("lock the fake process list")?
+            .push(player("/games/Portal"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while watch.current().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        check_eq(
+            watch.current(),
+            Some("game (pid 4242)".to_owned()),
+            "a launch after the first scan should show up in a later one",
+        )
+    }
+
+    #[test]
+    fn a_max_pass_that_met_its_floor_counts_as_finished() -> TestResult {
+        let max = Preset::Max.level_plan();
+        // The backend reports the lowest level any file got.
+        check_eq(
+            level_to_record(max, Some(9), None, 15),
+            15,
+            "Max records its ceiling once the floor was applied",
+        )?;
+        check(
+            9 >= max.floor(),
+            "the next run's reuse test compares against the floor",
+        )?;
+        check_eq(
+            level_to_record(max, Some(3), None, 15),
+            3,
+            "a kernel that refused the level records what it applied",
+        )?;
+        check_eq(
+            level_to_record(Preset::Balanced.level_plan(), Some(9), Some(15), 9),
+            15,
+            "a higher earlier level stays for the files skipped as unchanged",
+        )?;
+        check_eq(
+            level_to_record(Preset::Fast.level_plan(), None, None, 3),
+            3,
+            "no level reported falls back to the requested one",
+        )
+    }
+
+    #[test]
+    fn a_cancelled_pass_counts_only_the_share_it_finished() -> TestResult {
+        check_eq(scaled_saving(1000, 10, 100), 100, "a tenth of the plan")?;
+        check_eq(scaled_saving(1000, 100, 100), 1000, "the whole plan")?;
+        check_eq(
+            scaled_saving(1000, 0, 0),
+            1000,
+            "an empty plan keeps the figure",
+        )?;
+        check_eq(
+            scaled_saving(u64::MAX, u64::MAX - 1, u64::MAX),
+            u64::MAX - 1,
+            "large figures do not overflow",
+        )
+    }
+
+    #[test]
+    fn levels_and_threads_are_checked_at_the_parser() -> TestResult {
+        use clap::Parser;
+        let parse = |args: &[&str]| {
+            let mut full = vec!["flummox", "compress", "game"];
+            full.extend_from_slice(args);
+            Cli::try_parse_from(full).is_ok()
+        };
+        check(parse(&["--level=15"]), "15 is the top of the range")?;
+        check(parse(&["--level=-15"]), "-15 is the bottom of the range")?;
+        check(!parse(&["--level=99"]), "99 is out of range")?;
+        check(!parse(&["--level=-16"]), "-16 is out of range")?;
+        check(
+            !parse(&["--level=0"]),
+            "0 reads as 'not compressed' in the database",
+        )?;
+        check(parse(&["--threads=32"]), "32 threads is the most allowed")?;
+        check(!parse(&["--threads=0"]), "0 threads cannot work")?;
+        check(!parse(&["--threads=33"]), "33 threads is over the limit")
+    }
+
+    #[test]
+    fn direct_paths_refuse_what_the_coordinator_refuses() -> TestResult {
+        let opts = |threads, level| CompressOpts {
+            threads,
+            level,
+            ..CompressOpts::default()
+        };
+        check(
+            check_job_opts(&opts(2, Some(9))).is_ok(),
+            "ordinary settings",
+        )?;
+        check(check_job_opts(&opts(0, None)).is_err(), "no threads")?;
+        check(check_job_opts(&opts(2, Some(99))).is_err(), "level 99")?;
+        check(check_job_opts(&opts(2, Some(0))).is_err(), "level 0")
+    }
+
+    #[test]
+    fn the_written_unit_is_as_hardened_as_the_packaged_one() -> TestResult {
+        let packaged = include_str!("../../packaging/flummox-watch.service");
+        let unit = unit_text(
+            Path::new("/usr/bin/flummox"),
+            &LevelArgs {
+                preset: PresetArg::Max,
+                level: None,
+            },
+            8,
+            false,
+        )
+        .ctx("render the unit")?;
+        let mut in_service = false;
+        let mut directives = 0;
+        for line in packaged.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                in_service = line == "[Service]";
+                continue;
+            }
+            let hardening =
+                line.contains('=') && !line.starts_with('#') && !line.starts_with("ExecStart=");
+            if in_service && hardening {
+                directives += 1;
+                check(
+                    unit.lines().any(|written| written == line),
+                    format!("the written unit lacks {line}"),
+                )?;
+            }
+        }
+        check(directives >= 8, "the packaged unit was read")?;
+        check(
+            unit.lines()
+                .any(|l| l == "ExecStart=\"/usr/bin/flummox\" watch --preset max --threads 8"),
+            "the watch flags reach ExecStart",
+        )
+    }
+
+    #[test]
+    fn the_unit_carries_level_and_dry_run() -> TestResult {
+        let unit = unit_text(
+            Path::new("/usr/bin/flummox"),
+            &LevelArgs {
+                preset: PresetArg::Fast,
+                level: Some(7),
+            },
+            2,
+            true,
+        )
+        .ctx("render the unit")?;
+        check(
+            unit.lines().any(|l| {
+                l == "ExecStart=\"/usr/bin/flummox\" watch --preset fast --level 7 --threads 2 --dry-run"
+            }),
+            "level and dry run are written in",
+        )
+    }
+
+    #[test]
+    fn exclude_remove_needs_one_clear_match() -> TestResult {
+        use crate::model::{GameId, Launcher};
+        let hidden = vec![
+            (GameId::new(Launcher::Steam, "400"), "Portal".to_owned()),
+            (GameId::new(Launcher::Steam, "620"), "Portal 2".to_owned()),
+        ];
+        let title = |selector: &str| pick_hidden(&hidden, selector).map(|(_, t)| t.clone());
+        check_eq(
+            title("portal").ctx("whole title")?,
+            "Portal".to_owned(),
+            "whole title",
+        )?;
+        check_eq(title("620").ctx("id")?, "Portal 2".to_owned(), "id")?;
+        check_eq(
+            title("steam:400").ctx("full id")?,
+            "Portal".to_owned(),
+            "full id",
+        )?;
+        check_eq(
+            title("2").ctx("partial")?,
+            "Portal 2".to_owned(),
+            "one partial match",
+        )?;
+        check(
+            title("port").is_err(),
+            "a partial title with two matches is refused",
+        )?;
+        check(title("").is_err(), "an empty selector names nothing")?;
+        check(title("  ").is_err(), "a blank selector names nothing")?;
+        check(title("zelda").is_err(), "no match is an error")
+    }
+
+    #[test]
+    fn bcachefs_is_not_offered_without_a_backend() -> TestResult {
+        use crate::fsprobe::BackendKind;
+        check(
+            native_supported(&Tier::Native(BackendKind::Btrfs)),
+            "btrfs has a backend",
+        )?;
+        check(
+            !native_supported(&Tier::Native(BackendKind::Bcachefs)),
+            "bcachefs has none",
+        )?;
+        check(
+            !native_supported(&Tier::Pack),
+            "pack is not an in-place tier",
+        )
+    }
+
+    #[test]
+    fn an_oversized_report_is_refused_before_it_is_parsed() -> TestResult {
+        let tmp = tempfile::tempdir().ctx("temporary directory")?;
+        let small = tmp.path().join("small.json");
+        std::fs::write(&small, b"{}").ctx("write the small report")?;
+        check_eq(
+            read_report(&small).ctx("read the small report")?,
+            b"{}".to_vec(),
+            "a small file is read whole",
+        )?;
+        let big = tmp.path().join("big.json");
+        std::fs::write(&big, vec![b' '; (MAX_REPORT_BYTES + 1) as usize])
+            .ctx("write the big report")?;
+        check(read_report(&big).is_err(), "over 1 MiB is refused")
+    }
+
+    #[test]
+    fn typed_folders_are_made_absolute_for_the_coordinator() -> TestResult {
+        let home = Path::new("/home/someone");
+        let relative = client_path("games/Portal", home).ctx("relative")?;
+        check(
+            relative.is_absolute(),
+            "a relative path gains its directory",
+        )?;
+        check(relative.ends_with("games/Portal"), "and keeps its tail")?;
+        check_eq(
+            client_path("~/games", home).ctx("home")?,
+            PathBuf::from("/home/someone/games"),
+            "a tilde still expands",
+        )
+    }
+
+    #[test]
+    fn a_file_left_below_the_floor_is_picked_up_again() -> TestResult {
+        let entry = |name: &str, ino| inventory::FileEntry {
+            rel: PathBuf::from(name),
+            size: 100_000,
+            ino,
+            mtime_ns: 1,
+            ctime_ns: 1,
+            action: inventory::Action::Compress,
+        };
+        let print = |ino, level| crate::db::FileFingerprint {
+            size: 100_000,
+            ino,
+            mtime_ns: 1,
+            ctime_ns: 1,
+            level_applied: level,
+        };
+        let inv = Inventory {
+            files: vec![
+                entry("low.dat", 1),
+                entry("high.dat", 2),
+                entry("never.dat", 3),
+            ],
+            warnings: vec![],
+        };
+        let stored = HashMap::from([
+            (PathBuf::from("low.dat"), print(1, 3)),
+            (PathBuf::from("high.dat"), print(2, 15)),
+            (
+                PathBuf::from("never.dat"),
+                print(3, crate::db::NOT_ATTEMPTED),
+            ),
+        ]);
+        let names: Vec<_> = below_floor(&stored, &inv, 9)
+            .into_iter()
+            .map(|e| e.rel)
+            .collect();
+        check_eq(
+            names,
+            vec![PathBuf::from("low.dat")],
+            "only the file compressed below the floor is redone",
         )
     }
 }
