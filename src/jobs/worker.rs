@@ -65,6 +65,18 @@ impl crate::pack::Observer for AnalysisObserver<'_> {
 }
 
 /// Runs one job through to its `Done` event. `run` reports an `Err` as `Failed`.
+/// The saving to record after a pass: this pass's estimate plus the share of
+/// the earlier figure that belongs to bytes this pass did not rewrite.
+fn carried_saving(earlier: u64, install_bytes: u64, rewritten: u64, this_pass: u64) -> u64 {
+    let untouched = install_bytes.saturating_sub(rewritten);
+    let kept = if install_bytes == 0 {
+        0
+    } else {
+        (u128::from(earlier) * u128::from(untouched) / u128::from(install_bytes)) as u64
+    };
+    kept.saturating_add(this_pass)
+}
+
 fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Result<()> {
     ensure!(work.version == VERSION, "Worker version mismatch");
     let job = work.job;
@@ -448,8 +460,20 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
         record.build = job.game.build.clone();
         record.install_bytes = full.total_bytes();
         record.level = outcome.effective_level.unwrap_or(0);
-        // The number describes this pass's analysis, never a measured receipt.
-        record.est_saving = i64::try_from(summary.saving()).unwrap_or(i64::MAX);
+        // The number describes analysis, never a measured receipt. A pass
+        // after an update analyses only the files that changed, so the share
+        // of the earlier figure that belongs to untouched files is kept.
+        // Without it the recorded saving shrank to the latest pass alone.
+        let earlier = db.game(&job.game.id)?.map_or(0, |previous| {
+            u64::try_from(previous.est_saving).unwrap_or(0)
+        });
+        record.est_saving = i64::try_from(carried_saving(
+            earlier,
+            record.install_bytes,
+            outcome.bytes,
+            summary.saving(),
+        ))
+        .unwrap_or(i64::MAX);
         let mut confirmed = outcome.completed.clone();
         confirmed.extend(full.files.iter().filter_map(|entry| {
             completed
@@ -479,4 +503,26 @@ pub(super) fn run() -> Result<()> {
         output.send(WorkerEvent::Failed(format!("{error:#}")));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::carried_saving;
+    use crate::testutil::{TestResult, check_eq};
+
+    #[test]
+    fn a_later_pass_keeps_the_saving_on_files_it_did_not_touch() -> TestResult {
+        check_eq(carried_saving(0, 1000, 1000, 300), 300, "a first pass")?;
+        check_eq(
+            carried_saving(300, 1000, 0, 0),
+            300,
+            "a pass with nothing to do changes nothing",
+        )?;
+        check_eq(
+            carried_saving(300, 1000, 100, 40),
+            310,
+            "an update to a tenth of the game replaces a tenth of the figure",
+        )?;
+        check_eq(carried_saving(300, 0, 0, 0), 0, "an empty game")
+    }
 }

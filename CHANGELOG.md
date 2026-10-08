@@ -26,6 +26,14 @@ version has no download yet. [Full notes](docs/releases/0.0.2.md).
 
 ### Changed
 
+- The Games page opens with the games worth compressing at the top, grouped
+  as Worth compressing, Not analyzed yet, Compressed and Little to gain.
+- A compressed game says what it gained, on its row and in History. Native
+  results are estimates and say so; Maximum Space results are the store's own
+  sizes.
+- The window uses Compress, Decompress and Analyze throughout, on every
+  platform. Optimize, Recheck, Restore and Reclaim are gone as button names.
+
 - A newer Flummox replaces an older idle background worker by itself. Before,
   it asked you to run `flummox jobs restart` or log out.
 - A compress job reports its progress once and in order. The bar used to fill
@@ -54,6 +62,11 @@ open items are listed there.
   to skip appear as scan warnings.
 
 ### Fixed
+
+- The saved-space total no longer shrinks after a game update. A second pass
+  analyses only the changed files, and its figure used to replace the first.
+- The saved-space total no longer counts a Maximum Space game whose original
+  has not been deleted yet.
 
 - Windows: the background worker no longer crashes when it starts within a
   minute of boot, and Restore no longer stops at a file that was never

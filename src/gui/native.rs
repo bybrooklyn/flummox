@@ -1213,11 +1213,11 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
 
     // Games page, second panel: the selected folder and everything that acts on it.
     let controls = row![
-        button("Optimize")
+        button("Compress")
             .padding([11, 18])
             .style(theme::action_button)
             .on_press_maybe((!state.working).then_some(Message::Optimize)),
-        button("Restore")
+        button("Decompress")
             .padding([11, 18])
             .style(theme::secondary_button)
             .on_press_maybe((!state.working).then_some(Message::Restore)),
@@ -1236,7 +1236,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         button("Browse…").on_press_maybe(
             (!state.picker_busy && !state.working).then_some(Message::BrowseFolder(false))
         ),
-        theme::muted("Optimize skips files the filesystem cannot shrink"),
+        theme::muted("Compress skips files the filesystem cannot shrink"),
         controls,
         button("Qualify compatibility")
             .on_press_maybe((!state.working).then_some(Message::Qualify)),
@@ -1892,7 +1892,7 @@ fn worker_jobs(state: &State) -> iced::widget::Column<'_, Message> {
                         theme::muted(format!(
                             "{} · {}",
                             if job.restore {
-                                "Restore"
+                                "Decompression"
                             } else {
                                 "Compression"
                             },

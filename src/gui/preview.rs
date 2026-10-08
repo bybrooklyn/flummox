@@ -88,6 +88,95 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
         pack_interruptible: false,
         space_plan: None,
     });
+    // More games, so the Games page shows each group of the Worth order and
+    // each kind of result: a native pass, a Maximum Space game whose original
+    // is still kept, one whose original is deleted, a game with nothing to
+    // gain, and one not analyzed yet.
+    let extra = |key: &str, title: &str| {
+        let game = Game {
+            id: GameId::new(Launcher::Manual, key),
+            title: title.into(),
+            install_dir: temp.path().join(title),
+            ..game.clone()
+        };
+        GameRow {
+            game,
+            filesystem: "btrfs".into(),
+            mountpoint: Some(temp.path().to_path_buf()),
+            supported: true,
+            native_supported: true,
+            pack_supported: true,
+            note: None,
+            artwork: None,
+            cover: None,
+        }
+    };
+    let finished = |id: i64, row: &GameRow, operation: Operation, after: u64| Job {
+        id,
+        game: row.game.clone(),
+        operation,
+        options: Default::default(),
+        phase: Phase::Completed,
+        files_done: 140,
+        bytes_done: 4_000_000_000,
+        files_total: 140,
+        bytes_total: 4_000_000_000,
+        estimate: Some(crate::estimate::Estimate {
+            disk_now: 4_000_000_000,
+            disk_after: after,
+            install_bytes: 4_000_000_000,
+            sampled: 28_000_000,
+            inspected_files: 140,
+            ..Default::default()
+        }),
+        message: "Finished".into(),
+        errors: vec![],
+        created: 0,
+        elapsed: 12,
+        drive_change: None,
+        user_paused: false,
+        pack: None,
+        pack_interruptible: false,
+        space_plan: None,
+    };
+    let native = extra("native", "Compressed Quest");
+    let flat = extra("flat", "Already Packed Racing");
+    let unknown = extra("unknown", "Unchecked Tales");
+    let kept = extra("kept", "Maximum With Original");
+    let confirmed = extra("confirmed", "Maximum Confirmed");
+    state
+        .snapshot
+        .jobs
+        .push(finished(20, &native, Operation::Compress, 2_500_000_000));
+    state
+        .snapshot
+        .jobs
+        .push(finished(21, &flat, Operation::Analyze, 4_000_000_000));
+    for (row, original) in [(&kept, true), (&confirmed, false)] {
+        state.snapshot.packs.push(crate::pack::Install {
+            game_path: row.game.install_dir.clone(),
+            store_path: temp.path().join("store"),
+            writes_path: temp.path().join("updates"),
+            backup_path: original.then(|| temp.path().join("original")),
+            previous_store_path: None,
+            previous_writes_path: None,
+            summary: serde_json::from_value(serde_json::json!({
+                "files": 140,
+                "logical_bytes": 4_000_000_000u64,
+                "archive_bytes": 1_900_000_000u64,
+                "metadata_bytes": 2_000_000,
+                "unique_chunks": 900,
+                "duplicate_bytes": 0
+            }))
+            .ctx("store summary")?,
+            phase: crate::pack::InstallPhase::Mounted,
+            message: "Writable compressed install is mounted".into(),
+        });
+    }
+    for row in [native, flat, unknown, kept, confirmed] {
+        state.games.push(row);
+    }
+    state.capture_order();
     state.folder = "~/My Games".into();
     state.snapshot.libraries.push(Library {
         path: "/home/player/My Games".into(),
@@ -110,6 +199,15 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
         render(&state, 1100, 900, &output.join(format!("{name}-light.png")))?;
         state.theme = crate::jobs::ThemePreference::Dark;
     }
+    // The Games list with no row open, so every group heading is in view,
+    // then with the last group expanded.
+    let open = state.expanded.take();
+    state.page = Page::Games;
+    render(&state, 1100, 900, &output.join("games-groups.png"))?;
+    state.show_low = true;
+    render(&state, 1100, 1000, &output.join("games-groups-all.png"))?;
+    state.show_low = false;
+    state.expanded = open;
     // The storage plan review that precedes a job.
     state.planned = Some((
         crate::jobs::Command::Enqueue {
