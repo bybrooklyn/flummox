@@ -381,32 +381,104 @@ fn metadata_equal(first: &Path, second: &Path) -> Result<()> {
     Ok(())
 }
 
+fn is_app(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "app")
+}
 // The nearest of the path and its ancestors that has an `.app` extension.
 fn bundle(path: &Path) -> Option<PathBuf> {
     path.ancestors()
-        .find(|parent| {
-            parent
-                .extension()
-                .is_some_and(|extension| extension == "app")
-        })
+        .find(|parent| is_app(parent))
         .map(Path::to_path_buf)
 }
-// The enclosing application bundle if it carries a code signature. `codesign
-// --display` failing is read as unsigned and returns None. A signed bundle must
-// verify now, before any file in it is replaced.
-fn signed_bundle(path: &Path) -> Result<Option<PathBuf>> {
-    let Some(bundle) = bundle(path) else {
-        return Ok(None);
+// The outermost of the path and its ancestors that has an `.app` extension.
+fn outer_bundle(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .filter(|parent| is_app(parent))
+        .last()
+        .map(Path::to_path_buf)
+}
+// The directory that holds the work directory for `source`. For a file inside an
+// application bundle it is the folder containing the outermost bundle, because a
+// work directory inside a signed bundle breaks its seal. Otherwise it is the
+// file's own folder. Both are on the file's volume, so the swap stays atomic.
+fn work_parent(source: &Path) -> Option<PathBuf> {
+    outer_bundle(source)
+        .as_deref()
+        .unwrap_or(source)
+        .parent()
+        .map(Path::to_path_buf)
+}
+// Whether a journal's staged path is somewhere `stage` could have put it for
+// `source`: the current layout, or the older one beside the file inside `root`.
+fn staging_expected(root: &Path, source: &Path, staged: &Path) -> bool {
+    let Some(parent) = staged.parent().and_then(Path::parent) else {
+        return false;
     };
+    work_parent(source).is_some_and(|expected| expected == parent)
+        || (source.parent() == Some(parent) && staged.starts_with(root))
+}
+// True when `codesign --display` succeeds, which is how this module reads "signed".
+fn is_signed(bundle: &Path) -> Result<bool> {
     let output = std::process::Command::new("/usr/bin/codesign")
         .args(["--display"])
-        .arg(&bundle)
+        .arg(bundle)
         .output()?;
-    if !output.status.success() {
-        return Ok(None);
+    Ok(output.status.success())
+}
+// Signature state of each application bundle met in one pass.
+#[derive(Default)]
+struct Seals {
+    bundles: std::collections::BTreeMap<PathBuf, Seal>,
+}
+struct Seal {
+    // The bundle was signed and verified before its first file was replaced.
+    valid: bool,
+    // At least one file in it has been replaced.
+    changed: bool,
+}
+impl Seals {
+    // Called before a file is replaced. The first call for a bundle verifies it. A
+    // bundle that is unsigned, or whose signature is already invalid, is not
+    // verified again afterwards.
+    fn before(&mut self, path: &Path) -> Result<()> {
+        let Some(bundle) = bundle(path) else {
+            return Ok(());
+        };
+        if self.bundles.contains_key(&bundle) {
+            return Ok(());
+        }
+        let valid = is_signed(&bundle)? && verify_bundle(&bundle).is_ok();
+        self.bundles.insert(
+            bundle,
+            Seal {
+                valid,
+                changed: false,
+            },
+        );
+        Ok(())
     }
-    verify_bundle(&bundle)?;
-    Ok(Some(bundle))
+    // Notes that a file under `path`'s bundle was replaced.
+    fn changed(&mut self, path: &Path) {
+        if let Some(bundle) = bundle(path)
+            && let Some(seal) = self.bundles.get_mut(&bundle)
+        {
+            seal.changed = true;
+        }
+    }
+    // Verifies each bundle that was valid before the pass and had a file replaced.
+    fn verify_after(&self) -> Result<()> {
+        for (bundle, seal) in &self.bundles {
+            if seal.valid && seal.changed {
+                verify_bundle(bundle).with_context(|| {
+                    format!(
+                        "{} no longer verifies; decompress the game to undo the pass",
+                        bundle.display()
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
 }
 fn verify_bundle(path: &Path) -> Result<()> {
     let output = std::process::Command::new("/usr/bin/codesign")
@@ -468,7 +540,7 @@ fn clear_record(record: &Recovery) -> Result<()> {
 pub fn recover_original(record: &Recovery) -> Result<()> {
     let root = validate(&record.root)?;
     ensure!(
-        record.source.starts_with(&root) && record.staged.starts_with(&root),
+        record.source.starts_with(&root) && staging_expected(&root, &record.source, &record.staged),
         "Recovery paths escaped the game folder"
     );
     ensure!(
@@ -514,7 +586,7 @@ pub fn recover_original(record: &Recovery) -> Result<()> {
 // is set. Returns false when the file is left alone. The copy is built beside the
 // file, verified, journaled and swapped in. The original is deleted only after the
 // swapped result has been verified too.
-fn stage(root: &Path, source: &Path, restore: bool) -> Result<bool> {
+fn stage(root: &Path, source: &Path, restore: bool, seals: &mut Seals) -> Result<bool> {
     let original = identity(source)?;
     let stat = std::fs::symlink_metadata(source)?;
     let compressed = stat.st_flags() & libc::UF_COMPRESSED != 0;
@@ -533,12 +605,14 @@ fn stage(root: &Path, source: &Path, restore: bool) -> Result<bool> {
         "Temporary file and replacement",
     )?;
     space.recheck()?;
-    let signature = signed_bundle(source)?;
-    // The work directory sits beside the file, so the swap stays on one volume.
+    seals.before(source)?;
+    // The work directory sits beside the file, or beside the enclosing `.app`, so
+    // the swap stays on one volume and the bundle's seal is not disturbed.
     let parent = source.parent().context("File has no parent")?;
+    let work = work_parent(source).context("File has no parent")?;
     let temporary = tempfile::Builder::new()
         .prefix(".flummox-work-")
-        .tempdir_in(parent)?;
+        .tempdir_in(&work)?;
     let staged = temporary.path().join("candidate");
     let before_hash = hash(source)?;
     // Restore: reading a compressed file yields its plain bytes, so a byte copy is
@@ -621,12 +695,13 @@ fn stage(root: &Path, source: &Path, restore: bool) -> Result<bool> {
         candidate: identity(&staged)?,
         hash: before_hash,
     };
-    // From here the work directory must outlive this function on any error, and
-    // the journal must be on disk before the swap. An early return below leaves
-    // both files and the journal for `recover_original`.
-    let _retained = temporary.keep();
+    // The journal must be on disk before the swap. If saving fails, `temporary`
+    // drops and removes the work directory. Once it is saved the directory is kept
+    // on any error below, with both files, for `recover_original`.
     save(&record)?;
+    let _retained = temporary.keep();
     swap(source, &staged)?;
+    seals.changed(source);
     File::open(parent)?.sync_all()?;
     // After the swap `staged` holds the original and `source` holds the new copy.
     ensure!(
@@ -638,9 +713,6 @@ fn stage(root: &Path, source: &Path, restore: bool) -> Result<bool> {
         "Published bytes failed verification; recovery copies retained"
     );
     metadata_equal(source, &staged)?;
-    if let Some(bundle) = signature {
-        verify_bundle(&bundle)?;
-    }
     clear_record(&record)?;
     Ok(true)
 }
@@ -876,7 +948,7 @@ mod tests {
         xattr::set(&path, "user.flummox-fixture", b"metadata").ctx("attribute")?;
         let before = std::fs::symlink_metadata(&path).ctx("original metadata")?;
         check(
-            stage(&root, &path, false).ctx("compress")?,
+            stage(&root, &path, false, &mut Seals::default()).ctx("compress")?,
             "APFS must actually compress the positive control",
         )?;
         let compressed = std::fs::symlink_metadata(&path).ctx("compressed metadata")?;
@@ -890,7 +962,7 @@ mod tests {
             "ordinary reads preserve bytes",
         )?;
         check(
-            stage(&root, &path, true).ctx("restore")?,
+            stage(&root, &path, true, &mut Seals::default()).ctx("restore")?,
             "compressed file must restore",
         )?;
         check_eq(
