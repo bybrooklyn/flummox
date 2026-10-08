@@ -79,6 +79,13 @@ open items are listed there.
 
 ### Fixed
 
+- Scrolling with the mouse wheel rebuilt the whole page on every frame, which
+  made it stutter and filled the terminal with layout warnings. The window now
+  keeps track of the scroll position without doing that.
+- A game's details were a tall stack of single buttons and analysis text. The
+  cover now sits beside the controls, the chosen mode is the filled button,
+  the actions share one row, and the technical lines are under Advanced.
+
 - Pressing Pause just as a job finished showed a lost-connection error that
   stayed on screen. It is now ignored.
 - Compressing several games no longer fails entirely when one of them cannot
