@@ -100,6 +100,9 @@ pub fn save_override(game: String, path: PathBuf) -> Result<()> {
 }
 /// Removes the saved image for a game, so it goes back to its default
 /// artwork. Blocks on file I/O.
+// The Linux window's "Use default artwork" button calls this. The native
+// window has no such button yet.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn clear_override(game: &str) -> Result<()> {
     let mut items = overrides()?;
     items.retain(|item| item.game != game);
