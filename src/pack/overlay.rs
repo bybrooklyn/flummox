@@ -707,13 +707,9 @@ impl Overlay {
     }
 
     /// Makes `path` visible again after something was created or moved there.
-    ///
-    /// The whiteout on `path` also hid everything the store holds below it.
-    /// Those children get whiteouts of their own, so a folder recreated or
-    /// moved here starts with only what the update layer holds. Whiteouts
-    /// below `path` that now have an upper entry are dropped for the same
-    /// reason `open` drops them, and a dropped whiteout over a store folder
-    /// is replaced by whiteouts over that folder's children.
+    /// Store children the old whiteout hid get whiteouts of their own. A
+    /// whiteout below `path` that now has an upper entry is dropped and
+    /// replaced by whiteouts over that entry's store children.
     fn reveal(&mut self, reader: &Reader, path: &Path) {
         if self.deleted.remove(path) {
             self.hide_children(reader, path);
@@ -918,7 +914,12 @@ mod tests {
         let reader = store_from(temp.path(), &["data/sub/deep.bin"])?;
         let mut overlay = Overlay::open(&temp.path().join("layer")).ctx("layer")?;
         overlay
-            .rename(&reader, Path::new("data/sub"), Path::new("elsewhere"), false)
+            .rename(
+                &reader,
+                Path::new("data/sub"),
+                Path::new("elsewhere"),
+                false,
+            )
             .ctx("move the store folder away")?;
         overlay
             .mkdir(&reader, Path::new("newdata"), 0o755)
@@ -984,7 +985,9 @@ mod tests {
         // A copy-up that died after staging leaves its temporary file here.
         let stale = layer.join(STAGING).join(".tmpleftover");
         std::fs::write(&stale, b"partial").ctx("stale staging file")?;
-        overlay.copy_up(&reader, Path::new("dir/b")).ctx("copy up")?;
+        overlay
+            .copy_up(&reader, Path::new("dir/b"))
+            .ctx("copy up")?;
         drop(overlay);
         let _reopened = reopen(&layer)?;
         check(!stale.exists(), "staging is emptied when the layer opens")?;
@@ -1077,12 +1080,9 @@ mod tests {
             Ok(())
         })();
         // Write access back, so the temporary folder can be removed.
-        for root in [
-            source.clone(),
-            layer.join(FILES),
-            destination.clone(),
-        ] {
-            let _ = std::fs::set_permissions(root.join("rd"), std::fs::Permissions::from_mode(0o755));
+        for root in [source.clone(), layer.join(FILES), destination.clone()] {
+            let _restored =
+                std::fs::set_permissions(root.join("rd"), std::fs::Permissions::from_mode(0o755));
         }
         outcome
     }

@@ -550,11 +550,13 @@ mod tests {
             phase,
             message: String::new(),
         };
-        let mut snapshot = Snapshot::default();
-        snapshot.packs = vec![
-            record(crate::pack::InstallPhase::Reclaiming),
-            record(crate::pack::InstallPhase::Mounted),
-        ];
+        let mut snapshot = Snapshot {
+            packs: vec![
+                record(crate::pack::InstallPhase::Reclaiming),
+                record(crate::pack::InstallPhase::Mounted),
+            ],
+            ..Snapshot::default()
+        };
         let db = database()?;
         let mut mounts = Vec::new();
         recover_packs(&mut snapshot, &db, &mut mounts).ctx("recover")?;
@@ -625,11 +627,7 @@ mod tests {
             refused.is_err(),
             "compaction is refused while a process uses the folder",
         )?;
-        check_eq(
-            mounts.len(),
-            1,
-            "the mount is still held after the refusal",
-        )?;
+        check_eq(mounts.len(), 1, "the mount is still held after the refusal")?;
         check_eq(
             std::fs::read(canonical.join("data")).ctx("read through the mount")?,
             b"bytes".to_vec(),

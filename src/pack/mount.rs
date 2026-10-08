@@ -491,7 +491,10 @@ fn timespec(time: SystemTime) -> rustix::fs::Timespec {
             let back = i64::try_from(before.as_secs()).unwrap_or(i64::MAX);
             match i64::from(before.subsec_nanos()) {
                 0 => (back.saturating_neg(), 0),
-                nanos => (back.saturating_add(1).saturating_neg(), 1_000_000_000 - nanos),
+                nanos => (
+                    back.saturating_add(1).saturating_neg(),
+                    1_000_000_000 - nanos,
+                ),
             }
         }
     };
@@ -802,7 +805,10 @@ impl Filesystem for StoreFs {
                 .path(ino)
                 .ok()
                 .filter(|path| self.visible(path).unwrap_or(false));
-            match (current, handle.as_ref().and_then(|handle| handle.base.as_ref())) {
+            match (
+                current,
+                handle.as_ref().and_then(|handle| handle.base.as_ref()),
+            ) {
                 (Some(path), _) => match &self.overlay {
                     Some(overlay) => overlay
                         .lock()
@@ -877,7 +883,9 @@ impl Filesystem for StoreFs {
         {
             match file.sync_all() {
                 Ok(()) => reply.ok(),
-                Err(error) => reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO))),
+                Err(error) => {
+                    reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO)))
+                }
             }
             return;
         }

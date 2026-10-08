@@ -139,9 +139,10 @@ mod enabled {
             let (Ok(pid), Ok(_attempt)) = (pid.parse::<u32>(), attempt.parse::<u32>()) else {
                 continue;
             };
-            let recorded = path == install.store_path
-                || install.previous_store_path.as_ref() == Some(&path);
-            let running = pid != std::process::id() && Path::new("/proc").join(pid.to_string()).exists();
+            let recorded =
+                path == install.store_path || install.previous_store_path.as_ref() == Some(&path);
+            let running =
+                pid != std::process::id() && Path::new("/proc").join(pid.to_string()).exists();
             if recorded || running {
                 continue;
             }
@@ -727,7 +728,10 @@ mod tests {
         // Control: the intact store opens, so only the damage below matters.
         crate::pack::Reader::open(&store).ctx("intact store opens")?;
         std::fs::remove_file(store.join("manifest")).ctx("interrupted deletion")?;
-        check(crate::pack::Reader::open(&store).is_err(), "the damaged store no longer opens")?;
+        check(
+            crate::pack::Reader::open(&store).is_err(),
+            "the damaged store no longer opens",
+        )?;
         let mut pruning = record(&game, InstallPhase::Pruning);
         pruning.previous_store_path = Some(store.clone());
         finish_prune(&mut pruning).ctx("finish the prune")?;
@@ -740,8 +744,14 @@ mod tests {
         std::fs::write(other.join("notes.txt"), b"keep").ctx("notes")?;
         let mut pruning = record(&game, InstallPhase::Pruning);
         pruning.previous_store_path = Some(other.clone());
-        check(finish_prune(&mut pruning).is_err(), "other folders are refused")?;
-        check(other.join("notes.txt").exists(), "their files are untouched")
+        check(
+            finish_prune(&mut pruning).is_err(),
+            "other folders are refused",
+        )?;
+        check(
+            other.join("notes.txt").exists(),
+            "their files are untouched",
+        )
     }
 
     #[test]
@@ -765,9 +775,16 @@ mod tests {
         }
         install.store_path = recorded.clone();
         install.previous_store_path = Some(previous.clone());
-        check_eq(remove_orphaned_compactions(&install), 2, "two orphans removed")?;
+        check_eq(
+            remove_orphaned_compactions(&install),
+            2,
+            "two orphans removed",
+        )?;
         check(!orphan.exists(), "a dead process's store is removed")?;
-        check(!own_orphan.exists(), "an earlier attempt of this process is removed")?;
+        check(
+            !own_orphan.exists(),
+            "an earlier attempt of this process is removed",
+        )?;
         check(recorded.exists(), "the current store is kept")?;
         check(previous.exists(), "the previous store is kept")?;
         check(other_game.exists(), "another game's store is kept")

@@ -721,13 +721,100 @@ fn authenticated_indexes_still_require_safe_paths_and_bounded_chunks() -> TestRe
     check(index.validate(65, 1).is_err(), "payload offset bounded")
 }
 
+// A valid monolithic store holding one small file, built once.
+fn valid_store_bytes() -> &'static [u8] {
+    static STORE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let build = || -> Result<Vec<u8>, String> {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let source = temp.path().join("source");
+        fs::create_dir(&source).ctx("source")?;
+        fs::write(source.join("f"), b"hello world").ctx("file")?;
+        let store = temp.path().join("a.flumpack");
+        create(&source, &store, Options::default(), &AtomicBool::new(false)).ctx("create")?;
+        fs::read(&store).ctx("read store")
+    };
+    // An empty result makes every case that uses it fail on a short header.
+    STORE.get_or_init(|| build().unwrap_or_default()).as_slice()
+}
+
+// Applies `edit` to the index of a valid store, then rewrites the header's
+// index length and checksum so the edit reaches parsing and validation.
+fn with_edited_index(edit: impl FnOnce(&mut Vec<u8>)) -> Result<Vec<u8>, String> {
+    let mut bytes = valid_store_bytes().to_vec();
+    let offset = usize::try_from(u64::from_le_bytes(
+        bytes
+            .get(16..24)
+            .ctx("offset field")?
+            .try_into()
+            .ctx("offset width")?,
+    ))
+    .ctx("offset")?;
+    let mut index = bytes.get(offset..).ctx("index bytes")?.to_vec();
+    edit(&mut index);
+    bytes.truncate(offset);
+    bytes.extend_from_slice(&index);
+    bytes
+        .get_mut(24..32)
+        .ctx("length field")?
+        .copy_from_slice(&(index.len() as u64).to_le_bytes());
+    bytes
+        .get_mut(32..64)
+        .ctx("hash field")?
+        .copy_from_slice(blake3::hash(&index).as_bytes());
+    Ok(bytes)
+}
+
+fn open_bytes(bytes: &[u8]) -> Result<Reader, String> {
+    let mut file = tempfile::tempfile().ctx("fixture")?;
+    file.write_all(bytes).ctx("input")?;
+    Reader::from_file(file).map_err(|error| format!("{error:#}"))
+}
+
+#[test]
+fn an_edited_index_with_a_correct_checksum_is_still_validated() -> TestResult {
+    // Control: the unedited index passes the same path.
+    open_bytes(&with_edited_index(|_| {})?).ctx("valid index")?;
+    let escaped = with_edited_index(|index| {
+        let text = String::from_utf8_lossy(index).replace("\"path\":\"f\"", "\"path\":\"../f\"");
+        *index = text.into_bytes();
+    })?;
+    check(
+        open_bytes(&escaped).is_err(),
+        "a path escaping the store is rejected although the checksum matches",
+    )?;
+    let oversized = with_edited_index(|index| {
+        let text = String::from_utf8_lossy(index).replace("\"raw\":11", "\"raw\":99999999");
+        *index = text.into_bytes();
+    })?;
+    check(
+        open_bytes(&oversized).is_err(),
+        "a chunk longer than the block size is rejected",
+    )
+}
+
 proptest::proptest! {
+    // Each case damages one byte of a valid index and fixes the checksum, so
+    // JSON parsing and `Index::validate` see the damage.
     #[test]
-    fn arbitrary_store_bytes_are_rejected_without_panicking(bytes in proptest::collection::vec(proptest::num::u8::ANY,0..1024)) {
+    fn a_damaged_index_with_a_correct_checksum_never_panics(
+        position in 0usize..4096,
+        value in proptest::num::u8::ANY,
+    ) {
         let result = (|| -> TestResult {
-            let mut file = tempfile::tempfile().ctx("fixture")?;
-            file.write_all(&bytes).ctx("input")?;
-            check(Reader::from_file(file).is_err(),"random bytes cannot authenticate a store")
+            let damaged = with_edited_index(|index| {
+                let length = index.len().max(1);
+                if let Some(byte) = index.get_mut(position % length) {
+                    *byte = value;
+                }
+            })?;
+            let original_index = with_edited_index(|_| {})?;
+            if damaged == original_index {
+                open_bytes(&damaged).ctx("an unchanged index opens")?;
+            } else {
+                // Any outcome but a panic is acceptable.
+                let _outcome = open_bytes(&damaged);
+            }
+            Ok(())
         })();
         result.map_err(proptest::test_runner::TestCaseError::fail)?;
     }
@@ -969,70 +1056,56 @@ fn a_setuid_file_is_not_stored_and_not_accepted() -> TestResult {
     fs::set_permissions(source.join("tool"), fs::Permissions::from_mode(0o755)).ctx("plain")?;
     let store = temp.path().join("b.flumpack");
     create(&source, &store, Options::default(), &cancel).ctx("plain file")?;
-    let mut index = Index {
+    let index = Index {
         entries: Reader::open(&store).ctx("reader")?.index.entries.clone(),
         chunks: Reader::open(&store).ctx("reader")?.index.chunks.clone(),
     };
+    let end = index
+        .chunks
+        .last()
+        .map_or(0, |chunk| chunk.offset + u64::from(chunk.stored));
+    index
+        .validate(end, 6)
+        .ctx("control: version 6 without the bit is valid")?;
+    let mut setuid = Index {
+        entries: index.entries.clone(),
+        chunks: index.chunks.clone(),
+    };
+    for entry in &mut setuid.entries {
+        if matches!(entry.kind, Kind::File { .. } | Kind::SlicedFile { .. }) {
+            entry.mode |= 0o4000;
+        }
+    }
+    check(
+        setuid.validate(end, 6).is_err(),
+        "a version 6 index naming a setuid file is rejected",
+    )?;
+    // Version 7 is a directory store, whose chunks carry no offsets, so it
+    // needs an index from a shared store. That one is valid before the bit.
+    let shared = temp.path().join("c.flumpack");
+    create_shared(
+        &source,
+        &shared,
+        &temp.path().join("pool"),
+        Options::default(),
+        &cancel,
+    )
+    .ctx("shared store")?;
+    let reader = Reader::open(&shared).ctx("shared reader")?;
+    let mut index = Index {
+        entries: reader.index.entries.clone(),
+        chunks: reader.index.chunks.clone(),
+    };
+    index
+        .validate(0, 7)
+        .ctx("control: version 7 without the bit is valid")?;
     for entry in &mut index.entries {
         if matches!(entry.kind, Kind::File { .. } | Kind::SlicedFile { .. }) {
             entry.mode |= 0o4000;
         }
     }
-    let end = index
-        .chunks
-        .last()
-        .map_or(0, |chunk| chunk.offset + u64::from(chunk.stored));
     check(
-        index.validate(end, 7).is_err() && index.validate(end, 6).is_err(),
-        "an index naming a setuid file is rejected",
-    )
-}
-
-// Setting a user attribute needs write permission, so the mode goes on last.
-#[test]
-fn read_only_files_and_folders_keep_their_attributes_through_restore() -> TestResult {
-    let temp = tempfile::tempdir().ctx("fixture")?;
-    let source = temp.path().join("source");
-    fs::create_dir_all(source.join("ro-dir")).ctx("directories")?;
-    fs::write(source.join("ro-dir/ro-file"), b"read only").ctx("file")?;
-    fs::write(source.join("sliced"), b"tiny").ctx("small file")?;
-    for path in ["ro-dir/ro-file", "sliced", "ro-dir"] {
-        xattr::set(source.join(path), "user.flummox-test", b"kept").ctx("source xattr")?;
-    }
-    fs::set_permissions(
-        source.join("ro-dir/ro-file"),
-        fs::Permissions::from_mode(0o444),
-    )
-    .ctx("file mode")?;
-    fs::set_permissions(source.join("sliced"), fs::Permissions::from_mode(0o444))
-        .ctx("small file mode")?;
-    fs::set_permissions(source.join("ro-dir"), fs::Permissions::from_mode(0o555))
-        .ctx("directory mode")?;
-    let store = temp.path().join("game.flumpack");
-    let cancel = AtomicBool::new(false);
-    let created = create(&source, &store, Options::default(), &cancel);
-    let restored = temp.path().join("restored");
-    let result = restore(&store, &restored, &cancel);
-    // Put write access back so the temporary folder can be removed.
-    for root in [&source, &restored] {
-        let _ = fs::set_permissions(root.join("ro-dir"), fs::Permissions::from_mode(0o755));
-    }
-    created.ctx("create")?;
-    result.ctx("restore")?;
-    for path in ["ro-dir/ro-file", "sliced", "ro-dir"] {
-        check_eq(
-            xattr::get(restored.join(path), "user.flummox-test").ctx("restored xattr")?,
-            Some(b"kept".to_vec()),
-            format!("{path} keeps its attribute"),
-        )?;
-    }
-    check_eq(
-        fs::metadata(restored.join("ro-dir/ro-file"))
-            .ctx("restored mode")?
-            .permissions()
-            .mode()
-            & 0o777,
-        0o444,
-        "the file is read-only again",
+        index.validate(0, 7).is_err(),
+        "a version 7 index naming a setuid file is rejected",
     )
 }

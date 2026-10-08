@@ -415,8 +415,8 @@ fn a_recreated_name_does_not_join_a_file_that_still_has_another_name() -> TestRe
     }
     let fixture = mounted_fixture(&[("t", b"base bytes")], &[("a", "t")])?;
     let target = &fixture.target;
-    let session = pack::mount::mount(&fixture.store, target, Some(&fixture.writes))
-        .ctx("writable mount")?;
+    let session =
+        pack::mount::mount(&fixture.store, target, Some(&fixture.writes)).ctx("writable mount")?;
     // A link made through the mount, then its first name removed and reused.
     fs::write(target.join("f.tmp"), b"one").ctx("first temp file")?;
     fs::hard_link(target.join("f.tmp"), target.join("f")).ctx("link")?;
@@ -462,8 +462,8 @@ fn exchanging_two_names_is_refused_and_changes_nothing() -> TestResult {
     }
     let fixture = mounted_fixture(&[("a", b"first"), ("b", b"second")], &[])?;
     let target = &fixture.target;
-    let session = pack::mount::mount(&fixture.store, target, Some(&fixture.writes))
-        .ctx("writable mount")?;
+    let session =
+        pack::mount::mount(&fixture.store, target, Some(&fixture.writes)).ctx("writable mount")?;
     let exchange = rustix::fs::renameat_with(
         rustix::fs::CWD,
         target.join("a"),
@@ -503,8 +503,8 @@ fn an_open_file_stays_readable_and_writable_after_its_name_changes() -> TestResu
     }
     let fixture = mounted_fixture(&[("config", b"base config"), ("spare", b"spare")], &[])?;
     let target = &fixture.target;
-    let session = pack::mount::mount(&fixture.store, target, Some(&fixture.writes))
-        .ctx("writable mount")?;
+    let session =
+        pack::mount::mount(&fixture.store, target, Some(&fixture.writes)).ctx("writable mount")?;
     // A store file opened, then removed.
     let first = fs::File::open(target.join("config")).ctx("open base file")?;
     fs::remove_file(target.join("config")).ctx("unlink open file")?;
@@ -547,8 +547,8 @@ fn a_file_created_read_only_can_be_written_through_its_descriptor() -> TestResul
     }
     let fixture = mounted_fixture(&[("base", b"x")], &[])?;
     let target = &fixture.target;
-    let session = pack::mount::mount(&fixture.store, target, Some(&fixture.writes))
-        .ctx("writable mount")?;
+    let session =
+        pack::mount::mount(&fixture.store, target, Some(&fixture.writes)).ctx("writable mount")?;
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -588,8 +588,8 @@ fn setting_times_on_a_symlink_leaves_what_it_points_at_alone() -> TestResult {
     let victim = fixture.temp.path().join("victim");
     fs::write(&victim, b"outside").ctx("victim")?;
     let before = fs::metadata(&victim).ctx("victim stat")?.mtime();
-    let session = pack::mount::mount(&fixture.store, target, Some(&fixture.writes))
-        .ctx("writable mount")?;
+    let session =
+        pack::mount::mount(&fixture.store, target, Some(&fixture.writes)).ctx("writable mount")?;
     symlink("../../victim", target.join("link")).ctx("symlink")?;
     let stamp = rustix::fs::Timespec {
         tv_sec: 1_000_000_000,
