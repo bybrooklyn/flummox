@@ -7,6 +7,7 @@ use iced::{Element, Length, Task, Theme};
 use super::theme;
 
 struct State {
+    /// Follows the system. Anything but Light renders dark.
     system_theme: iced::theme::Mode,
 }
 
@@ -58,6 +59,8 @@ fn boot() -> (State, Task<Message>) {
     )
 }
 
+/// Runs a window that states the version and that no backend exists. It touches
+/// no game files.
 pub fn run() -> Result<()> {
     iced::application(boot, update, view)
         .title("Flummox")

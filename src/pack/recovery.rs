@@ -8,12 +8,16 @@ use std::{
     sync::atomic::AtomicBool,
 };
 
+// Per path: full st_mode, symlink target, sorted xattrs, and for a multiply
+// linked file the first path in sorted order that shares its inode. The
+// tuple holds no times and no ownership, so those are not compared.
 type Metadata = (
     u32,
     Option<PathBuf>,
     Vec<(Vec<u8>, Vec<u8>)>,
     Option<PathBuf>,
 );
+// Walks `root` and collects the comparable metadata of every path in it.
 fn metadata(root: &Path, observer: &dyn Observer) -> Result<BTreeMap<PathBuf, Metadata>> {
     let mut result = BTreeMap::new();
     let mut links = BTreeMap::new();
@@ -55,6 +59,11 @@ fn metadata(root: &Path, observer: &dyn Observer) -> Result<BTreeMap<PathBuf, Me
     Ok(result)
 }
 
+/// Checks that the ordinary files at the game path equal the store with its
+/// update layer applied. Requires `Attention` or `Restoring`, an unmounted
+/// game path and no process using it. Rebuilds the expected tree in a
+/// temporary sibling folder, so it needs space for a full copy. Deletes
+/// nothing but that temporary folder, whatever the outcome.
 pub fn verify_restored(
     install: &Install,
     cancel: &AtomicBool,
@@ -99,6 +108,8 @@ pub fn verify_restored(
     let expected = staging.path().join("expected");
     super::restore(&install.store_path, &expected, cancel)?;
     super::overlay::Overlay::open(&install.writes_path)?.apply_to(&expected)?;
+    // Two comparisons: a hash over every regular file's path, size and
+    // bytes, then the mode, link target, xattrs and hard links of every path.
     let expected_bytes = crate::compatibility::corpus(&expected, cancel, observer)?;
     let actual_bytes = crate::compatibility::corpus(&install.game_path, cancel, observer)?;
     ensure!(

@@ -7,6 +7,7 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 
+/// A text input of the wizard form.
 #[derive(Debug, Clone, Copy)]
 pub enum Field {
     Build,
@@ -15,23 +16,31 @@ pub enum Field {
     AllocationBefore,
     AllocationAfter,
 }
+/// A checkbox of the wizard form. Each maps to one flag in [`Checks`].
 #[derive(Debug, Clone, Copy)]
 pub enum Check {
     Bytes,
     Metadata,
+    /// The launcher updated and verified the game under the tested mode.
     Update,
+    /// Restoring ordinary files and restarting worked.
     Restore,
     Launch,
+    /// Ticked when a problem was seen. A ticked issue box disqualifies.
     AntiCheat,
     Gameplay,
 }
 
+/// Form state for one qualification run. Numeric inputs stay as typed text
+/// until [`Wizard::report`] parses them.
 #[derive(Debug, Clone)]
 pub struct Wizard {
     pub game: Game,
+    /// Hash of the game's files taken when the wizard started.
     pub corpus: Corpus,
     pub mode: StorageMode,
     pub build: String,
+    /// Load times in milliseconds and allocations in bytes, as typed.
     pub baseline_load: String,
     pub candidate_load: String,
     pub allocated_before: String,
@@ -41,6 +50,7 @@ pub struct Wizard {
     pub checks: Checks,
 }
 impl Wizard {
+    /// An empty form for `game`, with the build taken from the game record.
     pub fn new(game: Game, corpus: Corpus) -> Self {
         Self {
             build: game.build.clone().unwrap_or_default(),
@@ -65,6 +75,7 @@ impl Wizard {
             },
         }
     }
+    /// Stores the text typed into one input.
     pub fn field(&mut self, field: Field, text: String) {
         match field {
             Field::Build => self.build = text,
@@ -106,6 +117,7 @@ impl Wizard {
             Err(error) => format!("Compressed copy not measured: {error}."),
         });
     }
+    /// Sets one checkbox.
     pub fn check(&mut self, check: Check, value: bool) {
         match check {
             Check::Bytes => self.checks.bytes_verified = value,
@@ -117,6 +129,8 @@ impl Wizard {
             Check::Gameplay => self.checks.gameplay_issue = value,
         }
     }
+    /// Builds the report the form describes. Fails when a number is missing
+    /// or not a whole number, an allocation is zero, or validation fails.
     pub fn report(&self) -> Result<Report> {
         let integer = |text: &str, label: &str| -> Result<u64> {
             text.trim()
@@ -156,6 +170,9 @@ impl Wizard {
     }
 }
 
+/// Hashes every file of the game into a [`Corpus`]. Linux uses
+/// `compatibility::corpus`. Other platforms walk the folder here and fail
+/// if a file changes size or modification time while it is read.
 pub fn baseline(game: &Game) -> Result<Corpus> {
     #[cfg(target_os = "linux")]
     return compatibility::corpus(
@@ -175,6 +192,7 @@ pub fn baseline(game: &Game) -> Result<Corpus> {
                 files.push(entry.into_path());
             }
         }
+        // Per file, in sorted path order: path length, path, size, content.
         files.sort();
         let mut hash = Sha256::new();
         let mut total = 0u64;
@@ -219,6 +237,9 @@ pub fn baseline(game: &Game) -> Result<Corpus> {
     }
 }
 
+/// Renders the wizard form. `field`, `check` and `mode` turn an edit into the
+/// caller's message. The save button is enabled only while
+/// [`Wizard::report`] succeeds, and its error is shown otherwise.
 #[cfg(feature = "gui")]
 pub fn view<'a, Message: Clone + 'a>(
     wizard: &'a Wizard,
@@ -231,6 +252,7 @@ pub fn view<'a, Message: Clone + 'a>(
 ) -> iced::Element<'a, Message> {
     use iced::widget::{button, checkbox, column, pick_list, row, text, text_input};
     let mut form = column![text(format!("Qualify {}", wizard.game.title)).size(20), text("Use a disposable game copy. Measure the ordinary install, then compression, launch, gameplay, update, verification, restart, and restoration.").size(13), text(format!("Baseline: {} files · {} logical bytes", wizard.corpus.files, wizard.corpus.bytes)).size(12), pick_list([StorageMode::Native, StorageMode::MaximumSpace], Some(wizard.mode), mode)].spacing(8);
+    // One text input per `Field`, then one checkbox per `Check`.
     for (label, value, kind) in [
         ("Game build", &wizard.build, Field::Build),
         (

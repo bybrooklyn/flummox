@@ -15,6 +15,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+/// Converts a stored mtime to a `SystemTime`. Seconds may be negative, and
+/// nanoseconds always count forward from that second.
 pub(super) fn modified(seconds: i64, nanos: u32) -> Result<SystemTime> {
     let duration = Duration::from_secs(seconds.unsigned_abs());
     let base = if seconds < 0 {
@@ -30,6 +32,7 @@ fn timestamp(entry: &super::Entry) -> Result<SystemTime> {
     modified(entry.modified_secs, entry.modified_nanos)
 }
 
+/// Sets each stored attribute on `path`. Attributes already there are kept.
 pub(super) fn apply_xattrs(path: &Path, attributes: &[super::format::Xattr]) -> Result<()> {
     for attribute in attributes {
         xattr::set(path, OsStr::from_bytes(&attribute.name), &attribute.value)?;
@@ -37,6 +40,7 @@ pub(super) fn apply_xattrs(path: &Path, attributes: &[super::format::Xattr]) -> 
     Ok(())
 }
 
+/// Copies every attribute of `source` onto `destination`.
 #[cfg(feature = "pack-mount")]
 pub(super) fn copy_xattrs(source: &Path, destination: &Path) -> Result<()> {
     for name in xattr::list(source)? {
@@ -61,6 +65,11 @@ pub fn restore(store: &Path, destination: &Path, cancel: &AtomicBool) -> Result<
         "Ordinary restored files and metadata",
     )?;
     space.recheck()?;
+    // Passes over the index, in this order: directories and file contents,
+    // hard links, symlinks, then directory metadata. Symlinks come after all
+    // file writes so no write can pass through one. Directory times and
+    // modes come last, deepest first, because creating children changes a
+    // directory's mtime and a read-only mode would block them.
     let staged = tempfile::Builder::new()
         .prefix(".flummox-restore-")
         .tempdir_in(&parent)?;
@@ -76,6 +85,8 @@ pub fn restore(store: &Path, destination: &Path, cancel: &AtomicBool) -> Result<
                     .write(true)
                     .create_new(true)
                     .open(&path)?;
+                // A zero chunk is skipped with a seek and becomes a hole. The
+                // `set_len` below fixes the length when the file ends in one.
                 for id in chunks {
                     ensure!(!cancel.load(Ordering::Relaxed), "Restore cancelled");
                     if let Some(length) = reader.zero_chunk_len(*id)? {
@@ -125,6 +136,9 @@ pub fn restore(store: &Path, destination: &Path, cancel: &AtomicBool) -> Result<
         }
     }
     ensure!(!cancel.load(Ordering::Relaxed), "Restore cancelled");
+    // The only step that touches the destination: a rename that fails if
+    // anything exists there, followed by a sync of the parent. Any earlier
+    // failure removes the staging folder and leaves the destination absent.
     rustix::fs::renameat_with(
         rustix::fs::CWD,
         staged.path(),

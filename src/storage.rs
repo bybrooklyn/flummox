@@ -5,14 +5,21 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Size of a folder tree as storage planning counts it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Footprint {
+    /// Regular files.
     pub files: u64,
+    /// Sum of their apparent sizes.
     pub bytes: u64,
+    /// Size of the largest file.
     pub largest: u64,
+    /// Allowance for store metadata: per entry, 16 KiB plus eight times its
+    /// path length and, on Linux, eight times the size of its xattrs.
     pub metadata_bytes: u64,
 }
 
+/// Walks `root` without following symlinks and totals its footprint.
 pub fn inventory(root: &Path) -> Result<Footprint> {
     ensure!(
         root.is_dir(),
@@ -54,14 +61,21 @@ pub fn inventory(root: &Path) -> Result<Footprint> {
     Ok(result)
 }
 
+/// One filesystem and its free space at the time of the reading.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Volume {
+    /// Stable name for the filesystem. Two paths on the same volume give the
+    /// same identity.
     pub identity: String,
+    /// The mount point.
     #[serde(with = "crate::path_serde")]
     pub path: PathBuf,
+    /// Free bytes available to this user.
     pub available: u64,
 }
 
+/// The volume holding `path`, or its nearest existing ancestor when `path`
+/// does not exist yet. On Linux and macOS a read-only volume is an error.
 pub fn volume(path: &Path) -> Result<Volume> {
     let existing = path
         .ancestors()
@@ -71,6 +85,8 @@ pub fn volume(path: &Path) -> Result<Volume> {
     volume_existing(&existing)
 }
 
+/// Identity is the filesystem type plus its UUID from `/dev/disk/by-uuid`.
+/// Without a UUID it falls back to the mount source and filesystem id.
 #[cfg(target_os = "linux")]
 fn volume_existing(path: &Path) -> Result<Volume> {
     let fs = crate::fsprobe::probe(path)?;
@@ -244,21 +260,29 @@ fn volume_existing(_path: &Path) -> Result<Volume> {
     anyhow::bail!("Storage planning is unavailable on this platform")
 }
 
+/// Free space one volume must have before a job starts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Requirement {
     pub volume: Volume,
+    /// Bytes the job may write to this volume, summed over every reason.
     pub additional: u64,
+    /// Margin on top: 5 percent of `additional`, at least 64 MiB.
     pub headroom: u64,
+    /// One line per allocation counted into `additional`.
     pub reasons: Vec<String>,
 }
 
+/// The free-space requirements of one job, one row per volume.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SpacePlan {
     pub requirements: Vec<Requirement>,
+    /// The job leaves the original files on disk beside the new copy.
     pub retained_original: bool,
 }
 
 impl SpacePlan {
+    /// Adds `bytes` to the requirement for `volume`, merging with an existing
+    /// row for the same identity and keeping the lower free-space reading.
     pub fn add(&mut self, volume: Volume, bytes: u64, reason: &str) -> Result<()> {
         if let Some(existing) = self
             .requirements
@@ -283,6 +307,8 @@ impl SpacePlan {
         Ok(())
     }
 
+    /// Fails when any volume's recorded free space is below its requirement
+    /// plus headroom. Uses the readings stored in the plan.
     pub fn check(&self) -> Result<()> {
         for requirement in &self.requirements {
             let needed = requirement
@@ -300,6 +326,8 @@ impl SpacePlan {
         Ok(())
     }
 
+    /// Reads each volume's free space again and checks the plan against it.
+    /// Fails when a mount point now belongs to a different volume.
     pub fn recheck(&self) -> Result<()> {
         let mut current = self.clone();
         for row in &mut current.requirements {
@@ -314,6 +342,8 @@ impl SpacePlan {
     }
 }
 
+/// Plan for a native compress or, with `restore`, decompress of `root`: the
+/// whole install plus its largest file, on the install's own volume.
 pub fn native_plan(root: &Path, restore: bool) -> Result<SpacePlan> {
     let footprint = inventory(root)?;
     let mut plan = SpacePlan::default();
@@ -334,6 +364,8 @@ pub fn native_plan(root: &Path, restore: bool) -> Result<SpacePlan> {
     Ok(plan)
 }
 
+/// Upper bound on a new store's size: the content, plus 1/32 of it, plus the
+/// metadata allowance, plus 16 MiB.
 pub fn pack_bound(footprint: &Footprint) -> Result<u64> {
     footprint
         .bytes

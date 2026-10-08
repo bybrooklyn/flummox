@@ -17,12 +17,17 @@ use iced::widget::{
 };
 use iced::{Alignment, Element, Length};
 
+// Shared pieces: byte formatting, the two button styles and the two cards.
+
+/// Bytes formatted in decimal units (kB, MB, GB).
 fn size(bytes: u64) -> String {
     format_size(bytes, DECIMAL)
 }
+/// The filled button for the main action of a row or page.
 fn action(label: impl Into<String>, message: Message) -> Element<'static, Message> {
     action_maybe(label, Some(message))
 }
+/// As `action`, drawn disabled when `message` is `None`.
 fn action_maybe(label: impl Into<String>, message: Option<Message>) -> Element<'static, Message> {
     button(text(label.into()))
         .padding([10, 14])
@@ -30,9 +35,11 @@ fn action_maybe(label: impl Into<String>, message: Option<Message>) -> Element<'
         .on_press_maybe(message)
         .into()
 }
+/// The outlined button for every other action.
 fn secondary(label: impl Into<String>, message: Message) -> Element<'static, Message> {
     secondary_maybe(label, Some(message))
 }
+/// As `secondary`, drawn disabled when `message` is `None`.
 fn secondary_maybe(
     label: impl Into<String>,
     message: Option<Message>,
@@ -58,6 +65,11 @@ fn hero<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
         .into()
 }
 
+/// Builds the whole window from `state`.
+///
+/// Passed to iced as a function item.
+/// The layout switches to its compact form below 880 pixels of width. The
+/// outer wrapper keeps frames coming while anything animates.
 pub fn view(state: &State) -> Element<'_, Message> {
     super::surface::animate(
         responsive(move |size| layout(state, size.width < 880.0)),
@@ -69,7 +81,13 @@ pub fn view(state: &State) -> Element<'_, Message> {
     )
 }
 
+/// The window frame: sidebar, then a column of scan banner, qualification
+/// wizard, space plan review, the page, and the active job bar, with the
+/// toast stacked over the bottom right corner. `compact` shrinks the sidebar
+/// to icons.
 fn layout(state: &State, compact: bool) -> Element<'_, Message> {
+    // Sidebar. Entries in `PAGES` animate their highlight. Settings sits at
+    // the bottom and switches without animation.
     let mut nav = column![
         if compact {
             Element::from(text("F").size(24))
@@ -167,6 +185,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         .width(if compact { 72 } else { 208 })
         .height(Length::Fill)
         .style(theme::sidebar);
+    // Banner shown while the worker is discovering games.
     let mut body = column![].spacing(0).width(Length::Fill);
     if let Some(source) = &state.snapshot.scan_source {
         body = body.push(
@@ -199,6 +218,8 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
             .height(Length::Fixed(420.0)),
         ));
     }
+    // Space plan review. "Start job" is disabled while the plan's own check
+    // fails, and the failure is shown above it.
     if let Some((_, plan)) = &state.planned {
         let mut review = column![theme::section_title("Storage plan")].spacing(8);
         for requirement in &plan.requirements {
@@ -241,6 +262,10 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         Page::Recovery => recovery(state),
         Page::Settings => settings_page(state),
     };
+    // The page slides in over `distance` pixels as its reveal animation runs.
+    // The scrollable's id and the surface key are both the main page's label,
+    // which is what `scroll_to` in `app` and the surface's keyboard scrolling
+    // address.
     let page_reveal = if state.reduced_motion {
         1.0
     } else {
@@ -269,6 +294,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         !state.reduced_motion && state.motion != MotionPreference::Reduced,
         page_key.label(),
     ));
+    // The bar for the job in progress, on every page.
     if let Some(job) = state.active() {
         body = body.push(
             container(panel(
@@ -292,6 +318,8 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         .height(Length::Fill)
         .style(theme::app_background)
         .into();
+    // The toast is stacked over the window so it does not move the page. It
+    // fades in and moves 14 pixels into place.
     let Some(status) = &state.status else {
         return base;
     };
@@ -334,6 +362,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         .into()
 }
 
+/// The symbol drawn for a page in the sidebar.
 fn page_icon(page: Page) -> &'static str {
     match page {
         Page::Overview => "⌂",
@@ -345,6 +374,11 @@ fn page_icon(page: Page) -> &'static str {
     }
 }
 
+// Overview page.
+
+/// The Overview page: the saving so far with the main action, library totals,
+/// a count of things needing attention, drives, and recent jobs. Recent jobs
+/// are left out when `compact`.
 fn overview(state: &State, compact: bool) -> Element<'_, Message> {
     let compressed = state
         .games
@@ -354,6 +388,7 @@ fn overview(state: &State, compact: bool) -> Element<'_, Message> {
     let current = state.current_saving();
     let potential = state.potential_saving();
     let total = state.total_bytes();
+    // The same test as `Filter::Attention`.
     let attention = state
         .games
         .iter()
@@ -367,6 +402,9 @@ fn overview(state: &State, compact: bool) -> Element<'_, Message> {
                 })
         })
         .count();
+    // The hero's main button compresses the library when a saving is
+    // predicted, is disabled while scanning or analysing, and otherwise
+    // offers another scan.
     let mut content = column![
         row![
             theme::page_title("Overview").width(Length::Fill),
@@ -508,8 +546,13 @@ fn overview(state: &State, compact: bool) -> Element<'_, Message> {
     content.into()
 }
 
+// Games page.
+
+/// The Games page: search, filters, the bulk action bar and the first
+/// `state.shown` rows of the filtered list.
 fn games(state: &State, compact: bool) -> Element<'_, Message> {
     let filtered = state.filtered();
+    // The same three controls, stacked when compact and in one row otherwise.
     let search_and_sort: Element<'_, Message> = if compact {
         column![
             text_input("Search your games", &state.query)
@@ -583,6 +626,8 @@ fn games(state: &State, compact: bool) -> Element<'_, Message> {
         search_and_sort,
     ]
     .spacing(12);
+    // Drive and launcher filters. The first option of each stands for no
+    // filter and is mapped back to `None` by comparing its label.
     let mut drive_options = vec!["All drives".to_owned()];
     drive_options.extend(state.drives.iter().map(|d| d.path.display().to_string()));
     let selected_drive = state
@@ -642,6 +687,8 @@ fn games(state: &State, compact: bool) -> Element<'_, Message> {
             ))
             .into();
     }
+    // Rows are keyed by a hash of the game id, so a row keeps its widget
+    // state when the list is filtered or reordered.
     content = content.push(
         iced::widget::keyed_column(filtered.iter().take(state.shown).map(|game| {
             (
@@ -660,10 +707,15 @@ fn games(state: &State, compact: bool) -> Element<'_, Message> {
     content.into()
 }
 
+/// One game: a summary line, and below it the detail pane when this game is
+/// the expanded one.
 fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'a, Message> {
     let game = &item.game;
     let id = game.id.to_string();
     let compressed = state.compressed(game);
+    // Artwork tile. The sensor asks for a decode when the tile is first
+    // shown, and the title's first letter stands in until an image arrives.
+    // Clicking the tile picks a local image.
     let artwork_size = if compact { 44 } else { 52 };
     let fallback = || {
         container(text(game.title.chars().next().unwrap_or('F').to_string()).size(23))
@@ -692,6 +744,8 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
         (!state.picker_busy).then(|| Message::Browse(super::dialog::Target::Artwork(id.clone()))),
     );
     let icon = tooltip(icon, "Choose local artwork", tooltip::Position::Bottom);
+    // Status under the title: the row's note, else the phase of a job that
+    // is active or ended badly, else "Compressed", else the launcher's name.
     let status = item.note.clone().unwrap_or_else(|| {
         if let Some(job) = state.latest(game)
             && (job.phase.active()
@@ -728,6 +782,9 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                 "Not analyzed yet".into()
             }
         });
+    // Summary line: checkbox, artwork, title and status, size and saving,
+    // then the main button. The button reads "Recheck" and queues an analysis
+    // once the game is compressed.
     let check_id = id.clone();
     let mut line = row![
         checkbox(state.selected.contains(&id)).on_toggle_maybe(
@@ -767,6 +824,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
             }),
         ));
     }
+    // Detail pane. It stays in the tree while its closing animation runs.
     let mut contents = column![line].spacing(12);
     if state.expanded.as_ref() == Some(&id)
         && (state.detail.value()
@@ -797,6 +855,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                     .on_show(move |_| Message::ArtworkVisible(source.clone())),
             );
         }
+        // Preset, Analyze and Decompress.
         let preset_id = id.clone();
         if item.supported {
             details = details
@@ -835,6 +894,9 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                 Message::ToggleAdvanced(id.clone()),
             ));
         }
+        // Advanced storage. A game with a pack install gets its summary and
+        // maintenance actions. A game without one gets the form that creates
+        // a store.
         if item.pack_supported && state.advanced.contains(&id) {
             if let Some(install) = state
                 .snapshot
@@ -849,6 +911,8 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                         install.phase.label(),
                         install.message
                     )));
+                // Bytes shared with another game's store are not charged to
+                // this game when comparing against its logical size.
                 if let Some(summary) = &install.summary {
                     let used = summary.archive_bytes.saturating_sub(summary.shared_bytes);
                     let difference = summary.logical_bytes.abs_diff(used);
@@ -878,6 +942,10 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                         )));
                     }
                 }
+                // Two button rows follow. While a previous store is retained,
+                // compacting gives way to deleting that store. While the
+                // original is retained, it can be reclaimed. Both deletions
+                // take a second press on a confirm button.
                 details = details
                     .push(theme::muted(format!(
                         "Store: {} · updates: {}",
@@ -1012,6 +1080,8 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                 excluded: true,
             }),
         ));
+        // What the analysis found: the recommendation and its reasons, the
+        // qualification state, and how much was sampled.
         if let Some(est) = state.estimate(game) {
             if let Some(choice) = state.recommendation(game) {
                 details = details
@@ -1091,6 +1161,11 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
     panel(contents)
 }
 
+// Settings sections: recovery, jobs, locations and preferences.
+
+/// The Recovery section: jobs that failed, were partial or were interrupted,
+/// and pack installs that are not simply mounted or that still retain an
+/// original or a previous store.
 fn recovery(state: &State) -> Element<'_, Message> {
     let mut content = column![
         theme::page_title("Recovery"),
@@ -1143,6 +1218,8 @@ fn recovery(state: &State) -> Element<'_, Message> {
             .games
             .iter()
             .find(|row| row.game.install_dir == install.game_path);
+        // True while any job for this game is active. Restore and verify are
+        // offered only without one.
         let pending = state
             .snapshot
             .jobs
@@ -1188,6 +1265,8 @@ fn recovery(state: &State) -> Element<'_, Message> {
     content.into()
 }
 
+/// A job's progress bar, by bytes when a byte total is known and by files
+/// otherwise. Empty when neither total is known.
 fn progress<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
     let fraction = if job.bytes_total > 0 {
         job.bytes_done as f32 / job.bytes_total as f32
@@ -1212,7 +1291,11 @@ fn progress<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
     .girth(5)
     .into()
 }
+/// A card for a job that is running, waiting or needs attention, with its
+/// controls.
 fn job_row<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
+    // Pause and Cancel for an active job, except a pack job in a step that
+    // cannot be interrupted. Retry for a job that stopped short of completing.
     let mut controls = row![].spacing(8);
     if job.phase.active() && (job.operation != Operation::Pack || job.pack_interruptible) {
         controls = controls
@@ -1264,6 +1347,8 @@ fn job_row<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
         .spacing(12)
     ]
     .spacing(10);
+    // The free-space change covers the whole filesystem, so the label says
+    // it includes other programs' writes.
     if let Some(change) = job.drive_change {
         content = content.push(theme::muted(format!(
             "Drive free-space change: {}{}. Includes other applications' disk activity.",
@@ -1276,6 +1361,9 @@ fn job_row<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
     }
     panel(content)
 }
+/// The Jobs section: connection state, then jobs grouped as running, waiting,
+/// needing attention and history, then recent activity. Analyses are not
+/// listed. History shows the newest 20.
 fn queue(state: &State) -> Element<'_, Message> {
     let mut content = column![
         theme::page_title("Jobs"),
@@ -1348,6 +1436,8 @@ fn queue(state: &State) -> Element<'_, Message> {
     }
     content.into()
 }
+/// The Locations section: the form that adds a folder, one card per library
+/// with its maintenance toggle, and the excluded games.
 fn drives(state: &State) -> Element<'_, Message> {
     let mut content = column![
         theme::page_title("Drives & libraries"),
@@ -1384,6 +1474,8 @@ fn drives(state: &State) -> Element<'_, Message> {
         )
     ]
     .spacing(14);
+    // Libraries the worker knows, followed by the parent folder of any game
+    // that is in none of them. Those are listed as detected libraries.
     let mut paths: Vec<_> = state
         .snapshot
         .libraries
@@ -1459,6 +1551,10 @@ fn drives(state: &State) -> Element<'_, Message> {
     content.into()
 }
 
+/// The Settings page: jump links, then every section in one scrolling column.
+///
+/// The container ids here are the ones `Page::section` and `Message::Jump`
+/// look for.
 fn settings_page(state: &State) -> Element<'_, Message> {
     let links = iced::widget::Row::with_children(
         [
@@ -1495,6 +1591,8 @@ fn settings_page(state: &State) -> Element<'_, Message> {
     .spacing(28)
     .into()
 }
+/// The last Settings sections: worker restart, automatic maintenance,
+/// appearance, compatibility reports and About.
 fn preferences(state: &State) -> Element<'_, Message> {
     let maintained = state
         .snapshot
@@ -1599,6 +1697,8 @@ fn preferences(state: &State) -> Element<'_, Message> {
     .into()
 }
 
+/// A one-line card for a finished or cancelled job in History. A cancelled
+/// job can be retried.
 fn completed_job_row(job: &Job) -> Element<'_, Message> {
     let kind = match job.operation {
         Operation::Analyze => "Analysis",

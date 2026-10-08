@@ -14,6 +14,7 @@ pub enum ThemeChoice {
     Dark,
     Light,
 }
+/// How far and how long a page moves when it appears. `Reduced` removes the movement.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MotionChoice {
@@ -25,10 +26,13 @@ pub enum MotionChoice {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LocationKind {
+    /// The path is one game's folder.
     #[default]
     Game,
+    /// Each immediate subdirectory of the path is a game.
     Collection,
 }
+// Implements `Display` with the labels the pick lists show.
 macro_rules! display_choices {
     ($name:ident, $( $variant:ident => $label:literal ),+) => {
         impl std::fmt::Display for $name {
@@ -42,6 +46,7 @@ display_choices!(ThemeChoice, System => "System", Dark => "Dark", Light => "Ligh
 display_choices!(MotionChoice, Normal => "Smooth", Subtle => "Subtle", Reduced => "Reduced");
 display_choices!(LocationKind, Game => "One game", Collection => "Games library");
 impl MotionChoice {
+    /// Length of the page transition.
     pub fn duration(self) -> std::time::Duration {
         std::time::Duration::from_millis(match self {
             Self::Normal => 180,
@@ -49,6 +54,7 @@ impl MotionChoice {
             Self::Reduced => 0,
         })
     }
+    /// Offset the incoming page starts from.
     pub fn distance(self) -> f32 {
         match self {
             Self::Normal => 12.0,
@@ -57,25 +63,34 @@ impl MotionChoice {
         }
     }
 }
+/// A folder the user added: one game, or a library of games.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Location {
     #[serde(with = "crate::path_serde")]
     pub path: PathBuf,
     #[serde(default)]
     pub kind: LocationKind,
+    /// Background maintenance may queue games under this path. Only the Windows
+    /// worker acts on it.
     #[serde(default)]
     pub automatic: bool,
 }
+/// Contents of `desktop.json`. Every field defaults, so an older file still loads.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {
     pub theme: ThemeChoice,
     pub motion: MotionChoice,
     pub locations: Vec<Location>,
+    /// Game ids, as text, that get no compression jobs. Restoring them is still allowed.
     pub excluded: Vec<String>,
     pub start_at_login: bool,
+    /// Holds every job while true. On Windows the worker owns this value, and a
+    /// Settings command from the window does not change it.
     pub maintenance_paused: bool,
 }
+/// Reads a whole file, failing if it holds more than `limit` bytes. It reads one byte
+/// past the limit, so the check does not depend on the size the filesystem reports.
 pub fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     let mut bytes = vec![];
     std::fs::File::open(path)?
@@ -88,12 +103,16 @@ pub fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     );
     Ok(bytes)
 }
+/// True when the error is an I/O "not found", which callers treat as "no file yet".
 fn missing(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<std::io::Error>()
         .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
 impl Preferences {
+    /// Loads `desktop.json` from `root`. Without one it migrates the older
+    /// `folders.json` list of game folders, and with neither it returns the defaults.
+    /// A malformed or oversized file is an error.
     pub fn load(root: &Path) -> Result<Self> {
         match read_bounded(&root.join("desktop.json"), 1024 * 1024) {
             Ok(bytes) => {
@@ -125,6 +144,8 @@ impl Preferences {
         }
         Ok(settings)
     }
+    /// Replaces `desktop.json` atomically: temp file, fsync, rename, directory fsync.
+    /// Refuses to write more than `load` would read back.
     pub fn save(&self, root: &Path) -> Result<()> {
         crate::libraries::private_dir(root)?;
         let bytes = serde_json::to_vec(self)?;
@@ -140,6 +161,8 @@ impl Preferences {
         std::fs::File::open(root)?.sync_all()?;
         Ok(())
     }
+    /// Adds a location, or changes the kind of one already listed. The path must
+    /// exist and is stored canonical. A filesystem root is refused.
     pub fn add(&mut self, path: &Path, kind: LocationKind) -> Result<()> {
         let path = path.canonicalize()?;
         ensure!(
@@ -161,11 +184,16 @@ impl Preferences {
         }
         Ok(())
     }
+    /// Removes a location from the list. Nothing on disk is deleted. Paths are
+    /// compared resolved, so a location on a disconnected drive can still be removed.
     pub fn remove(&mut self, path: &Path) {
         let resolved = resolved_path(path);
         self.locations
             .retain(|location| resolved_path(&location.path) != resolved);
     }
+    /// The games under the user's locations, plus one warning per path that could
+    /// not be read. Each game's build is a metadata stamp of its files, so a change
+    /// on disk shows up as a new build.
     pub fn custom_games(&self) -> (Vec<crate::model::Game>, Vec<String>) {
         let mut games = vec![];
         let mut warnings = vec![];
@@ -175,6 +203,8 @@ impl Preferences {
             } else {
                 match std::fs::read_dir(&location.path) {
                     Ok(entries) => {
+                        // `DirEntry::file_type` does not follow links, so a linked
+                        // folder is left out. Sorted so the order is stable.
                         let mut paths: Vec<_> = entries
                             .filter_map(|entry| entry.ok())
                             .filter(|entry| {
@@ -205,6 +235,8 @@ impl Preferences {
                 let mut game = manual_game(title, path);
                 match content_stamp(&game.install_dir) {
                     Ok(stamp) => game.build = Some(format!("local:{stamp}")),
+                    // Includes a tree too large to stamp within its limits. The game
+                    // stays listed, and a broken game cannot start a job.
                     Err(error) => {
                         warnings.push(format!("{}: {error}", game.install_dir.display()));
                         game.state = crate::model::InstallState::Broken {
@@ -217,6 +249,8 @@ impl Preferences {
         }
         (games, warnings)
     }
+    /// Whether a cached game should stay remembered. Launcher games always do. A
+    /// manual game does only while a location still covers its folder.
     pub fn keeps(&self, game: &crate::model::Game) -> bool {
         game.id.launcher != crate::model::Launcher::Manual
             || self.locations.iter().any(|location| {
@@ -243,6 +277,8 @@ fn resolved_path(path: &Path) -> PathBuf {
         })
         .unwrap_or_else(|| path.to_path_buf())
 }
+/// A game with no launcher. Its id is a hash of the path bytes as given, so the same
+/// spelling of a path always yields the same id and a different spelling does not.
 pub fn manual_game(title: String, path: PathBuf) -> crate::model::Game {
     crate::model::Game {
         id: crate::model::GameId::new(
@@ -260,6 +296,8 @@ pub fn manual_game(title: String, path: PathBuf) -> crate::model::Game {
         is_tool: false,
     }
 }
+/// Collapses games that share a canonical install directory into the first one seen.
+/// It collects the other ids in `also`, and a later non-idle state replaces its own.
 pub fn merge(games: Vec<crate::model::Game>) -> Vec<crate::model::Game> {
     let mut merged: Vec<crate::model::Game> = vec![];
     for mut game in games {
@@ -294,6 +332,7 @@ pub fn content_stamp(root: &Path) -> Result<String> {
         .into_iter()
         .enumerate()
     {
+        // Bounded at 250000 entries and 5 seconds. Past either the stamp is an error.
         ensure!(
             count < 250000 && std::time::Instant::now() < deadline,
             "Game metadata scan exceeds its limit"
@@ -308,6 +347,8 @@ pub fn content_stamp(root: &Path) -> Result<String> {
             .strip_prefix(root)?
             .as_os_str()
             .as_encoded_bytes();
+        // Per file: relative name, size and mtime. The name's length is hashed first
+        // so one file's fields cannot be read as part of the next file's name.
         fingerprint.update(&(name.len() as u64).to_le_bytes());
         fingerprint.update(name);
         fingerprint.update(&metadata.len().to_le_bytes());

@@ -11,6 +11,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+// Layout of an update layer folder:
+//   state.json  the journal: every whiteout, rewritten whole on each change
+//   files/      the upper tree, mirroring game paths; an entry here wins
+//               over the store's entry at the same path
+//   trash/      where a removed upper entry is moved before it is deleted
+//   owner.lock  locked for as long as an `Overlay` is open
 const STATE: &str = "state.json";
 const FILES: &str = "files";
 const TRASH: &str = "trash";
@@ -18,6 +24,7 @@ const TRASH: &str = "trash";
 #[derive(Serialize, Deserialize)]
 struct Deleted(#[serde(with = "crate::path_serde")] PathBuf);
 
+// On-disk form of `state.json`.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Journal {
@@ -26,14 +33,21 @@ struct Journal {
     deleted: Vec<Deleted>,
 }
 
+/// One open update layer. Paths passed in are relative to the game folder.
+/// Methods taking a `Reader` must always be given the store this layer was
+/// written over: whiteouts and copy-up refer to that store's entries.
 pub(super) struct Overlay {
     root: PathBuf,
     files: PathBuf,
+    /// Whiteouts: store paths hidden from the merged view, with everything
+    /// beneath them. Checked before the upper tree, so a whiteout wins.
     deleted: HashSet<PathBuf>,
     _owner: File,
 }
 
 impl Overlay {
+    /// Opens or creates a layer and takes its lock, failing if another mount
+    /// or commit holds it. A new layer is created only in an empty folder.
     pub fn open(path: &Path) -> Result<Self> {
         if !path.exists() {
             std::fs::create_dir(path)?;
@@ -84,6 +98,9 @@ impl Overlay {
             ensure!(safe_path(&path), "Unsafe path in update journal");
             deleted.insert(path);
         }
+        // A whiteout whose path exists in the upper tree is dropped. That
+        // pair is what a crash leaves between an upper change and the journal
+        // write that follows it, and the upper entry is taken as current.
         deleted.retain(|path| std::fs::symlink_metadata(files.join(path)).is_err());
         let overlay = Self {
             root,
@@ -95,14 +112,19 @@ impl Overlay {
         Ok(overlay)
     }
 
+    /// Location of `path` in the upper tree, with no checks. Prefer `checked_upper`.
     pub fn upper(&self, path: &Path) -> PathBuf {
         self.files.join(path)
     }
 
+    /// The layer folder itself, which holds `files`, `trash` and the journal.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    /// Location of `path` in the upper tree. Fails if any existing ancestor
+    /// there is a symlink or a file, so no caller reads or writes through a
+    /// link the game created. The final component is not checked.
     pub fn checked_upper(&self, path: &Path) -> Result<PathBuf> {
         ensure!(
             path.as_os_str().is_empty() || safe_path(path),
@@ -122,11 +144,14 @@ impl Overlay {
         Ok(self.upper(path))
     }
 
+    /// True when `path` or any ancestor carries a whiteout.
     pub fn hidden(&self, path: &Path) -> bool {
         path.ancestors()
             .any(|ancestor| self.deleted.contains(ancestor))
     }
 
+    /// True when the merged view has `path`: not hidden, and present in the
+    /// upper tree or in the store.
     pub fn visible(&self, reader: &Reader, path: &Path) -> bool {
         !self.hidden(path)
             && (self
@@ -135,6 +160,8 @@ impl Overlay {
                 || reader.entry(path).is_some())
     }
 
+    /// Merged, sorted listing of a directory: store children without a
+    /// whiteout, plus upper children. Scans every store entry on each call.
     pub fn children(&self, reader: &Reader, path: &Path) -> Result<Vec<PathBuf>> {
         let mut names = BTreeSet::new();
         for entry in reader.entries() {
@@ -157,6 +184,8 @@ impl Overlay {
         Ok(names.into_iter().map(|name| path.join(name)).collect())
     }
 
+    /// Reads from the upper copy when one exists, otherwise from the store.
+    /// An upper copy is always a whole file, so the two are never mixed.
     pub fn read(
         &self,
         reader: &Reader,
@@ -180,6 +209,10 @@ impl Overlay {
         reader.read(path, offset, length)
     }
 
+    /// Makes sure `path` exists in the upper tree and returns its location
+    /// there. An existing upper entry is returned untouched. Otherwise the
+    /// store's entry is copied whole, with mode, mtime and xattrs. Changes
+    /// nothing in the merged view, so it writes no journal entry.
     pub fn copy_up(&mut self, reader: &Reader, path: &Path) -> Result<PathBuf> {
         ensure!(
             safe_path(path) && !self.hidden(path),
@@ -193,6 +226,10 @@ impl Overlay {
         self.ensure_parent(reader, path)?;
         match &entry.kind {
             Kind::File { size, chunks } => {
+                // The copy is built in a temporary file beside its target,
+                // synced, then published without replacement, so a crash
+                // never leaves a partial file under the real name. Zero
+                // chunks are skipped with a seek and become holes.
                 let parent = output.parent().context("Missing update parent")?;
                 let mut staged = tempfile::NamedTempFile::new_in(parent)?;
                 for id in chunks {
@@ -220,6 +257,9 @@ impl Overlay {
                     .persist_noclobber(&output)
                     .map_err(|error| error.error)?;
                 File::open(parent)?.sync_all()?;
+                // Copying a hard-link target also links each visible alias
+                // to the new upper file, so a write still reaches every name.
+                // Copying an alias path brings up that one name alone.
                 if entry.hardlink_to.is_none() {
                     for alias in reader.hardlink_aliases(path) {
                         if self.hidden(&alias) {
@@ -277,6 +317,9 @@ impl Overlay {
         Ok(output)
     }
 
+    /// Copies up `path` and, for a directory, everything visible beneath it,
+    /// so the whole subtree can then move with one rename in the upper tree.
+    /// The directory's mode and mtime are put back after its children land.
     fn copy_up_tree(&mut self, reader: &Reader, path: &Path) -> Result<PathBuf> {
         let upper = self.checked_upper(path)?;
         let upper_metadata = std::fs::symlink_metadata(&upper).ok();
@@ -308,6 +351,8 @@ impl Overlay {
         Ok(output)
     }
 
+    /// Creates the missing upper directories above `path`, each with its
+    /// store entry's mode. Fails if a missing ancestor is not a store directory.
     fn ensure_parent(&mut self, reader: &Reader, path: &Path) -> Result<()> {
         let parent = path.parent().context("Missing parent")?;
         if parent.as_os_str().is_empty() {
@@ -330,6 +375,9 @@ impl Overlay {
         Ok(())
     }
 
+    /// Creates a new empty file where the merged view has nothing. Like
+    /// `mkdir` and `symlink`, it makes the upper entry first and then clears
+    /// any whiteout at `path` in the journal.
     pub fn create_file(&mut self, reader: &Reader, path: &Path, mode: u32) -> Result<File> {
         ensure!(
             safe_path(path) && !self.visible(reader, path),
@@ -347,6 +395,7 @@ impl Overlay {
         Ok(file)
     }
 
+    /// Creates a directory where the merged view has nothing.
     pub fn mkdir(&mut self, reader: &Reader, path: &Path, mode: u32) -> Result<()> {
         ensure!(
             safe_path(path) && !self.visible(reader, path),
@@ -363,6 +412,8 @@ impl Overlay {
         Ok(())
     }
 
+    /// Creates a symlink where the merged view has nothing. Absolute targets
+    /// are refused. A relative target is stored as given, without resolving it.
     pub fn symlink(&mut self, reader: &Reader, path: &Path, target: &Path) -> Result<()> {
         ensure!(
             safe_path(path) && !self.visible(reader, path),
@@ -379,6 +430,10 @@ impl Overlay {
         Ok(())
     }
 
+    /// Removes one visible path. With `directory` set it must have no visible
+    /// children. An upper entry is moved to `trash` and deleted when this
+    /// returns. A path the store also holds gets a whiteout, and if the
+    /// journal write fails the upper entry is moved back.
     pub fn remove(&mut self, reader: &Reader, path: &Path, directory: bool) -> Result<()> {
         ensure!(
             safe_path(path) && self.visible(reader, path),
@@ -391,6 +446,9 @@ impl Overlay {
             );
         }
         let upper = self.checked_upper(path)?;
+        // Order: move the upper entry to trash, write the whiteout, then
+        // delete the trash copy as `staged` drops. Between the first two
+        // steps the store's version of the path is visible again.
         let staged = if std::fs::symlink_metadata(&upper).is_ok() {
             let staged = tempfile::Builder::new()
                 .prefix("removed-")
@@ -413,6 +471,10 @@ impl Overlay {
         Ok(())
     }
 
+    /// Renames a visible file or directory. A replaced target must be the
+    /// same type, and a replaced directory must be empty. The source subtree
+    /// is copied up in full first, so renaming a large store directory writes
+    /// all of it to the update layer.
     pub fn rename(
         &mut self,
         reader: &Reader,
@@ -462,6 +524,11 @@ impl Overlay {
                 );
             }
         }
+        // Order: copy the subtree up, write a whiteout for a source the store
+        // holds, rename in the upper tree, then clear any whiteout at the
+        // target. A crash after the whiteout and before the rename leaves
+        // both the whiteout and the upper source, and `open` drops the
+        // whiteout, so the source is still there.
         let source = self.copy_up_tree(reader, from)?;
         self.ensure_parent(reader, to)?;
         let target = self.checked_upper(to)?;
@@ -481,6 +548,8 @@ impl Overlay {
         self.persist()
     }
 
+    /// Hard-links a visible regular file to a new name. The source is copied
+    /// up first, because a link can only be made between two upper files.
     pub fn link(&mut self, reader: &Reader, from: &Path, to: &Path) -> Result<()> {
         ensure!(
             safe_path(from)
@@ -500,6 +569,10 @@ impl Overlay {
         self.persist()
     }
 
+    /// Replays this layer onto an ordinary copy of the store's tree: removes
+    /// every whited-out path, deepest first, then copies the upper tree over
+    /// it. Edits `destination` in place and is not atomic. The layer itself
+    /// is not changed.
     pub fn apply_to(&self, destination: &Path) -> Result<()> {
         let destination = destination.canonicalize()?;
         let mut deleted: Vec<_> = self.deleted.iter().collect();
@@ -582,10 +655,13 @@ impl Overlay {
         Ok(())
     }
 
+    // Clears the whiteout at exactly `path`, in memory. Whiteouts on its
+    // ancestors and descendants stay. The caller persists afterwards.
     fn reveal(&mut self, path: &Path) {
         self.deleted.remove(path);
     }
 
+    // Writes the whole whiteout set to the journal, sorted.
     fn persist(&self) -> Result<()> {
         let mut deleted: Vec<_> = self.deleted.iter().cloned().map(Deleted).collect();
         deleted.sort_by(|a, b| a.0.cmp(&b.0));
@@ -599,6 +675,8 @@ impl Overlay {
     }
 }
 
+/// Replaces `state.json` atomically: temporary file, sync, rename over the
+/// old journal, then sync the folder. A reader sees the old or the new set.
 fn write_journal(root: &Path, journal: &Journal) -> Result<()> {
     let bytes = serde_json::to_vec(journal)?;
     let mut staged = tempfile::NamedTempFile::new_in(root)?;
@@ -611,6 +689,10 @@ fn write_journal(root: &Path, journal: &Journal) -> Result<()> {
     Ok(())
 }
 
+/// Builds a new store at `output` from `store` with the layer at `writes`
+/// applied. Holds the layer's lock, so a mounted layer is refused. Needs
+/// scratch space for a full uncompressed copy. The old store and the layer
+/// are left as they were.
 pub(super) fn commit(
     store: &Path,
     writes: &Path,

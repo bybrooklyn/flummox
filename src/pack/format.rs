@@ -17,19 +17,30 @@ use std::{
     },
 };
 
+/// Largest decoded chunk, and the largest single `Reader::read`.
 pub const CHUNK_BYTES: usize = 4 * 1024 * 1024;
+/// Smallest content-defined chunk that is not the last chunk of its file.
 pub(super) const MIN_CHUNK_BYTES: usize = 512 * 1024;
+/// Fixed header at the start of a store file or a directory store's manifest.
 pub(super) const HEADER_BYTES: u64 = 64;
+/// Largest encoded index a reader allocates memory for.
 pub(super) const MAX_INDEX: u64 = 32 * 1024 * 1024;
+/// Most entries an index may hold. `validate` checks this before walking them.
 pub(super) const MAX_ENTRIES: usize = 100_000;
+/// Most unique chunks an index may hold.
 pub(super) const MAX_CHUNKS: usize = 1_000_000;
+/// First eight bytes of a store file or manifest.
 pub(super) const MAGIC: &[u8; 8] = b"FLUMPK01";
+/// First eight bytes of a chunk object in a directory store or pool.
 pub(super) const OBJECT_MAGIC: &[u8; 8] = b"FLUMCH01";
+/// Header bytes before the payload of a chunk object.
 pub(super) const OBJECT_HEADER: u64 = 64;
+// Decoded chunks one reader keeps: 8 chunks of at most 4 MiB, so 32 MiB.
 const CACHE_CHUNKS: usize = 8;
 const MAX_XATTRS_PER_ENTRY: usize = 256;
 const MAX_XATTR_BYTES_PER_ENTRY: usize = 1024 * 1024;
 
+/// One extended attribute as raw bytes. Creation stores an entry's list sorted by name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Xattr {
@@ -37,11 +48,14 @@ pub struct Xattr {
     pub value: Vec<u8>,
 }
 
+/// One path in the store. The first entry is the root directory, with an empty path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
+    /// Relative to the game folder. Unix filename bytes survive encoding unchanged.
     #[serde(with = "crate::path_serde")]
     pub path: PathBuf,
+    /// Permission bits. Versions before 4 allow only the low nine.
     pub mode: u32,
     pub modified_secs: i64,
     pub modified_nanos: u32,
@@ -52,14 +66,18 @@ pub struct Entry {
         skip_serializing_if = "Option::is_none",
         with = "crate::path_serde::option"
     )]
+    /// Earlier entry this file shares an inode with. The alias repeats that
+    /// entry's kind and metadata, and the target is never itself an alias.
     pub hardlink_to: Option<PathBuf>,
     pub kind: Kind,
 }
 
+/// What an entry holds. Chunk numbers are positions in `Index::chunks`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Kind {
     Directory,
+    /// A file made of whole chunks, listed in file order.
     File {
         size: u64,
         chunks: Vec<u32>,
@@ -68,6 +86,7 @@ pub enum Kind {
     SlicedFile {
         size: u64,
         chunk: u32,
+        /// Where this file starts inside the decoded frame.
         offset: u32,
     },
     Symlink {
@@ -77,6 +96,7 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// Logical length of a regular file. `None` for directories and symlinks.
     pub fn size(&self) -> Option<u64> {
         match self {
             Self::File { size, .. } | Self::SlicedFile { size, .. } => Some(*size),
@@ -85,23 +105,33 @@ impl Kind {
     }
 }
 
+/// How a chunk's payload is stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum Codec {
+    /// Stored as is, because zstd did not make it smaller.
     Raw,
     Zstd,
+    /// Every decoded byte is zero. No payload is stored.
     Zero,
 }
 
+/// Descriptor of one unique chunk. `chunk_name` derives an object's file name from it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Chunk {
+    /// Byte position in a monolithic store. Always 0 in a directory store.
     pub offset: u64,
+    /// Encoded payload length.
     pub stored: u32,
+    /// Decoded length.
     pub raw: u32,
     pub codec: Codec,
+    /// BLAKE3 of the decoded bytes.
     pub hash: [u8; 32],
 }
 
+/// The JSON index. Entries are in parent-before-child order and refer to
+/// chunks by position, so neither list can be reordered on its own.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Index {
@@ -109,6 +139,7 @@ pub(super) struct Index {
     pub chunks: Vec<Chunk>,
 }
 
+/// Contents of a directory store's `pool.json`: the pool its objects were linked from.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct PoolRecord {
@@ -120,30 +151,43 @@ pub(super) struct PoolRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Summary {
     pub files: u64,
+    /// Sum of the sizes of all regular files, counting each hard-link alias.
     pub logical_bytes: u64,
     pub archive_bytes: u64,
+    /// Header and index, plus `pool.json` and object headers in a directory store.
     pub metadata_bytes: u64,
+    /// Decoded bytes of the unique chunks stored raw.
     #[serde(default)]
     pub raw_bytes: u64,
+    /// Decoded bytes of the unique chunks stored as zstd.
     #[serde(default)]
     pub compressed_input_bytes: u64,
+    /// Encoded bytes of those zstd chunks.
     #[serde(default)]
     pub compressed_bytes: u64,
     #[serde(default)]
     pub zero_bytes: u64,
+    /// Object bytes in this store that another store also hard-links.
     #[serde(default)]
     pub shared_bytes: u64,
     pub unique_chunks: u64,
+    /// `logical_bytes` minus the decoded bytes of all unique chunks.
     pub duplicate_bytes: u64,
 }
 
 impl Index {
+    /// Checks every structural rule the reader relies on and returns the path table.
+    /// `payload_end` is the index offset of a monolithic store. Directory stores pass 0.
+    /// A matching index checksum does not replace this: it must run before any read.
     pub(super) fn validate(
         &self,
         payload_end: u64,
         version: u32,
     ) -> Result<BTreeMap<PathBuf, usize>> {
         ensure!(matches!(version, 1..=7), "Unsupported store version");
+        // Versions 3, 5 and 7 are directory stores, whose chunks are separate
+        // objects with no offset. Versions from 4 allow xattrs, hard links and
+        // the setuid, setgid and sticky bits.
         let external_chunks = matches!(version, 3 | 5 | 7);
         let extended_metadata = version >= 4;
         ensure!(
@@ -151,6 +195,8 @@ impl Index {
             "Invalid entry count"
         );
         ensure!(self.chunks.len() <= MAX_CHUNKS, "Too many chunks");
+        // In a monolithic store the payloads must tile the bytes between the
+        // header and the index in chunk order: no gap, overlap or trailing data.
         let mut next = HEADER_BYTES;
         for chunk in &self.chunks {
             ensure!(
@@ -187,6 +233,8 @@ impl Index {
         let mut used = vec![false; self.chunks.len()];
         let mut total = 0u64;
         let mut slices = HashMap::<u32, Vec<(u32, u32)>>::new();
+        // `paths` holds only the entries accepted so far, so a parent or a
+        // hard-link target is found only when it comes earlier in the index.
         for (number, entry) in self.entries.iter().enumerate() {
             let mode_mask = if extended_metadata { 0o7777 } else { 0o777 };
             ensure!(
@@ -277,6 +325,9 @@ impl Index {
                     );
                 }
                 let mut remaining = *size;
+                // Version 1 cut files every CHUNK_BYTES. Later versions cut on
+                // content, where every chunk but the last is at least
+                // MIN_CHUNK_BYTES, which bounds the count.
                 if version == 1 {
                     ensure!(
                         chunks.len() as u64 == size.div_ceil(CHUNK_BYTES as u64),
@@ -373,6 +424,8 @@ impl Index {
                 "Only regular files can be hard links"
             );
         }
+        // The slices of a shared frame must cover it end to end. A hard-link
+        // alias repeats its target's range, so equal ranges are merged first.
         for (id, mut ranges) in slices {
             ranges.sort_unstable();
             ranges.dedup();
@@ -391,6 +444,7 @@ impl Index {
             used.iter().all(|used| *used),
             "Unreferenced chunk in store index"
         );
+        // Links are checked once every path is known: a target may name a later entry.
         for entry in &self.entries {
             if let Kind::Symlink { target } = &entry.kind {
                 self.check_link(&entry.path, target, &paths)?;
@@ -399,6 +453,9 @@ impl Index {
         Ok(paths)
     }
 
+    /// Walks `target` from the link's folder through the index, expanding each
+    /// link it meets. Fails on an absolute target, a step above the root, or
+    /// more than 40 expansions. A target that names no entry is accepted.
     fn check_link(
         &self,
         path: &Path,
@@ -450,6 +507,8 @@ impl Index {
     }
 }
 
+/// True for a relative path of plain names: no `..`, `.`, root or NUL byte,
+/// at most 4096 bytes and 256 components. The empty path is refused.
 pub(super) fn safe_path(path: &Path) -> bool {
     !path.as_os_str().is_empty()
         && path.as_os_str().as_encoded_bytes().len() <= 4096
@@ -458,6 +517,7 @@ pub(super) fn safe_path(path: &Path) -> bool {
         && !path.as_os_str().as_encoded_bytes().contains(&0)
 }
 
+// Decoded chunks by id. `recent` lists the same ids, least recently used first.
 #[derive(Default)]
 struct Cache {
     chunks: HashMap<u32, Arc<Vec<u8>>>,
@@ -468,18 +528,25 @@ struct Cache {
 pub struct Reader {
     backing: Backing,
     pub(super) index: Index,
+    /// Entry position by path, as returned by `Index::validate`.
     paths: BTreeMap<PathBuf, usize>,
+    /// Per entry, the file offset where each of its chunks begins. Empty unless `Kind::File`.
     starts: Vec<Vec<u64>>,
     cache: Mutex<Cache>,
     summary: Summary,
     pool: Option<PathBuf>,
 }
 
+/// Where payloads are read from.
 enum Backing {
+    /// A monolithic store. The mutex keeps one seek and read pair together.
     Archive(Mutex<File>),
+    /// The `chunks` folder of a directory store, one object file per chunk.
     Chunks(PathBuf),
 }
 
+/// Object file name: decoded hash, decoded length, codec number, stored length.
+/// Two encodings of the same bytes therefore get different names.
 pub(super) fn chunk_name(chunk: &Chunk) -> String {
     format!(
         "{}-{}-{}-{}",
@@ -491,6 +558,8 @@ pub(super) fn chunk_name(chunk: &Chunk) -> String {
 }
 
 impl Reader {
+    /// Opens a store file or directory store and validates its whole index.
+    /// No payload is read. Call `verify` to check the chunks themselves.
     pub fn open(path: &Path) -> Result<Self> {
         let metadata = std::fs::symlink_metadata(path)?;
         if metadata.is_file() {
@@ -505,6 +574,8 @@ impl Reader {
         Self::from_directory(path)
     }
 
+    /// Reads a monolithic store (versions 1, 2, 4, 6). The index must end
+    /// at the last byte of the file.
     pub(super) fn from_file(mut file: File) -> Result<Self> {
         let metadata = file.metadata()?;
         ensure!(metadata.is_file(), "A store must be a regular file");
@@ -530,6 +601,9 @@ impl Reader {
         )
     }
 
+    /// Reads a directory store (versions 3, 5, 7): `manifest`, `chunks/` and an
+    /// optional `pool.json`. Each object's header is checked against the
+    /// manifest here. Object payloads are not read.
     fn from_directory(path: &Path) -> Result<Self> {
         let root = path.canonicalize()?;
         let mut manifest = std::fs::OpenOptions::new()
@@ -561,6 +635,8 @@ impl Reader {
             let path = chunks.join(chunk_name(chunk));
             validate_object(&path, chunk)?;
             let object_bytes = OBJECT_HEADER + u64::from(chunk.stored);
+            // Two links are this store's and the pool's. A third means another
+            // store links the object. With the pool deleted this undercounts.
             if std::fs::symlink_metadata(&path)?.nlink() > 2 {
                 shared_bytes = shared_bytes
                     .checked_add(object_bytes)
@@ -584,6 +660,7 @@ impl Reader {
         )
     }
 
+    /// Builds the per-file chunk offsets and the size summary for a validated index.
     fn finish(
         backing: Backing,
         index: Index,
@@ -658,18 +735,23 @@ impl Reader {
     pub fn summary(&self) -> &Summary {
         &self.summary
     }
+    /// Pool path recorded by a directory store. It comes from `pool.json`,
+    /// which the index checksum does not cover.
     pub fn pool_path(&self) -> Option<&Path> {
         self.pool.as_deref()
     }
+    /// All entries in index order: the root first, parents before children.
     pub fn entries(&self) -> &[Entry] {
         &self.index.entries
     }
+    /// Looks up one entry. The root is the empty path.
     pub fn entry(&self, path: &Path) -> Option<&Entry> {
         self.paths
             .get(path)
             .and_then(|id| self.index.entries.get(*id))
     }
 
+    /// Paths whose `hardlink_to` names `path`. Scans every entry.
     #[cfg(feature = "pack-mount")]
     pub(super) fn hardlink_aliases(&self, path: &Path) -> Vec<PathBuf> {
         self.index
@@ -680,6 +762,8 @@ impl Reader {
             .collect()
     }
 
+    /// Returns one decoded chunk, from the cache when it is there. A miss
+    /// decodes and hash-checks it, then evicts the least recently used chunk.
     pub(super) fn chunk(&self, id: u32) -> Result<Arc<Vec<u8>>> {
         let mut cache = self
             .cache
@@ -701,6 +785,7 @@ impl Reader {
         Ok(bytes)
     }
 
+    /// Length of a zero chunk, so a writer can seek past it and leave a hole.
     pub(super) fn zero_chunk_len(&self, id: u32) -> Result<Option<u32>> {
         let chunk = self
             .index
@@ -710,6 +795,8 @@ impl Reader {
         Ok(matches!(chunk.codec, Codec::Zero).then_some(chunk.raw))
     }
 
+    /// Reads, decodes and hash-checks one chunk from storage. Never uses the
+    /// cache. A directory store rechecks the object's header on every call.
     fn decode(&self, id: u32) -> Result<Vec<u8>> {
         let chunk = self
             .index
@@ -738,6 +825,8 @@ impl Reader {
             Codec::Zero => vec![0; chunk.raw as usize],
             Codec::Zstd => {
                 let mut decoder = zstd::bulk::Decompressor::new()?;
+                // Window log 23 is 8 MiB, which covers any 4 MiB chunk. A frame
+                // that asks for a larger window is refused.
                 decoder.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(23))?;
                 decoder.decompress(&encoded, chunk.raw as usize)?
             }
@@ -759,6 +848,7 @@ impl Reader {
             _ => anyhow::bail!("Entry is not a regular file"),
         };
         let count = u64::try_from(length)?.min(size.saturating_sub(offset)) as usize;
+        // A sliced file sits inside one frame, so one decoded chunk serves the read.
         if let Kind::SlicedFile {
             chunk,
             offset: start,
@@ -782,6 +872,8 @@ impl Reader {
         let mut result = Vec::with_capacity(count);
         let mut position = offset;
         while result.len() < count {
+            // `starts` ascends, so the chunk holding `position` is the last
+            // one that begins at or before it.
             let ordinal = starts
                 .partition_point(|start| *start <= position)
                 .saturating_sub(1);
@@ -808,6 +900,7 @@ impl Reader {
         self.verify_observed(cancel, &super::NoObserver)
     }
 
+    /// `verify`, reporting one step per chunk to `observer`.
     pub fn verify_observed(
         &self,
         cancel: &AtomicBool,
@@ -828,6 +921,9 @@ impl Reader {
         self.verify_directory_observed(root, cancel, &super::NoObserver)
     }
 
+    /// `verify_directory` with progress. Compares paths, modes, xattrs,
+    /// hard-link identity and every byte, then stats each path again and fails
+    /// if anything moved while the comparison ran. Activation relies on this.
     pub fn verify_directory_observed(
         &self,
         root: &Path,
@@ -939,6 +1035,8 @@ impl Reader {
             seen == self.entries().len(),
             "The source is missing files contained in the store"
         );
+        // Second pass: a path whose inode, size, times or mode differ from
+        // what was recorded as it was compared means the tree was written to.
         for (path, dev, ino, size, mtime, mtime_nsec, ctime, ctime_nsec, mode) in identities {
             observer.checkpoint()?;
             ensure!(!cancel.load(Ordering::Relaxed), "Verification cancelled");
@@ -962,7 +1060,12 @@ impl Reader {
     }
 }
 
+/// Reads the header and the checksummed index. Returns the version, chunk
+/// size, index offset, index length and the parsed index, not yet validated.
 fn read_index(file: &mut File) -> Result<(u32, u32, u64, u64, Index)> {
+    // Header, 64 bytes, integers little-endian: magic[8], version u32,
+    // maximum chunk size u32, index offset u64, index length u64, and the
+    // BLAKE3 digest of the index bytes[32].
     file.seek(SeekFrom::Start(0))?;
     let mut magic = [0; 8];
     file.read_exact(&mut magic)?;
@@ -1000,6 +1103,7 @@ fn read_index(file: &mut File) -> Result<(u32, u32, u64, u64, Index)> {
     ))
 }
 
+/// Codec number written in object headers and object file names.
 pub(super) fn codec_number(codec: Codec) -> u32 {
     match codec {
         Codec::Raw => 0,
@@ -1017,12 +1121,19 @@ fn open_object(path: &Path, expected: &Chunk) -> Result<File> {
     Ok(file)
 }
 
+/// Opens a chunk object and parses its header into a descriptor with offset 0.
+/// The payload is not read, so the hash in the header is not checked here.
 fn inspect_object(path: &Path) -> Result<(File, Chunk)> {
+    // O_NOFOLLOW refuses a symlink. O_NONBLOCK makes the open of a FIFO return
+    // at once, and the file-type check below then rejects it.
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     ensure!(file.metadata()?.is_file(), "Shared chunk is not a file");
+    // Object header, 64 bytes, integers little-endian: magic[8], codec u32,
+    // decoded length u32, stored length u32, BLAKE3 of the decoded bytes[32],
+    // then 12 zero bytes. The payload is the rest of the file.
     let mut magic = [0; 8];
     file.read_exact(&mut magic)?;
     ensure!(&magic == OBJECT_MAGIC, "Unknown shared chunk format");
@@ -1058,11 +1169,13 @@ fn inspect_object(path: &Path) -> Result<(File, Chunk)> {
     ))
 }
 
+/// Checks that the object at `path` carries the header `expected` describes.
 pub(super) fn validate_object(path: &Path, expected: &Chunk) -> Result<()> {
     let _file = open_object(path, expected)?;
     Ok(())
 }
 
+/// Checks that a file in a pool is a chunk object named after its own header.
 pub(super) fn validate_pool_object(path: &Path) -> Result<()> {
     let (_file, chunk) = inspect_object(path)?;
     ensure!(

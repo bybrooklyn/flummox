@@ -11,9 +11,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// A game as last discovered, with the volume it was on at that time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RememberedGame {
     pub game: Game,
+    /// Compared by identity later to tell whether the same drive is mounted.
     pub volume: storage::Volume,
 }
 
@@ -22,6 +24,8 @@ struct Cache {
     games: Vec<RememberedGame>,
 }
 
+/// The per-user `flummox` state directory for this platform. It is not created
+/// here. Callers use `private_dir` before writing.
 pub fn data_dir() -> Result<PathBuf> {
     #[cfg(windows)]
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
@@ -39,6 +43,8 @@ pub fn data_dir() -> Result<PathBuf> {
         .join("flummox"))
 }
 
+/// Creates the directory and its parents. On Unix the mode is 0700, and an existing
+/// directory is tightened to 0700 as well.
 pub fn private_dir(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -54,8 +60,13 @@ pub fn private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Merges a fresh discovery with `libraries.json` under `root` and writes the result
+/// back. A cached game that was not rediscovered is returned as `Broken` for as long
+/// as `keep` accepts it. A `keep` that returns false forgets the game.
 pub fn remember(root: &Path, games: Vec<Game>, keep: impl Fn(&Game) -> bool) -> Result<Vec<Game>> {
     private_dir(root)?;
+    // The lock serialises the read, merge and write between processes. It is
+    // released when `lock` drops at return.
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -71,6 +82,8 @@ pub fn remember(root: &Path, games: Vec<Game>, keep: impl Fn(&Game) -> bool) -> 
     };
     let mut result = Vec::new();
     for game in games {
+        // This path was cached on a volume that is now absent or replaced by another.
+        // Skip the new sighting. The loop below carries the cached record forward.
         if let Some(previous) = old
             .games
             .iter()
@@ -82,12 +95,15 @@ pub fn remember(root: &Path, games: Vec<Game>, keep: impl Fn(&Game) -> bool) -> 
                 continue;
             }
         }
+        // A game whose folder is missing is not cached from this scan either.
         let volume = match storage::volume(&game.install_dir) {
             Ok(volume) if game.install_dir.is_dir() => volume,
             _ => continue,
         };
         result.push(RememberedGame { game, volume });
     }
+    // Cached games missing from this scan stay listed as broken. The detail says
+    // whether the drive is gone or only the game.
     for mut previous in old.games {
         if !keep(&previous.game)
             || result
@@ -101,6 +117,8 @@ pub fn remember(root: &Path, games: Vec<Game>, keep: impl Fn(&Game) -> bool) -> 
         previous.game.state = InstallState::Broken { detail: if online { "Library unavailable: game was not rediscovered; refresh after checking its launcher" } else { "Library unavailable: reconnect its original drive" }.into() };
         result.push(previous);
     }
+    // Write a temp file in the same directory, fsync it, rename it over the cache,
+    // then fsync the directory so the rename itself survives a crash.
     let mut staged = tempfile::NamedTempFile::new_in(root)?;
     serde_json::to_writer(
         &mut staged,

@@ -5,6 +5,9 @@ use anyhow::Context;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
+/// Turns typed or pasted text into a path: trims whitespace and quotes, turns a
+/// backslash-escaped space into a space, and expands a leading `~/`. It does not
+/// touch the filesystem, so the result may not exist.
 pub fn folder_path(input: &str) -> PathBuf {
     let text = input.trim().trim_matches(['\"', '\'']);
     let text = text.replace("\\ ", " ");
@@ -16,12 +19,16 @@ pub fn folder_path(input: &str) -> PathBuf {
     PathBuf::from(text)
 }
 
+/// Adds an existing folder to the saved locations as one game.
 pub fn add_folder(path: &Path) -> Result<()> {
     let root = libraries::data_dir()?;
     let mut preferences = crate::desktop::Preferences::load(&root)?;
     preferences.add(path, crate::desktop::LocationKind::Game)?;
     preferences.save(&root)
 }
+/// Launcher discovery plus the user's own locations, merged by install directory,
+/// then passed through the remembered-library cache. The cache keeps a game on a
+/// disconnected drive listed as broken. Reads and rewrites files in the data directory.
 pub fn discover_catalog() -> Result<crate::desktop_discovery::Catalog> {
     #[cfg(windows)]
     let mut catalog = crate::windows::launchers::discover();
@@ -44,12 +51,19 @@ pub fn discover_catalog() -> Result<crate::desktop_discovery::Catalog> {
     catalog.games = libraries::remember(&root, catalog.games, |game| preferences.keeps(game))?;
     Ok(catalog)
 }
+/// The games of `discover_catalog`, without its warnings or artwork roots.
 pub fn discover() -> Result<Vec<Game>> {
     Ok(discover_catalog()?.games)
 }
 
 /// Opens a platform picker without interpolating paths into scripts.
+/// `artwork` picks a PNG or JPEG file. Otherwise it picks a folder. Blocks until the
+/// dialog closes and returns `Ok(None)` when the user cancels.
 pub fn pick(artwork: bool) -> Result<Option<PathBuf>> {
+    // The dialog runs in PowerShell. -STA is required because Windows Forms dialogs
+    // need a single-threaded apartment. Console output is switched to UTF-8 without
+    // a byte order mark so a non-ASCII path arrives intact. A cancelled dialog
+    // prints nothing.
     #[cfg(windows)]
     let output = {
         let picker = if artwork {
@@ -72,6 +86,7 @@ pub fn pick(artwork: bool) -> Result<Option<PathBuf>> {
         .output()?;
     if !output.status.success() {
         let error = String::from_utf8_lossy(&output.stderr);
+        // osascript reports a cancelled dialog as error -128.
         if error.contains("(-128)") {
             return Ok(None);
         }

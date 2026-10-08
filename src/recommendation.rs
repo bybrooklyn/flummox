@@ -47,8 +47,12 @@ impl Confidence {
 /// Defaults used by the one-click optimizer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Policy {
+    /// Smallest predicted saving, in bytes, that justifies any change.
     pub minimum_saving: u64,
+    /// Smallest predicted saving as basis points of current disk usage.
     pub minimum_ratio_bps: u16,
+    /// How much more Maximum Space must save than native compression, in
+    /// basis points of current disk usage, before it is chosen over native.
     pub maximum_advantage_bps: u16,
 }
 
@@ -66,14 +70,21 @@ impl Default for Policy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Recommendation {
     pub mode: StorageMode,
+    /// Predicted bytes saved by `mode`. For `Skip`, the larger of the two
+    /// projections.
     pub predicted_saving: u64,
+    /// Predicted bytes saved by native compression.
     pub native_saving: u64,
+    /// Predicted bytes saved by Maximum Space, when the estimate has one.
     pub maximum_saving: Option<u64>,
     pub confidence: Confidence,
+    /// Sentences for the user explaining the choice.
     pub reasons: Vec<String>,
+    /// What the chosen mode needs from the system. Empty unless Maximum Space.
     pub requirements: Vec<String>,
 }
 
+/// Whether a saving meets both the absolute and the relative minimum.
 fn clears_threshold(saving: u64, current: u64, policy: Policy) -> bool {
     saving >= policy.minimum_saving
         && current > 0
@@ -81,6 +92,8 @@ fn clears_threshold(saving: u64, current: u64, policy: Policy) -> bool {
             >= current.saturating_mul(u64::from(policy.minimum_ratio_bps))
 }
 
+/// Low with no sampled file or under 4 MiB sampled. Medium when fewer than a
+/// quarter of the eligible files were sampled. High otherwise.
 fn confidence(estimate: &Estimate) -> Confidence {
     let considered = estimate
         .inspected_files
@@ -95,6 +108,10 @@ fn confidence(estimate: &Estimate) -> Confidence {
 }
 
 /// Selects one mode from native and pack projections.
+///
+/// Maximum Space needs `maximum_compatible` and either the required advantage
+/// over native or no native backend at all. Native needs `native_available`
+/// and a saving over the thresholds. Anything else is `Skip`.
 pub fn choose(
     estimate: &Estimate,
     native_available: bool,
@@ -111,6 +128,8 @@ pub fn choose(
                     .disk_now
                     .saturating_mul(u64::from(policy.maximum_advantage_bps))
     });
+    // Without a native backend there is nothing to beat, so the pack only
+    // has to clear the ordinary thresholds.
     let maximum_is_only_mode = maximum.is_some_and(|saving| {
         !native_available && clears_threshold(saving, estimate.disk_now, policy)
     });

@@ -43,6 +43,7 @@ const RECOVERY_ACTION: &str = "Restore ordinary storage";
 #[cfg(target_os = "macos")]
 const RECOVERY_ACTION: &str = "Restore retained original";
 
+/// The one banner line under the controls. `error` picks the banner style.
 struct Status {
     error: bool,
     text: String,
@@ -62,6 +63,7 @@ impl Page {
             Self::Settings => "Settings",
         }
     }
+    /// Position in the navigation column. Decides the direction of the page transition.
     fn rank(self) -> u8 {
         match self {
             Self::Overview => 0,
@@ -70,15 +72,21 @@ impl Page {
         }
     }
 }
+/// Result of one background discovery pass, with artwork located per game id.
 #[derive(Debug, Clone)]
 struct Scan {
+    /// Worker (epoch, revision) the games were read at. Compared with later snapshots.
     #[cfg(windows)]
     stamp: (u64, u64),
     games: Vec<crate::model::Game>,
     warnings: Vec<String>,
+    /// Image for the 44 px list tile, by game id.
     artwork: HashMap<String, super::artwork::Source>,
+    /// Image for the tall cover beside the controls, by game id.
     covers: HashMap<String, super::artwork::Source>,
 }
+/// Lists games and locates their artwork. Blocking, so it runs through `background`.
+/// On Windows the list comes from the worker, which `request` starts if none is running.
 fn scan() -> std::result::Result<Scan, String> {
     #[cfg(target_os = "macos")]
     let catalog = crate::native::discover_catalog().map_err(|error| error.to_string())?;
@@ -121,7 +129,9 @@ fn scan() -> std::result::Result<Scan, String> {
 enum GameFilter {
     #[default]
     All,
+    /// Build changed between two scans, or since the last completed compression (Windows).
     Updated,
+    /// Install state is anything but idle.
     Attention,
 }
 impl std::fmt::Display for GameFilter {
@@ -148,42 +158,61 @@ impl std::fmt::Display for GameSort {
     }
 }
 struct State {
+    /// Last snapshot accepted from the worker.
     #[cfg(windows)]
     worker: crate::windows::coordinator::Snapshot,
+    /// Set while polls fail. The previous snapshot stays on screen.
     #[cfg(windows)]
     worker_error: Option<String>,
+    /// False once the user stops the worker or a snapshot reports it stopping.
+    /// Polling stops while it is false.
     #[cfg(windows)]
     worker_enabled: bool,
     preferences: Preferences,
+    /// Saving is refused until the load succeeds, so defaults never replace the file.
     preferences_loaded: bool,
+    /// A save is in flight.
     saving_preferences: bool,
+    /// Preferences changed during a save. Another save follows it.
     preferences_dirty: bool,
+    /// Rescan when the pending save lands. Set when locations change.
     refresh_after_save: bool,
     location_kind: LocationKind,
     location_input: String,
+    /// A native picker dialog is open. Only one runs at a time.
     picker_busy: bool,
     warnings: Vec<String>,
     query: String,
     game_filter: GameFilter,
     game_sort: GameSort,
+    /// Ids of games whose build changed between two scans in this session.
     updated: std::collections::HashSet<String>,
     artwork: HashMap<String, super::artwork::Source>,
     covers: HashMap<String, super::artwork::Source>,
     artwork_cache: super::artwork::Cache,
     page: Page,
+    /// Progress of the page transition.
     reveal: Animation<bool>,
+    /// Frames are requested until this instant so a programmatic scroll gets drawn.
     scroll_redraw_until: Option<Instant>,
+    /// Sign of the transition offset: -1.0 towards an earlier page, 1.0 otherwise.
     direction: f32,
+    /// Last scroll offset per page label, restored on navigation.
     scroll_positions: std::collections::HashMap<&'static str, f32>,
     games: Vec<crate::model::Game>,
+    /// Text of the selected-folder field. Every action targets this path.
     folder: String,
     status: Option<Status>,
+    /// A space plan is being computed or, on macOS, a storage job is running.
     working: bool,
     scanning: bool,
     progress: Option<backend::Progress>,
+    /// Stop flag shared with an in-process job thread. Only the macOS path sets it.
     cancel: Option<Arc<AtomicBool>>,
     system_theme: iced::theme::Mode,
+    /// Folder, whether it is a compression, and its space plan, awaiting confirmation.
     planned: Option<(PathBuf, bool, crate::storage::SpacePlan)>,
+    /// The scan in flight came from the timer, so its result posts no status line.
     refreshing: bool,
     recovery: Vec<backend::Recovery>,
     qualification: Option<crate::qualification::Wizard>,
@@ -243,14 +272,18 @@ enum Message {
     Worker(std::result::Result<crate::windows::coordinator::Snapshot, String>),
     #[cfg(windows)]
     WorkerCommand(crate::windows::coordinator::Command),
+    /// Turn maintenance on or off for the location at this path.
     #[cfg(windows)]
     Automatic(PathBuf, bool),
     #[cfg(windows)]
     StartAtLogin(bool),
+    /// A game id, and whether it is now excluded from background work.
     #[cfg(windows)]
     Exclude(String, bool),
     GoTo(Page),
+    /// Open Settings and scroll to the container with this id.
     Jump(&'static str),
+    /// The offset `Jump` measured for its section.
     JumpOffset(f32),
     PreferencesLoaded(std::result::Result<Preferences, String>),
     PreferencesSaved(std::result::Result<(), String>),
@@ -264,30 +297,40 @@ enum Message {
     AddLocation,
     LocationResolved(LocationKind, std::result::Result<PathBuf, String>),
     RemoveLocation(PathBuf),
+    /// Open the folder picker. `true` fills the location field, `false` the selected folder.
     BrowseFolder(bool),
+    /// The picker closed. `Ok(None)` means the user cancelled.
     FolderPicked(bool, std::result::Result<Option<PathBuf>, String>),
+    /// A tile scrolled into view and wants its image decoded.
     ArtworkVisible(super::artwork::Source),
     ArtworkLoaded(super::artwork::Source, Option<image::Handle>),
     BrowseArtwork(String),
     ArtworkPicked(String, std::result::Result<Option<PathBuf>, String>),
     ArtworkSaved(std::result::Result<(), String>),
     Scrolled(Page, f32),
+    /// Carries nothing. Its arrival makes iced redraw.
     Tick,
+    /// The selected-folder field was edited.
     Folder(String),
+    /// A game in the list was clicked.
     Select(PathBuf),
     Refresh,
     #[cfg(target_os = "macos")]
     Poll,
     Key(iced::keyboard::Event),
     Scanned(std::result::Result<Scan, String>),
+    /// Plan a compression of the selected folder. `Restore` plans the reverse.
     Optimize,
+    /// The space plan for a folder is ready. The bool is true for compression.
     Planned(
         PathBuf,
         bool,
         std::result::Result<crate::storage::SpacePlan, String>,
     ),
+    /// The user confirmed the plan on screen.
     StartPlanned,
     CancelPlanned,
+    /// Add the selected folder to the locations as one game.
     Remember,
     Qualify,
     QualificationReady(std::result::Result<Box<crate::qualification::Wizard>, String>),
@@ -311,6 +354,8 @@ enum Message {
     SystemTheme(iced::theme::Mode),
 }
 
+/// Runs a blocking operation on its own thread and awaits the result, so the UI
+/// thread never blocks on disk, a dialog or the worker pipe.
 async fn background<T: Send + 'static>(
     operation: impl FnOnce() -> std::result::Result<T, String> + Send + 'static,
 ) -> std::result::Result<T, String> {
@@ -323,6 +368,8 @@ async fn background<T: Send + 'static>(
         .map_err(|_| "The background operation stopped unexpectedly.".to_owned())?
 }
 
+/// Computes the space plan for the selected folder. Nothing on disk changes until
+/// the user confirms it with `StartPlanned`.
 fn plan(state: &mut State, optimize: bool) -> Task<Message> {
     if state.working {
         return Task::none();
@@ -339,6 +386,8 @@ fn plan(state: &mut State, optimize: bool) -> Task<Message> {
     )
 }
 
+// Runs the job on a thread inside this process and streams its progress back as
+// messages. macOS has no worker process.
 #[cfg(target_os = "macos")]
 fn start(state: &mut State, folder: PathBuf, optimize: bool) -> Task<Message> {
     if state.working {
@@ -372,6 +421,8 @@ fn start(state: &mut State, folder: PathBuf, optimize: bool) -> Task<Message> {
     });
     let stream = iced::stream::channel(32, async move |sender| {
         std::thread::spawn(move || {
+            // try_send drops a progress update when the 32-slot channel is full. Each
+            // update is a running total, so the next one replaces it.
             let mut progress_sender = sender.clone();
             let result = if optimize {
                 backend::optimize_folder_with(&folder, &cancel, move |progress| {
@@ -383,6 +434,7 @@ fn start(state: &mut State, folder: PathBuf, optimize: bool) -> Task<Message> {
                 })
             }
             .map_err(|error| error.to_string());
+            // The result uses a blocking send, which waits for room in the channel.
             let mut finished_sender = sender;
             let _sent =
                 iced::futures::executor::block_on(finished_sender.send(Message::Finished(result)));
@@ -391,10 +443,13 @@ fn start(state: &mut State, folder: PathBuf, optimize: bool) -> Task<Message> {
     Task::run(stream, |message| message)
 }
 
+/// Applies one message. Arms that start their own task return early. The rest fall
+/// through to `artwork_tasks`, which starts any image decodes the view asked for.
 fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
         #[cfg(windows)]
         Message::Exclude(id, excluded) => {
+            // Remove first so an id is never listed twice.
             state.preferences.excluded.retain(|old| old != &id);
             if excluded {
                 state.preferences.excluded.push(id);
@@ -420,6 +475,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         #[cfg(windows)]
         Message::WorkerCommand(command) => {
+            // Any command but Shutdown turns polling back on. `request` starts a
+            // worker if none is running, which is how "Start background worker" works.
             state.worker_enabled =
                 !matches!(command, crate::windows::coordinator::Command::Shutdown);
             return worker_send(command);
@@ -427,6 +484,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         #[cfg(windows)]
         Message::Worker(result) => match result {
             Ok(snapshot) => {
+                // Replies can arrive out of order. Drop any that is not newer than the
+                // one on screen: epoch is the worker's start time, revision counts its
+                // replies.
                 if state.worker.epoch > 0
                     && (snapshot.epoch < state.worker.epoch
                         || (snapshot.epoch == state.worker.epoch
@@ -435,6 +495,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     return Task::none();
                 }
                 let changed = state.worker.games != snapshot.games;
+                // A job that was active in the previous snapshot has ended.
                 let finished = snapshot.jobs.iter().any(|job| {
                     !job.phase.active()
                         && state
@@ -443,6 +504,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                             .iter()
                             .any(|old| old.id == job.id && old.phase.active())
                 });
+                // Mirror the running or paused job's counters into the progress panel.
                 if let Some(job) = snapshot.jobs.iter().find(|job| {
                     job.phase.active() && job.phase != crate::desktop_jobs::Phase::Waiting
                 }) {
@@ -462,12 +524,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 replace_games(state, state.worker.games.clone());
                 state.warnings = state.worker.warnings.clone();
                 let mut tasks = vec![];
+                // A finished job may have left or cleared a recovery record.
                 if finished {
                     tasks.push(Task::perform(
                         background(|| backend::recovery().map_err(|error| error.to_string())),
                         Message::RecoveryScanned,
                     ));
                 }
+                // The artwork maps were built for the old game list. Rebuild them.
                 if changed && !state.scanning && state.worker_enabled {
                     state.scanning = true;
                     tasks.push(Task::perform(background(scan), Message::Scanned));
@@ -488,6 +552,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if let Err(text) = result {
                 state.status = Some(Status { error: true, text });
             } else if state.preferences_dirty {
+                // Preferences changed while this save ran. Write the newer copy first.
                 return save_preferences(state);
             } else if state.refresh_after_save {
                 state.refresh_after_save = false;
@@ -514,6 +579,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::LocationResolved(kind, result) => match result {
             Ok(path) => {
+                // A path that is already listed only has its kind changed.
                 if let Some(old) = state
                     .preferences
                     .locations
@@ -603,6 +669,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             Err(text) => state.status = Some(Status { error: true, text }),
         },
         Message::Jump(section) => {
+            // GoTo's own task restores the page's old scroll offset. It is dropped
+            // because the jump scrolls to the section.
             let _navigation = update(state, Message::GoTo(Page::Settings));
             return super::surface::jump(section, Message::JumpOffset);
         }
@@ -619,6 +687,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::GoTo(page) => {
             if state.page != page {
+                // Restart the transition, then put the page back at its last offset.
                 state.direction = if page.rank() < state.page.rank() {
                     -1.0
                 } else {
@@ -650,6 +719,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::Tick => {}
 
+        // The compatibility wizard. Its state lives in `state.qualification`, and
+        // these arms forward to it while it is open.
         Message::Qualify => {
             let path = crate::native::folder_path(&state.folder);
             if let Some(game) = state
@@ -765,6 +836,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.status = None;
             return navigation;
         }
+        // Tab and Shift+Tab move focus. Escape closes the plan and the wizard.
         Message::Key(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
             if key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab) {
                 return if modifiers.shift() {
@@ -781,6 +853,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::Key(_) => {}
         #[cfg(target_os = "macos")]
         Message::Poll => {
+            // The timer rescan waits while a job, a scan, a pending plan or the
+            // wizard is using the current game list.
             if !state.working
                 && !state.scanning
                 && state.planned.is_none()
@@ -796,6 +870,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             state.scanning = true;
             let scan = Task::perform(background(scan), Message::Scanned);
+            // The worker keeps its own game list, so ask it to rediscover as well.
             #[cfg(windows)]
             return Task::batch([
                 scan,
@@ -808,6 +883,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.scanning = false;
             match games {
                 Ok(scan) => {
+                    // This scan read an older snapshot than the one on screen and
+                    // disagrees with it. Applying it would roll the list back, so
+                    // scan again.
                     #[cfg(windows)]
                     if scan.stamp < (state.worker.epoch, state.worker.revision)
                         && scan.games != state.worker.games
@@ -855,6 +933,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::StartPlanned => {
             if let Some((folder, optimize, plan)) = state.planned.take() {
+                // Free space and the mounted volume may have changed since the plan
+                // was shown.
                 if let Err(error) = plan.recheck() {
                     state.status = Some(Status {
                         error: true,
@@ -872,6 +952,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 LocationKind::Game,
             );
         }
+        // On Windows recovery is an ordinary restore job queued with the worker.
         #[cfg(windows)]
         Message::Recover(folder) => return start(state, folder, false),
         #[cfg(target_os = "macos")]
@@ -896,6 +977,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         },
         Message::Stop => {
+            // Windows cancels the worker's running or paused job. macOS raises the
+            // flag its job thread checks before each file.
             #[cfg(windows)]
             if let Some(job) =
                 state.worker.jobs.iter().find(|job| {
@@ -916,6 +999,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::Progress(progress) => state.progress = Some(progress),
         #[cfg(target_os = "macos")]
         Message::Finished(result) => {
+            // A stopped job returns an error. Report it as a stop, then reread the
+            // recovery journal either way.
             let stopped = state
                 .cancel
                 .take()
@@ -939,6 +1024,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
     artwork_tasks(state)
 }
 
+/// Swaps in a new game list. A game whose build differs from the old list is marked
+/// updated. On Windows the mark clears once the latest completed compression job for
+/// the game covers its current build.
 fn replace_games(state: &mut State, games: Vec<crate::model::Game>) {
     for game in &games {
         if state
@@ -966,6 +1054,8 @@ fn replace_games(state: &mut State, games: Vec<crate::model::Game>) {
     }
     state.games = games;
 }
+/// Games matching the search box and filter, in the chosen order. The search is a
+/// case-insensitive substring match on the title.
 fn filtered_games(state: &State) -> Vec<&crate::model::Game> {
     let query = state.query.to_lowercase();
     let mut games: Vec<_> = state
@@ -973,6 +1063,8 @@ fn filtered_games(state: &State) -> Vec<&crate::model::Game> {
         .iter()
         .filter(|game| {
             let updated = state.updated.contains(&game.id.to_string());
+            // The job history survives a restart of the window, so it also marks a
+            // game whose latest completed compression was for another build.
             #[cfg(windows)]
             let updated = updated
                 || state
@@ -994,6 +1086,8 @@ fn filtered_games(state: &State) -> Vec<&crate::model::Game> {
                 }
         })
         .collect();
+    // Both orders use one key shape. Title order leaves the launcher slot empty, and
+    // the id breaks ties so the order is stable between scans.
     games.sort_by_key(|game| match state.game_sort {
         GameSort::Title => (
             String::new(),
@@ -1008,6 +1102,8 @@ fn filtered_games(state: &State) -> Vec<&crate::model::Game> {
     });
     games
 }
+/// Lays the window out, compact under 760 px wide. The second argument keeps frames
+/// coming while a page transition or a programmatic scroll is in progress.
 fn view(state: &State) -> Element<'_, Message> {
     super::surface::animate(
         responsive(move |size| layout(state, size.width < 760.0)),
@@ -1019,6 +1115,8 @@ fn view(state: &State) -> Element<'_, Message> {
     )
 }
 
+/// Builds all three pages' parts and shows the current one beside the navigation
+/// column. `compact` stacks the Games page's two panels and narrows the navigation.
 fn layout(state: &State, compact: bool) -> Element<'_, Message> {
     let hero = container(
         column![
@@ -1036,6 +1134,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
     .width(Length::Fill)
     .style(theme::hero);
 
+    // Games page, first panel: refresh, search, filter, sort, then one button per game.
     let mut game_list = column![
         row![
             text(format!("Library · {} games", state.games.len())).size(16),
@@ -1096,6 +1195,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
             )
             .width(Length::Fill)
             .padding([9, 11])
+            // A game that is busy, updating or unavailable cannot be selected.
             .on_press_maybe(
                 (!state.working && !state.scanning && game.state.is_idle())
                     .then(|| Message::Select(game.install_dir.clone())),
@@ -1111,6 +1211,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         })
         .style(theme::panel);
 
+    // Games page, second panel: the selected folder and everything that acts on it.
     let controls = row![
         button("Optimize")
             .padding([11, 18])
@@ -1144,6 +1245,8 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         ),
     ]
     .spacing(14);
+    // Exclusion and artwork controls need a game id, so they appear only when the
+    // folder text resolves to a known game.
     if let Some(game) = state
         .games
         .iter()
@@ -1183,6 +1286,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
             Message::CloseQualification,
         ));
     }
+    // The confirmation step: one line per volume, and Start only if the plan fits.
     if let Some((_, _, plan)) = &state.planned {
         action = action.push(theme::section_title("Storage plan"));
         for row in &plan.requirements {
@@ -1211,6 +1315,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
             .spacing(10),
         );
     }
+    // Allocation is summed over the files visited so far, so `freed` grows with the job.
     if let Some(progress) = &state.progress {
         let freed = progress
             .allocation_before
@@ -1272,6 +1377,8 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         }
         Page::Settings => settings_page(state),
     };
+    // The page starts offset by the motion distance and settles to zero as `reveal`
+    // runs from 0 to 1. Reduced motion pins it at 1.
     let reveal = if state.preferences.motion == MotionChoice::Reduced {
         1.0
     } else {
@@ -1279,6 +1386,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
     };
     let body = super::surface::surface(
         scrollable(container(content).padding(24).width(Length::Fill))
+            // The scrollable's id is the page label. `scroll_to` in `update` targets it.
             .id(page.label())
             .on_scroll(move |viewport| Message::Scrolled(page, viewport.absolute_offset().y))
             .height(Length::Fill),
@@ -1323,6 +1431,7 @@ fn theme(state: &State) -> Theme {
     })
 }
 
+/// Starts the first scan, the preference load and the recovery check side by side.
 fn boot() -> (State, Task<Message>) {
     let state = State::default();
     let task = Task::batch([
@@ -1344,6 +1453,8 @@ fn boot() -> (State, Task<Message>) {
     (state, task)
 }
 
+// Emits Poll every 30 seconds. The sleep runs on a helper thread through
+// `background`, so it does not block the executor.
 #[cfg(target_os = "macos")]
 fn polls() -> impl iced::futures::Stream<Item = Message> {
     iced::futures::stream::unfold((), |()| async {
@@ -1363,6 +1474,8 @@ pub fn run() -> Result<()> {
         .theme(theme)
         .subscription(|state: &State| {
             iced::Subscription::batch([
+                // Frame ticks only while something is moving. An idle window does
+                // not redraw.
                 if (state.preferences.motion != MotionChoice::Reduced
                     && state.reveal.is_animating(Instant::now()))
                     || state
@@ -1384,6 +1497,8 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+/// Canonicalises a typed path off the UI thread. Rejects anything that is not an
+/// existing directory with a parent, which rules out a drive or filesystem root.
 fn resolve_location(path: PathBuf, kind: LocationKind) -> Task<Message> {
     Task::perform(
         background(move || {
@@ -1396,10 +1511,13 @@ fn resolve_location(path: PathBuf, kind: LocationKind) -> Task<Message> {
         move |result| Message::LocationResolved(kind, result),
     )
 }
+/// Writes the preferences, one save at a time. On Windows the worker writes the file
+/// and applies the change in the same step. On macOS this process writes it.
 fn save_preferences(state: &mut State) -> Task<Message> {
     if !state.preferences_loaded {
         return Task::none();
     }
+    // A save is running. `PreferencesSaved` starts the next one when it returns.
     if state.saving_preferences {
         state.preferences_dirty = true;
         return Task::none();
@@ -1421,6 +1539,8 @@ fn save_preferences(state: &mut State) -> Task<Message> {
         Message::PreferencesSaved,
     )
 }
+/// Starts a decode for every image the cache has queued. A failed decode reports
+/// `None`, and the tile keeps its letter.
 fn artwork_tasks(state: &mut State) -> Task<Message> {
     let mut tasks = vec![];
     while let Some(source) = state.artwork_cache.next() {
@@ -1432,6 +1552,9 @@ fn artwork_tasks(state: &mut State) -> Task<Message> {
     }
     Task::batch(tasks)
 }
+/// A game's image, or the first letter of its title until one is loaded. `cover`
+/// picks the tall 128x192 cover over the 44 px list tile. The sensor asks for the
+/// decode only when the tile is shown.
 fn artwork_tile<'a>(
     state: &'a State,
     game: &'a crate::model::Game,
@@ -1470,7 +1593,10 @@ fn artwork_tile<'a>(
         None => tile,
     }
 }
+/// The Settings page: jobs, locations, recovery, maintenance, appearance, reports
+/// and about, then any discovery warnings.
 fn settings_page(state: &State) -> Element<'_, Message> {
+    // Each id here must match the `.id(...)` of a container in `content` below.
     let jumps = iced::widget::Row::with_children(
         [
             ("Jobs", "settings-jobs"),
@@ -1491,6 +1617,7 @@ fn settings_page(state: &State) -> Element<'_, Message> {
     )
     .spacing(8)
     .wrap();
+    // macOS shows the one in-process job. Windows lists the worker's queue.
     #[cfg(target_os = "macos")]
     let jobs = {
         let mut jobs = column![
@@ -1543,6 +1670,7 @@ fn settings_page(state: &State) -> Element<'_, Message> {
     ]
     .spacing(12);
     for location in &state.preferences.locations {
+        // Maintenance is opt-in per location and needs the worker, so Windows only.
         #[cfg(windows)]
         {
             let path = location.path.clone();
@@ -1653,6 +1781,8 @@ fn settings_page(state: &State) -> Element<'_, Message> {
     content.into()
 }
 
+/// Queues a job with the worker. A folder that is not a known game is sent as a
+/// manual game named after the folder.
 #[cfg(windows)]
 fn start(state: &mut State, folder: PathBuf, optimize: bool) -> Task<Message> {
     let game = state
@@ -1674,6 +1804,8 @@ fn start(state: &mut State, folder: PathBuf, optimize: bool) -> Task<Message> {
         restore: !optimize,
     })
 }
+/// Sends one command to the worker, starting it if needed, and feeds the returned
+/// snapshot back as `Message::Worker`.
 #[cfg(windows)]
 fn worker_send(command: crate::windows::coordinator::Command) -> Task<Message> {
     Task::perform(
@@ -1683,6 +1815,8 @@ fn worker_send(command: crate::windows::coordinator::Command) -> Task<Message> {
         Message::Worker,
     )
 }
+/// Asks the worker for a snapshot once a second. `poll` never starts a worker, so
+/// a stopped one stays stopped.
 #[cfg(windows)]
 fn polls() -> impl iced::futures::Stream<Item = Message> {
     iced::futures::stream::unfold((), |_| async {
@@ -1695,6 +1829,7 @@ fn polls() -> impl iced::futures::Stream<Item = Message> {
     })
 }
 
+/// The worker's jobs in four groups, newest first. History shows its latest 20.
 #[cfg(windows)]
 fn worker_jobs(state: &State) -> iced::widget::Column<'_, Message> {
     use crate::desktop_jobs::Phase;
@@ -1730,6 +1865,8 @@ fn worker_jobs(state: &State) -> iced::widget::Column<'_, Message> {
         }
         for job in items.iter().rev().take(limit) {
             let mut controls = row![].spacing(8);
+            // Active jobs can be paused or cancelled. Failed, interrupted and
+            // stopped ones can be retried. Completed ones have no controls.
             if job.phase.active() {
                 controls = controls
                     .push(
@@ -1781,6 +1918,7 @@ fn worker_jobs(state: &State) -> iced::widget::Column<'_, Message> {
     jobs
 }
 
+/// The platform's periodic refresh: worker snapshots on Windows, a rescan on macOS.
 fn poll_subscription(state: &State) -> iced::Subscription<Message> {
     #[cfg(windows)]
     if !state.worker_enabled {
@@ -1791,6 +1929,7 @@ fn poll_subscription(state: &State) -> iced::Subscription<Message> {
     iced::Subscription::run(polls)
 }
 
+/// Whether Stop has a job to act on. A job still waiting in the queue does not count.
 fn can_stop(state: &State) -> bool {
     #[cfg(windows)]
     {
@@ -1806,6 +1945,7 @@ fn can_stop(state: &State) -> bool {
     }
 }
 
+/// One line for the Overview page describing the first active job, if any.
 fn current_work(state: &State) -> String {
     #[cfg(windows)]
     {

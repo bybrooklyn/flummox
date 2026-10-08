@@ -16,8 +16,10 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+/// The worker's stdout, shared by its threads.
 struct Output(Mutex<std::io::Stdout>);
 impl Output {
+    /// Writes one event as a flushed JSON line. Write errors are discarded.
     fn send(&self, event: WorkerEvent) {
         if let Ok(mut output) = self.0.lock() {
             let _sent = serde_json::to_writer(&mut *output, &event)
@@ -32,8 +34,10 @@ impl EventSink for Output {
         self.send(WorkerEvent::Progress(event));
     }
 }
+/// Presents the coordinator's pause flag to the backend as a busy check.
 struct Pause(Arc<AtomicBool>);
 impl BusyCheck for Pause {
+    // Reading the flag costs nothing, so it is checked on every call.
     fn check_interval(&self) -> std::time::Duration {
         std::time::Duration::ZERO
     }
@@ -44,6 +48,7 @@ impl BusyCheck for Pause {
     }
 }
 
+/// Makes pack sampling and corpus hashing wait while paused and stop on cancel.
 struct AnalysisObserver<'a> {
     output: &'a Output,
     ctx: &'a JobCtx<'a>,
@@ -59,15 +64,20 @@ impl crate::pack::Observer for AnalysisObserver<'_> {
     }
 }
 
+/// Runs one job through to its `Done` event. `run` reports an `Err` as `Failed`.
 fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Result<()> {
     ensure!(work.version == VERSION, "Worker version mismatch");
     let job = work.job;
+    // Checks that need the whole filesystem come first. The sandbox below
+    // narrows this process to the game folder.
     let _operation = super::operation_lock()?;
     if let Some(plan) = &job.space_plan {
         plan.recheck()?;
     }
     let path = validate_folder(&job.game.install_dir)?;
     let fs = crate::fsprobe::probe(&path)?;
+    // Analysis also runs on a drive with no native backend. It then samples
+    // with the btrfs backend's model.
     let kind = crate::fsprobe::tier_for(&fs)
         .backend()
         .or_else(|| {
@@ -88,6 +98,9 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
             "This game is excluded. Restore it before processing."
         );
     }
+    // Receipts stored under this job's policy name files an earlier attempt
+    // finished. A compression receipt below the requested level floor is
+    // ignored, so that file is processed again.
     let mut completed = std::collections::HashMap::new();
     let receipts = rusqlite::Connection::open_with_flags(
         super::state_dir()?.join("queue.sqlite"),
@@ -106,6 +119,9 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
     }
     drop(stmt);
     drop(receipts);
+    // Receipts under any other policy describe a state this job is about to
+    // overwrite. They go before the first rewrite, so an interrupted job
+    // cannot leave them behind.
     if job.operation != Operation::Analyze {
         service::invalidate_receipts(
             &super::state_dir()?.join("queue.sqlite"),
@@ -130,6 +146,8 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
     let paused = Arc::new(AtomicBool::new(false));
     let control_cancel = cancel.clone();
     let control_pause = paused.clone();
+    // Control thread: applies Pause and Cancel lines from stdin. A read
+    // error, which includes the coordinator closing the pipe, cancels the job.
     std::thread::spawn(move || {
         let mut input = input;
         loop {
@@ -164,6 +182,8 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
         }
         Err(e) => return Err(e.into()),
     };
+    // `full` is every file. `inv` leaves out files whose receipt still matches
+    // their fingerprint.
     let mut inv = Inventory {
         files: full
             .files
@@ -193,6 +213,8 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
         ..Estimate::default()
     };
     let mut failures: Vec<_> = inv.warnings.iter().take(20).cloned().collect();
+    // Analysis only: when a saved report covers this game build, hash the
+    // whole install and record the report whose corpus matches.
     if job.operation == Operation::Analyze {
         let reports = reports.load()?;
         let candidates: Vec<_> = reports
@@ -224,6 +246,9 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
         }
     }
 
+    // Sampling pass for Analyze and Compress. It fills the estimate and
+    // narrows `inv` to the files a native rewrite is expected to shrink, plus
+    // eligible files the sample budget did not reach.
     if job.operation != Operation::Decompress {
         summary.maximum_after = Some(0);
         // A storage job reports totals once, from the backend, when rewriting
@@ -354,6 +379,7 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
         inv.files = candidates;
         output.send(WorkerEvent::Estimate(summary));
     }
+    // Analysis ends here, and so does a job cancelled during sampling.
     if job.operation == Operation::Analyze || cancel.load(Ordering::Relaxed) {
         output.send(WorkerEvent::Done {
             cancelled: cancel.load(Ordering::Relaxed),
@@ -383,6 +409,9 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
     {
         failures.push("The kernel used its default compression level. A newer kernel is needed to apply the requested preset.".into());
     }
+    // History: a compress pass records the files it finished together with
+    // earlier receipts that still match. A decompress with no errors forgets
+    // the game.
     if job.operation == Operation::Compress {
         let mut record = GameRecord::new(
             job.game.id.clone(),
@@ -415,6 +444,8 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
     Ok(())
 }
 
+/// Worker entry point. Reads one [`Work`] line from stdin and runs it. A
+/// failure is sent as `WorkerEvent::Failed`, so this always returns `Ok`.
 pub(super) fn run() -> Result<()> {
     let output = Output(Mutex::new(std::io::stdout()));
     let mut input = BufReader::new(std::io::stdin());

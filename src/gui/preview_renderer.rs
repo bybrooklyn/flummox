@@ -3,6 +3,9 @@ use super::theme;
 use crate::testutil::{Ctx, TestResult, check};
 use iced::{Color, Rectangle, Size};
 use iced_tiny_skia::core::{Layout, layout, mouse, renderer::Style, widget::Tree};
+/// Lays out and draws `element` with the software renderer and saves a PNG
+/// at `path`. Fails when the result is almost entirely dark, which is what a
+/// layout that drew nothing looks like.
 pub fn render<Message>(
     mut element: iced::Element<'_, Message>,
     palette: iced::Theme,
@@ -43,6 +46,7 @@ pub fn render<Message>(
         &[Rectangle::with_size(size)],
         Color::BLACK,
     );
+    // Tests the first byte of each pixel, which is blue before the swap below.
     check(
         pixels
             .data()

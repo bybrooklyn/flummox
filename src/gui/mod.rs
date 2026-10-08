@@ -72,6 +72,8 @@ fn theme_of(state: &app::State) -> iced::Theme {
     theme::theme(dark)
 }
 
+/// Whether any animation held in the state is still running. Always false
+/// when motion is reduced.
 #[cfg(target_os = "linux")]
 fn animation_pending(state: &app::State) -> bool {
     let now = std::time::Instant::now();
@@ -99,6 +101,8 @@ fn animation_frames(state: &app::State) -> iced::Subscription<app::Message> {
         || state
             .scroll_redraw_until
             .is_some_and(|until| std::time::Instant::now() < until);
+    // A toast with a deadline also needs frames: `Tick` is what notices the
+    // deadline has passed.
     let frames = if moving || state.status_deadline.is_some() {
         iced::window::frames().map(|_| app::Message::Tick)
     } else {
@@ -117,6 +121,8 @@ fn animation_frames(state: &app::State) -> iced::Subscription<app::Message> {
     ])
 }
 
+/// Opens the window and runs until it closes. Logs go to stderr at `warn`
+/// unless `RUST_LOG` says otherwise.
 #[cfg(target_os = "linux")]
 pub fn run() -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -128,10 +134,11 @@ pub fn run() -> Result<()> {
 
     let env = Env::current().context("HOME is not set, so no game library can be found")?;
 
-    // `view::view` is passed as a function item, not wrapped in a closure: a
-    // closure's return lifetime is a fresh one rather than tied to its
-    // argument, which is exactly the higher-ranked bound `ViewFn` needs.
+    // `view::view` is passed as a function item, not wrapped in a closure. A
+    // closure's return lifetime is inferred as a fresh one, and `ViewFn`
+    // needs it tied to the argument for every lifetime.
     iced::application(
+        // The first scan and the desktop theme query start with the window.
         move || {
             let mut state = app::State::new(env.clone());
             let refresh = app::update(&mut state, app::Message::Refresh);

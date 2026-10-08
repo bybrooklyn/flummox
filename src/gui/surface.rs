@@ -4,6 +4,12 @@ use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, overlay, r
 use iced::{Element, Event, Length, Rectangle, Size, Vector};
 use std::time::{Duration, Instant};
 
+/// Wraps `content`, drawing it `offset` pixels lower and clipped to its own
+/// bounds.
+///
+/// With `smooth`, line-based wheel steps over the first scrollable inside are
+/// eased. `key` must be that scrollable's widget id, and a changed `key`
+/// resets the easing state.
 pub fn surface<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
     offset: f32,
@@ -31,22 +37,32 @@ pub fn animate<'a, Message: 'a>(
         animating,
     })
 }
+/// The widget behind both `surface` and `animate`.
 struct Surface<'a, Message> {
     content: Element<'a, Message>,
+    /// Vertical translation of the content, in pixels.
     offset: f32,
     smooth: bool,
     key: &'static str,
+    /// Ask for another frame after each redraw.
     animating: bool,
 }
+/// One eased wheel movement, kept in the widget tree between frames.
 #[derive(Default)]
 struct Motion {
+    /// Scroll offset when the movement started or was last retargeted.
     from: f32,
+    /// Scroll offset the movement ends at.
     target: f32,
+    /// `None` while no movement is in progress.
     start: Option<Instant>,
+    /// Where the pointer was at the wheel step. The synthetic scroll events
+    /// are delivered there.
     cursor: Option<iced::Point>,
     key: &'static str,
 }
 impl Motion {
+    /// The offset at `now`: ease-out cubic from `from` to `target` over 0.1 s.
     fn value(&self, now: Instant) -> f32 {
         let Some(start) = self.start else {
             return self.target;
@@ -54,6 +70,11 @@ impl Motion {
         let t = now.saturating_duration_since(start).as_secs_f32() / 0.1;
         self.from + (self.target - self.from) * (1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3))
     }
+    /// Starts or extends a movement by `delta` pixels and restarts the clock.
+    ///
+    /// A step in the direction already travelling adds to the pending target,
+    /// so quick steps accumulate. A first step or a reversal starts from
+    /// `current`. The target is clamped to `0..=maximum`.
     fn retarget(&mut self, current: f32, delta: f32, maximum: f32, now: Instant) {
         let reversing = self.start.is_some() && delta.signum() != (self.target - current).signum();
         let base = if self.start.is_none() || reversing {
@@ -66,6 +87,8 @@ impl Motion {
         self.start = Some(now);
     }
 }
+/// A widget operation that reads the first scrollable it meets: its vertical
+/// offset, the largest offset it allows and its visible height.
 #[derive(Default)]
 struct Position {
     current: f32,
@@ -111,6 +134,8 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
         vec![Tree::new(self.content.as_widget())]
     }
     fn diff(&self, tree: &mut Tree) {
+        // A different key means different content, so a movement in progress
+        // must not carry over to it.
         let motion = tree.state.downcast_mut::<Motion>();
         if motion.key != self.key {
             *motion = Motion {
@@ -174,6 +199,8 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
         if !self.smooth {
             motion.start = None;
         }
+        // A vertical line-based wheel step is captured here and turned into
+        // an eased movement. The child never sees the original event.
         if self.smooth
             && cursor.is_over(layout.bounds())
             && let Event::Mouse(mouse::Event::WheelScrolled {
@@ -199,6 +226,8 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
                 return;
             }
         }
+        // Trackpad scrolling, a click or a key press ends the movement so
+        // direct input is not fought by the easing.
         if matches!(
             event,
             Event::Mouse(mouse::Event::WheelScrolled {
@@ -208,6 +237,9 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
         ) {
             motion.start = None;
         }
+        // Each frame of a movement: read where the scrollable is, compute
+        // where the easing puts it, and send the child a pixel wheel event
+        // for the difference.
         if let Event::Window(iced::window::Event::RedrawRequested(now)) = event
             && let Some(start) = motion.start
         {
@@ -245,6 +277,8 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
         self.content.as_widget_mut().update(
             child, event, bounds, cursor, renderer, clipboard, shell, viewport,
         );
+        // Page Up and Page Down move 90 percent of the visible height. Home
+        // and End go to the edges.
         // Inputs and open menus get first refusal, so Home/End still edit text.
         if self.key != "animation-driver"
             && !shell.is_event_captured()
@@ -298,6 +332,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
         viewport: &Rectangle,
     ) {
         use iced::advanced::Renderer;
+        // The layer clips the translated content to this widget's bounds.
         if let (Some(child), Some(bounds)) = (tree.children.first(), layout.children().next())
             && let Some(clip) = layout.bounds().intersection(viewport)
         {
@@ -342,10 +377,17 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
     }
 }
 
+/// Finds the container with id `section` and reports how far down it sits.
+///
+/// The distance is measured from the top of the content of the scrollable
+/// whose id is `Settings`. No message is produced when the container is not
+/// in the current view.
 pub fn jump<Message: Send + 'static>(
     section: &'static str,
     message: impl Fn(f32) -> Message + Send + 'static,
 ) -> iced::Task<Message> {
+    // The scrollable is visited before the containers inside it, so `origin`
+    // is set by the time a section is found.
     struct Anchor {
         section: widget::Id,
         origin: f32,

@@ -5,6 +5,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Report schema version. [`Report::validate`] rejects any other.
 pub const VERSION: u32 = 1;
 
 /// A game build without its title or installation path.
@@ -17,12 +18,15 @@ pub struct GameBuild {
 }
 
 impl GameBuild {
+    /// Whether `game` is this launcher entry at this build. A game whose
+    /// build is unknown never matches.
     pub fn matches(&self, game: &Game) -> bool {
         self.launcher == game.id.launcher
             && self.key == game.id.key
             && game.build.as_deref() == Some(self.build.as_str())
     }
 
+    /// The game's id, which carries no build.
     pub fn id(&self) -> GameId {
         GameId::new(self.launcher, self.key.clone())
     }
@@ -32,8 +36,12 @@ impl GameBuild {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Corpus {
+    /// Hex SHA-256 over every file in path order: path length, path bytes,
+    /// file size, then content.
     pub sha256: String,
+    /// Regular files hashed.
     pub files: u64,
+    /// Total content bytes hashed.
     pub bytes: u64,
 }
 
@@ -65,6 +73,7 @@ pub enum Platform {
 }
 
 impl Platform {
+    /// The platform this binary was compiled for.
     pub fn current() -> Self {
         if cfg!(target_os = "linux") {
             Self::Linux
@@ -87,9 +96,12 @@ pub struct Checks {
     pub writable_update_verified: bool,
     pub rollback_verified: bool,
     pub launched: bool,
+    /// A problem was observed. Both issue flags must be false to qualify.
     pub anti_cheat_issue: bool,
     pub gameplay_issue: bool,
+    /// Load time of the ordinary install, in milliseconds.
     pub baseline_load_ms: u64,
+    /// Load time under the tested storage mode, in milliseconds.
     pub candidate_load_ms: u64,
 }
 
@@ -97,9 +109,13 @@ pub struct Checks {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageResult {
+    /// Sum of file sizes. Must equal the corpus's `bytes`.
     pub logical_bytes: u64,
+    /// Bytes allocated by the ordinary install.
     pub allocated_before: u64,
+    /// Bytes allocated under the tested storage mode.
     pub allocated_after: u64,
+    /// 95th-percentile random read latency in nanoseconds, when measured.
     pub random_read_p95_ns: Option<u64>,
 }
 
@@ -114,9 +130,11 @@ pub struct Report {
     pub mode: StorageMode,
     pub checks: Checks,
     pub storage: StorageResult,
+    /// Version of the Flummox build that wrote the report.
     pub flummox_version: String,
 }
 
+/// Thresholds a valid report must meet before it qualifies a game.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Policy {
     /// Maximum accepted load-time increase in basis points.
@@ -132,10 +150,14 @@ impl Default for Policy {
 }
 
 impl Report {
+    /// BLAKE3 of the report's JSON. An estimate stores it to name the report
+    /// that matched the analyzed game.
     pub fn identity(&self) -> Result<[u8; 32]> {
         Ok(*blake3::hash(&serde_json::to_vec(self)?).as_bytes())
     }
 
+    /// Checks that the report is complete and self-consistent. Passing says
+    /// nothing about whether the recorded results are good enough.
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.version == VERSION,
@@ -173,6 +195,10 @@ impl Report {
         Ok(())
     }
 
+    /// Whether this report permits automatic Maximum Space for `game` here:
+    /// a valid Maximum Space report from this platform, for this build and
+    /// corpus hash, with every check passed, no issue seen, and the load time
+    /// within the policy's allowance over the baseline.
     pub fn qualifies(&self, game: &Game, corpus_sha256: &str, policy: Policy) -> bool {
         self.validate().is_ok()
             && self.mode == StorageMode::MaximumSpace
@@ -192,6 +218,7 @@ impl Report {
                 )
     }
 
+    /// The content-derived file name a valid report is stored under.
     fn filename(&self) -> Result<String> {
         self.validate()?;
         let bytes = serde_json::to_vec(self)?;
@@ -205,12 +232,14 @@ pub struct Store {
 }
 
 impl Store {
+    /// Opens the store at `root`, creating the folder owner-only.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         create_private_dir(&root)?;
         Ok(Self { root })
     }
 
+    /// The store beside this user's state database.
     #[cfg(target_os = "linux")]
     pub fn local() -> Result<Self> {
         let database = crate::db::Db::default_path().context("Cannot locate state folder")?;
@@ -223,6 +252,8 @@ impl Store {
         Self::open(crate::libraries::data_dir()?.join("compatibility"))
     }
 
+    /// Writes a valid report under its content-derived name and returns the
+    /// path. A report already stored is left untouched.
     pub fn save(&self, report: &Report) -> Result<PathBuf> {
         let path = self.root.join(report.filename()?);
         if path.exists() {
@@ -254,6 +285,7 @@ impl Store {
         Ok(reports)
     }
 
+    /// Reads and validates one report file of at most 1 MiB.
     fn read(path: &Path) -> Result<Report> {
         ensure!(
             std::fs::metadata(path)?.len() <= 1024 * 1024,
@@ -266,6 +298,7 @@ impl Store {
     }
 }
 
+/// Creates `path` and its parents, and sets `path` to mode 0700.
 #[cfg(unix)]
 fn create_private_dir(path: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -283,6 +316,7 @@ fn create_private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Creates `path` with mode 0600, writes it and syncs it. Fails if it exists.
 #[cfg(unix)]
 fn write_private_new(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
@@ -333,6 +367,7 @@ pub fn corpus(
         inventory.warnings.is_empty(),
         "Cannot verify every file in this game"
     );
+    // Hash in path order, so the result does not depend on walk order.
     inventory.files.sort_by(|a, b| a.rel.cmp(&b.rel));
     let mut hash = Sha256::new();
     let mut bytes = 0u64;
@@ -375,6 +410,8 @@ pub fn corpus(
             "File changed during compatibility verification"
         );
     }
+    // Walk again and compare every fingerprint. A file added, removed or
+    // changed while hashing ran means the hash describes no real state.
     let after = crate::inventory::walk_cancellable(
         &root,
         &crate::inventory::WalkOpts { min_size: 0 },

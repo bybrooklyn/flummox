@@ -15,10 +15,16 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+// A boundary needs 21 zero bits, so past the minimum length one occurs on
+// average every 2 MiB of content.
 const CONTENT_MASK: u64 = (1 << 21) - 1;
+// Files below one minimum chunk are candidates for a shared frame.
 const SMALL_FILE_LIMIT: u64 = MIN_CHUNK_BYTES as u64;
+// A shared frame is kept only when it beats separate chunks by this many bytes.
 const GROUP_GAIN_FLOOR: usize = 4096;
 
+// Inputs shared by the small-file grouping passes. `pool` lets the cost
+// comparison treat an object already in the pool as free.
 #[derive(Clone, Copy)]
 struct GroupParams<'a> {
     anchor: &'a crate::safeio::Anchor,
@@ -28,6 +34,8 @@ struct GroupParams<'a> {
     observer: &'a dyn Observer,
 }
 
+// The splitmix64 finalizer of the byte. It stands in for a 256-entry gear
+// table, and changing it moves every chunk boundary.
 fn gear(byte: u8) -> u64 {
     let mut value = u64::from(byte).wrapping_add(0x9e37_79b9_7f4a_7c15);
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -35,8 +43,14 @@ fn gear(byte: u8) -> u64 {
     value ^ (value >> 31)
 }
 
+/// Reads the next content-defined chunk into `output`. Returns false at end
+/// of input. A chunk ends at CHUNK_BYTES, at end of input, or once it holds
+/// MIN_CHUNK_BYTES and the fingerprint's low 21 bits are zero.
 fn read_content_chunk(reader: &mut impl BufRead, output: &mut Vec<u8>) -> std::io::Result<bool> {
     output.clear();
+    // The fingerprint restarts with each chunk and shifts left once per byte,
+    // so its low 21 bits depend only on the 21 bytes before a boundary. Cut
+    // points follow content, and line up again after inserted or removed bytes.
     let mut fingerprint = 0u64;
     loop {
         let available = reader.fill_buf()?;
@@ -73,7 +87,10 @@ fn read_content_chunk(reader: &mut impl BufRead, output: &mut Vec<u8>) -> std::i
 /// Maximum tries the useful high-level steps on each unique chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Options {
+    /// zstd level tried on every chunk, 1 to 22.
     pub level: i32,
+    /// `Some(22)` also tries 15, 19 and 22. Any other value tries that one
+    /// extra level. The smallest encoding is kept.
     pub compare_level: Option<i32>,
 }
 impl Default for Options {
@@ -94,6 +111,8 @@ impl Options {
     }
 }
 
+// The stat fields compared before and after each read, and across the two
+// source snapshots. A difference in any of them aborts the build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Stamp {
     device: u64,
@@ -118,6 +137,8 @@ impl From<&Metadata> for Stamp {
     }
 }
 
+// One source path as the walk saw it. `link` is a symlink's target.
+// `hardlink_to` names the first path, in walk order, with the same inode.
 #[derive(Debug, PartialEq, Eq)]
 struct Source {
     path: PathBuf,
@@ -140,6 +161,9 @@ fn read_xattrs(path: &Path) -> Result<Vec<Xattr>> {
     Ok(attributes)
 }
 
+/// Walks the source in sorted order and records every path's metadata. Run
+/// before and after a build, the two results must be equal for the store to
+/// be published. Refuses device nodes, sockets and FIFOs.
 fn snapshot(root: &Path, cancel: &AtomicBool) -> Result<Vec<Source>> {
     let mut result = Vec::new();
     for entry in walkdir::WalkDir::new(root)
@@ -180,6 +204,9 @@ fn snapshot(root: &Path, cancel: &AtomicBool) -> Result<Vec<Source>> {
             hardlink_to: None,
         });
     }
+    // Count how many walked paths share each multiply linked inode. If that
+    // is fewer than the inode's link count, a link lives outside the game
+    // folder and the store could not preserve it.
     let mut counts = HashMap::<(u64, u64), u64>::new();
     for source in &result {
         if source.stamp.mode & libc::S_IFMT == libc::S_IFREG && source.stamp.links > 1 {
@@ -209,6 +236,9 @@ fn snapshot(root: &Path, cancel: &AtomicBool) -> Result<Vec<Source>> {
     Ok(result)
 }
 
+/// Returns the id of the chunk holding `bytes`, storing it through `store`
+/// only when no chunk with the same hash and length exists yet. `prepared`
+/// passes an encoding already made, so it is not computed twice.
 fn intern_chunk(
     index: &mut Index,
     known: &mut HashMap<([u8; 32], u32), u32>,
@@ -239,6 +269,9 @@ fn intern_chunk(
     Ok(id)
 }
 
+/// Packs small files into shared frames where that saves space, and returns
+/// the `Kind::SlicedFile` for each file it grouped. Files it leaves out are
+/// chunked on their own by the caller.
 fn group_small_files(
     params: GroupParams<'_>,
     sources: &[Source],
@@ -246,6 +279,8 @@ fn group_small_files(
     known: &mut HashMap<([u8; 32], u32), u32>,
     store: &mut impl FnMut(u32, Codec, &[u8], [u8; 32]) -> Result<Chunk>,
 ) -> Result<HashMap<PathBuf, Kind>> {
+    // First pass: hash every small file to count how many share its content.
+    // Hard-link aliases are skipped because they reuse their target's kind.
     let mut counts = HashMap::<([u8; 32], u32), u32>::new();
     let mut fingerprints = HashMap::<PathBuf, ([u8; 32], u32)>::new();
     for source in sources {
@@ -283,6 +318,9 @@ fn group_small_files(
         *counts.entry(key).or_default() += 1;
         fingerprints.insert(source.path.clone(), key);
     }
+    // Second pass: only files with unique content are grouped, so exact
+    // duplicates keep sharing one chunk. Candidates are bucketed by lowercase
+    // extension, then cut into frames of at most CHUNK_BYTES in path order.
     let mut by_extension = BTreeMap::<Vec<u8>, Vec<&Source>>::new();
     for source in sources {
         if source.stamp.mode & libc::S_IFMT == libc::S_IFREG
@@ -321,6 +359,9 @@ fn group_small_files(
     Ok(grouped)
 }
 
+/// Builds one candidate frame and stores it only if it costs at least
+/// GROUP_GAIN_FLOOR bytes less than encoding its files separately. A chunk
+/// already in this store or in the pool counts as free on either side.
 fn store_group(
     params: GroupParams<'_>,
     group: &[&Source],
@@ -419,6 +460,8 @@ fn store_group(
     Ok(())
 }
 
+/// Resolves an output path to (canonical parent, final path) and fails if
+/// anything, including a dangling symlink, already exists there.
 pub(super) fn destination(path: &Path) -> Result<(PathBuf, PathBuf)> {
     let name = path.file_name().context("Choose a new destination name")?;
     let parent = path
@@ -435,6 +478,9 @@ pub(super) fn destination(path: &Path) -> Result<(PathBuf, PathBuf)> {
     Ok((parent, target))
 }
 
+/// Reads the whole source and returns its index with the snapshot it was
+/// built from. `store` receives each new unique chunk (decoded length, codec,
+/// encoded bytes, hash) and returns the descriptor to record for it.
 fn build_index(
     root: &Path,
     options: Options,
@@ -480,10 +526,13 @@ fn build_index(
         &mut known,
         &mut store,
     )?;
+    // Kind of each first-seen file, so a later hard-link alias can repeat it.
     let mut primary_files = HashMap::<PathBuf, Kind>::new();
     let mut buffer = Vec::with_capacity(CHUNK_BYTES);
     let mut files_done = 0u64;
     let mut bytes_done = 0u64;
+    // Sources are in sorted walk order, which puts parents before children
+    // and hard-link targets before aliases, as `Index::validate` requires.
     for source in &sources {
         observer.checkpoint()?;
         ensure!(!cancel.load(Ordering::Relaxed), "Store creation cancelled");
@@ -507,6 +556,9 @@ fn build_index(
             primary_files.insert(source.path.clone(), kind.clone());
             kind.clone()
         } else {
+            // The file is opened beneath the anchored root and its stat is
+            // compared with the snapshot before the first and after the last
+            // read, so a swapped or rewritten file aborts the build.
             let mut file = anchor.open_with(
                 &source.path,
                 rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NONBLOCK,
@@ -569,6 +621,9 @@ pub fn create(
     create_observed(root, output, options, cancel, &NoObserver)
 }
 
+/// `create` with progress. Writes a version 6 monolithic store. Nothing
+/// appears at `output` until every chunk has been read back and the source
+/// has been walked again and found unchanged.
 pub fn create_observed(
     root: &Path,
     output: &Path,
@@ -597,6 +652,8 @@ pub fn create_observed(
         !target.starts_with(&root),
         "Keep the store outside its source folder"
     );
+    // Order: placeholder header, payloads, index, then the real header over
+    // the placeholder, because the header records where the index landed.
     let mut staged = tempfile::NamedTempFile::new_in(&parent)?;
     staged.write_all(&[0; HEADER_BYTES as usize])?;
     let mut position = HEADER_BYTES;
@@ -636,6 +693,9 @@ pub fn create_observed(
     staged.write_all(&(bytes.len() as u64).to_le_bytes())?;
     staged.write_all(blake3::hash(&bytes).as_bytes())?;
     staged.as_file().sync_all()?;
+    // Durable steps: sync the staged file, reopen and decode every chunk,
+    // compare a fresh source snapshot, publish without replacement, then
+    // sync the parent. An earlier failure drops the staged file.
     let reader = Reader::from_file(staged.reopen()?)?;
     observer.started(0, 0, "Verifying stored bytes");
     reader.verify_observed(cancel, observer)?;
@@ -651,6 +711,8 @@ pub fn create_observed(
     Ok(reader.summary().clone())
 }
 
+/// Creates or opens a pool. An existing folder must belong to this user and
+/// hold only pool entries, and is then set to mode 0700.
 fn pool_dir(path: &Path) -> Result<PathBuf> {
     if !path.exists() {
         std::fs::DirBuilder::new()
@@ -698,6 +760,9 @@ fn ensure_only_pool_entries(pool: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Takes the pool's exclusive lock, waiting for it if needed. Creation holds
+/// it for a whole build and pruning for a whole pass, so pruning never sees
+/// an object that a build has published but not yet linked into its store.
 fn lock_pool(pool: &Path) -> Result<File> {
     let lock = std::fs::OpenOptions::new()
         .read(true)
@@ -710,6 +775,9 @@ fn lock_pool(pool: &Path) -> Result<File> {
     Ok(lock)
 }
 
+/// Puts one chunk object in the pool and returns its path. An object already
+/// there is reused after its header is checked. Its payload is not reread.
+/// The caller must hold the pool lock.
 fn publish_object(pool: &Path, chunk: &Chunk, encoded: &[u8]) -> Result<PathBuf> {
     let target = pool.join(chunk_name(chunk));
     match std::fs::symlink_metadata(&target) {
@@ -720,6 +788,8 @@ fn publish_object(pool: &Path, chunk: &Chunk, encoded: &[u8]) -> Result<PathBuf>
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
+    // Header layout matches `inspect_object` in format.rs. The object is
+    // synced and made read-only before it is published without replacement.
     let mut staged = tempfile::NamedTempFile::new_in(pool)?;
     staged.write_all(OBJECT_MAGIC)?;
     staged.write_all(&codec_number(chunk.codec).to_le_bytes())?;
@@ -742,6 +812,7 @@ fn publish_object(pool: &Path, chunk: &Chunk, encoded: &[u8]) -> Result<PathBuf>
     Ok(target)
 }
 
+/// Writes a version 7 manifest: the 64-byte header, then the index at offset 64.
 fn write_manifest(path: &Path, index: &Index) -> Result<()> {
     index.validate(0, 7)?;
     let bytes = serde_json::to_vec(index)?;
@@ -777,6 +848,9 @@ pub fn create_shared(
     create_shared_observed(root, output, pool, options, cancel, &NoObserver)
 }
 
+/// `create_shared` with progress. Writes a version 7 directory store. The
+/// pool and the store's parent must be on one filesystem. A failed build
+/// leaves its new objects in the pool with one link, for `prune_shared_pool`.
 pub fn create_shared_observed(
     root: &Path,
     output: &Path,
@@ -843,6 +917,8 @@ pub fn create_shared_observed(
                 codec,
                 hash,
             };
+            // The store reads through its own link, so it stays complete if
+            // the pool entry is later pruned or the pool is removed.
             let object = publish_object(&pool, &chunk, encoded)?;
             std::fs::hard_link(&object, chunks_path.join(chunk_name(&chunk)))?;
             Ok(chunk)
@@ -857,6 +933,9 @@ pub fn create_shared_observed(
         .open(staged.path().join("pool.json"))?;
     serde_json::to_writer(&mut pool_file, &pool_record)?;
     pool_file.sync_all()?;
+    // Durable steps: sync both staged folders, reopen and decode every
+    // chunk, compare a fresh source snapshot, rename the folder into place
+    // without replacement, then sync the parent.
     File::open(&chunks_path)?.sync_all()?;
     File::open(staged.path())?.sync_all()?;
     let reader = Reader::open(staged.path())?;
@@ -880,13 +959,17 @@ pub fn create_shared_observed(
     Ok(reader.summary().clone())
 }
 
+/// What one `prune_shared_pool` pass removed.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct PoolPruneSummary {
     pub objects: u64,
+    /// Allocated size of the removed files, from their block counts.
     pub reclaimed_bytes: u64,
 }
 
 /// Removes pool directory entries that no shared store still hard-links.
+/// Refuses a folder that holds anything a pool would not, and holds the pool
+/// lock for the whole pass. Leftover `.tmp` files are removed too.
 pub fn prune_shared_pool(pool: &Path) -> Result<PoolPruneSummary> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -912,6 +995,8 @@ pub fn prune_shared_pool(pool: &Path) -> Result<PoolPruneSummary> {
         }
         let metadata = std::fs::symlink_metadata(entry.path())?;
         ensure!(metadata.is_file(), "Unexpected entry in the shared pool");
+        // A link count of 1 means the pool's own name is the last one: every
+        // store that linked this object has been deleted.
         if metadata.nlink() == 1 {
             if !name.as_bytes().starts_with(b".tmp") {
                 validate_pool_object(&entry.path())?;
@@ -927,6 +1012,9 @@ pub fn prune_shared_pool(pool: &Path) -> Result<PoolPruneSummary> {
     Ok(summary)
 }
 
+/// Picks the smallest encoding among the configured levels. All-zero input
+/// stores nothing, and input zstd cannot shrink is stored raw, so a payload
+/// is never longer than its chunk.
 fn encode(bytes: &[u8], options: Options) -> Result<(Codec, Vec<u8>)> {
     if bytes.iter().all(|byte| *byte == 0) {
         return Ok((Codec::Zero, Vec::new()));
@@ -1066,10 +1154,14 @@ pub fn sample_small_files(
     })
 }
 
+/// Result of `sample_small_files`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SmallFileSample {
+    /// Small files read, after the byte budget and one per inode.
     pub files: u64,
     pub bytes: u64,
+    /// Files that grouping placed in a shared frame.
     pub grouped_files: u64,
+    /// Payload bytes of those files encoded separately, minus their frames.
     pub extra_payload_saving: u64,
 }

@@ -2,14 +2,25 @@
 
 use std::{path::PathBuf, process::Command};
 
+/// What the picker is choosing. This sets the title, the file filter and
+/// whether a folder or a file is expected.
 #[derive(Debug, Clone)]
 pub enum Target {
+    /// A folder of games to add as a location.
     Game,
+    /// The folder for a Maximum Space store. Holds the game's id string.
     Storage(String),
+    /// A compatibility report, as a JSON file.
     Report,
+    /// An image for a game. Holds the game's id string.
     Artwork(String),
 }
 
+/// Turns a dialog's exit code and stdout into a path.
+///
+/// Exit code 1 is the user cancelling and gives `Ok(None)`. The bytes are
+/// kept as they are apart from one trailing newline, so names that are not
+/// UTF-8 or that end in spaces survive.
 fn selected(code: Option<i32>, bytes: &[u8]) -> Result<Option<PathBuf>, String> {
     use std::os::unix::ffi::OsStringExt;
     if code == Some(1) {
@@ -29,6 +40,10 @@ fn selected(code: Option<i32>, bytes: &[u8]) -> Result<Option<PathBuf>, String> 
     ))))
 }
 
+/// Opens a native picker and waits for it to close.
+///
+/// Blocks until the user answers, so call it off the window thread.
+/// `Ok(None)` means the user cancelled. The error text is shown to the user.
 pub fn choose(target: &Target) -> Result<Option<PathBuf>, String> {
     if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
         return Err(
@@ -43,6 +58,8 @@ pub fn choose(target: &Target) -> Result<Option<PathBuf>, String> {
         Target::Report => "Import a compatibility report",
         Target::Artwork(_) => "Choose local game artwork",
     };
+    // Try the desktop's own dialog first and fall back to the other when the
+    // program is not installed.
     let kde = std::env::var("XDG_CURRENT_DESKTOP")
         .unwrap_or_default()
         .to_lowercase()

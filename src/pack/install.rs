@@ -7,16 +7,21 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Install {
+    /// The launcher's path for the game, where the store is mounted.
     #[serde(with = "crate::path_serde")]
     pub game_path: PathBuf,
     #[serde(with = "crate::path_serde")]
     pub store_path: PathBuf,
+    /// The update layer holding every change made through the mount.
     #[serde(with = "crate::path_serde")]
     pub writes_path: PathBuf,
+    /// The original game folder, kept beside `game_path` until reclaimed.
     #[serde(default, with = "crate::path_serde::option")]
     pub backup_path: Option<PathBuf>,
+    /// Store replaced by the last compaction, kept until pruned.
     #[serde(default, with = "crate::path_serde::option")]
     pub previous_store_path: Option<PathBuf>,
+    /// Update layer that the last compaction folded into the current store.
     #[serde(default, with = "crate::path_serde::option")]
     pub previous_writes_path: Option<PathBuf>,
     #[serde(default)]
@@ -25,20 +30,30 @@ pub struct Install {
     pub message: String,
 }
 
-/// Recovery state for an activated install.
+/// Recovery state for an activated install. The functions here change it in
+/// memory only. The caller saves the record before each step that follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum InstallPhase {
+    /// Recorded by `prepare`. The original may or may not have been moved
+    /// aside yet, and `activate` continues from either state.
     Switching,
     Mounted,
+    /// The retained original is being deleted. Recovery finishes the delete.
     Reclaiming,
+    /// The old store is being unmounted for a switch. The record still names
+    /// the old store, so recovery remounts that one.
     Compacting,
+    /// The previous store and layer are being deleted. Recovery finishes it.
     Pruning,
+    /// A rollback is writing ordinary files at the game path.
     Restoring,
+    /// Automatic recovery failed or a rollback was interrupted.
     Attention,
 }
 
 impl InstallPhase {
+    /// Short status text for the CLI and GUI.
     pub fn label(self) -> &'static str {
         match self {
             Self::Switching => "Activating",
@@ -64,26 +79,31 @@ mod enabled {
         sync::atomic::AtomicBool,
     };
 
+    /// A live FUSE session serving one install at `path`.
     pub(crate) struct MountedInstall {
         pub path: PathBuf,
         session: mount::Session,
     }
 
     impl MountedInstall {
+        /// True once the FUSE session thread has exited.
         pub fn finished(&self) -> bool {
             self.session.is_finished()
         }
 
+        /// Handle for reading the mutation counter and freezing writes.
         pub fn writes(&self) -> Option<mount::WriteController> {
             self.session.writes()
         }
 
+        /// Unmounts and waits for the FUSE session thread to exit.
         pub fn stop(self) -> Result<()> {
             self.session.umount_and_join()?;
             Ok(())
         }
     }
 
+    // Canonical path of the update layer, created with mode 0700 if absent.
     fn canonical_new_dir(path: &Path) -> Result<PathBuf> {
         if path.exists() {
             let path = path.canonicalize()?;
@@ -103,12 +123,16 @@ mod enabled {
         Ok(path.canonicalize()?)
     }
 
+    // The rollback copy is a hidden sibling, so moving the original there is
+    // one rename within the same directory.
     fn backup_for(game: &Path) -> Result<PathBuf> {
         let parent = game.parent().context("The game folder has no parent")?;
         let name = game.file_name().context("The game folder has no name")?;
         Ok(parent.join(format!(".{}.flummox-original", name.to_string_lossy())))
     }
 
+    // Activation renames the game folder away and mounts over its path, so a
+    // store or layer inside it would no longer be at its recorded path.
     fn validate_paths(game: &Path, store: &Path, writes: &Path) -> Result<()> {
         ensure!(
             game != store && game != writes && store != writes,
@@ -125,6 +149,8 @@ mod enabled {
         Ok(())
     }
 
+    // Mounts the recorded store with its update layer, then lists the game
+    // path once so a mount that cannot serve reads fails here.
     fn mount_record(install: &Install) -> Result<MountedInstall> {
         let session = mount::mount(
             &install.store_path,
@@ -142,6 +168,9 @@ mod enabled {
         })
     }
 
+    // Unmounts a mount left at `path` by a coordinator that died. Only a FUSE
+    // mount whose source is `flummox-pack`, the name `mount::mount` sets, is
+    // touched. Any other mount is left for the device check in `recover`.
     fn clear_disconnected_mount(path: &Path) -> Result<()> {
         let managed = crate::fsprobe::mounts()?.iter().any(|mount| {
             mount.mountpoint == path
@@ -182,6 +211,9 @@ mod enabled {
         prepare_observed(game, store, writes, cancel, &crate::pack::NoObserver)
     }
 
+    /// `prepare` with progress. Compares every path and byte of the game
+    /// folder with the store. The only change on disk is creating the update
+    /// layer folder. The caller must save the returned record before `activate`.
     pub(crate) fn prepare_observed(
         game: &Path,
         store: &Path,
@@ -192,6 +224,7 @@ mod enabled {
         let game = game.canonicalize().context("Finding the installed game")?;
         ensure!(game.is_dir(), "The game path must be a directory");
         let parent = game.parent().context("The game folder has no parent")?;
+        // A folder on a different device from its parent is a mount point.
         ensure!(
             std::fs::symlink_metadata(&game)?.dev() == std::fs::symlink_metadata(parent)?.dev(),
             "The game path is already a mount point"
@@ -227,6 +260,8 @@ mod enabled {
     }
 
     /// Completes a prepared path switch and starts its writable mount.
+    /// Requires `Switching`, with that record already saved. Safe to run again
+    /// after a crash: a step whose result is already on disk is skipped.
     pub(crate) fn activate(install: &mut Install) -> Result<MountedInstall> {
         ensure!(
             install.phase == InstallPhase::Switching,
@@ -236,6 +271,8 @@ mod enabled {
             .backup_path
             .as_ref()
             .context("The rollback path is missing")?;
+        // Steps: move the original aside, create an empty mount point, mount.
+        // An existing backup means the move already happened in an earlier run.
         if !backup.exists() {
             ensure!(
                 install.game_path.is_dir(),
@@ -257,6 +294,8 @@ mod enabled {
     }
 
     /// Restarts an existing mount or completes an interrupted transaction.
+    /// Finishes a reclaim or prune, falls back from an interrupted compaction,
+    /// resumes an activation, then mounts. The caller saves the record after.
     pub(crate) fn recover(install: &mut Install) -> Result<Option<MountedInstall>> {
         if install.phase == InstallPhase::Reclaiming {
             // The retained original is the only other copy of the game, so an
@@ -291,6 +330,8 @@ mod enabled {
                 .mode(0o700)
                 .create(&install.game_path)?;
         }
+        // Mount only over an empty folder that is not a mount point, so files
+        // someone placed at the game path are never covered.
         let parent = install
             .game_path
             .parent()
@@ -314,6 +355,8 @@ mod enabled {
         Ok(Some(mounted))
     }
 
+    /// Marks the install `Reclaiming`. Deletes nothing. The caller verifies
+    /// the whole store first, then saves this phase before `finish_reclaim`.
     pub(crate) fn reclaim(install: &mut Install) -> Result<()> {
         ensure!(
             install.phase == InstallPhase::Mounted,
@@ -328,6 +371,10 @@ mod enabled {
         Ok(())
     }
 
+    /// Deletes the retained original and returns to `Mounted`. After this the
+    /// store and update layer are the only copy of the game. A crash partway
+    /// leaves `Reclaiming` on record and a partial original, which `recover`
+    /// finishes deleting. Does not check the store itself.
     pub(crate) fn finish_reclaim(install: &mut Install) -> Result<()> {
         ensure!(
             install.phase == InstallPhase::Reclaiming,
@@ -344,6 +391,8 @@ mod enabled {
         Ok(())
     }
 
+    /// Marks the install `Pruning`. Deletes nothing. The caller saves this
+    /// phase before `finish_prune`.
     pub(crate) fn begin_prune(install: &mut Install) -> Result<()> {
         ensure!(
             install.phase == InstallPhase::Mounted,
@@ -358,6 +407,10 @@ mod enabled {
         Ok(())
     }
 
+    /// Deletes the previous store and update layer and returns to `Mounted`.
+    /// Refuses a previous path equal to the current one. Paths already gone
+    /// are accepted, so this can run again after a crash. Pool objects the
+    /// old store linked stay until `prune_shared_pool`.
     pub(crate) fn finish_prune(install: &mut Install) -> Result<()> {
         ensure!(
             install.phase == InstallPhase::Pruning,
@@ -401,6 +454,11 @@ mod enabled {
         Ok(())
     }
 
+    /// Unmounts and puts ordinary files back at the game path, with every
+    /// change from the update layer applied. Uses the retained original when
+    /// it is current, otherwise rebuilds from the store. The store and layer
+    /// are left in place. The caller saves `Restoring` first and removes the
+    /// record after success.
     pub(crate) fn rollback(
         install: &Install,
         mounted: Option<MountedInstall>,
@@ -431,6 +489,8 @@ mod enabled {
             std::fs::read_dir(&install.game_path)?.next().is_none(),
             "The launcher path did not unmount cleanly"
         );
+        // The empty mount point is removed so a rename can put the restored
+        // folder at this path. Until that rename the game path does not exist.
         std::fs::remove_dir(&install.game_path)?;
         // After a compaction the retained original predates the updates the
         // new store absorbed, and the update layer no longer describes changes
@@ -451,6 +511,8 @@ mod enabled {
                 }
             }
         }
+        // No current original: rebuild in a sibling staging folder, apply the
+        // update layer, then rename the result into place.
         let parent = install
             .game_path
             .parent()

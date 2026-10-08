@@ -15,6 +15,7 @@ use windows_sys::Win32::{
     Storage::FileSystem::*,
     System::{Pipes::*, Threading::*},
 };
+/// Frees a `LocalAlloc` allocation on drop.
 struct Local(*mut core::ffi::c_void);
 impl Drop for Local {
     fn drop(&mut self) {
@@ -24,6 +25,8 @@ impl Drop for Local {
         }
     }
 }
+/// The current user's SID as text, such as `S-1-5-21-...`. It names the pipe and
+/// is the only identity the pipe's access list admits.
 pub fn user_sid() -> Result<String> {
     // SAFETY: GetCurrentProcess returns a valid pseudo-handle without pointers.
     let process = unsafe { GetCurrentProcess() };
@@ -33,6 +36,8 @@ pub fn user_sid() -> Result<String> {
     ensure!(result != 0, "Cannot read the current user's token");
     // SAFETY: the successful token handle is uniquely transferred to an owned file for closing.
     let token = unsafe { std::fs::File::from_raw_handle(handle.cast()) };
+    // The first call has no buffer and exists to learn the size. Its failure status
+    // is expected, so only `needed` is examined.
     let mut needed = 0;
     // SAFETY: the sizing call writes only needed and does not access a null buffer.
     unsafe {
@@ -78,9 +83,12 @@ pub fn user_sid() -> Result<String> {
     }
     anyhow::bail!("Current-user SID exceeds its limit")
 }
+/// UTF-16 with a terminating zero, as the wide Win32 calls expect.
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
+/// The pipe name. It contains the user's SID, so each user gets a separate pipe.
+/// Test builds append FLUMMOX_IPC_TEST_NAME so a fixture never reaches a real worker.
 fn name() -> Result<String> {
     let base = format!("\\\\.\\pipe\\flummox-{}-v1", user_sid()?);
     #[cfg(test)]
@@ -89,10 +97,14 @@ fn name() -> Result<String> {
     }
     Ok(base)
 }
+/// Creates the server end of the pipe. Fails if any process already serves the name.
+/// The handle is nonblocking and serves one client at a time. Poll it with `accept`.
 pub fn listener() -> Result<std::fs::File> {
     listener_named(&name()?)
 }
 fn listener_named(pipe_name: &str) -> Result<std::fs::File> {
+    // A protected DACL with one entry: generic read and write for this user's SID.
+    // The 1 passed below is SDDL_REVISION_1.
     let sddl = wide(&format!("D:P(A;;GRGW;;;{})", user_sid()?));
     let mut descriptor = std::ptr::null_mut();
     // SAFETY: sddl is terminated and descriptor is a writable output slot.
@@ -115,6 +127,9 @@ fn listener_named(pipe_name: &str) -> Result<std::fs::File> {
         bInheritHandle: 0,
     };
     let name = wide(pipe_name);
+    // FILE_FLAG_FIRST_PIPE_INSTANCE makes creation fail when the name is taken.
+    // PIPE_NOWAIT makes connect, read and write return at once. The numbers are one
+    // instance, 64 KiB buffers each way and a 1000 ms default client wait.
     // SAFETY: the name and security descriptor stay live until CreateNamedPipe copies them.
     let handle = unsafe {
         CreateNamedPipeW(
@@ -136,10 +151,14 @@ fn listener_named(pipe_name: &str) -> Result<std::fs::File> {
     // SAFETY: the successful pipe handle is uniquely transferred to this owned file.
     Ok(unsafe { std::fs::File::from_raw_handle(handle.cast()) })
 }
+/// Opens the client end, nonblocking. Fails at once if no worker is listening or
+/// the worker is serving another client.
 pub fn connect() -> Result<std::fs::File> {
     connect_named(&name()?)
 }
 fn connect_named(name: &str) -> Result<std::fs::File> {
+    // SECURITY_IDENTIFICATION lets the server learn who the client is and stops it
+    // from acting with the client's rights.
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -158,6 +177,8 @@ fn connect_named(name: &str) -> Result<std::fs::File> {
     ensure!(result != 0, "Cannot set pipe timeout mode");
     Ok(file)
 }
+/// Polls for a client. `Ok(true)` means one is connected. `Ok(false)` means none
+/// yet, so call again after a short sleep.
 pub fn accept(file: &std::fs::File) -> Result<bool> {
     // SAFETY: file owns a live non-overlapped pipe handle.
     let result = unsafe { ConnectNamedPipe(file.as_raw_handle().cast(), std::ptr::null_mut()) };
@@ -169,6 +190,7 @@ pub fn accept(file: &std::fs::File) -> Result<bool> {
     match unsafe { GetLastError() } {
         ERROR_PIPE_CONNECTED => Ok(true),
         ERROR_PIPE_LISTENING => Ok(false),
+        // The last client closed its end and the instance was never reset.
         ERROR_NO_DATA => {
             disconnect(file);
             Ok(false)
@@ -176,12 +198,16 @@ pub fn accept(file: &std::fs::File) -> Result<bool> {
         error => anyhow::bail!("Accepting coordinator client failed ({error})"),
     }
 }
+/// Drops the current client so the single instance can take the next one. A
+/// failure is not reported.
 pub fn disconnect(file: &std::fs::File) {
     // SAFETY: file owns a live named pipe handle.
     unsafe {
         DisconnectNamedPipe(file.as_raw_handle().cast());
     }
 }
+/// Fills `bytes` from a nonblocking pipe, sleeping 5 ms whenever it is empty, until
+/// `deadline`. A closed connection is an error.
 fn read_exact_wait(
     file: &mut std::fs::File,
     mut bytes: &mut [u8],
@@ -211,6 +237,7 @@ fn read_exact_wait(
         match result {
             Ok(0) => anyhow::bail!("Coordinator connection closed"),
             Ok(count) => bytes = bytes.get_mut(count..).context("Pipe read bounds")?,
+            // 232 is ERROR_NO_DATA and 536 is ERROR_PIPE_LISTENING: nothing to read yet.
             Err(error) if matches!(error.raw_os_error(), Some(232 | 536)) => {
                 std::thread::sleep(Duration::from_millis(5))
             }
@@ -219,6 +246,9 @@ fn read_exact_wait(
     }
     Ok(())
 }
+/// Reads one frame: a 4-byte little-endian length, then that many bytes of JSON.
+/// The length is checked against 16 MiB before anything is allocated. The whole
+/// frame must arrive within 3 seconds.
 pub fn receive<T: serde::de::DeserializeOwned>(file: &mut std::fs::File) -> Result<T> {
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut header = [0u8; 4];
@@ -232,6 +262,8 @@ pub fn receive<T: serde::de::DeserializeOwned>(file: &mut std::fs::File) -> Resu
     read_exact_wait(file, &mut bytes, deadline)?;
     Ok(serde_json::from_slice(&bytes)?)
 }
+/// Writes one frame in the format `receive` reads, within 3 seconds. A nonblocking
+/// pipe accepts what fits in its buffer, so the loop retries the remainder.
 pub fn send<T: serde::Serialize>(file: &mut std::fs::File, value: &T) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
     ensure!(
@@ -246,6 +278,7 @@ pub fn send<T: serde::Serialize>(file: &mut std::fs::File, value: &T) -> Result<
             match file.write(remaining) {
                 Ok(0) => std::thread::sleep(Duration::from_millis(5)),
                 Ok(count) => remaining = remaining.get(count..).context("Pipe write bounds")?,
+                // The same two codes as in `read_exact_wait`: the pipe is not ready.
                 Err(error) if matches!(error.raw_os_error(), Some(232 | 536)) => {
                     std::thread::sleep(Duration::from_millis(5))
                 }
@@ -256,6 +289,8 @@ pub fn send<T: serde::Serialize>(file: &mut std::fs::File, value: &T) -> Result<
     Ok(())
 }
 
+/// Connects to a fixture worker's pipe by suffix, retrying for up to 5 seconds
+/// while that worker starts.
 #[cfg(test)]
 pub(crate) fn test_connect(suffix: &str) -> Result<std::fs::File> {
     let name = format!("{}-{suffix}", name()?);
@@ -306,6 +341,7 @@ mod tests {
             receive::<bool>(&mut server).ctx("request")?,
             "request received",
         )?;
+        // The client is now reading an empty pipe. It must wait, not report EOF.
         std::thread::sleep(Duration::from_millis(100));
         send(&mut server, &true).ctx("delayed reply")?;
         check(

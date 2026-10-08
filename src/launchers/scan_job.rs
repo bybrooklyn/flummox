@@ -7,16 +7,22 @@ use std::sync::{
     mpsc,
 };
 
+/// Messages from a running discovery scan, in the order they happen.
 pub enum Event {
+    /// The source about to be read.
     Source(&'static str),
+    /// Every game found so far, earlier batches included, before merging.
     Batch(Vec<Game>),
+    /// The merged scan. `None` when it was cancelled or its thread died.
     Finished(Option<Scan>),
 }
+/// A discovery scan on its own thread. Dropping it cancels the scan.
 pub struct Worker {
     receiver: mpsc::Receiver<Event>,
     cancel: Arc<AtomicBool>,
 }
 impl Worker {
+    /// Starts scanning `env` in the background.
     pub fn start(env: Env) -> Self {
         let (send, receiver) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -29,12 +35,18 @@ impl Worker {
         });
         Self { receiver, cancel }
     }
+    /// Asks the scan to stop. It checks between sources, so the one being
+    /// read finishes first.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
+    /// Whether `cancel` was called.
     pub fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
+    /// Takes the events that have arrived, without blocking. `Finished` is
+    /// always last. A thread that ended without sending it yields
+    /// `Finished(None)`.
     pub fn events(&self) -> Vec<Event> {
         let mut events = vec![];
         loop {
