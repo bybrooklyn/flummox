@@ -611,4 +611,18 @@ mod tests {
         content_stamp(temp.path()).ctx("stamp with an old file")?;
         Ok(())
     }
+    #[test]
+    fn a_location_cannot_be_a_filesystem_root() -> TestResult {
+        let mut settings = Preferences::default();
+        check(
+            settings.add(Path::new("/"), LocationKind::Collection).is_err(),
+            "the drive root is refused",
+        )?;
+        check(settings.locations.is_empty(), "and nothing is stored")?;
+        let fixture = tempfile::tempdir().ctx("fixture")?;
+        settings
+            .add(fixture.path(), LocationKind::Collection)
+            .ctx("control: an ordinary folder")?;
+        check_eq(settings.locations.len(), 1, "is stored")
+    }
 }

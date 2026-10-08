@@ -187,6 +187,87 @@ fn cancel_unrunnable(
     }
 }
 
+/// How long one discovery scan may run before the coordinator stops waiting
+/// for it.
+const SCAN_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Stops waiting for a scan that has run past `deadline`.
+///
+/// A scan stuck reading a dead network mount never finishes, and no new one
+/// starts while it is current. The worker moves to `abandoned`, a warning is
+/// raised, and every game in `games` becomes not idle, so no job starts or
+/// continues on states nobody has confirmed. Returns whether it gave up.
+fn abandon_slow_scan(
+    discovery: &mut Option<crate::launchers::scan_job::Worker>,
+    started: Instant,
+    now: Instant,
+    deadline: Duration,
+    abandoned: &mut Vec<crate::launchers::scan_job::Worker>,
+    snapshot: &mut Snapshot,
+    games: &mut [Game],
+) -> bool {
+    if now.saturating_duration_since(started) < deadline {
+        return false;
+    }
+    let Some(worker) = discovery.take() else {
+        return false;
+    };
+    worker.cancel();
+    abandoned.push(worker);
+    snapshot.scan_source = None;
+    snapshot.scan_warnings.push(format!(
+        "Discovery has not finished in {} seconds. Game states are unknown until it does, so no job will start.",
+        deadline.as_secs()
+    ));
+    for game in games {
+        game.state = crate::model::InstallState::Broken {
+            detail: "Discovery is not responding".into(),
+        };
+    }
+    true
+}
+
+/// Drops the abandoned scans whose threads have ended.
+fn prune_abandoned(abandoned: &mut Vec<crate::launchers::scan_job::Worker>) {
+    abandoned.retain(|worker| {
+        !worker
+            .events()
+            .iter()
+            .any(|event| matches!(event, crate::launchers::scan_job::Event::Finished(_)))
+    });
+}
+
+/// Records that the game called `title` has run from a store with updates
+/// folded in, which lets upkeep delete the previous version.
+///
+/// A process that merely has the folder open, such as a shell or a client
+/// verifying files, does not count. Only code running from the game folder
+/// does.
+fn mark_played(
+    snapshot: &Snapshot,
+    games: &[Game],
+    title: &str,
+    source: &dyn crate::busy::ProcSource,
+    upkeep: &mut std::collections::HashMap<String, Upkeep>,
+) {
+    for install in snapshot
+        .packs
+        .iter()
+        .filter(|install| install.previous_store_path.is_some())
+    {
+        if games
+            .iter()
+            .any(|game| game.install_dir == install.game_path && game.title == title)
+            && crate::busy::played_from(&install.game_path, source)
+        {
+            upkeep
+                .entry(install.game_path.to_string_lossy().into_owned())
+                .or_default()
+                .played = true;
+        }
+    }
+}
+
 /// Whether the loop has work to watch for: a running worker or storage
 /// thread, or a job that can be started. A job the user paused before it
 /// started waits for the user and needs neither.
@@ -1764,6 +1845,9 @@ pub(super) fn run() -> Result<()> {
     );
     snapshot.revision = 0;
     let mut discovery: Option<crate::launchers::scan_job::Worker> = None;
+    let mut discovery_started = Instant::now();
+    // Scans given up on that have not ended. None starts while one is here.
+    let mut abandoned: Vec<crate::launchers::scan_job::Worker> = Vec::new();
     let mut refresh_requested = false;
     // Maintenance observations from earlier runs. With none saved, the first
     // finished scan sets a baseline and queues nothing.
@@ -1799,7 +1883,9 @@ pub(super) fn run() -> Result<()> {
             } else {
                 30
             };
+        prune_abandoned(&mut abandoned);
         if discovery.is_none()
+            && abandoned.is_empty()
             && (refresh_requested || last_scan.elapsed() >= Duration::from_secs(scan_interval))
         {
             last_scan = Instant::now();
@@ -1808,8 +1894,18 @@ pub(super) fn run() -> Result<()> {
                 snapshot.scan_generation = snapshot.scan_generation.saturating_add(1);
                 snapshot.scan_source = Some("Starting discovery".into());
                 discovery = Some(crate::launchers::scan_job::Worker::start(env));
+                discovery_started = Instant::now();
             }
         }
+        abandon_slow_scan(
+            &mut discovery,
+            discovery_started,
+            Instant::now(),
+            SCAN_DEADLINE,
+            &mut abandoned,
+            &mut snapshot,
+            &mut games,
+        );
         // Drain the scan's events. Batches update the visible list as they
         // arrive, and the finished scan replaces it. Events from a cancelled
         // scan are dropped, except that `Finished` still clears `discovery`.
@@ -1901,21 +1997,13 @@ pub(super) fn run() -> Result<()> {
             // A store with updates folded in counts as played once its game
             // is seen running. Upkeep deletes the previous version after that.
             if let Some(title) = &snapshot.gaming {
-                for install in snapshot
-                    .packs
-                    .iter()
-                    .filter(|install| install.previous_store_path.is_some())
-                {
-                    if games
-                        .iter()
-                        .any(|game| game.install_dir == install.game_path && game.title == *title)
-                    {
-                        upkeep
-                            .entry(install.game_path.to_string_lossy().into_owned())
-                            .or_default()
-                            .played = true;
-                    }
-                }
+                mark_played(
+                    &snapshot,
+                    &games,
+                    title,
+                    &crate::busy::ProcFs::new().with_maps(),
+                    &mut upkeep,
+                );
             }
         }
         // Maintenance, after each finished scan: queue compression for new
@@ -2442,6 +2530,126 @@ mod tests {
             "a restore is refused while a compaction waits",
         )?;
         check_eq(snapshot.jobs.len(), 1, "a refused task queues nothing")
+    }
+
+    struct FakeProcs(Vec<crate::busy::ProcInfo>);
+
+    impl crate::busy::ProcSource for FakeProcs {
+        fn processes(&self) -> Vec<crate::busy::ProcInfo> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn a_shell_in_the_game_folder_does_not_count_as_playing() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let folder = temp.path().join("game");
+        std::fs::create_dir(&folder).ctx("game folder")?;
+        let (_db, mut snapshot) = open_store(&temp.path().join("jobs.sqlite")).ctx("store")?;
+        snapshot.packs.push(crate::pack::Install {
+            game_path: folder.clone(),
+            store_path: temp.path().join("store"),
+            writes_path: temp.path().join("writes"),
+            backup_path: None,
+            previous_store_path: Some(temp.path().join("previous")),
+            previous_writes_path: None,
+            summary: None,
+            phase: crate::pack::InstallPhase::Mounted,
+            message: String::new(),
+        });
+        let games = [game(&folder, "game")];
+        let key = folder.to_string_lossy().into_owned();
+        let shell = crate::busy::ProcInfo {
+            pid: 30,
+            name: "bash".into(),
+            exe: Some("/usr/bin/bash".into()),
+            cwd: Some(folder.clone()),
+            ..crate::busy::ProcInfo::default()
+        };
+        let mut records = std::collections::HashMap::new();
+        mark_played(
+            &snapshot,
+            &games,
+            "game",
+            &FakeProcs(vec![shell]),
+            &mut records,
+        );
+        check(
+            records
+                .get(&key)
+                .is_none_or(|record: &Upkeep| !record.played),
+            "a shell with its working directory there has not played the game",
+        )?;
+        let player = crate::busy::ProcInfo {
+            pid: 31,
+            name: "game".into(),
+            exe: Some(folder.join("game.bin")),
+            ..crate::busy::ProcInfo::default()
+        };
+        mark_played(
+            &snapshot,
+            &games,
+            "game",
+            &FakeProcs(vec![player]),
+            &mut records,
+        );
+        check(
+            records.get(&key).is_some_and(|record| record.played),
+            "control: a process running from the folder has",
+        )
+    }
+
+    #[test]
+    fn a_scan_past_its_deadline_is_abandoned_and_games_stop_being_idle() -> TestResult {
+        let temp = tempfile::tempdir().ctx("home")?;
+        let folder = temp.path().join("game");
+        std::fs::create_dir(&folder).ctx("game folder")?;
+        let (_db, mut snapshot) = open_store(&temp.path().join("jobs.sqlite")).ctx("store")?;
+        let mut discovery = Some(crate::launchers::scan_job::Worker::start(
+            crate::launchers::Env::from_home(temp.path()),
+        ));
+        let started = Instant::now();
+        let deadline = Duration::from_secs(120);
+        let mut abandoned = Vec::new();
+        let mut games = vec![game(&folder, "game")];
+        let early = started.checked_add(Duration::from_secs(5)).ctx("early")?;
+        check(
+            !abandon_slow_scan(
+                &mut discovery,
+                started,
+                early,
+                deadline,
+                &mut abandoned,
+                &mut snapshot,
+                &mut games,
+            ),
+            "control: a scan inside its deadline keeps running",
+        )?;
+        check(discovery.is_some(), "control: the worker is kept")?;
+        check(
+            games.iter().all(|game| game.state.is_idle()),
+            "control: states are untouched",
+        )?;
+        let late = started.checked_add(deadline).ctx("late")?;
+        check(
+            abandon_slow_scan(
+                &mut discovery,
+                started,
+                late,
+                deadline,
+                &mut abandoned,
+                &mut snapshot,
+                &mut games,
+            ),
+            "a scan at its deadline is abandoned",
+        )?;
+        check(discovery.is_none(), "so a later scan may start")?;
+        check_eq(abandoned.len(), 1, "the worker is kept until it ends")?;
+        check_eq(snapshot.scan_warnings.len(), 1, "the user is told")?;
+        check(
+            games.iter().all(|game| !game.state.is_idle()),
+            "no game counts as idle until a scan completes",
+        )
     }
 
     #[test]

@@ -881,6 +881,15 @@ fn sample_block(index: u64, blocks: u64, samples: u64) -> u64 {
     }
 }
 
+/// The share of `saving` that `done` of `planned` bytes account for.
+pub fn scaled_saving(saving: u64, done: u64, planned: u64) -> u64 {
+    if planned == 0 || done >= planned {
+        return saving;
+    }
+    let scaled = u128::from(saving) * u128::from(done) / u128::from(planned);
+    u64::try_from(scaled).unwrap_or(saving)
+}
+
 /// Start of sample window `index` of `samples`, each `window` bytes, in a file
 /// of `size` bytes.
 ///

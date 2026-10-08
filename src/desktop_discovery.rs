@@ -514,4 +514,29 @@ mod tests {
             "offline install retained",
         )
     }
+    #[test]
+    fn a_launcher_path_that_is_a_filesystem_root_is_listed_broken() -> TestResult {
+        let root = installed(
+            Launcher::Epic,
+            "root".into(),
+            "Root".into(),
+            PathBuf::from("/"),
+            None,
+        )
+        .ctx("a root is listed, not dropped")?;
+        check(
+            matches!(root.state, InstallState::Broken { .. }),
+            "a launcher that names the drive root cannot be started as a game",
+        )?;
+        let fixture = tempfile::tempdir().ctx("fixture")?;
+        let game = installed(
+            Launcher::Epic,
+            "ok".into(),
+            "Ok".into(),
+            fixture.path().to_path_buf(),
+            None,
+        )
+        .ctx("a folder")?;
+        check(game.state.is_idle(), "control: an ordinary folder is idle")
+    }
 }

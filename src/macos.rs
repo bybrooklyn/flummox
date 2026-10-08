@@ -755,7 +755,7 @@ fn visit(
     idle(&root)?;
     let found = survey(&root);
     remove_orphans(&found.work_dirs, &recovery()?)?;
-    crate::storage::native_plan(&root, restore)?.recheck()?;
+    crate::storage::per_file_plan(&root, restore)?.recheck()?;
     let mut summary = Progress {
         skipped: found.unreadable,
         ..Progress::default()
@@ -1066,7 +1066,7 @@ pub fn run() -> Result<()> {
         }
         Command::Analyze { folder } => println!(
             "{}",
-            serde_json::to_string_pretty(&crate::storage::native_plan(
+            serde_json::to_string_pretty(&crate::storage::per_file_plan(
                 &validate(&folder)?,
                 false
             )?)?

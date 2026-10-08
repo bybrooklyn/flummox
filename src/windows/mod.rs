@@ -347,6 +347,7 @@ fn visit_in(
         .canonicalize()
         .with_context(|| format!("Opening {}", root.display()))?;
     ensure!(root.is_dir(), "Choose an installed game folder");
+    crate::desktop::ProtectedFolders::from_environment().check(&root)?;
     crate::libraries::private_dir(state)?;
     let lock = OpenOptions::new()
         .create(true)
@@ -367,7 +368,7 @@ fn visit_in(
             "Review the interrupted job before processing another game"
         );
     }
-    crate::desktop_jobs::native_space_plan(&root, restore)?.recheck()?;
+    crate::storage::per_file_plan(&root, restore)?.recheck()?;
     let mut journal = tempfile::NamedTempFile::new_in(state)?;
     serde_json::to_writer(
         &mut journal,
@@ -579,7 +580,7 @@ pub fn run() -> Result<()> {
         Command::Analyze { folder, restore } => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&crate::desktop_jobs::native_space_plan(
+                serde_json::to_string_pretty(&crate::storage::per_file_plan(
                     &folder, restore
                 )?)?
             );

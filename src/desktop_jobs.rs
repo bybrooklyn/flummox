@@ -371,23 +371,6 @@ fn location_key(path: &Path) -> String {
         .to_hex()
         .to_string()
 }
-/// Free space a Windows pass needs. WOF rewrites one file at a time, so a
-/// compression needs room for the largest file. A restore can expand every file.
-pub fn native_space_plan(root: &Path, restore: bool) -> Result<crate::storage::SpacePlan> {
-    let footprint = crate::storage::inventory(root)?;
-    let (bytes, reason) = if restore {
-        (footprint.bytes, "Restored files return to their full size")
-    } else {
-        (
-            footprint.largest,
-            "One file at a time is rewritten before the old blocks are freed",
-        )
-    };
-    let mut plan = crate::storage::SpacePlan::default();
-    plan.add(crate::storage::volume(root)?, bytes, reason)?;
-    Ok(plan)
-}
-
 /// Files that Windows reported would not shrink, keyed by path inside the game
 /// folder, with the size and modification time seen then. A file that still has
 /// both is skipped on the next pass. Losing the record only costs a recompression.
@@ -688,24 +671,6 @@ mod tests {
             queue.observe(&[fresh], &preferences, true).len(),
             1,
             "control: an unknown folder is a new install",
-        )
-    }
-    #[test]
-    fn compression_plans_for_the_largest_file_and_restore_for_all_of_them() -> TestResult {
-        let temp = tempfile::tempdir().ctx("fixture")?;
-        std::fs::write(temp.path().join("big.dat"), vec![1u8; 3 * 1024 * 1024]).ctx("big")?;
-        std::fs::write(temp.path().join("small.dat"), vec![1u8; 1024 * 1024]).ctx("small")?;
-        let compress = native_space_plan(temp.path(), false).ctx("compress plan")?;
-        let restore = native_space_plan(temp.path(), true).ctx("restore plan")?;
-        check_eq(
-            compress.requirements.first().ctx("row")?.additional,
-            3 * 1024 * 1024,
-            "compression needs the largest file",
-        )?;
-        check_eq(
-            restore.requirements.first().ctx("row")?.additional,
-            4 * 1024 * 1024,
-            "restore needs every file",
         )
     }
     #[test]

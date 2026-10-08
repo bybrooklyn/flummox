@@ -575,86 +575,18 @@ struct ScanRow {
     note: Option<String>,
 }
 
-/// Watches for a process using the game from a thread of its own.
-///
-/// Landlock denies the reads of `/proc/<pid>/{exe,cwd,fd}` that detection
-/// needs, for the thread that restricts itself and every thread started
-/// after. This thread is started before [`sandbox::restrict`], so it keeps
-/// seeing `/proc`. Drop the watch to stop the thread.
-struct GameWatch {
-    who: Arc<std::sync::Mutex<Option<String>>>,
-    done: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl GameWatch {
-    /// Scans once on the calling thread, then again every `interval`.
-    fn start<S>(install_dir: PathBuf, source: S, interval: std::time::Duration) -> Self
-    where
-        S: busy::ProcSource + Send + 'static,
-    {
-        use std::sync::atomic::Ordering::Relaxed;
-        let who = Arc::new(std::sync::Mutex::new(busy::process_using(
-            &install_dir,
-            &source,
-        )));
-        let done = Arc::new(AtomicBool::new(false));
-        let thread = {
-            let (who, done) = (Arc::clone(&who), Arc::clone(&done));
-            std::thread::Builder::new()
-                .name("game-watch".to_owned())
-                .spawn(move || {
-                    let step = std::time::Duration::from_millis(20);
-                    let mut waited = std::time::Duration::ZERO;
-                    while !done.load(Relaxed) {
-                        std::thread::sleep(step);
-                        waited += step;
-                        if waited < interval {
-                            continue;
-                        }
-                        waited = std::time::Duration::ZERO;
-                        let found = busy::process_using(&install_dir, &source);
-                        if let Ok(mut slot) = who.lock() {
-                            *slot = found;
-                        }
-                    }
-                })
-                .ok()
-        };
-        Self { who, done, thread }
-    }
-
-    /// Who was using the game at the last scan.
-    ///
-    /// If the thread could not be started this stays at the first scan's
-    /// answer, so a launch after the start goes unseen.
-    fn current(&self) -> Option<String> {
-        self.who.lock().ok().and_then(|slot| slot.clone())
-    }
-}
-
-impl Drop for GameWatch {
-    fn drop(&mut self) {
-        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
-            // A panicked watch thread has nothing left to report.
-            let _joined = thread.join();
-        }
-    }
-}
-
 /// What a running job does when the game is launched.
 ///
 /// Pausing waits for the game to close. Stopping sets the cancel flag, which
 /// ends the job at the next file boundary.
 struct LaunchGuard<'a> {
-    watch: &'a GameWatch,
+    watch: &'a busy::BackgroundScan,
     stop: Option<&'a AtomicBool>,
 }
 
 impl backend::BusyCheck for LaunchGuard<'_> {
     fn in_use_by(&self) -> Option<String> {
-        let who = self.watch.current()?;
+        let who = self.watch.latest().blocking()?;
         let Some(stop) = self.stop else {
             return Some(who);
         };
@@ -1050,7 +982,7 @@ fn cmd_estimate(
         "estimating"
     );
     let model = backend.model(&opts);
-    let est_opts = EstimateOpts::new(opts.btrfs_level(), &fs);
+    let est_opts = EstimateOpts::new(opts.btrfs_level(), &fs).with_floor(opts.attainable_floor());
     let measured = backend.disk_probe();
     let probe = RecordedProbe {
         measured: measured.as_ref(),
@@ -1307,22 +1239,11 @@ fn cmd_compress(
     let previous = db.as_ref().and_then(|db| db.game(&game.id).ok().flatten());
     let reuse = previous
         .as_ref()
-        .is_some_and(|prev| prev.level >= opts.level_plan().floor());
+        .is_some_and(|prev| prev.level >= opts.attainable_floor());
     let mut unchanged = 0usize;
     let inv = match (reuse, db.as_ref()) {
         (true, Some(open)) => {
-            match open
-                .changed_since(&game.id, &full_inv)
-                .and_then(|mut changed| {
-                    // A file an earlier pass left below this pass's floor keeps its
-                    // fingerprint, so the change test alone would never pick it up.
-                    changed.extend(below_floor(
-                        &open.fingerprints(&game.id)?,
-                        &full_inv,
-                        opts.level_plan().floor(),
-                    ));
-                    Ok(changed)
-                }) {
+            match open.changed_since_floor(&game.id, &full_inv, opts.attainable_floor()) {
                 Ok(changed) => {
                     unchanged = full_inv.files.len().saturating_sub(changed.len());
                     Inventory {
@@ -1356,7 +1277,8 @@ fn cmd_compress(
 
     if dry_run {
         let model = backend.model(&opts);
-        let est_opts = EstimateOpts::new(opts.btrfs_level(), &fs);
+        let est_opts =
+            EstimateOpts::new(opts.btrfs_level(), &fs).with_floor(opts.attainable_floor());
         let measured = backend.disk_probe();
         let probe = RecordedProbe {
             measured: measured.as_ref(),
@@ -1380,11 +1302,8 @@ fn cmd_compress(
 
     // The scan that spots a launch has to start before the sandbox goes up,
     // because Landlock then denies the reads it makes.
-    let watch = GameWatch::start(
-        game.install_dir.clone(),
-        ProcFs::new(),
-        std::time::Duration::from_secs(2),
-    );
+    let watch =
+        busy::BackgroundScan::start(game.install_dir.clone(), std::time::Duration::from_secs(2));
     // Drop this process's access to everything except the game itself, before
     // any worker thread exists. Discovery is already finished, so nothing
     // further needs to read Steam's configuration.
@@ -1396,7 +1315,8 @@ fn cmd_compress(
     // the sandbox so the sampling threads are confined too.
     let pass_saving = {
         let model = backend.model(&opts);
-        let est_opts = EstimateOpts::new(opts.btrfs_level(), &fs);
+        let est_opts =
+            EstimateOpts::new(opts.btrfs_level(), &fs).with_floor(opts.attainable_floor());
         let measured = backend.disk_probe();
         let probe = RecordedProbe {
             measured: measured.as_ref(),
@@ -1486,7 +1406,7 @@ fn cmd_compress(
         // Only the share of the plan this pass got through counts, or a
         // cancelled pass followed by a rerun would count the saving twice.
         let planned: u64 = inv.to_compress().map(|f| f.size).sum();
-        let pass_saving = scaled_saving(pass_saving, outcome.bytes, planned);
+        let pass_saving = estimate::scaled_saving(pass_saving, outcome.bytes, planned);
         record.est_saving = previous
             .as_ref()
             .map_or(0, |p| p.est_saving)
@@ -1540,28 +1460,6 @@ fn cmd_compress(
     Ok(())
 }
 
-/// Unchanged files whose last pass applied a level under `floor`.
-///
-/// Files never attempted are left to the change test.
-fn below_floor(
-    stored: &HashMap<PathBuf, crate::db::FileFingerprint>,
-    inv: &Inventory,
-    floor: i32,
-) -> Vec<inventory::FileEntry> {
-    inv.files
-        .iter()
-        .filter(|entry| {
-            entry.action.is_compress()
-                && stored.get(&entry.rel).is_some_and(|fp| {
-                    fp.matches(entry)
-                        && fp.level_applied != crate::db::NOT_ATTEMPTED
-                        && fp.level_applied < floor
-                })
-        })
-        .cloned()
-        .collect()
-}
-
 /// Prints the first few per-file failures to stderr.
 fn report_failures(outcome: &backend::Outcome) {
     if outcome.errors.is_empty() {
@@ -1580,15 +1478,6 @@ fn pass_problem(outcome: &backend::Outcome) -> String {
         (true, n) => format!("it was stopped early and {n} files failed"),
         (false, n) => format!("{n} files failed"),
     }
-}
-
-/// The share of `saving` that `done` of `planned` bytes account for.
-fn scaled_saving(saving: u64, done: u64, planned: u64) -> u64 {
-    if planned == 0 || done >= planned {
-        return saving;
-    }
-    let scaled = u128::from(saving) * u128::from(done) / u128::from(planned);
-    u64::try_from(scaled).unwrap_or(saving)
 }
 
 /// The level to keep for a game after a pass.
@@ -2463,13 +2352,9 @@ fn cmd_doctor(env: &Env) -> Result<()> {
     match std::fs::read_to_string("/proc/sys/kernel/osrelease") {
         Ok(release) => {
             let release = release.trim();
-            let (major, minor) = parse_kernel_version(release);
             println!("[ok] kernel {release}");
-            if (major, minor) < (6, 15) {
-                println!(
-                    "[!]  btrfs compression levels need kernel 6.15+; on this kernel the \
-                     drive's default level is used instead"
-                );
+            for note in kernel_notes(release) {
+                println!("[!]  {note}");
             }
         }
         Err(e) => println!("[!] cannot read the kernel version: {e}"),
@@ -2530,6 +2415,22 @@ fn cmd_doctor(env: &Env) -> Result<()> {
     Ok(())
 }
 
+/// What this kernel cannot do for btrfs, as lines for `doctor`.
+fn kernel_notes(release: &str) -> Vec<&'static str> {
+    let mut notes = Vec::new();
+    if parse_kernel_version(release) < (6, 15) {
+        notes.push(
+            "btrfs compression levels need kernel 6.15+; on this kernel the drive's \
+             default level is used instead",
+        );
+    }
+    notes.push(
+        "decompress needs a kernel that honours the defrag NOCOMPRESS flag; one that \
+         does not fails the pass or leaves files stored compressed, and says so",
+    );
+    notes
+}
+
 /// Parses `major.minor` out of a kernel release string such as `7.2.3-1-x`.
 fn parse_kernel_version(release: &str) -> (u32, u32) {
     let mut parts = release.split(['.', '-']);
@@ -2543,6 +2444,19 @@ mod tests {
     use crate::testutil::{Ctx, TestResult, check, check_eq};
 
     use super::*;
+
+    #[test]
+    fn doctor_names_both_kernel_requirements_on_an_old_kernel() -> TestResult {
+        let old = kernel_notes("6.8.0-generic").join("\n");
+        check(old.contains("6.15"), "the level requirement is named")?;
+        check(
+            old.contains("NOCOMPRESS"),
+            "the decompress requirement is named",
+        )?;
+        let new = kernel_notes("7.2.3").join("\n");
+        check(!new.contains("6.15"), "a new kernel has no level warning")?;
+        check(new.contains("NOCOMPRESS"), "the decompress note stays")
+    }
 
     #[test]
     fn parses_kernel_versions() -> TestResult {
@@ -2681,12 +2595,15 @@ mod tests {
 
     fn fake_watch(
         procs: Vec<busy::ProcInfo>,
-    ) -> (GameWatch, Arc<std::sync::Mutex<Vec<busy::ProcInfo>>>) {
+    ) -> (
+        busy::BackgroundScan,
+        Arc<std::sync::Mutex<Vec<busy::ProcInfo>>>,
+    ) {
         let shared = Arc::new(std::sync::Mutex::new(procs));
-        let watch = GameWatch::start(
+        let watch = busy::BackgroundScan::start_with(
             PathBuf::from("/games/Portal"),
-            FakeProcs(Arc::clone(&shared)),
             std::time::Duration::from_millis(20),
+            FakeProcs(Arc::clone(&shared)),
         );
         (watch, shared)
     }
@@ -2739,18 +2656,22 @@ mod tests {
     #[test]
     fn the_watch_thread_notices_a_launch_after_it_started() -> TestResult {
         let (watch, procs) = fake_watch(Vec::new());
-        check_eq(watch.current(), None, "nothing is running at the start")?;
+        check_eq(
+            watch.latest(),
+            busy::Usage::Free,
+            "nothing is running at the start",
+        )?;
         procs
             .lock()
             .ctx("lock the fake process list")?
             .push(player("/games/Portal"));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while watch.current().is_none() && std::time::Instant::now() < deadline {
+        while watch.latest() == busy::Usage::Free && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         check_eq(
-            watch.current(),
-            Some("game (pid 4242)".to_owned()),
+            watch.latest(),
+            busy::Usage::InUse("game (pid 4242)".to_owned()),
             "a launch after the first scan should show up in a later one",
         )
     }
@@ -2787,15 +2708,23 @@ mod tests {
 
     #[test]
     fn a_cancelled_pass_counts_only_the_share_it_finished() -> TestResult {
-        check_eq(scaled_saving(1000, 10, 100), 100, "a tenth of the plan")?;
-        check_eq(scaled_saving(1000, 100, 100), 1000, "the whole plan")?;
         check_eq(
-            scaled_saving(1000, 0, 0),
+            estimate::scaled_saving(1000, 10, 100),
+            100,
+            "a tenth of the plan",
+        )?;
+        check_eq(
+            estimate::scaled_saving(1000, 100, 100),
+            1000,
+            "the whole plan",
+        )?;
+        check_eq(
+            estimate::scaled_saving(1000, 0, 0),
             1000,
             "an empty plan keeps the figure",
         )?;
         check_eq(
-            scaled_saving(u64::MAX, u64::MAX - 1, u64::MAX),
+            estimate::scaled_saving(u64::MAX, u64::MAX - 1, u64::MAX),
             u64::MAX - 1,
             "large figures do not overflow",
         )
@@ -2976,50 +2905,6 @@ mod tests {
             client_path("~/games", home).ctx("home")?,
             PathBuf::from("/home/someone/games"),
             "a tilde still expands",
-        )
-    }
-
-    #[test]
-    fn a_file_left_below_the_floor_is_picked_up_again() -> TestResult {
-        let entry = |name: &str, ino| inventory::FileEntry {
-            rel: PathBuf::from(name),
-            size: 100_000,
-            ino,
-            mtime_ns: 1,
-            ctime_ns: 1,
-            action: inventory::Action::Compress,
-        };
-        let print = |ino, level| crate::db::FileFingerprint {
-            size: 100_000,
-            ino,
-            mtime_ns: 1,
-            ctime_ns: 1,
-            level_applied: level,
-        };
-        let inv = Inventory {
-            files: vec![
-                entry("low.dat", 1),
-                entry("high.dat", 2),
-                entry("never.dat", 3),
-            ],
-            warnings: vec![],
-        };
-        let stored = HashMap::from([
-            (PathBuf::from("low.dat"), print(1, 3)),
-            (PathBuf::from("high.dat"), print(2, 15)),
-            (
-                PathBuf::from("never.dat"),
-                print(3, crate::db::NOT_ATTEMPTED),
-            ),
-        ]);
-        let names: Vec<_> = below_floor(&stored, &inv, 9)
-            .into_iter()
-            .map(|e| e.rel)
-            .collect();
-        check_eq(
-            names,
-            vec![PathBuf::from("low.dat")],
-            "only the file compressed below the floor is redone",
         )
     }
 }

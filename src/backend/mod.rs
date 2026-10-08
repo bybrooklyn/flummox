@@ -125,6 +125,14 @@ impl CompressOpts {
             .unwrap_or_else(|| self.preset.level_plan())
     }
 
+    /// The plan's floor, lowered to what this kernel can apply.
+    ///
+    /// Compare recorded levels with this, not with `level_plan().floor()`, or
+    /// a kernel before 6.15 rewrites every file on every pass.
+    pub fn attainable_floor(&self) -> i32 {
+        btrfs::attainable_level(self.level_plan().floor())
+    }
+
     /// The level this job will use on btrfs.
     pub fn btrfs_level(&self) -> i32 {
         self.level.unwrap_or_else(|| self.preset.btrfs_level())

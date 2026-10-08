@@ -68,93 +68,11 @@ impl crate::pack::Observer for AnalysisObserver<'_> {
 const ANALYSIS_BUDGET: u64 = 32 * 1024 * 1024;
 /// Source bytes analysis may read from one file.
 const FILE_SAMPLE_CAP: u64 = 2 * 1024 * 1024;
-/// Size of one sampled window. A btrfs block, so the model sees whole blocks.
-const SAMPLE_WINDOW: u64 = 128 * 1024;
-/// Remaining budget below which a file is left to the scaled-in remainder.
-/// A window smaller than a few sectors cannot show a saving at all.
-const MIN_SAMPLE: u64 = SAMPLE_WINDOW;
-
-/// Scores `file` from windows spread over its whole length. Reading only the
-/// head and tail misjudges containers whose headers compress and whose bodies
-/// do not. The windows are gathered into an anonymous in-memory file, scored
-/// as one sample, and the result scaled to `size`. A file within `cap` is
-/// scored whole.
-fn spread_estimate(
-    file: &std::fs::File,
-    size: u64,
-    cap: u64,
-    preview: PreviewEstimate<'_>,
-) -> Result<(estimate::FileEstimate, estimate::FileEstimate)> {
-    use std::io::{Seek, SeekFrom};
-    use std::os::unix::fs::FileExt;
-    if size <= cap {
-        return Ok(estimate::estimate_open_file_pair(
-            file,
-            size,
-            PreviewEstimate {
-                byte_cap: cap,
-                ..preview
-            },
-        )?);
-    }
-    let window = SAMPLE_WINDOW.min(size);
-    let windows = (cap / window).max(1);
-    let last_start = size - window;
-    let gathered = std::fs::File::from(nix::sys::memfd::memfd_create(
-        c"flummox-sample",
-        nix::sys::memfd::MFdFlags::empty(),
-    )?);
-    let mut buffer = vec![0u8; usize::try_from(window).context("sample window")?];
-    let mut length = 0u64;
-    for index in 0..windows {
-        let offset = if windows == 1 {
-            last_start / 2
-        } else {
-            index * last_start / (windows - 1)
-        };
-        let mut read = 0usize;
-        while read < buffer.len() {
-            let Some(rest) = buffer.get_mut(read..) else {
-                break;
-            };
-            match file.read_at(rest, offset + read as u64) {
-                Ok(0) => break,
-                Ok(count) => read += count,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        let Some(chunk) = buffer.get(..read) else {
-            break;
-        };
-        (&gathered).write_all(chunk)?;
-        length += read as u64;
-    }
-    (&gathered).seek(SeekFrom::Start(0))?;
-    let (mut native, mut maximum) = estimate::estimate_open_file_pair(
-        &gathered,
-        length,
-        PreviewEstimate {
-            byte_cap: length,
-            ..preview
-        },
-    )?;
-    if length > 0 {
-        let scale = size as f64 / length as f64;
-        for estimate in [&mut native, &mut maximum] {
-            estimate.size = size;
-            estimate.disk_now = (estimate.disk_now as f64 * scale) as u64;
-            estimate.disk_after = (estimate.disk_after as f64 * scale) as u64;
-        }
-    }
-    Ok((native, maximum))
-}
-
 /// Whether the remaining `budget` is too small to judge a file of `size`. A
 /// sliver of a few sectors cannot show a saving, so the file is left to the
 /// scaled-in remainder, unless the sliver still covers all of it.
 fn budget_spent(budget: u64, size: u64) -> bool {
-    budget < MIN_SAMPLE && size > budget
+    budget < estimate::MIN_SAMPLE_BUDGET && size > budget
 }
 
 /// The level to record after a compress pass. A pass that had nothing to do
@@ -166,11 +84,11 @@ fn recorded_level(effective: Option<i32>, previous: Option<i32>) -> i32 {
 /// This pass's share of its estimated saving. A cancelled pass rewrote only
 /// part of the planned bytes, and a resumed pass estimates the rest.
 fn pass_saving(saving: u64, planned: u64, rewritten: u64, cancelled: bool) -> u64 {
-    if !cancelled || planned == 0 {
-        return saving;
+    if cancelled {
+        estimate::scaled_saving(saving, rewritten, planned)
+    } else {
+        saving
     }
-    let share = u128::from(saving) * u128::from(rewritten.min(planned)) / u128::from(planned);
-    u64::try_from(share).unwrap_or(u64::MAX)
 }
 
 /// The saving to record after a pass: this pass's estimate plus the share of
@@ -234,7 +152,7 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
         |r| r.get::<_, String>(0),
     )? {
         let (entry, level): (inventory::FileEntry, i32) = serde_json::from_str(&row?)?;
-        if job.operation == Operation::Decompress || level >= job.options.level_plan().floor() {
+        if job.operation == Operation::Decompress || level >= job.options.attainable_floor() {
             completed.insert(entry.rel.clone(), (entry, level));
         }
     }
@@ -431,10 +349,9 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
                     .measure(&path.join(&entry.rel))
                     .and_then(|(c, n)| (n > 0).then_some(c as f64 / n as f64));
                 let sample_cap = budget.min(FILE_SAMPLE_CAP);
-                let (native, maximum) = spread_estimate(
+                let (native, maximum) = estimate::estimate_open_file_pair(
                     &file,
                     entry.size,
-                    sample_cap,
                     PreviewEstimate {
                         native: model.as_ref(),
                         native_opts: &opts,
@@ -662,17 +579,16 @@ mod tests {
             mount_level: None,
             floor: None,
         };
-        let (native, maximum) = spread_estimate(
+        let (native, maximum) = estimate::estimate_open_file_pair(
             &file,
             size,
-            FILE_SAMPLE_CAP,
             PreviewEstimate {
                 native: &BtrfsModel { level: 3 },
                 native_opts: &native_opts,
                 measured: None,
                 maximum: &PackModel { level: 19 },
                 maximum_opts: &maximum_opts,
-                byte_cap: 0,
+                byte_cap: FILE_SAMPLE_CAP,
             },
         )
         .ctx("estimate")?;
@@ -693,17 +609,16 @@ mod tests {
         )?;
         let zeros = dir.path().join("zeros.bin");
         std::fs::write(&zeros, vec![0u8; 16 * 1024 * 1024]).ctx("write zeros")?;
-        let (flat, _) = spread_estimate(
+        let (flat, _) = estimate::estimate_open_file_pair(
             &std::fs::File::open(&zeros).ctx("open zeros")?,
             16 * 1024 * 1024,
-            FILE_SAMPLE_CAP,
             PreviewEstimate {
                 native: &BtrfsModel { level: 3 },
                 native_opts: &native_opts,
                 measured: None,
                 maximum: &PackModel { level: 19 },
                 maximum_opts: &maximum_opts,
-                byte_cap: 0,
+                byte_cap: FILE_SAMPLE_CAP,
             },
         )
         .ctx("estimate zeros")?;
@@ -754,7 +669,7 @@ mod tests {
             "control: a file the sliver covers whole",
         )?;
         check(
-            !budget_spent(MIN_SAMPLE, 2_000_000_000),
+            !budget_spent(estimate::MIN_SAMPLE_BUDGET, 2_000_000_000),
             "control: a workable remainder is used",
         )
     }
