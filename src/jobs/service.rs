@@ -171,8 +171,9 @@ fn layer_bytes(writes: &Path) -> u64 {
 /// Queues the upkeep each install is due and records what was decided.
 ///
 /// A task is not queued while its game is busy or has a job waiting, or
-/// while the last attempt at the same task needs attention. That last rule
-/// keeps a failing task from being queued again every scan.
+/// while the last attempt at the same task needs attention or was cancelled
+/// for the same build. That last rule keeps a failing or declined task from
+/// being queued again every scan.
 fn run_upkeep(
     snapshot: &mut Snapshot,
     games: &[Game],
@@ -216,7 +217,7 @@ fn run_upkeep(
                 matches!(
                     job.phase,
                     Phase::Failed | Phase::Partial | Phase::Interrupted
-                )
+                ) || (job.phase == Phase::Cancelled && job.game.build == game.build)
             });
         if !game.state.is_idle() || stuck || jobs().any(|job| job.phase.active()) {
             continue;
@@ -342,7 +343,12 @@ fn open_store(path: &Path) -> Result<(Connection, Snapshot)> {
     // Load the newest 500 jobs, then reverse them into oldest-first order.
     let mut stmt = db.prepare("SELECT data FROM queue ORDER BY id DESC LIMIT 500")?;
     for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
-        let mut job: Job = serde_json::from_str(&row?)?;
+        // A row from another version that no longer parses is skipped, so
+        // one old entry cannot stop the coordinator from starting.
+        let Ok(mut job) = serde_json::from_str::<Job>(&row?) else {
+            eprintln!("skipping a queue entry that cannot be read");
+            continue;
+        };
         // A job the user paused before it ever started has no work to lose.
         // It stays paused and starts when resumed.
         let never_started = job.phase == Phase::Paused
@@ -762,7 +768,6 @@ fn apply(
         // The id is removed and, when excluding, added back, so it is listed
         // once. Excluding also cancels every active job for the game.
         Command::Exclude { id, excluded } => {
-            snapshot.excluded.retain(|i| i != &id);
             if excluded {
                 for job in snapshot
                     .jobs
@@ -783,6 +788,11 @@ fn apply(
                     job.message = "Excluded from future work".into();
                     save(db, job)?;
                 }
+            }
+            // The list changes only after the fallible steps above, so an
+            // error leaves it as the database has it.
+            snapshot.excluded.retain(|i| i != &id);
+            if excluded {
                 snapshot.excluded.push(id);
             }
             settings(db, snapshot)?;
@@ -968,13 +978,19 @@ fn event(job: &mut Job, event: WorkerEvent, db: &Connection) -> Result<bool> {
                         job.errors.push(message);
                     }
                 }
-                Event::Paused { by } => {
+                // A pause or resume that crosses a cancel must not undo it.
+                Event::Paused { by } if job.phase != Phase::Cancelling => {
                     job.phase = Phase::Paused;
                     job.message = by;
                 }
-                Event::Resumed => {
-                    job.phase = Phase::Running;
+                Event::Resumed if job.phase != Phase::Cancelling => {
+                    job.phase = if job.operation == Operation::Analyze {
+                        Phase::Analyzing
+                    } else {
+                        Phase::Running
+                    };
                 }
+                Event::Paused { .. } | Event::Resumed => {}
                 Event::Finished(_) => {}
             }
         }
@@ -1045,17 +1061,34 @@ impl PackControl {
         use crate::pack::Observer;
         use std::sync::atomic::Ordering;
         self.checkpoint()?;
-        let _transition = self
-            .transition
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Storage control lock stopped"))?;
-        self.interruptible.store(false, Ordering::SeqCst);
-        ensure!(
-            !self.cancel.load(Ordering::SeqCst),
-            "Storage job stopped before switching files"
-        );
+        {
+            let _transition = self
+                .transition
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Storage control lock stopped"))?;
+            self.interruptible.store(false, Ordering::SeqCst);
+            ensure!(
+                !self.cancel.load(Ordering::SeqCst),
+                "Storage job stopped before switching files"
+            );
+        }
+        // Sent after the lock is released: a full channel blocks this call,
+        // and a control request waiting on the lock would block with it.
         self.started(0, 0, message);
         Ok(())
+    }
+    /// Asks the task to stop, unless it is already in a step that must
+    /// finish. Returns whether the request was accepted.
+    fn cancel_if_interruptible(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let Ok(_transition) = self.transition.lock() else {
+            return false;
+        };
+        let accepted = self.interruptible.load(Ordering::SeqCst);
+        if accepted {
+            self.cancel.store(true, Ordering::SeqCst);
+        }
+        accepted
     }
     /// Applies a client's pause or cancel to the storage task, or fails once
     /// the task is past the point where it can stop.
@@ -1386,8 +1419,11 @@ fn poll_pack(
             .iter_mut()
             .find(|job| job.id == running.id)
             .context("Storage job is missing")?;
+        // An exclusion marks the job without asking the task, so the request
+        // is made here. A step that must finish refuses it, and the job then
+        // ends as Failed or Completed rather than Cancelled.
         if job.phase == Phase::Cancelling || job.phase == Phase::Cancelled {
-            running.control.cancel.store(true, Ordering::SeqCst);
+            running.control.cancel_if_interruptible();
         }
         // The thread only acts on this flag at a checkpoint, so setting it
         // during a step that must finish has no effect.
@@ -1951,16 +1987,8 @@ pub(super) fn run() -> Result<()> {
             if let Some(current) = current_game(&job.game, &games) {
                 job.game = current.clone();
             }
-            if is_excluded(&job.game, &snapshot.excluded)
-                && running
-                    .control
-                    .interruptible
-                    .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                running
-                    .control
-                    .cancel
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            if is_excluded(&job.game, &snapshot.excluded) {
+                running.control.cancel_if_interruptible();
             }
         }
         survive(
@@ -2191,6 +2219,160 @@ mod tests {
         )?;
         queue(&mut snapshot, &sibling).ctx("control: an unrelated sibling is accepted")?;
         queue(&mut snapshot, &inside).ctx("control: the game's own folder is accepted")
+    }
+
+
+    #[test]
+    fn a_cancelled_upkeep_task_is_not_queued_again() -> TestResult {
+        let temp = tempfile::tempdir().ctx("upkeep fixture")?;
+        let folder = temp.path().join("game");
+        let writes = temp.path().join("updates");
+        std::fs::create_dir(&folder).ctx("game folder")?;
+        std::fs::create_dir_all(writes.join("files")).ctx("update layer")?;
+        // A sparse file of the size that counts as an update on its own.
+        std::fs::File::create(writes.join("files/patch.bin"))
+            .and_then(|file| file.set_len(UPKEEP_LAYER_BYTES))
+            .ctx("update")?;
+        let (db, mut snapshot) = open_store(&temp.path().join("queue.sqlite")).ctx("queue")?;
+        let game = game(&folder, "upkeep");
+        snapshot.packs.push(crate::pack::Install {
+            game_path: folder.clone(),
+            store_path: temp.path().join("store"),
+            writes_path: writes,
+            backup_path: None,
+            previous_store_path: None,
+            previous_writes_path: None,
+            summary: None,
+            phase: crate::pack::InstallPhase::Mounted,
+            message: String::new(),
+        });
+        let mut records = std::collections::HashMap::new();
+        run_upkeep(&mut snapshot, std::slice::from_ref(&game), &mut records, &db);
+        check_eq(snapshot.jobs.len(), 1, "the update queues one compaction")?;
+        snapshot.jobs.first_mut().ctx("job")?.phase = Phase::Cancelled;
+        for _scan in 0..3 {
+            run_upkeep(&mut snapshot, std::slice::from_ref(&game), &mut records, &db);
+        }
+        check_eq(
+            snapshot.jobs.len(),
+            1,
+            "a compaction the user cancelled stays cancelled",
+        )
+    }
+
+    #[test]
+    fn pause_and_resume_events_do_not_overwrite_a_cancel() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let (db, mut snapshot) = open_store(&temp.path().join("jobs.sqlite")).ctx("store")?;
+        enqueue(
+            &mut snapshot,
+            game(temp.path(), "game"),
+            Operation::Analyze,
+            CompressOpts::default(),
+            &db,
+        )
+        .ctx("job")?;
+        let job = snapshot.jobs.first_mut().ctx("job")?;
+        job.phase = Phase::Cancelling;
+        for progress in [
+            crate::backend::Event::Paused { by: "late".into() },
+            crate::backend::Event::Resumed,
+        ] {
+            event(job, WorkerEvent::Progress(progress), &db).ctx("event")?;
+            check_eq(job.phase, Phase::Cancelling, "a cancel stays a cancel")?;
+        }
+        job.phase = Phase::Paused;
+        event(job, WorkerEvent::Progress(crate::backend::Event::Resumed), &db).ctx("resume")?;
+        check_eq(
+            job.phase,
+            Phase::Analyzing,
+            "resuming an analysis shows it as analyzing",
+        )?;
+        job.operation = Operation::Compress;
+        job.phase = Phase::Paused;
+        event(job, WorkerEvent::Progress(crate::backend::Event::Resumed), &db).ctx("resume")?;
+        check_eq(job.phase, Phase::Running, "control: other jobs run")
+    }
+
+    #[test]
+    fn a_queue_row_that_no_longer_parses_does_not_stop_the_coordinator() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let path = temp.path().join("jobs.sqlite");
+        let (db, mut snapshot) = open_store(&path).ctx("store")?;
+        enqueue(
+            &mut snapshot,
+            game(temp.path(), "game"),
+            Operation::Compress,
+            CompressOpts::default(),
+            &db,
+        )
+        .ctx("job")?;
+        db.execute(
+            "INSERT INTO queue(id, data) VALUES(99, 'not a job')",
+            [],
+        )
+        .ctx("damaged row")?;
+        drop(db);
+        let (_db, restored) = open_store(&path).ctx("reopen with a damaged row")?;
+        check_eq(restored.jobs.len(), 1, "the readable job is still loaded")
+    }
+
+    #[test]
+    fn a_cancel_is_accepted_only_while_the_task_can_still_stop() -> TestResult {
+        let stoppable = PackControl {
+            interruptible: std::sync::atomic::AtomicBool::new(true),
+            ..Default::default()
+        };
+        check(stoppable.cancel_if_interruptible(), "accepted before the switch")?;
+        check(
+            stoppable.cancel.load(std::sync::atomic::Ordering::SeqCst),
+            "the flag is set",
+        )?;
+        let committed = PackControl::default();
+        check(
+            !committed.cancel_if_interruptible(),
+            "refused during a step that must finish",
+        )?;
+        check(
+            !committed.cancel.load(std::sync::atomic::Ordering::SeqCst),
+            "a refused request leaves the flag alone, so a real failure is not reported as a stop",
+        )
+    }
+
+    #[cfg(feature = "pack-mount")]
+    #[test]
+    fn a_full_progress_channel_does_not_block_pause_and_cancel_requests() -> TestResult {
+        let (send, receive) = mpsc::sync_channel(1);
+        send.send(crate::backend::Event::Resumed).ctx("fill the channel")?;
+        let control = std::sync::Arc::new(PackControl {
+            interruptible: std::sync::atomic::AtomicBool::new(true),
+            events: Some(send),
+            ..Default::default()
+        });
+        let beginning = control.clone();
+        let transaction = std::thread::spawn(move || beginning.transaction("switching"));
+        let until = Instant::now() + Duration::from_secs(5);
+        while control.interruptible.load(std::sync::atomic::Ordering::SeqCst) {
+            check(Instant::now() < until, "the transaction began")?;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (answer, answered) = mpsc::channel();
+        let asking = control.clone();
+        std::thread::spawn(move || {
+            let _sent = answer.send(asking.request_control(&Command::Cancel(1)).is_err());
+        });
+        let refused = answered.recv_timeout(Duration::from_secs(2));
+        // Drain the channel so the transaction thread can finish either way.
+        while receive.recv_timeout(Duration::from_millis(200)).is_ok() {}
+        transaction
+            .join()
+            .map_err(|_| "transaction thread panicked".to_string())?
+            .ctx("transaction")?;
+        check_eq(
+            refused.ctx("the cancel request answered while the channel was full")?,
+            true,
+            "a cancel is refused once the step must finish",
+        )
     }
 
     #[test]
