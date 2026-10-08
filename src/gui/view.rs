@@ -505,11 +505,11 @@ fn overview(state: &State, compact: bool) -> Element<'_, Message> {
             !state.is_excluded(&row.game)
                 && (!row.supported
                     || state.latest(&row.game).is_some_and(|job| {
-                    matches!(
-                        job.phase,
-                        Phase::Failed | Phase::Partial | Phase::Interrupted
-                    )
-                }))
+                        matches!(
+                            job.phase,
+                            Phase::Failed | Phase::Partial | Phase::Interrupted
+                        )
+                    }))
         })
         .count();
     // The hero's main button compresses the library when a saving is
@@ -587,11 +587,9 @@ fn overview(state: &State, compact: bool) -> Element<'_, Message> {
     .spacing(16);
     if attention > 0 || !state.warnings.is_empty() {
         // Scan warnings are listed here, since no game row carries them.
-        let mut notes = column![
-            text(attention_title(attention + state.warnings.len())).size(16)
-        ]
-        .spacing(4)
-        .width(Length::Fill);
+        let mut notes = column![text(attention_title(attention + state.warnings.len())).size(16)]
+            .spacing(4)
+            .width(Length::Fill);
         for warning in state.warnings.iter().take(5) {
             notes = notes.push(theme::muted(warning));
         }
@@ -823,11 +821,7 @@ fn games(state: &State, compact: bool) -> Element<'_, Message> {
     }
     // The collapsed group has no rows in the list, so its heading and the
     // button that opens it come last.
-    if grouped
-        && !state.show_low
-        && listed.len() <= state.shown
-        && filtered.len() > listed.len()
-    {
+    if grouped && !state.show_low && listed.len() <= state.shown && filtered.len() > listed.len() {
         rows.push(group_line(state, &filtered, 3));
     }
     content = content.push(iced::widget::keyed_column(rows).spacing(12));
@@ -2070,4 +2064,123 @@ fn completed_job_row(job: &Job) -> Element<'_, Message> {
         .spacing(12)
         .align_y(Alignment::Center),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        launchers::Env,
+        testutil::{TestResult, check, check_eq},
+    };
+
+    #[test]
+    fn the_headline_never_contradicts_the_button_under_it() -> TestResult {
+        check_eq(
+            headline(0, 900_000_000, false, false),
+            "About 900 MB to save".to_owned(),
+            "a predicted saving is the headline",
+        )?;
+        check_eq(
+            headline(0, 0, false, false),
+            "Analyze your games".to_owned(),
+            "control: with nothing predicted the prompt stays",
+        )?;
+        check_eq(
+            headline(2_000_000_000, 900_000_000, false, false),
+            "2 GB".to_owned(),
+            "a saving so far leads",
+        )?;
+        check_eq(
+            headline(0, 900_000_000, true, false),
+            "Finding your games…".to_owned(),
+            "a scan in progress comes first",
+        )
+    }
+
+    #[test]
+    fn counts_agree_with_their_nouns() -> TestResult {
+        check_eq(
+            attention_title(1),
+            "1 item needs attention".to_owned(),
+            "one",
+        )?;
+        check_eq(
+            attention_title(3),
+            "3 items need attention".to_owned(),
+            "many",
+        )?;
+        check_eq(games_count(1), "1 game".to_owned(), "one game")?;
+        check_eq(games_count(0), "0 games".to_owned(), "no games")
+    }
+
+    #[test]
+    fn an_empty_games_page_says_why() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        state.scanning = true;
+        let (title, _, way_out) = empty_games(&state);
+        check_eq(title, "Finding your games…", "a first scan")?;
+        check(way_out.is_none(), "nothing to press while it runs")?;
+        state.scanning = false;
+        let (title, _, way_out) = empty_games(&state);
+        check_eq(title, "No games found", "an empty library")?;
+        check(
+            matches!(way_out, Some((_, Message::GoTo(Page::Drives)))),
+            "points at adding a folder",
+        )?;
+        state.games.push(GameRow {
+            game: crate::model::Game {
+                id: crate::model::GameId::new(crate::model::Launcher::Manual, "a"),
+                also: vec![],
+                title: "A".into(),
+                install_dir: "/fixture/a".into(),
+                build: None,
+                size_hint: None,
+                state: crate::model::InstallState::Idle,
+                is_tool: false,
+            },
+            filesystem: "fixturefs".into(),
+            mountpoint: None,
+            supported: true,
+            native_supported: true,
+            pack_supported: false,
+            note: None,
+            artwork: None,
+            cover: None,
+        });
+        state.query = "zzz".into();
+        let (title, _, way_out) = empty_games(&state);
+        check_eq(title, "No games match your search", "a search")?;
+        check(
+            matches!(way_out, Some((_, Message::Query(ref text))) if text.is_empty()),
+            "offers to clear it",
+        )?;
+        state.query.clear();
+        let (title, _, way_out) = empty_games(&state);
+        check_eq(title, "No games match these filters", "the filters")?;
+        check(
+            matches!(way_out, Some((_, Message::ClearFilters))),
+            "offers to clear them",
+        )
+    }
+
+    #[test]
+    fn a_plan_reports_how_far_short_it_is() -> TestResult {
+        let requirement = |available| crate::storage::Requirement {
+            volume: crate::storage::Volume {
+                identity: "fixture".into(),
+                path: "/Games".into(),
+                available,
+            },
+            additional: 4_000,
+            headroom: 200,
+            reasons: vec![],
+        };
+        let plan = |available| crate::storage::SpacePlan {
+            retained_original: false,
+            requirements: vec![requirement(available)],
+        };
+        check_eq(shortfall(&plan(1_200)), 3_000, "needed minus available")?;
+        check_eq(shortfall(&plan(10_000)), 0, "control: room to spare")
+    }
 }

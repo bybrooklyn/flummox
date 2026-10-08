@@ -282,9 +282,7 @@ impl Cache {
     /// Queues `source` for decoding unless it is cached, in flight or queued.
     /// The newest request goes first, since it is the one on screen now.
     pub fn request(&mut self, source: Source) {
-        if self.entries.iter().any(|(key, _)| *key == source)
-            || self.pending.contains(&source)
-        {
+        if self.entries.iter().any(|(key, _)| *key == source) || self.pending.contains(&source) {
             return;
         }
         self.waiting.retain(|queued| *queued != source);
@@ -380,5 +378,27 @@ mod tests {
             cache.loaded(key, None);
         }
         check_eq(cache.entries.len(), 256, "cache remains bounded")
+    }
+
+    #[test]
+    fn the_newest_request_is_decoded_first() -> TestResult {
+        let source = |bytes: u64| Source {
+            path: "/fixture/art.png".into(),
+            modified: None,
+            bytes,
+            edge: 52,
+        };
+        let mut cache = Cache::default();
+        for number in 1..=4 {
+            cache.request(source(number));
+        }
+        // A request seen again moves to the front, so a row scrolled back
+        // into view is not queued behind everything that came after it.
+        cache.request(source(1));
+        let first = cache.next().ctx("first decode")?;
+        let second = cache.next().ctx("second decode")?;
+        check_eq(first.bytes, 1, "the row just shown goes first")?;
+        check_eq(second.bytes, 4, "then the next newest")?;
+        check(cache.next().is_none(), "two at a time")
     }
 }

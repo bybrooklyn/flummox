@@ -176,10 +176,7 @@ impl GameRow {
 /// A store is mounted at the game's own path, so probing that path reports the
 /// FUSE mount. The drive is the one holding the mount's parent folder, which
 /// is what `storage::volume_existing` reads.
-fn probe_target<'a>(
-    game: &'a Game,
-    packs: &[crate::pack::Install],
-) -> (&'a std::path::Path, bool) {
+fn probe_target<'a>(game: &'a Game, packs: &[crate::pack::Install]) -> (&'a std::path::Path, bool) {
     if packs
         .iter()
         .any(|install| install.game_path == game.install_dir)
@@ -593,8 +590,7 @@ impl State {
     /// The database record of a compression at this game's installed build.
     /// A record at level 0 marks a decompressed game and does not count.
     fn record_of(&self, game: &Game) -> Option<&GameRecord> {
-        let matches =
-            |r: &&GameRecord| r.id == game.id && r.build == game.build && r.level > 0;
+        let matches = |r: &&GameRecord| r.id == game.id && r.build == game.build && r.level > 0;
         if self.index.records_len == self.records.len() {
             return self
                 .index
@@ -665,9 +661,7 @@ impl State {
         filtered
             .iter()
             .copied()
-            .filter(|row| {
-                self.sort != Sort::Worth || self.show_low || self.worth(&row.game).0 != 3
-            })
+            .filter(|row| self.sort != Sort::Worth || self.show_low || self.worth(&row.game).0 != 3)
             .collect()
     }
     /// Makes the row for this id part of the page that is drawn: clears the
@@ -921,12 +915,10 @@ impl State {
     }
     /// The estimate that still applies to this game at its installed build.
     ///
-    /// Jobs are read newest first. A finished analysis supplies the estimate.
-    /// The search ends with nothing at a compression or decompression that
-    /// completed or is running, since it used the saving up. One that was
-    /// cancelled or failed changed nothing. When the worker has dropped every
-    /// job for this build, the estimate remembered from the last analysis
-    /// applies unless the game is compressed.
+    /// Jobs are read newest first. A finished analysis supplies it. A
+    /// compression or decompression that completed or is running used the
+    /// saving up, so the answer is `None`; one that was cancelled or failed
+    /// changed nothing. With every job pruned, the remembered estimate applies.
     pub fn estimate(&self, game: &Game) -> Option<&crate::estimate::Estimate> {
         for job in self
             .jobs_for(&game.install_dir)
@@ -1099,7 +1091,7 @@ impl State {
                 if matches!(job.phase, Phase::Completed | Phase::Partial)
                     && let Some(estimate) = &job.estimate
                 {
-                    self.remembered.insert(key, estimate.clone());
+                    self.remembered.insert(key, *estimate);
                 }
             } else if matches!(job.phase, Phase::Completed | Phase::Partial) {
                 self.remembered.remove(&key);
@@ -1108,11 +1100,10 @@ impl State {
     }
     /// Whether the game counts as compressed at its installed build.
     ///
-    /// True with a pack install. Otherwise the newest started job that is
-    /// not an analysis decides: it must be a completed compression of this
-    /// build. A cancelled, failed or interrupted job changed nothing and is
-    /// passed over. With no deciding job, a database record of this build
-    /// that is not level 0 decides.
+    /// True with a pack install. Otherwise the newest job that is not an
+    /// analysis decides, skipping cancelled, failed and interrupted ones: it
+    /// must be a completed compression of this build. With none, a record of
+    /// this build above level 0 decides.
     pub fn compressed(&self, game: &Game) -> bool {
         if self
             .snapshot
@@ -1619,9 +1610,7 @@ fn analysis_candidates(state: &State) -> Vec<Game> {
         .filter(|row| {
             state.eligible(row)
                 && row.game.state.is_idle()
-                && !state
-                    .analysis_refused
-                    .contains(&row.game.id.to_string())
+                && !state.analysis_refused.contains(&row.game.id.to_string())
                 && !state.analysis_known(&row.game)
         })
         .collect();
@@ -3194,13 +3183,19 @@ mod tests {
         state.reduced_motion = true;
         let _task = update(&mut state, Message::Expand("manual:alpha".into()));
         let _task = update(&mut state, Message::Expand("manual:alpha".into()));
-        check(state.expanded.is_none(), "closing the pane releases the row")?;
+        check(
+            state.expanded.is_none(),
+            "closing the pane releases the row",
+        )?;
         // With motion, the row is released when the closing animation ends.
         state.reduced_motion = false;
         state.expanded = Some("manual:alpha".into());
         state.detail = Animation::new(false);
         let _task = update(&mut state, Message::Tick);
-        check(state.expanded.is_none(), "a finished close releases the row")?;
+        check(
+            state.expanded.is_none(),
+            "a finished close releases the row",
+        )?;
         let done = job(
             1,
             &beta,
@@ -3208,7 +3203,10 @@ mod tests {
             Phase::Completed,
             2_000_000_000,
         );
-        let _task = update(&mut state, Message::Snapshot(Ok(snapshot_of(2, vec![done]))));
+        let _task = update(
+            &mut state,
+            Message::Snapshot(Ok(snapshot_of(2, vec![done]))),
+        );
         check(!state.order_stale, "nothing is held, so no banner")?;
         check_eq(
             order(&state),
@@ -3539,6 +3537,234 @@ mod tests {
         check(
             state.folder_error.is_none(),
             "the folder is checked in the background",
+        )
+    }
+
+    fn mounted(game: &Game) -> crate::pack::Install {
+        crate::pack::Install {
+            game_path: game.install_dir.clone(),
+            store_path: "/fixture/store".into(),
+            writes_path: "/fixture/updates".into(),
+            backup_path: None,
+            previous_store_path: None,
+            previous_writes_path: None,
+            summary: None,
+            phase: crate::pack::InstallPhase::Mounted,
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_game_running_from_a_store_is_probed_through_the_mounts_parent() -> TestResult {
+        let temp = tempfile::tempdir().ctx("probe fixture")?;
+        let mut stored = game();
+        stored.install_dir = temp.path().join("Stored Game");
+        std::fs::create_dir(&stored.install_dir).ctx("game folder")?;
+        let packs = [mounted(&stored)];
+        let (target, is_stored) = probe_target(&stored, &packs);
+        check_eq(target, temp.path(), "the folder that holds the mount")?;
+        check(is_stored, "it is a stored game")?;
+        let (target, is_stored) = probe_target(&stored, &[]);
+        check_eq(target, stored.install_dir.as_path(), "control: no store")?;
+        check(!is_stored, "control: not stored")?;
+        let row = GameRow::probe(stored, None, None, &packs);
+        check(row.pack_supported, "a stored game is a Maximum game")?;
+        check(row.supported, "so it is not reported as unsupported")?;
+        check(row.note.is_none(), "and carries no unsupported note")?;
+        check(
+            row.mountpoint.is_some(),
+            "its drive is the one under the mount",
+        )
+    }
+
+    #[test]
+    fn the_list_leaves_out_the_collapsed_group_and_counts_what_is_hidden() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        state.games.push(named("a", true));
+        state.games.push(named("b", true));
+        state.games.push(named("c", false));
+        state.games.push(named("d", false));
+        state.capture_order();
+        state.shown = 2;
+        let collapsed: Vec<String> = {
+            let filtered = state.filtered();
+            let listed = state.listed(&filtered);
+            listed.iter().map(|row| row.game.title.clone()).collect()
+        };
+        check_eq(
+            collapsed,
+            ["a", "b"].map(String::from).to_vec(),
+            "the group of games with little to gain is collapsed",
+        )?;
+        state.show_low = true;
+        let filtered = state.filtered();
+        check_eq(
+            state.listed(&filtered).len(),
+            4,
+            "control: expanding it lists every game",
+        )
+    }
+
+    #[test]
+    fn a_game_is_named_by_its_title_and_unknown_ids_stay_as_they_are() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        state.games.push(named("alpha", true));
+        check_eq(
+            state.title_of("manual:alpha"),
+            "alpha".to_owned(),
+            "a known id shows its title",
+        )?;
+        check_eq(
+            state.title_of("manual:gone"),
+            "manual:gone".to_owned(),
+            "an unknown id is not hidden",
+        )
+    }
+
+    #[test]
+    fn refused_commands_are_reported_and_the_connection_stays_up() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        let batch = Batch {
+            snapshot: snapshot_of(1, vec![]),
+            refused: vec![
+                ("manual:a".into(), "This game is excluded.".into()),
+                ("manual:b".into(), "The queue is full.".into()),
+            ],
+        };
+        let _task = update(&mut state, Message::Batched(Ok(batch)));
+        check(state.connection_error.is_none(), "not a lost worker")?;
+        check(
+            state.snapshot_loaded,
+            "the commands that went through were applied",
+        )?;
+        let text = state.status.as_ref().map(|status| status.text.clone());
+        check(
+            text.as_deref()
+                .is_some_and(|text| text.starts_with("2 jobs could not be queued")),
+            format!("the refusals are counted: {text:?}"),
+        )?;
+        check(
+            state.status.as_ref().is_some_and(|status| status.is_error),
+            "and shown as an error",
+        )
+    }
+
+    #[test]
+    fn a_refused_analysis_is_skipped_and_is_not_a_lost_connection() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        state.games.push(named("a", true));
+        state.analysis_queuing = true;
+        let batch = Batch {
+            snapshot: snapshot_of(1, vec![]),
+            refused: vec![("manual:a".into(), "The queue is full.".into())],
+        };
+        let _task = update(&mut state, Message::AnalysisQueued(Ok(batch)));
+        check(!state.analysis_queuing(), "the batch is over")?;
+        check(state.connection_error.is_none(), "not a lost worker")?;
+        check(
+            analysis_candidates(&state).is_empty(),
+            "the refused game is not tried again at once",
+        )?;
+        let _task = update(&mut state, Message::AnalysisQueued(Err("offline".into())));
+        check(
+            state.connection_error.is_some(),
+            "control: no reply at all is a lost connection",
+        )
+    }
+
+    #[test]
+    fn adding_a_folder_reports_a_missing_folder_and_a_refusal_differently() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        let _task = update(&mut state, Message::FolderAdded(Err(FolderError::Missing)));
+        check(
+            state.folder_error.is_some(),
+            "a missing folder is a form error",
+        )?;
+        check(state.status.is_none(), "and not a toast")?;
+        state.folder_error = None;
+        let _task = update(
+            &mut state,
+            Message::FolderAdded(Err(FolderError::Refused("Not allowed.".into()))),
+        );
+        check(
+            state.folder_error.is_none(),
+            "a refusal is not a form error",
+        )?;
+        check(state.status.is_some(), "it is a toast")?;
+        check(state.connection_error.is_none(), "and not a lost worker")
+    }
+
+    #[test]
+    fn review_attention_opens_the_games_that_need_it() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        state.query = "zzz".into();
+        state.drive_filter = Some("/nowhere".into());
+        let _task = update(&mut state, Message::ReviewAttention);
+        check_eq(state.page, Page::Games, "the Games page")?;
+        check_eq(state.filter, Filter::Attention, "filtered to attention")?;
+        check(
+            state.query.is_empty() && state.drive_filter.is_none(),
+            "with nothing else hiding games",
+        )
+    }
+
+    #[test]
+    fn a_toast_gets_one_timer_for_its_deadline() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        check(state.scheduled_deadline.is_none(), "control: none at first")?;
+        let _task = update(
+            &mut state,
+            Message::DiagnosticsExported(Ok("/fixture/diagnostics.json".into())),
+        );
+        check(state.status_deadline.is_some(), "the toast has a deadline")?;
+        check_eq(
+            state.scheduled_deadline,
+            state.status_deadline,
+            "a timer was started for it",
+        )
+    }
+
+    #[test]
+    fn every_transition_takes_its_length_from_one_table() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        check_eq(
+            state.motion_duration(timing::NAV),
+            Duration::from_millis(timing::NAV.0),
+            "expressive",
+        )?;
+        state.motion = MotionPreference::Subtle;
+        check_eq(
+            state.motion_duration(timing::DETAIL),
+            Duration::from_millis(timing::DETAIL.1),
+            "subtle",
+        )?;
+        state.motion = MotionPreference::Reduced;
+        check_eq(
+            state.motion_duration(timing::PAGE),
+            Duration::ZERO,
+            "reduced motion resolves at once",
+        )
+    }
+
+    #[test]
+    fn clearing_the_filters_shows_every_game_again() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        state.games.push(named("alpha", true));
+        state.query = "zzz".into();
+        state.filter = Filter::Compressed;
+        state.launcher_filter = Some("Steam".into());
+        check(state.filtered().is_empty(), "control: the filters hide it")?;
+        let _task = update(&mut state, Message::ClearFilters);
+        check_eq(state.filtered().len(), 1, "cleared")
+    }
+
+    #[test]
+    fn refusals_are_summarised_by_count_and_first_reason() -> TestResult {
+        check(refusal_text(&[], "job").is_none(), "nothing refused")?;
+        check_eq(
+            refusal_text(&[("a".into(), "Why.".into())], "job"),
+            Some("1 job could not be queued. Why.".to_owned()),
+            "one",
         )
     }
 }

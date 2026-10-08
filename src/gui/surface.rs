@@ -674,7 +674,10 @@ mod tests {
             position.current > 0.0 && position.current < 60.0,
             "the frame moved the content part of the way",
         )?;
-        check(!captured, "the redraw event reaches later widgets uncaptured")
+        check(
+            !captured,
+            "the redraw event reaches later widgets uncaptured",
+        )
     }
     #[test]
     fn wheel_retargets_reverses_and_stops_at_its_clamped_target() -> TestResult {
