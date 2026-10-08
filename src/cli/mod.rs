@@ -1406,7 +1406,7 @@ fn cmd_compress(
         // Only the share of the plan this pass got through counts, or a
         // cancelled pass followed by a rerun would count the saving twice.
         let planned: u64 = inv.to_compress().map(|f| f.size).sum();
-        let pass_saving = scaled_saving(pass_saving, outcome.bytes, planned);
+        let pass_saving = estimate::scaled_saving(pass_saving, outcome.bytes, planned);
         record.est_saving = previous
             .as_ref()
             .map_or(0, |p| p.est_saving)
@@ -1478,15 +1478,6 @@ fn pass_problem(outcome: &backend::Outcome) -> String {
         (true, n) => format!("it was stopped early and {n} files failed"),
         (false, n) => format!("{n} files failed"),
     }
-}
-
-/// The share of `saving` that `done` of `planned` bytes account for.
-fn scaled_saving(saving: u64, done: u64, planned: u64) -> u64 {
-    if planned == 0 || done >= planned {
-        return saving;
-    }
-    let scaled = u128::from(saving) * u128::from(done) / u128::from(planned);
-    u64::try_from(scaled).unwrap_or(saving)
 }
 
 /// The level to keep for a game after a pass.
@@ -2717,15 +2708,23 @@ mod tests {
 
     #[test]
     fn a_cancelled_pass_counts_only_the_share_it_finished() -> TestResult {
-        check_eq(scaled_saving(1000, 10, 100), 100, "a tenth of the plan")?;
-        check_eq(scaled_saving(1000, 100, 100), 1000, "the whole plan")?;
         check_eq(
-            scaled_saving(1000, 0, 0),
+            estimate::scaled_saving(1000, 10, 100),
+            100,
+            "a tenth of the plan",
+        )?;
+        check_eq(
+            estimate::scaled_saving(1000, 100, 100),
+            1000,
+            "the whole plan",
+        )?;
+        check_eq(
+            estimate::scaled_saving(1000, 0, 0),
             1000,
             "an empty plan keeps the figure",
         )?;
         check_eq(
-            scaled_saving(u64::MAX, u64::MAX - 1, u64::MAX),
+            estimate::scaled_saving(u64::MAX, u64::MAX - 1, u64::MAX),
             u64::MAX - 1,
             "large figures do not overflow",
         )

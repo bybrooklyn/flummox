@@ -84,11 +84,11 @@ fn recorded_level(effective: Option<i32>, previous: Option<i32>) -> i32 {
 /// This pass's share of its estimated saving. A cancelled pass rewrote only
 /// part of the planned bytes, and a resumed pass estimates the rest.
 fn pass_saving(saving: u64, planned: u64, rewritten: u64, cancelled: bool) -> u64 {
-    if !cancelled || planned == 0 {
-        return saving;
+    if cancelled {
+        estimate::scaled_saving(saving, rewritten, planned)
+    } else {
+        saving
     }
-    let share = u128::from(saving) * u128::from(rewritten.min(planned)) / u128::from(planned);
-    u64::try_from(share).unwrap_or(u64::MAX)
 }
 
 /// The saving to record after a pass: this pass's estimate plus the share of
