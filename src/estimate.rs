@@ -40,10 +40,16 @@ const MIN_SAVING_BYTES: u64 = 4096;
 
 /// Window used by the desktop preview shared by native and pack estimates.
 ///
-/// It is large enough to give zstd useful history, but smaller than the pack's
-/// real frame. That keeps the projection conservative and lets a fixed budget
-/// cover many files instead of being spent on one or two large archives.
-const PREVIEW_WINDOW: u64 = 512 * 1024;
+/// One native block, smaller than the pack's real frame. That keeps the
+/// projection conservative and lets a budget of a few windows per file cover
+/// the whole file instead of its head and tail.
+const PREVIEW_WINDOW: u64 = 128 * 1024;
+
+/// Smallest per-file budget, in bytes, that still yields a usable sample.
+///
+/// Below this, a file should be treated as unsampled: one window shorter than
+/// a few sectors cannot show the whole-sector saving both models require.
+pub const MIN_SAMPLE_BUDGET: u64 = 128 * 1024;
 
 /// Models how a backend turns compressed bytes into disk usage.
 pub trait UnitModel: Sync {
@@ -831,14 +837,20 @@ fn sample_block(index: u64, blocks: u64, samples: u64) -> u64 {
     }
 }
 
-/// Spaces byte windows without leaving the tail sample short.
-fn sample_offset(index: u64, size: u64, window: u64, samples: u64) -> u64 {
+/// Start of sample window `index` of `samples`, each `window` bytes, in a file
+/// of `size` bytes.
+///
+/// The file is cut into `samples` equal strata and each window is centred in
+/// its stratum, so head and tail carry no more weight than any other part.
+/// The result keeps the window inside the file.
+pub fn sample_offset(index: u64, size: u64, window: u64, samples: u64) -> u64 {
     let last_start = size.saturating_sub(window);
-    if samples <= 1 {
-        last_start / 2
-    } else {
-        index.saturating_mul(last_start) / (samples - 1)
-    }
+    let samples = samples.max(1);
+    let stratum = size / samples;
+    let start = index
+        .saturating_mul(stratum)
+        .saturating_add(stratum.saturating_sub(window) / 2);
+    start.min(last_start)
 }
 
 /// Reads until the buffer is full or the file ends.
@@ -877,6 +889,85 @@ mod tests {
         }
         check_eq(sample_block(0, 1, 1), 0, "single-block file")?;
         check_eq(sample_block(0, 9, 1), 4, "one sample uses the middle")
+    }
+
+    /// Saving fraction of a file under the pair estimator with a 1 MiB budget.
+    fn paired_saving_ratio(bytes: Vec<u8>) -> Result<f64, String> {
+        let tmp = tempfile::tempdir().ctx("tempdir")?;
+        let path = tmp.path().join("body.pak");
+        let size = write_file(&path, bytes)?;
+        let file = std::fs::File::open(&path).ctx("open body.pak")?;
+        let opts = EstimateOpts {
+            level: 3,
+            mount_level: None,
+        };
+        let (native, _) = estimate_open_file_pair(
+            &file,
+            size,
+            PreviewEstimate {
+                native: &BtrfsModel { level: 3 },
+                native_opts: &opts,
+                measured: None,
+                maximum: &PackModel { level: 3 },
+                maximum_opts: &opts,
+                byte_cap: 1024 * 1024,
+            },
+        )
+        .ctx("estimate body.pak")?;
+        check(native.sampled > 0, "something was sampled")?;
+        Ok(native.saving() as f64 / native.disk_now.max(1) as f64)
+    }
+
+    fn shaped(head: &[u8], body: &[u8], tail: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(head);
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(tail);
+        bytes
+    }
+
+    #[test]
+    fn sampling_sees_the_body_not_only_the_head_and_tail() -> TestResult {
+        let edge = vec![0u8; 512 * 1024];
+        let mib = 1024 * 1024;
+        // Controls: a file that is all zeros must save, all noise must not.
+        check(
+            paired_saving_ratio(vec![0u8; 8 * mib])? > 0.9,
+            "control: zeros compress",
+        )?;
+        check(
+            paired_saving_ratio(noise(8 * mib))? < 0.05,
+            "control: noise does not",
+        )?;
+        let packed = shaped(&edge, &noise(7 * mib), &edge);
+        let ratio = paired_saving_ratio(packed)?;
+        check(
+            ratio < 0.3,
+            format!("compressible edges around noise saved {ratio:.3} of the file"),
+        )?;
+        let loose = shaped(&noise(512 * 1024), &vec![0u8; 7 * mib], &noise(512 * 1024));
+        let ratio = paired_saving_ratio(loose)?;
+        check(
+            ratio > 0.7,
+            format!("noise edges around a compressible body saved {ratio:.3}"),
+        )
+    }
+
+    #[test]
+    fn sample_windows_stay_inside_the_file_and_do_not_overlap() -> TestResult {
+        let size = 9 * 1024 * 1024;
+        let window = 128 * 1024;
+        let mut last_end = 0;
+        for index in 0..8 {
+            let start = sample_offset(index, size, window, 8);
+            check(start >= last_end, "windows do not overlap")?;
+            check(start + window <= size, "a window ends inside the file")?;
+            last_end = start + window;
+        }
+        check(
+            sample_offset(7, size, window, 8) > size / 2,
+            "the last window is in the back half",
+        )
     }
 
     #[test]
