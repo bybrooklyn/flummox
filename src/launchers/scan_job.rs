@@ -20,7 +20,11 @@ pub enum Event {
 pub struct Worker {
     receiver: mpsc::Receiver<Event>,
     cancel: Arc<AtomicBool>,
+    started: std::time::Instant,
 }
+
+/// How long a scan may run before the coordinator should abandon it.
+pub const SCAN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 impl Worker {
     /// Starts scanning `env` in the background.
     pub fn start(env: Env) -> Self {
@@ -33,12 +37,22 @@ impl Worker {
             });
             let _sent = send.send(Event::Finished(scan));
         });
-        Self { receiver, cancel }
+        Self {
+            receiver,
+            cancel,
+            started: std::time::Instant::now(),
+        }
     }
     /// Asks the scan to stop. It checks between sources, so the one being
     /// read finishes first.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
+    }
+    /// Whether the scan has run longer than `limit`. A scan stuck on a dead
+    /// network mount never checks its cancel flag, so the caller drops the
+    /// worker, raises a warning and treats game states as unknown.
+    pub fn overdue(&self, limit: std::time::Duration) -> bool {
+        self.started.elapsed() > limit
     }
     /// Whether `cancel` was called.
     pub fn cancelled(&self) -> bool {
@@ -78,6 +92,20 @@ impl Drop for Worker {
 mod tests {
     use super::*;
     use crate::testutil::{Ctx, TestResult, check};
+    #[test]
+    fn a_worker_reports_when_it_has_run_too_long() -> TestResult {
+        let fixture = tempfile::tempdir().ctx("discovery fixture")?;
+        let worker = Worker::start(Env::from_home(fixture.path()));
+        check(
+            !worker.overdue(std::time::Duration::from_secs(3600)),
+            "a new worker is not overdue",
+        )?;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        check(
+            worker.overdue(std::time::Duration::ZERO),
+            "any worker is overdue against a zero limit",
+        )
+    }
     #[test]
     fn cancellation_stops_later_providers_and_worker_finishes() -> TestResult {
         let fixture = tempfile::tempdir().ctx("discovery fixture")?;

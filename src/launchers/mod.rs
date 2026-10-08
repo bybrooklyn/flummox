@@ -122,13 +122,16 @@ pub(crate) fn scan_with(
     // missing drive listed as broken. Manual games are kept only while a
     // configured location still covers them. Skipped for fixture homes.
     if Env::current().is_some_and(|current| current.home == env.home) {
-        let libraries = crate::jobs::configured_libraries().unwrap_or_default();
-        let keep = |game: &Game| {
-            game.id.launcher != crate::model::Launcher::Manual
-                || libraries
-                    .iter()
-                    .any(|library| game.install_dir.starts_with(&library.path))
-        };
+        // When the settings cannot be read, keep every remembered game. An empty
+        // list would make `keep` refuse all of them and delete the offline ones.
+        let libraries = crate::jobs::configured_libraries();
+        if let Err(error) = &libraries {
+            scan.warnings.push(DetectError::new(
+                "Reading custom folders",
+                std::io::Error::other(error.to_string()),
+            ));
+        }
+        let keep = |game: &Game| remembered_game_kept(libraries.as_ref().ok(), game);
         match crate::libraries::data_dir()
             .and_then(|root| crate::libraries::remember(&root, scan.games.clone(), keep))
         {
@@ -140,4 +143,45 @@ pub(crate) fn scan_with(
         }
     }
     Some(scan)
+}
+
+/// Whether a remembered game stays. Without a configured-locations list, which
+/// is `None` when the settings could not be read, every game stays.
+fn remembered_game_kept(libraries: Option<&Vec<crate::jobs::Library>>, game: &Game) -> bool {
+    let Some(libraries) = libraries else {
+        return true;
+    };
+    game.id.launcher != crate::model::Launcher::Manual
+        || libraries
+            .iter()
+            .any(|library| game.install_dir.starts_with(&library.path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{GameId, InstallState, Launcher};
+    use crate::testutil::{TestResult, check};
+
+    #[test]
+    fn an_unreadable_settings_list_keeps_remembered_manual_games() -> TestResult {
+        let game = Game {
+            id: GameId::new(Launcher::Manual, "/mnt/offline/game"),
+            also: vec![],
+            title: "Offline".into(),
+            install_dir: "/mnt/offline/game".into(),
+            build: None,
+            size_hint: None,
+            state: InstallState::Idle,
+            is_tool: false,
+        };
+        check(
+            remembered_game_kept(None, &game),
+            "no list means keep everything",
+        )?;
+        check(
+            !remembered_game_kept(Some(&vec![]), &game),
+            "an empty list means the location was removed",
+        )
+    }
 }

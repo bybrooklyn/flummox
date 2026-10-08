@@ -43,12 +43,30 @@ pub fn discover_catalog() -> Result<crate::desktop_discovery::Catalog> {
         catalog
     };
     let root = libraries::data_dir()?;
-    let preferences = crate::desktop::Preferences::load(&root)?;
-    let (custom, warnings) = preferences.custom_games();
-    catalog.games.extend(custom);
-    catalog.warnings.extend(warnings);
+    // A preferences file or cache that cannot be used costs the custom folders or
+    // the remembered offline games, never the whole catalog.
+    let preferences = match crate::desktop::Preferences::load(&root) {
+        Ok(preferences) => Some(preferences),
+        Err(error) => {
+            catalog
+                .warnings
+                .push(format!("Reading saved locations: {error}"));
+            None
+        }
+    };
+    if let Some(preferences) = &preferences {
+        let (custom, warnings) = preferences.custom_games();
+        catalog.games.extend(custom);
+        catalog.warnings.extend(warnings);
+    }
     catalog = catalog.finish();
-    catalog.games = libraries::remember(&root, catalog.games, |game| preferences.keeps(game))?;
+    let keep = |game: &Game| preferences.as_ref().is_none_or(|p| p.keeps(game));
+    match libraries::remember(&root, catalog.games.clone(), keep) {
+        Ok(games) => catalog.games = games,
+        Err(error) => catalog
+            .warnings
+            .push(format!("Remembering offline libraries: {error}")),
+    }
     Ok(catalog)
 }
 /// The games of `discover_catalog`, without its warnings or artwork roots.

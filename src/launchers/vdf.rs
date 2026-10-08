@@ -489,7 +489,11 @@ mod tests {
         let closing = parse("\"r\" { \"k\" /}").ctx("slash before a brace")?;
         check_eq(closing.get_str("k"), Some("/"), "the brace still closes")?;
         let lines = parse("\"r\" {\n\"a\" /x\n\"b\" 1 }").ctx("line count")?;
-        check_eq(lines.get_str("b"), Some("1"), "the entry after a slash token")
+        check_eq(
+            lines.get_str("b"),
+            Some("1"),
+            "the entry after a slash token",
+        )
     }
 
     #[test]
