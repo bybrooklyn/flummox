@@ -185,10 +185,14 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         .width(if compact { 72 } else { 208 })
         .height(Length::Fill)
         .style(theme::sidebar);
+    // The scan banner, the wizard and the plan each keep a slot in the column
+    // while absent. Widget state is matched by position, so a child that came
+    // and went would shift the page and reset its scrolling and focus.
+    let absent = || Element::from(Space::new());
     // Banner shown while the worker is discovering games.
     let mut body = column![].spacing(0).width(Length::Fill);
-    if let Some(source) = &state.snapshot.scan_source {
-        body = body.push(
+    body = body.push(match &state.snapshot.scan_source {
+        Some(source) => Element::from(
             container(
                 row![
                     theme::muted(format!(
@@ -201,11 +205,11 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
                 .spacing(12),
             )
             .padding([8, 24]),
-        );
-    }
-
-    if let Some(wizard) = &state.qualification {
-        body = body.push(panel(
+        ),
+        None => absent(),
+    });
+    body = body.push(match &state.qualification {
+        Some(wizard) => panel(
             scrollable(crate::qualification::view(
                 wizard,
                 Message::QualificationField,
@@ -216,8 +220,9 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
                 Message::CloseQualification,
             ))
             .height(Length::Fixed(420.0)),
-        ));
-    }
+        ),
+        None => absent(),
+    });
     // Space plan review. "Start job" is disabled while the plan's own check
     // fails, and the failure is shown above it.
     if let Some((_, plan)) = &state.planned {
@@ -253,6 +258,8 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
             .spacing(8),
         );
         body = body.push(panel(review));
+    } else {
+        body = body.push(absent());
     }
     let page = match state.page {
         Page::Overview => overview(state, compact),
@@ -322,9 +329,13 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         .style(theme::app_background)
         .into();
     // The toast is stacked over the window so it does not move the page. It
-    // fades in and moves 14 pixels into place.
+    // fades in and moves 14 pixels into place. The stack is there without a
+    // toast too, for the reason the column above keeps its slots.
     let Some(status) = &state.status else {
-        return base;
+        return stack([base, Space::new().into()])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
     };
     let reveal = if state.reduced_motion {
         1.0

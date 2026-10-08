@@ -95,9 +95,6 @@ struct Motion {
     target: f32,
     /// `None` while no movement is in progress.
     start: Option<Instant>,
-    /// Where the pointer was at the wheel step. The synthetic scroll events
-    /// are delivered there.
-    cursor: Option<iced::Point>,
     key: &'static str,
 }
 impl Motion {
@@ -155,6 +152,21 @@ impl Operation for Position {
         self.maximum = (content.height - bounds.height).max(0.0);
         self.viewport = bounds.height;
     }
+}
+/// The vertical offset of the first scrollable under `element`, or `None`
+/// when it holds none.
+#[cfg(test)]
+pub fn offset<Message>(
+    element: &mut Element<'_, Message>,
+    tree: &mut Tree,
+    layout: Layout<'_>,
+    renderer: &iced::Renderer,
+) -> Option<f32> {
+    let mut position = Position::default();
+    element
+        .as_widget_mut()
+        .operate(tree, layout, renderer, &mut position);
+    position.found.then_some(position.current)
 }
 impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Message> {
     fn size(&self) -> Size<Length> {
@@ -259,7 +271,6 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
                     position.maximum,
                     Instant::now(),
                 );
-                motion.cursor = cursor.position();
                 shell.capture_event();
                 shell.request_redraw();
                 return;
@@ -276,9 +287,10 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
         ) {
             motion.start = None;
         }
-        // Each frame of a movement: read where the scrollable is, compute
-        // where the easing puts it, and send the child a pixel wheel event
-        // for the difference.
+        // Each frame of a movement: read where the scrollable is and set it to
+        // where the easing puts it. A synthetic wheel event would be captured
+        // by the scrollable, and a button given a captured redraw event
+        // returns before refreshing its status.
         if let Event::Window(iced::window::Event::RedrawRequested(now)) = event
             && let Some(start) = motion.start
         {
@@ -286,32 +298,21 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Surface<'_, Messa
             self.content
                 .as_widget_mut()
                 .operate(child, bounds, renderer, &mut position);
-            let delta = position.current - motion.value(*now).clamp(0.0, position.maximum);
-            let wheel = Event::Mouse(mouse::Event::WheelScrolled {
-                delta: mouse::ScrollDelta::Pixels { x: 0.0, y: delta },
-            });
-            let wheel_cursor = motion
-                .cursor
-                .map(mouse::Cursor::Available)
-                .unwrap_or(cursor);
-            self.content.as_widget_mut().update(
-                child,
-                &wheel,
-                bounds,
-                wheel_cursor,
-                renderer,
-                clipboard,
-                shell,
-                viewport,
+            let mut scroll = widget::operation::scrollable::scroll_to::<()>(
+                widget::Id::new(self.key),
+                widget::operation::scrollable::AbsoluteOffset {
+                    x: None,
+                    y: Some(motion.value(*now).clamp(0.0, position.maximum)),
+                },
             );
-            // The synthetic wheel changes widget state during a redraw event.
-            // Request another frame even when the easing reaches its endpoint.
-            shell.request_redraw();
+            self.content
+                .as_widget_mut()
+                .operate(child, bounds, renderer, &mut scroll);
             if now.saturating_duration_since(start) >= Duration::from_millis(100) {
                 motion.start = None;
-            } else {
-                shell.request_redraw();
             }
+            // One more frame after the endpoint draws the final offset.
+            shell.request_redraw();
         }
         self.content.as_widget_mut().update(
             child, event, bounds, cursor, renderer, clipboard, shell, viewport,
@@ -603,6 +604,74 @@ mod tests {
             )?;
         }
         Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_eased_frame_leaves_the_redraw_event_uncaptured() -> TestResult {
+        let mut element: Element<'_, ()> = surface(
+            iced::widget::scrollable(iced::widget::Space::new().height(1000).width(200))
+                .id("fixture")
+                .height(200)
+                .width(200),
+            0.0,
+            true,
+            "fixture",
+        );
+        let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
+            iced::Font::DEFAULT,
+            iced::Pixels(16.0),
+        ));
+        let widget = element.as_widget_mut();
+        let mut tree = Tree::new(&*widget);
+        let node = widget.layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(200.0, 200.0)),
+        );
+        let bounds = Layout::new(&node);
+        let viewport = Rectangle::with_size(Size::new(200.0, 200.0));
+        let cursor = mouse::Cursor::Available(iced::Point::new(50.0, 50.0));
+        let mut messages = vec![];
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let mut dispatch = |tree: &mut Tree, event: Event| {
+            let mut shell = Shell::new(&mut messages);
+            widget.update(
+                tree,
+                &event,
+                bounds,
+                cursor,
+                &renderer,
+                &mut clipboard,
+                &mut shell,
+                &viewport,
+            );
+            shell.is_event_captured()
+        };
+        check(
+            dispatch(
+                &mut tree,
+                Event::Mouse(mouse::Event::WheelScrolled {
+                    delta: mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+                }),
+            ),
+            "control: the wheel step itself is captured",
+        )?;
+        // A button returns before refreshing its status when the event it is
+        // given is already captured, and then draws as disabled.
+        let captured = dispatch(
+            &mut tree,
+            Event::Window(iced::window::Event::RedrawRequested(
+                Instant::now() + Duration::from_millis(50),
+            )),
+        );
+        drop(dispatch);
+        let mut position = Position::default();
+        widget.operate(&mut tree, bounds, &renderer, &mut position);
+        check(
+            position.current > 0.0 && position.current < 60.0,
+            "the frame moved the content part of the way",
+        )?;
+        check(!captured, "the redraw event reaches later widgets uncaptured")
     }
     #[test]
     fn wheel_retargets_reverses_and_stops_at_its_clamped_target() -> TestResult {

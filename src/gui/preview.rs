@@ -353,3 +353,91 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
     state.connection_error = Some("Worker disconnected; reconnecting".into());
     render(&state, 1100, 1800, &output.join("jobs-disconnected.png"))
 }
+
+/// A toast or the scan banner changes which widgets the window holds. The
+/// page keeps its scroll offset through both.
+#[test]
+fn a_toast_or_scan_banner_leaves_the_page_where_it_was_scrolled() -> TestResult {
+    use iced::advanced::{Layout, layout, widget::Tree};
+    let temp = tempfile::tempdir().ctx("scroll fixture")?;
+    let mut state = State::new(Env::from_home(temp.path()));
+    state.reduced_motion = true;
+    state.page = Page::Games;
+    for number in 0..30 {
+        state.games.push(GameRow {
+            game: Game {
+                id: GameId::new(Launcher::Manual, format!("game-{number}")),
+                also: vec![],
+                title: format!("Game {number}"),
+                install_dir: temp.path().join(format!("game-{number}")),
+                state: InstallState::Idle,
+                size_hint: Some(1_000_000_000),
+                build: Some("1".into()),
+                is_tool: false,
+            },
+            filesystem: "btrfs".into(),
+            mountpoint: Some(temp.path().to_path_buf()),
+            supported: true,
+            native_supported: true,
+            pack_supported: false,
+            note: None,
+            artwork: None,
+            cover: None,
+        });
+    }
+    let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
+        super::theme::BODY_FONT,
+        iced::Pixels(16.0),
+    ));
+    let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(1100.0, 720.0));
+    // Lays the window out against the same widget tree and reads the page's
+    // offset, scrolling to `scroll_to` first when one is given.
+    let offset = |state: &State, tree: &mut Option<Tree>, scroll_to: Option<f32>| {
+        let mut element = view::view(state);
+        let tree = match tree {
+            Some(tree) => {
+                tree.diff(element.as_widget());
+                tree
+            }
+            None => tree.insert(Tree::new(element.as_widget())),
+        };
+        let node = element.as_widget_mut().layout(tree, &renderer, &limits);
+        if let Some(y) = scroll_to {
+            let mut scroll = iced::advanced::widget::operation::scrollable::scroll_to::<()>(
+                iced::widget::Id::new("Games"),
+                iced::widget::operation::AbsoluteOffset {
+                    x: None,
+                    y: Some(y),
+                },
+            );
+            element
+                .as_widget_mut()
+                .operate(tree, Layout::new(&node), &renderer, &mut scroll);
+        }
+        super::surface::offset(&mut element, tree, Layout::new(&node), &renderer)
+    };
+    let mut tree = None;
+    crate::testutil::check_eq(
+        offset(&state, &mut tree, Some(300.0)),
+        Some(300.0),
+        "control: the page scrolls to where it is sent",
+    )?;
+    state.show_status(super::app::Status::info("Saved"));
+    crate::testutil::check_eq(
+        offset(&state, &mut tree, None),
+        Some(300.0),
+        "a toast appearing keeps the offset",
+    )?;
+    state.status = None;
+    crate::testutil::check_eq(
+        offset(&state, &mut tree, None),
+        Some(300.0),
+        "a toast leaving keeps the offset",
+    )?;
+    state.snapshot.scan_source = Some("Steam".into());
+    crate::testutil::check_eq(
+        offset(&state, &mut tree, None),
+        Some(300.0),
+        "the scan banner appearing keeps the offset",
+    )
+}
