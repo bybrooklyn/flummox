@@ -93,7 +93,9 @@ impl Anchor {
                 format!("{} escapes the install directory", rel.display()),
             ));
         }
-        let flags = flags | OFlags::CLOEXEC;
+        // A file swapped for a FIFO after the walk would block a plain open
+        // until someone wrote to it. Regular files ignore the flag.
+        let flags = flags | OFlags::CLOEXEC | OFlags::NONBLOCK;
         let fd = if self.fully_resolved {
             rustix::fs::openat2(
                 &self.dir,

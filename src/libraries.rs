@@ -31,6 +31,8 @@ pub fn data_dir() -> Result<PathBuf> {
     #[cfg(not(any(windows, target_os = "macos")))]
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
+        // The XDG specification says to ignore a relative value.
+        .filter(|path| path.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")));
     Ok(base
         .context("Cannot locate local application state")?

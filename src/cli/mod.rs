@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use humansize::{DECIMAL, format_size};
 
@@ -628,14 +628,37 @@ fn scan(env: &Env) -> Scan {
     scan
 }
 
+/// The games a selector names.
+///
+/// An id beats a title, and a whole title beats part of one. Otherwise
+/// "Portal" could never be chosen while "Portal 2" is installed, and a number
+/// in a title could stand in for another launcher's id.
+fn select_games(games: Vec<Game>, selector: &str) -> Vec<Game> {
+    let wanted = selector.trim();
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let by_id = |g: &Game| {
+        g.ids()
+            .any(|id| id.to_string().eq_ignore_ascii_case(wanted) || id.key == wanted)
+    };
+    let by_title = |g: &Game| g.title.eq_ignore_ascii_case(wanted);
+    if games.iter().any(by_id) {
+        games.into_iter().filter(by_id).collect()
+    } else if games.iter().any(by_title) {
+        games.into_iter().filter(by_title).collect()
+    } else {
+        games.into_iter().filter(|g| g.matches(wanted)).collect()
+    }
+}
+
 /// Finds the one game a selector names.
 fn find_game(env: &Env, selector: &str) -> Result<Game> {
-    let scan = scan(env);
-    let matches: Vec<Game> = scan
-        .games
-        .into_iter()
-        .filter(|g| g.matches(selector))
-        .collect();
+    ensure!(
+        !selector.trim().is_empty(),
+        "name a game; try `flummox scan`"
+    );
+    let matches = select_games(scan(env).games, selector);
     match matches.len() {
         0 => bail!("no game matches {selector:?}; try `flummox scan`"),
         1 => matches.into_iter().next().context("no game"),
@@ -1020,6 +1043,7 @@ fn cmd_compress(
     cancel: &Arc<AtomicBool>,
 ) -> Result<()> {
     let game = find_game(env, selector)?;
+    crate::jobs::validate_folder(&game.install_dir)?;
     let opts = level.opts(threads);
     let (fs, backend) = backend_for(&game.install_dir)?;
     check_idle(&game, force)?;
@@ -1280,6 +1304,7 @@ fn cmd_compress(
 
 fn cmd_decompress(env: &Env, selector: &str, force: bool, cancel: &Arc<AtomicBool>) -> Result<()> {
     let game = find_game(env, selector)?;
+    crate::jobs::validate_folder(&game.install_dir)?;
     if !force {
         return queued_job(
             game,
@@ -1608,12 +1633,50 @@ fn systemctl(args: &[&str]) -> Result<bool> {
     Ok(status.success())
 }
 
+/// Quotes an executable path for a unit's `ExecStart=`.
+///
+/// systemd splits an unquoted value at spaces and expands `%` and `$`, so a
+/// build unpacked under a path with a space would start a different program.
+fn unit_exec(exe: &Path) -> Result<String> {
+    let text = exe
+        .to_str()
+        .context("this executable's path is not valid UTF-8")?;
+    ensure!(
+        !text.chars().any(char::is_control),
+        "this executable's path contains a control character"
+    );
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('"');
+    for character in text.chars() {
+        match character {
+            '\\' | '"' => {
+                quoted.push('\\');
+                quoted.push(character);
+            }
+            '%' | '$' => {
+                quoted.push(character);
+                quoted.push(character);
+            }
+            _ => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    Ok(quoted)
+}
+
 /// Installs the user unit and starts it.
 fn service_enable() -> Result<()> {
     let dir = unit_dir().context("neither XDG_CONFIG_HOME nor HOME is set")?;
     let exe = std::env::current_exe().context("finding this executable")?;
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(UNIT_NAME);
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        ensure!(
+            existing.starts_with(UNIT_MARKER),
+            "{} exists and this tool did not write it",
+            path.display()
+        );
+    }
     // The running binary's own path is written in, so a build started from a
     // working tree runs that build rather than one installed elsewhere.
     let unit = format!(
@@ -1633,7 +1696,7 @@ fn service_enable() -> Result<()> {
          \n\
          [Install]\n\
          WantedBy=default.target\n",
-        exe.display()
+        unit_exec(&exe)?
     );
     std::fs::write(&path, unit).with_context(|| format!("writing {}", path.display()))?;
     systemctl(&["daemon-reload"])?;
@@ -1714,7 +1777,9 @@ fn cmd_watch(
             println!("  (dry run, nothing written)");
             return;
         }
-        let selector = app.appid.to_string();
+        // The full id, so a missing Steam folder cannot fall through to
+        // another launcher's game with this number in its title.
+        let selector = format!("steam:{}", app.appid);
         if let Err(e) = cmd_compress(env, &selector, level, threads, false, false, false, cancel) {
             eprintln!("warning: could not compress {}: {e:#}", app.name);
         }
@@ -2023,7 +2088,7 @@ fn parse_kernel_version(release: &str) -> (u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use crate::testutil::{Ctx, TestResult, check_eq};
+    use crate::testutil::{Ctx, TestResult, check, check_eq};
 
     use super::*;
 
@@ -2048,6 +2113,56 @@ mod tests {
         // clap's own consistency check over the derived command tree.
         Cli::command().debug_assert();
         Ok(())
+    }
+
+    #[test]
+    fn a_selector_prefers_an_id_then_a_whole_title() -> TestResult {
+        let game = |launcher, key: &str, title: &str| Game {
+            id: crate::model::GameId::new(launcher, key),
+            also: vec![],
+            title: title.into(),
+            install_dir: format!("/fixture/{key}").into(),
+            build: None,
+            size_hint: None,
+            state: crate::model::InstallState::Idle,
+            is_tool: false,
+        };
+        let games = || {
+            vec![
+                game(crate::model::Launcher::Steam, "400", "Portal"),
+                game(crate::model::Launcher::Steam, "620", "Portal 2"),
+                game(crate::model::Launcher::Manual, "elsewhere", "Area 620"),
+            ]
+        };
+        let titles = |selector: &str| -> Vec<String> {
+            select_games(games(), selector)
+                .into_iter()
+                .map(|g| g.title)
+                .collect()
+        };
+        check_eq(titles("portal"), vec!["Portal".to_owned()], "whole title")?;
+        check_eq(titles("620"), vec!["Portal 2".to_owned()], "id over title")?;
+        check_eq(titles("steam:620"), vec!["Portal 2".to_owned()], "full id")?;
+        check_eq(titles("port").len(), 2, "part of a title still matches")?;
+        check(titles("  ").is_empty(), "an empty selector names nothing")
+    }
+
+    #[test]
+    fn a_unit_path_is_quoted_so_systemd_reads_one_word() -> TestResult {
+        check_eq(
+            unit_exec(Path::new("/usr/bin/flummox")).ctx("plain")?,
+            "\"/usr/bin/flummox\"".to_owned(),
+            "a plain path",
+        )?;
+        check_eq(
+            unit_exec(Path::new("/tmp/my build/50%/$HOME/a\"b\\c")).ctx("awkward")?,
+            "\"/tmp/my build/50%%/$$HOME/a\\\"b\\\\c\"".to_owned(),
+            "spaces stay inside the quotes and specifiers are doubled",
+        )?;
+        check(
+            unit_exec(Path::new("/tmp/a\nExecStartPre=/bin/evil")).is_err(),
+            "a newline cannot add a directive",
+        )
     }
 
     #[test]

@@ -192,8 +192,10 @@ pub fn tier_for(fs: &FsInfo) -> Tier {
 
 /// Reads and parses `/proc/self/mountinfo`.
 pub fn mounts() -> io::Result<Vec<MountEntry>> {
-    let text = std::fs::read_to_string("/proc/self/mountinfo")?;
-    Ok(parse_mountinfo(&text))
+    // One mount point that is not UTF-8, which any user's FUSE mount can
+    // supply, must not make every other mount unreadable.
+    let bytes = std::fs::read("/proc/self/mountinfo")?;
+    Ok(parse_mountinfo(&String::from_utf8_lossy(&bytes)))
 }
 
 /// Parses the contents of a `mountinfo` file.

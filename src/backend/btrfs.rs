@@ -122,8 +122,9 @@ fn compress_range(file: &File, level: i32, start: u64, len: u64) -> io::Result<i
         compress_level: level.clamp(-15, 15) as i8,
         ..DefragRangeArgs::default()
     };
-    // SAFETY: `file` is an open btrfs file and `args` is a correctly laid out
-    // `btrfs_ioctl_defrag_range_args` that outlives the call.
+    // SAFETY: `file` is open for the call and `args` is a correctly laid out
+    // `btrfs_ioctl_defrag_range_args` that outlives it. A file on another
+    // filesystem makes the kernel return ENOTTY.
     let result = unsafe { btrfs_defrag_range(file.as_raw_fd(), &args) };
     match result {
         Ok(_) => Ok(level),
@@ -171,8 +172,9 @@ fn decompress_range(file: &File, start: u64, len: u64) -> io::Result<()> {
         flags: DEFRAG_RANGE_NOCOMPRESS | DEFRAG_RANGE_START_IO,
         ..DefragRangeArgs::default()
     };
-    // SAFETY: `file` is an open btrfs file and `args` is a correctly laid out
-    // `btrfs_ioctl_defrag_range_args` that outlives the call.
+    // SAFETY: `file` is open for the call and `args` is a correctly laid out
+    // `btrfs_ioctl_defrag_range_args` that outlives it. A file on another
+    // filesystem makes the kernel return ENOTTY.
     unsafe { btrfs_defrag_range(file.as_raw_fd(), &args) }
         .map(|_| ())
         .map_err(errno_to_io)
@@ -273,9 +275,8 @@ pub fn compressed_bytes_fd(file: &File) -> io::Result<(u64, u64)> {
             reserved: 0,
         };
         let ptr = buf.as_mut_ptr();
-        // SAFETY: `buf` is at least `size_of::<Fiemap>()` bytes and correctly
-        // aligned for it, since `Vec<u8>` allocations are word aligned and
-        // `Fiemap` contains only integers.
+        // SAFETY: `buf` is at least `size_of::<Fiemap>()` bytes, and an
+        // unaligned write needs no more than that.
         unsafe { std::ptr::write_unaligned(ptr.cast::<Fiemap>(), query) };
         // SAFETY: `fd` is open and `buf` is a fiemap header followed by room
         // for `FIEMAP_BATCH` extents, as the ioctl requires.
@@ -356,7 +357,9 @@ impl BtrfsBackend {
         }
         let targets: Vec<_> = inv.to_compress().collect();
         let files = targets.len() as u64;
-        let bytes = targets.iter().map(|f| f.size).sum();
+        let bytes = targets
+            .iter()
+            .fold(0u64, |total, f| total.saturating_add(f.size));
         ctx.events.event(Event::Started { files, bytes });
         if files == 0 {
             return Ok(Outcome {
@@ -574,7 +577,13 @@ impl Backend for BtrfsBackend {
             })
             .reduce(
                 || (0u64, 0u64, 0u64),
-                |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
+                |a, b| {
+                    (
+                        a.0.saturating_add(b.0),
+                        a.1.saturating_add(b.1),
+                        a.2.saturating_add(b.2),
+                    )
+                },
             );
         Ok(CompressionStatus {
             compressed_bytes: compressed,
