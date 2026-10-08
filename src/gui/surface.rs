@@ -155,7 +155,7 @@ impl Operation for Position {
 }
 /// The vertical offset of the first scrollable under `element`, or `None`
 /// when it holds none.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub fn offset<Message>(
     element: &mut Element<'_, Message>,
     tree: &mut Tree,
