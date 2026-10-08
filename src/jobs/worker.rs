@@ -234,7 +234,7 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
         |r| r.get::<_, String>(0),
     )? {
         let (entry, level): (inventory::FileEntry, i32) = serde_json::from_str(&row?)?;
-        if job.operation == Operation::Decompress || level >= job.options.level_plan().floor() {
+        if job.operation == Operation::Decompress || level >= job.options.attainable_floor() {
             completed.insert(entry.rel.clone(), (entry, level));
         }
     }

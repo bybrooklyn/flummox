@@ -247,9 +247,17 @@ pub struct BackgroundScan {
 impl BackgroundScan {
     /// Scans once before returning, then again every `every`.
     pub fn start(dir: PathBuf, every: std::time::Duration) -> Self {
+        Self::start_with(dir, every, ProcFs::new())
+    }
+
+    /// [`start`](Self::start) reading processes from `source`.
+    pub fn start_with<S>(dir: PathBuf, every: std::time::Duration, source: S) -> Self
+    where
+        S: ProcSource + Send + 'static,
+    {
         use std::sync::atomic::Ordering;
         use std::sync::{Arc, Mutex};
-        let latest = Arc::new(Mutex::new(usage(&dir, &ProcFs::new())));
+        let latest = Arc::new(Mutex::new(usage(&dir, &source)));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread = std::thread::Builder::new()
             .name("busy-scan".to_owned())
@@ -263,7 +271,7 @@ impl BackgroundScan {
                             std::thread::sleep(step);
                             waited += step;
                         }
-                        let now = usage(&dir, &ProcFs::new());
+                        let now = usage(&dir, &source);
                         if let Ok(mut slot) = latest.lock() {
                             *slot = now;
                         }
