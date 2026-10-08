@@ -11,94 +11,7 @@ use crate::model::{BusyReason, Game, GameId, InstallState, Launcher};
 use super::vdf;
 use super::{DetectError, Env};
 
-/// `StateFlags` bits from Steam's `EAppState`.
-pub mod state_flags {
-    /// Not installed.
-    pub const UNINSTALLED: u32 = 1;
-    /// An update is required before the game can run.
-    pub const UPDATE_REQUIRED: u32 = 2;
-    /// Installed and complete.
-    pub const FULLY_INSTALLED: u32 = 4;
-    /// Encrypted.
-    pub const ENCRYPTED: u32 = 8;
-    /// Locked.
-    pub const LOCKED: u32 = 16;
-    /// Files are missing.
-    pub const FILES_MISSING: u32 = 32;
-    /// The game is running.
-    pub const APP_RUNNING: u32 = 64;
-    /// Files are corrupt.
-    pub const FILES_CORRUPT: u32 = 128;
-    /// An update is running.
-    pub const UPDATE_RUNNING: u32 = 256;
-    /// An update is paused.
-    pub const UPDATE_PAUSED: u32 = 512;
-    /// An update has started.
-    pub const UPDATE_STARTED: u32 = 1024;
-    /// Being uninstalled.
-    pub const UNINSTALLING: u32 = 2048;
-    /// A backup is running.
-    pub const BACKUP_RUNNING: u32 = 4096;
-    /// Being reconfigured.
-    pub const RECONFIGURING: u32 = 65536;
-    /// Being validated.
-    pub const VALIDATING: u32 = 131_072;
-    /// Files are being added.
-    pub const ADDING_FILES: u32 = 262_144;
-    /// Space is being preallocated.
-    pub const PREALLOCATING: u32 = 524_288;
-    /// Downloading.
-    pub const DOWNLOADING: u32 = 1_048_576;
-    /// Staging downloaded data.
-    pub const STAGING: u32 = 2_097_152;
-    /// Committing staged data.
-    pub const COMMITTING: u32 = 4_194_304;
-    /// An update is stopping.
-    pub const UPDATE_STOPPING: u32 = 8_388_608;
-}
-
-/// Flags that mean Steam is actively working on the files.
-const WORKING_FLAGS: &[(u32, &str)] = &[
-    (state_flags::UPDATE_RUNNING, "updating"),
-    (state_flags::UPDATE_PAUSED, "update paused"),
-    (state_flags::UPDATE_STARTED, "update starting"),
-    (state_flags::UPDATE_STOPPING, "update stopping"),
-    (state_flags::UNINSTALLING, "uninstalling"),
-    (state_flags::BACKUP_RUNNING, "backing up"),
-    (state_flags::RECONFIGURING, "reconfiguring"),
-    (state_flags::VALIDATING, "validating"),
-    (state_flags::ADDING_FILES, "adding files"),
-    (state_flags::PREALLOCATING, "preallocating"),
-    (state_flags::DOWNLOADING, "downloading"),
-    (state_flags::STAGING, "staging"),
-    (state_flags::COMMITTING, "committing"),
-    (state_flags::LOCKED, "locked"),
-];
-
-/// Whether Steam is still working on an app's files.
-///
-/// Reads the same table the scan reports from, so a bit added there is
-/// honoured here without a second list to keep in step.
-pub fn is_working(flags: u32) -> bool {
-    WORKING_FLAGS.iter().any(|(bit, _)| flags & bit != 0)
-}
-
-/// Appids that are runtimes or redistributables rather than games.
-///
-/// Compressing these would slow every game's startup for almost no gain, so
-/// they are excluded unless the user asks for them by id.
-pub const TOOL_APPIDS: &[u32] = &[
-    228_980,   // Steamworks Common Redistributables
-    1_070_560, // Steam Linux Runtime 1.0 (scout)
-    1_391_110, // Steam Linux Runtime 2.0 (soldier)
-    1_628_350, // Steam Linux Runtime 3.0 (sniper)
-    1_493_710, // Proton Experimental
-    2_180_100, // Proton Hotfix
-    1_826_330, // Proton EasyAntiCheat Runtime
-    1_887_720, // Proton 7.0
-    2_348_590, // Proton 8.0
-    2_805_730, // Proton 9.0
-];
+pub use crate::model::steam_state::{TOOL_APPIDS, is_working, state_flags};
 
 /// One installed app, straight from its `appmanifest_*.acf`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,10 +41,7 @@ pub struct App {
 impl App {
     /// Whether this is a runtime or redistributable rather than a game.
     pub fn is_tool(&self) -> bool {
-        TOOL_APPIDS.contains(&self.appid)
-            || self.name.starts_with("Proton")
-            || self.name.starts_with("Steam Linux Runtime")
-            || self.name.starts_with("Steamworks")
+        crate::model::steam_state::is_tool(self.appid, &self.name)
     }
 
     /// Whether Steam still has bytes to fetch or stage for this app.
@@ -316,57 +226,16 @@ pub fn running_app_id(root: &Path) -> Option<u32> {
     None
 }
 
-/// Whether Steam left files in `steamapps/{downloading,temp}/<appid>`.
-///
-/// Empty leftovers are normal; content means a transfer is in flight.
-fn staging_in_progress(library: &Path, appid: u32) -> bool {
-    ["downloading", "temp"].iter().any(|sub| {
-        let dir = library.join("steamapps").join(sub).join(appid.to_string());
-        std::fs::read_dir(&dir).is_ok_and(|mut e| e.next().is_some())
-    })
-}
-
 /// Works out the state of a group of apps sharing one install directory.
 pub fn group_state(apps: &[App], running: Option<u32>) -> InstallState {
     if apps.iter().any(|a| Some(a.appid) == running) {
         return InstallState::Busy(BusyReason::Running);
     }
     let union = apps.iter().fold(0, |acc, a| acc | a.state_flags);
-    if let Some((_, what)) = WORKING_FLAGS.iter().find(|(bit, _)| union & bit != 0) {
-        return InstallState::Busy(BusyReason::LauncherBusy((*what).to_owned()));
-    }
-    if apps.iter().any(|a| a.transfer_pending())
-        || apps
-            .iter()
-            .any(|a| staging_in_progress(&a.library, a.appid))
-    {
-        return InstallState::Busy(BusyReason::LauncherBusy("transfer in progress".to_owned()));
-    }
-    if union & state_flags::FILES_MISSING != 0 {
-        return InstallState::Broken {
-            detail: "files missing".to_owned(),
-        };
-    }
-    if union & state_flags::FILES_CORRUPT != 0 {
-        return InstallState::Broken {
-            detail: "files corrupt".to_owned(),
-        };
-    }
-    if union & state_flags::UPDATE_REQUIRED != 0 {
-        return InstallState::UpdatePending;
-    }
-    if union & state_flags::FULLY_INSTALLED == 0 {
-        return InstallState::Broken {
-            detail: "not fully installed".to_owned(),
-        };
-    }
-    // Installed and idle as far as the flags go, except Steam sometimes
-    // leaves the running bit set after a crash. `RunningAppID` already said
-    // nothing is running, so this is reported as stale rather than busy.
-    if union & state_flags::APP_RUNNING != 0 {
-        return InstallState::Busy(BusyReason::StaleRunningFlag);
-    }
-    InstallState::Idle
+    let transfer = apps.iter().any(|a| {
+        a.transfer_pending() || crate::model::steam_state::staging_in_progress(&a.library, a.appid)
+    });
+    crate::model::steam_state::classify(union, transfer)
 }
 
 /// Finds every installed Steam game.
