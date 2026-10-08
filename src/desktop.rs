@@ -109,6 +109,85 @@ fn missing(error: &anyhow::Error) -> bool {
         .downcast_ref::<std::io::Error>()
         .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
+/// Renames an unreadable state file to `<name>.corrupt` (then `.corrupt.1`, and so on)
+/// so a fresh one can be written. Returns the new path. The contents are kept.
+pub fn quarantine(path: &Path) -> Result<PathBuf> {
+    let name = path
+        .file_name()
+        .context("State file has no name")?
+        .to_string_lossy()
+        .into_owned();
+    for attempt in 0..100u32 {
+        let suffix = if attempt == 0 {
+            ".corrupt".to_owned()
+        } else {
+            format!(".corrupt.{attempt}")
+        };
+        let target = path.with_file_name(format!("{name}{suffix}"));
+        if !target.exists() {
+            std::fs::rename(path, &target)?;
+            return Ok(target);
+        }
+    }
+    anyhow::bail!("Too many quarantined copies of {}", path.display())
+}
+
+/// Folders that must never be compressed whole, and the folders that contain them.
+#[derive(Debug, Default, Clone)]
+pub struct ProtectedFolders {
+    /// A game folder may not be one of these or hold one: the system root,
+    /// the user profile and the Program Files and ProgramData roots.
+    pub roots: Vec<PathBuf>,
+    /// A game folder may not be inside one of these: the system root.
+    pub trees: Vec<PathBuf>,
+}
+
+impl ProtectedFolders {
+    /// Reads the Windows locations from the environment, canonical where they
+    /// exist. Empty on a system that sets none of these variables.
+    pub fn from_environment() -> Self {
+        let find = |name: &str| {
+            std::env::var_os(name)
+                .map(PathBuf::from)
+                .and_then(|path| path.canonicalize().ok())
+        };
+        let trees: Vec<PathBuf> = ["SystemRoot", "windir"]
+            .iter()
+            .filter_map(|name| find(name))
+            .collect();
+        let mut roots = trees.clone();
+        roots.extend(
+            [
+                "USERPROFILE",
+                "ProgramFiles",
+                "ProgramFiles(x86)",
+                "ProgramW6432",
+                "ProgramData",
+            ]
+            .iter()
+            .filter_map(|name| find(name)),
+        );
+        Self { roots, trees }
+    }
+
+    /// Fails for a filesystem root, for a protected folder or one of its
+    /// ancestors, and for anything inside a protected tree. Expects canonical paths.
+    pub fn check(&self, path: &Path) -> Result<()> {
+        ensure!(path.parent().is_some(), "Choose a game folder, not a drive");
+        ensure!(
+            !self.roots.iter().any(|root| root.starts_with(path)),
+            "{} is a system or profile folder",
+            path.display()
+        );
+        ensure!(
+            !self.trees.iter().any(|tree| path.starts_with(tree)),
+            "{} is inside the Windows folder",
+            path.display()
+        );
+        Ok(())
+    }
+}
+
 impl Preferences {
     /// Loads `desktop.json` from `root`. Without one it migrates the older
     /// `folders.json` list of game folders, and with neither it returns the defaults.
@@ -165,10 +244,8 @@ impl Preferences {
     /// exist and is stored canonical. A filesystem root is refused.
     pub fn add(&mut self, path: &Path, kind: LocationKind) -> Result<()> {
         let path = path.canonicalize()?;
-        ensure!(
-            path.is_dir() && path.parent().is_some(),
-            "Choose an existing game or games library"
-        );
+        ensure!(path.is_dir(), "Choose an existing game or games library");
+        ProtectedFolders::from_environment().check(&path)?;
         if let Some(old) = self
             .locations
             .iter_mut()
@@ -197,6 +274,7 @@ impl Preferences {
     pub fn custom_games(&self) -> (Vec<crate::model::Game>, Vec<String>) {
         let mut games = vec![];
         let mut warnings = vec![];
+        let protected = ProtectedFolders::from_environment();
         for location in &self.locations {
             let paths = if location.kind == LocationKind::Game {
                 vec![location.path.clone()]
@@ -233,14 +311,25 @@ impl Preferences {
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "Custom game".into());
                 let mut game = manual_game(title, path);
+                // Listed but not startable, so a library placed over a drive root
+                // cannot offer the Windows folder as a game.
+                if let Ok(resolved) = game.install_dir.canonicalize()
+                    && protected.check(&resolved).is_err()
+                {
+                    game.state = crate::model::InstallState::Broken {
+                        detail: "System folders cannot be compressed".into(),
+                    };
+                    games.push(game);
+                    continue;
+                }
                 match content_stamp(&game.install_dir) {
                     Ok(stamp) => game.build = Some(format!("local:{stamp}")),
                     // Includes a tree too large to stamp within its limits. The game
-                    // stays listed, and a broken game cannot start a job.
+                    // stays listed and cannot start a job. No warning is added, since
+                    // a warning would hold maintenance for every other game too.
                     Err(error) => {
-                        warnings.push(format!("{}: {error}", game.install_dir.display()));
                         game.state = crate::model::InstallState::Broken {
-                            detail: "Game files could not be inspected".into(),
+                            detail: format!("Game files could not be inspected: {error}"),
                         };
                     }
                 }
@@ -352,13 +441,14 @@ pub fn content_stamp(root: &Path) -> Result<String> {
         fingerprint.update(&(name.len() as u64).to_le_bytes());
         fingerprint.update(name);
         fingerprint.update(&metadata.len().to_le_bytes());
-        fingerprint.update(
-            &metadata
-                .modified()?
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos()
-                .to_le_bytes(),
-        );
+        // A missing or pre-1970 timestamp hashes as zero, so one odd file does not
+        // make the whole game unstampable.
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        fingerprint.update(&modified.to_le_bytes());
     }
     Ok(fingerprint.finalize().to_hex().to_string())
 }
@@ -447,5 +537,78 @@ mod tests {
             second != content_stamp(temp.path()).ctx("new file stamp")?,
             "new files change the stamp",
         )
+    }
+    fn protected() -> ProtectedFolders {
+        ProtectedFolders {
+            roots: vec![
+                "/c/Windows".into(),
+                "/c/Users/me".into(),
+                "/c/Program Files".into(),
+            ],
+            trees: vec!["/c/Windows".into()],
+        }
+    }
+    #[test]
+    fn system_profile_and_program_roots_and_their_ancestors_are_refused() -> TestResult {
+        for refused in [
+            "/",
+            "/c",
+            "/c/Users",
+            "/c/Users/me",
+            "/c/Windows",
+            "/c/Windows/System32",
+            "/c/Program Files",
+        ] {
+            check(
+                protected().check(Path::new(refused)).is_err(),
+                format!("{refused} must be refused"),
+            )?;
+        }
+        // Control: ordinary game folders pass the same check.
+        for allowed in [
+            "/c/Program Files/Some Game",
+            "/c/Users/me/Games",
+            "/d/Games/One",
+        ] {
+            protected()
+                .check(Path::new(allowed))
+                .ctx(format!("{allowed} must be accepted"))?;
+        }
+        Ok(())
+    }
+    #[test]
+    fn unreadable_state_is_renamed_aside_and_never_overwritten() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let file = temp.path().join("native-queue.json");
+        std::fs::write(&file, b"first").ctx("write")?;
+        let first = quarantine(&file).ctx("first quarantine")?;
+        std::fs::write(&file, b"second").ctx("rewrite")?;
+        let second = quarantine(&file).ctx("second quarantine")?;
+        check(!file.exists(), "the original name is free again")?;
+        check_eq(
+            std::fs::read(&first).ctx("first copy")?,
+            b"first".to_vec(),
+            "first copy kept",
+        )?;
+        check_eq(
+            std::fs::read(&second).ctx("second copy")?,
+            b"second".to_vec(),
+            "second copy kept",
+        )
+    }
+    #[test]
+    fn a_file_with_a_timestamp_before_1970_does_not_stop_stamping() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let path = temp.path().join("old.dat");
+        std::fs::write(&path, b"data").ctx("write")?;
+        let before_epoch = std::time::UNIX_EPOCH - std::time::Duration::from_secs(86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .ctx("open")?
+            .set_modified(before_epoch)
+            .ctx("set mtime before 1970")?;
+        content_stamp(temp.path()).ctx("stamp with an old file")?;
+        Ok(())
     }
 }
