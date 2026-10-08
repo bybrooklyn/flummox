@@ -29,14 +29,14 @@ all-features = true
 [advisories]
 # Any crate with a known vulnerability is an error, not a warning. This is the
 # default in the current schema and is restated here because it is the single
-# most important line in the file: a build must fail rather than quietly ship
+# most important line in the file: a build must fail and not ship
 # a known hole in something that holds an open directory handle on a user's
 # games.
 db-urls = ["https://github.com/rustsec/advisory-db"]
 
 # A yanked crate has been withdrawn by its own author, most often because a
 # release was broken or compromised. Continuing to build against one is
-# depending on something nobody is willing to stand behind any more.
+# depending on something its author no longer stands behind.
 yanked = "deny"
 
 # Advisories consciously accepted, each of which must carry a comment saying

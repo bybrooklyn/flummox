@@ -47,7 +47,7 @@ For our Windows friends:
 cargo build --release --features gui
 ```
 
-Anything above here gives you two commands for your favorite terminal emulator, `flummox` for CLI and scripting, and `flummox-gui` for... you won't believe it-- the GUI!
+Anything above here gives you two commands for your favorite terminal emulator, `flummox` for CLI and scripting, and `flummox-gui` for the window.
 
 ## Is this safe?
 

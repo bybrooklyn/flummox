@@ -88,7 +88,7 @@ Parsers never unpack archives or alter their internal format.
 Distributed samples include the first and last blocks. Native Maximum compares
 levels 9 and 15 per file. Maximum Space compares levels 9, 15, 19, and 22 per
 unique chunk and keeps the smallest representation. Update compaction uses the
-same level search, so maintaining a store does not silently lower its compression
+same level search, so maintaining a store keeps its compression
 policy. Workers verify file identity before and after processing. Native btrfs
 rewrites flush dirty pages first so new writes have extents to process.
 
