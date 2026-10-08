@@ -652,6 +652,7 @@ pub enum Message {
     MeasureQualification,
     QualificationMeasured(Result<crate::allocation::Allocation, String>),
     SaveQualification,
+    OpenChangelog,
     CloseQualification,
     QualificationSaved(Result<PathBuf, String>),
     DiagnosticsExported(Result<PathBuf, String>),
@@ -953,6 +954,14 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::CloseQualification => state.qualification = None,
+        Message::OpenChangelog => {
+            if let Err(error) = super::open_changelog() {
+                state.show_status(Status::error(format!(
+                    "Could not open a browser ({error}). The changelog is at {}",
+                    super::CHANGELOG_URL
+                )));
+            }
+        }
         Message::QualificationSaved(result) => match result {
             Ok(path) => {
                 state.qualification = None;

@@ -98,7 +98,7 @@ requires the release automation's SSH key to be registered on the AUR account.
 Commit and push the changes first, then tag that commit and push the tag:
 
 ```sh
-git add .
+git add docs/validation CHANGELOG.md
 git commit -m "Prepare release"
 git push origin main
 git tag -a v0.0.1 -m "Flummox 0.0.1"
