@@ -73,8 +73,7 @@ mod enabled {
     use crate::pack::{Reader, mount};
     use anyhow::{Context, Result, ensure};
     use std::{
-        fs::Permissions,
-        os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+        os::unix::fs::{DirBuilderExt, MetadataExt},
         path::Path,
         sync::atomic::AtomicBool,
     };
@@ -125,7 +124,7 @@ mod enabled {
 
     // The rollback copy is a hidden sibling, so moving the original there is
     // one rename within the same directory.
-    fn backup_for(game: &Path) -> Result<PathBuf> {
+    pub(super) fn backup_for(game: &Path) -> Result<PathBuf> {
         let parent = game.parent().context("The game folder has no parent")?;
         let name = game.file_name().context("The game folder has no name")?;
         Ok(parent.join(format!(".{}.flummox-original", name.to_string_lossy())))
@@ -383,6 +382,14 @@ mod enabled {
         if let Some(backup) = &install.backup_path
             && backup.exists()
         {
+            // The record is read back from disk. Only the folder activation
+            // itself would have made is removed, whatever the record says.
+            ensure!(
+                *backup == backup_for(&install.game_path)?
+                    && std::fs::symlink_metadata(backup)?.is_dir(),
+                "{} is not this game's retained original, so it was left alone",
+                backup.display()
+            );
             std::fs::remove_dir_all(backup).context("Removing the rollback copy")?;
         }
         install.backup_path = None;
@@ -421,6 +428,16 @@ mod enabled {
                 previous != &install.store_path,
                 "The previous and current stores use the same path"
             );
+            // The record is read back from disk, so the path must still hold
+            // a store before anything under it is removed.
+            if std::fs::symlink_metadata(previous).is_ok() {
+                Reader::open(previous).with_context(|| {
+                    format!(
+                        "{} is not a store, so it was left alone",
+                        previous.display()
+                    )
+                })?;
+            }
             let removed = if previous.is_dir() {
                 std::fs::remove_dir_all(previous)
             } else {
@@ -436,6 +453,12 @@ mod enabled {
             ensure!(
                 previous != &install.writes_path,
                 "The previous and current update layers use the same path"
+            );
+            ensure!(
+                std::fs::symlink_metadata(previous).is_err()
+                    || crate::pack::overlay::Overlay::is_layer(previous),
+                "{} is not an update layer, so it was left alone",
+                previous.display()
             );
             match std::fs::remove_dir_all(previous) {
                 Ok(()) => {}
@@ -526,9 +549,8 @@ mod enabled {
         let restored = staging.path().join("game");
         crate::pack::restore(&install.store_path, &restored, cancel)?;
         crate::pack::overlay::Overlay::open(&install.writes_path)?.apply_to(&restored)?;
-        publish(&restored)?;
-        std::fs::set_permissions(&install.game_path, Permissions::from_mode(0o755))?;
-        Ok(())
+        // The restored folder already carries the mode the store recorded.
+        publish(&restored)
     }
 }
 
@@ -540,6 +562,60 @@ mod tests {
     use super::*;
     use crate::testutil::{Ctx, TestResult, check, check_eq};
     use std::sync::atomic::AtomicBool;
+
+    fn record(game: &std::path::Path, phase: InstallPhase) -> Install {
+        Install {
+            game_path: game.to_path_buf(),
+            store_path: game.with_extension("flumpack"),
+            writes_path: game.with_extension("updates"),
+            backup_path: None,
+            previous_store_path: None,
+            previous_writes_path: None,
+            summary: None,
+            phase,
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn an_edited_record_cannot_point_deletion_at_another_folder() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let game = temp.path().join("game");
+        let documents = temp.path().join("documents");
+        std::fs::create_dir(&documents).ctx("other folder")?;
+        std::fs::write(documents.join("notes.txt"), b"keep").ctx("other file")?;
+
+        let mut reclaiming = record(&game, InstallPhase::Reclaiming);
+        reclaiming.backup_path = Some(documents.clone());
+        check(
+            finish_reclaim(&mut reclaiming).is_err(),
+            "reclaim refuses a path that is not the retained original",
+        )?;
+        let mut pruning = record(&game, InstallPhase::Pruning);
+        pruning.previous_store_path = Some(documents.clone());
+        check(
+            finish_prune(&mut pruning).is_err(),
+            "prune refuses a previous store that is not a store",
+        )?;
+        let mut pruning = record(&game, InstallPhase::Pruning);
+        pruning.previous_writes_path = Some(documents.clone());
+        check(
+            finish_prune(&mut pruning).is_err(),
+            "prune refuses a previous layer that is not a layer",
+        )?;
+        check(
+            documents.join("notes.txt").exists(),
+            "the other folder is untouched",
+        )?;
+
+        // Control: the folder activation would have made is removed.
+        let original = backup_for(&game).ctx("expected name")?;
+        std::fs::create_dir(&original).ctx("retained original")?;
+        let mut reclaiming = record(&game, InstallPhase::Reclaiming);
+        reclaiming.backup_path = Some(original.clone());
+        finish_reclaim(&mut reclaiming).ctx("reclaim the real original")?;
+        check(!original.exists(), "the retained original is removed")
+    }
 
     #[test]
     fn activation_refuses_a_store_for_different_source_bytes() -> TestResult {

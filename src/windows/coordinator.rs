@@ -269,6 +269,18 @@ fn start(job: &Job) -> Active {
         drive_online: true,
     }
 }
+/// A moment far enough back that anything timed from it is due.
+///
+/// Windows counts `Instant` from boot and cannot represent a time before
+/// it, so plain subtraction panics in a worker started within a minute of
+/// boot, which a login start is. Falling back to now only delays the first
+/// scan by one interval.
+fn overdue() -> Instant {
+    Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .unwrap_or_else(Instant::now)
+}
+
 /// The worker: one loop, about every 20 ms, that owns the queue, runs at most one
 /// job at a time and answers clients. Returns after a shutdown once no job is
 /// running, or at once if another worker already holds the lock.
@@ -348,10 +360,10 @@ fn run() -> Result<()> {
     let mut active: Option<Active> = None;
     let mut shutdown = false;
     let mut queue_dirty = false;
-    let mut last_scan = Instant::now() - Duration::from_secs(60);
-    let mut last_activity = Instant::now() - Duration::from_secs(60);
+    let mut last_scan = overdue();
+    let mut last_activity = overdue();
     let mut last_save = Instant::now();
-    let mut last_preferences = Instant::now() - Duration::from_secs(60);
+    let mut last_preferences = overdue();
     let mut discovery: Option<
         mpsc::Receiver<std::result::Result<crate::desktop_discovery::Catalog, String>>,
     > = None;
@@ -494,7 +506,7 @@ fn run() -> Result<()> {
                 match request.command {
                     Command::Snapshot => {}
                     // Backdating the timer makes the discovery step above fire next pass.
-                    Command::Refresh => last_scan = Instant::now() - Duration::from_secs(60),
+                    Command::Refresh => last_scan = overdue(),
                     Command::Enqueue { mut game, restore } => {
                         game.install_dir = game.install_dir.canonicalize()?;
                         ensure!(
@@ -553,7 +565,7 @@ fn run() -> Result<()> {
                         }
                         settings.save(&root)?;
                         preferences = settings;
-                        last_scan = Instant::now() - Duration::from_secs(60);
+                        last_scan = overdue();
                     }
                     Command::Shutdown => {
                         shutdown = true;

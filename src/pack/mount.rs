@@ -130,7 +130,7 @@ pub struct StoreFs {
 
 // Shared between the filesystem and compaction. Every mutating handler holds
 // the read side of `gate` while it works and adds one to `generation` when it
-// succeeds. Compaction takes the write side to stop mutations.
+// finishes. Compaction takes the write side to stop mutations.
 #[derive(Default)]
 struct WriteControl {
     gate: RwLock<()>,
@@ -144,9 +144,16 @@ struct Mutation<'a> {
 }
 
 impl Mutation<'_> {
-    // Records that the mutation took effect. A handler that returns an error
-    // drops the guard without calling this, so the counter does not move.
-    fn committed(self) {
+    // Marks the point where a handler finished its change.
+    fn committed(self) {}
+}
+
+// The counter moves whenever a handler held the guard, whether or not it
+// succeeded. A write that fails partway has already changed bytes, and a
+// compaction that missed it would publish a store without them. The cost is
+// a compaction asked to retry after a failed request that changed nothing.
+impl Drop for Mutation<'_> {
+    fn drop(&mut self) {
         self.generation.fetch_add(1, Ordering::Release);
     }
 }

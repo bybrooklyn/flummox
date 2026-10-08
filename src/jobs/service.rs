@@ -186,7 +186,13 @@ fn open_store(path: &Path) -> Result<(Connection, Snapshot)> {
     let mut stmt = db.prepare("SELECT data FROM queue ORDER BY id DESC LIMIT 500")?;
     for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
         let mut job: Job = serde_json::from_str(&row?)?;
-        if job.phase.active() && job.phase != Phase::Queued {
+        // A job the user paused before it ever started has no work to lose.
+        // It stays paused and starts when resumed.
+        let never_started = job.phase == Phase::Paused
+            && job.user_paused
+            && job.files_total == 0
+            && job.elapsed == 0;
+        if job.phase.active() && job.phase != Phase::Queued && !never_started {
             job.phase = Phase::Interrupted;
             job.message = "Work was interrupted. Resume to finish the remaining files.".into();
             save(&db, &job)?;
@@ -386,19 +392,20 @@ fn apply(
                 "Space plans apply only to storage jobs"
             );
             plan.recheck()?;
-            let path = match &*command {
-                Command::Enqueue { game, .. } | Command::EnqueuePack { game, .. } => {
-                    game.install_dir.clone()
-                }
+            let (path, operation) = match &*command {
+                Command::Enqueue {
+                    game, operation, ..
+                } => (game.install_dir.clone(), *operation),
+                Command::EnqueuePack { game, .. } => (game.install_dir.clone(), Operation::Pack),
                 _ => bail!("Storage command is missing"),
             };
             apply(*command, snapshot, db, active, mounts, running_pack)?;
-            if let Some(job) = snapshot
-                .jobs
-                .iter_mut()
-                .rev()
-                .find(|job| job.game.install_dir == path && job.phase.active())
-            {
+            // The enqueue may have joined an existing job. The plan belongs
+            // to the job for this operation, not to whichever job for the
+            // folder is newest.
+            if let Some(job) = snapshot.jobs.iter_mut().rev().find(|job| {
+                job.game.install_dir == path && job.operation == operation && job.phase.active()
+            }) {
                 job.space_plan = Some(plan);
                 save(db, job)?;
             }
@@ -582,6 +589,11 @@ fn apply(
                 {
                     if let Some(worker) = active.as_mut().filter(|a| a.id == job.id) {
                         send_control(&mut worker.input, Control::Cancel)?;
+                        job.phase = Phase::Cancelling;
+                    } else if running_pack == Some(job.id) {
+                        // A storage thread stops at its next checkpoint, as
+                        // it does for Cancel. Marking it Cancelled here would
+                        // report a step that must finish as already stopped.
                         job.phase = Phase::Cancelling;
                     } else {
                         job.phase = Phase::Cancelled;
@@ -2132,6 +2144,20 @@ mod tests {
             Some(task.clone()),
             "paths and task survive restart",
         )?;
+        check_eq(
+            snapshot.jobs.first().ctx("restored phase")?.phase,
+            Phase::Paused,
+            "a job paused before it started is still paused after a restart",
+        )?;
+        apply(
+            Command::Cancel(id),
+            &mut snapshot,
+            &db,
+            &mut None,
+            &mut Vec::new(),
+            None,
+        )
+        .ctx("cancel the paused task")?;
         apply(
             Command::Retry(id),
             &mut snapshot,
@@ -2140,7 +2166,7 @@ mod tests {
             &mut Vec::new(),
             None,
         )
-        .ctx("retry interrupted preparation")?;
+        .ctx("retry the cancelled preparation")?;
         check_eq(
             snapshot.jobs.last().ctx("retry")?.pack.clone(),
             Some(task),

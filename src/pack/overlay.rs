@@ -46,6 +46,13 @@ pub(super) struct Overlay {
 }
 
 impl Overlay {
+    /// Whether `path` is a real folder laid out as an update layer.
+    pub fn is_layer(path: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+            && path.join(STATE).is_file()
+            && path.join(FILES).is_dir()
+    }
+
     /// Opens or creates a layer and takes its lock, failing if another mount
     /// or commit holds it. A new layer is created only in an empty folder.
     pub fn open(path: &Path) -> Result<Self> {

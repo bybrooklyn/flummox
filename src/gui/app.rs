@@ -1215,10 +1215,11 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 .insert(page.main().label().into(), offset);
         }
         Message::Jump(section) => {
-            // The task `GoTo` returns is dropped, so the saved Settings scroll
-            // offset is not restored before the jump.
-            let _navigation = update(state, Message::GoTo(Page::Settings));
-            return super::surface::jump(section, Message::JumpOffset);
+            // `GoTo` can return artwork decodes it has already marked as
+            // pending. Dropping that task left them pending for good, and
+            // with two decodes allowed at once artwork loading could stall.
+            let navigation = update(state, Message::GoTo(Page::Settings));
+            return navigation.chain(super::surface::jump(section, Message::JumpOffset));
         }
         Message::JumpOffset(offset) => {
             state.scroll_redraw_until = Some(Instant::now() + Duration::from_millis(150));

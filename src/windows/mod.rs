@@ -220,9 +220,11 @@ fn decompress_file(path: &Path) -> Result<bool> {
     // A file without external backing is already restored.
     // SAFETY: GetLastError reads this thread's Win32 error slot and takes no pointers.
     let error = unsafe { GetLastError() };
-    // 1 is ERROR_INVALID_FUNCTION, 50 is ERROR_NOT_SUPPORTED and 4390 is
-    // ERROR_NOT_A_REPARSE_POINT.
-    if matches!(error, 1 | 50 | 4390) {
+    // 1 is ERROR_INVALID_FUNCTION, 50 is ERROR_NOT_SUPPORTED, 342 is
+    // ERROR_OBJECT_NOT_EXTERNALLY_BACKED and 4390 is ERROR_NOT_A_REPARSE_POINT.
+    // 342 is what a file that was never compressed reports, and without it
+    // a restore stopped at the first such file.
+    if matches!(error, 1 | 50 | 342 | 4390) {
         return Ok(false);
     }
     anyhow::bail!(

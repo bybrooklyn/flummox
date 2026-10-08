@@ -662,6 +662,11 @@ fn build_index(
             bytes_done = bytes_done.saturating_add(source.stamp.size);
             observer.progress(files_done, bytes_done, "Building Maximum Space store");
         }
+        ensure!(
+            source.stamp.mode & libc::S_IFMT != libc::S_IFREG || source.stamp.mode & 0o6000 == 0,
+            "{} is setuid or setgid, which a store does not keep",
+            source.path.display()
+        );
         index.entries.push(Entry {
             path: source.path.clone(),
             mode: source.stamp.mode & 0o7777,

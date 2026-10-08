@@ -940,3 +940,50 @@ fn a_store_is_the_same_whatever_the_thread_count() -> TestResult {
         "restored bytes match the source",
     )
 }
+
+// A restored setuid file would run with the restoring user's identity.
+#[test]
+fn a_setuid_file_is_not_stored_and_not_accepted() -> TestResult {
+    use format::Index;
+    let temp = tempfile::tempdir().ctx("fixture")?;
+    let source = temp.path().join("game");
+    fs::create_dir(&source).ctx("source")?;
+    fs::write(source.join("tool"), b"#!/bin/sh\n").ctx("file")?;
+    fs::set_permissions(source.join("tool"), fs::Permissions::from_mode(0o4755))
+        .ctx("setuid bit")?;
+    let cancel = AtomicBool::new(false);
+    let refused = create(
+        &source,
+        &temp.path().join("a.flumpack"),
+        Options::default(),
+        &cancel,
+    );
+    check(
+        refused
+            .as_ref()
+            .err()
+            .is_some_and(|error| format!("{error:#}").contains("setuid")),
+        format!("creation names the setuid file: {refused:?}"),
+    )?;
+    // Control: the same file without the bit is stored.
+    fs::set_permissions(source.join("tool"), fs::Permissions::from_mode(0o755)).ctx("plain")?;
+    let store = temp.path().join("b.flumpack");
+    create(&source, &store, Options::default(), &cancel).ctx("plain file")?;
+    let mut index = Index {
+        entries: Reader::open(&store).ctx("reader")?.index.entries.clone(),
+        chunks: Reader::open(&store).ctx("reader")?.index.chunks.clone(),
+    };
+    for entry in &mut index.entries {
+        if matches!(entry.kind, Kind::File { .. } | Kind::SlicedFile { .. }) {
+            entry.mode |= 0o4000;
+        }
+    }
+    let end = index
+        .chunks
+        .last()
+        .map_or(0, |chunk| chunk.offset + u64::from(chunk.stored));
+    check(
+        index.validate(end, 7).is_err() && index.validate(end, 6).is_err(),
+        "an index naming a setuid file is rejected",
+    )
+}
