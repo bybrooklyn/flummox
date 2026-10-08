@@ -95,7 +95,7 @@ fn file_handle(path: &Path) -> Result<std::fs::File> {
         .with_context(|| format!("Opening {}", path.display()))
 }
 
-fn allocation_size(path: &Path) -> Result<u64> {
+pub(crate) fn allocation_size(path: &Path) -> Result<u64> {
     let file = OpenOptions::new()
         .read(true)
         .open(path)

@@ -244,6 +244,7 @@ flummox status 105600               # how much is stored compressed
 flummox log                         # what Flummox has done
 flummox doctor                      # check this machine
 flummox compatibility list --json  # export path-free qualification records
+flummox compatibility measure DIR  # allocated bytes for a qualification
 ```
 
 Import a locally produced compatibility qualification from Settings or an

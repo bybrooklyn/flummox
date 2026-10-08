@@ -196,6 +196,11 @@ enum CompatibilityAction {
     Import { report: PathBuf },
     /// List stored reports. Use --json for sanitized export data.
     List,
+    /// Report the allocated bytes of files and folders for a qualification.
+    Measure {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -382,6 +387,15 @@ fn compatibility_store() -> Result<crate::compatibility::Store> {
 }
 
 fn cmd_compatibility(out: Output, action: CompatibilityAction) -> Result<()> {
+    if let CompatibilityAction::Measure { paths } = &action {
+        let found = crate::allocation::measure(paths)?;
+        return out.emit(&found, || {
+            println!(
+                "{} files  {} logical bytes  {} allocated bytes",
+                found.files, found.logical_bytes, found.allocated_bytes
+            );
+        });
+    }
     let store = compatibility_store()?;
     match action {
         CompatibilityAction::Import { report } => {
@@ -413,6 +427,7 @@ fn cmd_compatibility(out: Output, action: CompatibilityAction) -> Result<()> {
                 }
             })
         }
+        CompatibilityAction::Measure { .. } => Ok(()),
     }
 }
 
