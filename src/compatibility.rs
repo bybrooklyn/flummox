@@ -17,12 +17,40 @@ pub struct GameBuild {
     pub build: String,
 }
 
+/// Longest key a report may carry.
+const MAX_KEY_LEN: usize = 256;
+/// Longest build or tool version a report may carry.
+const MAX_TEXT_LEN: usize = 128;
+
 impl GameBuild {
+    /// The build record for `id` at `build`, with the key made path-free.
+    pub fn new(id: &GameId, build: &str) -> Self {
+        Self {
+            launcher: id.launcher,
+            key: Self::key_for(id),
+            build: build.trim().into(),
+        }
+    }
+
+    /// The key a report stores for `id`.
+    ///
+    /// A manual game is keyed by its install path, and a path names the
+    /// user's folders, so manual keys, and any key holding a path separator,
+    /// are stored as a BLAKE3 hash of the key. Other keys are stored as given.
+    pub fn key_for(id: &GameId) -> String {
+        if id.launcher == Launcher::Manual || id.key.contains(['/', '\\']) {
+            let hex = blake3::hash(id.key.as_bytes()).to_hex();
+            format!("hash-{}", hex.chars().take(32).collect::<String>())
+        } else {
+            id.key.clone()
+        }
+    }
+
     /// Whether `game` is this launcher entry at this build. A game whose
     /// build is unknown never matches.
     pub fn matches(&self, game: &Game) -> bool {
         self.launcher == game.id.launcher
-            && self.key == game.id.key
+            && self.key == Self::key_for(&game.id)
             && game.build.as_deref() == Some(self.build.as_str())
     }
 
@@ -32,12 +60,19 @@ impl GameBuild {
     }
 }
 
+/// Reads a string and folds it to lower case, so a hand-edited report with an
+/// upper-case hash compares equal to the walk's own output.
+fn lowercase<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    String::deserialize(deserializer).map(|text| text.to_ascii_lowercase())
+}
+
 /// Stable source identity produced by a verified full-corpus walk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Corpus {
     /// Hex SHA-256 over every file in path order: path length, path bytes,
-    /// file size, then content.
+    /// file size, then content. Read back in lower case.
+    #[serde(deserialize_with = "lowercase")]
     pub sha256: String,
     /// Regular files hashed.
     pub files: u64,
@@ -167,6 +202,14 @@ impl Report {
             !self.game.key.is_empty() && !self.game.build.is_empty(),
             "Compatibility report game identity is incomplete"
         );
+        let path_free =
+            |text: &str, limit: usize| text.len() <= limit && !text.contains(['/', '\\']);
+        ensure!(
+            path_free(&self.game.key, MAX_KEY_LEN)
+                && path_free(&self.game.build, MAX_TEXT_LEN)
+                && path_free(&self.flummox_version, MAX_TEXT_LEN),
+            "Compatibility report identity holds a path separator or is too long"
+        );
         ensure!(
             self.corpus.sha256.len() == 64
                 && self
@@ -212,10 +255,9 @@ impl Report {
             && self.checks.launched
             && !self.checks.anti_cheat_issue
             && !self.checks.gameplay_issue
-            && self.checks.candidate_load_ms.saturating_mul(10_000)
-                <= self.checks.baseline_load_ms.saturating_mul(
-                    10_000u64.saturating_add(u64::from(policy.maximum_load_regression_bps)),
-                )
+            && u128::from(self.checks.candidate_load_ms) * 10_000
+                <= u128::from(self.checks.baseline_load_ms)
+                    * (10_000 + u128::from(policy.maximum_load_regression_bps))
     }
 
     /// The content-derived file name a valid report is stored under.
@@ -534,23 +576,136 @@ mod tests {
         )
     }
 
+    fn manual_game() -> Game {
+        Game {
+            id: GameId::new(Launcher::Manual, "/home/person/Games/private"),
+            also: vec![],
+            title: "Private title".into(),
+            install_dir: "/home/person/Games/private".into(),
+            build: Some("7".into()),
+            size_hint: Some(4096),
+            state: InstallState::Idle,
+            is_tool: false,
+        }
+    }
+
+    /// A report for `game` made by the form's own builder.
+    fn built_report(game: &Game) -> Result<Report, anyhow::Error> {
+        let mut wizard = crate::qualification::Wizard::new(
+            game.clone(),
+            Corpus {
+                sha256: "a".repeat(64),
+                files: 2,
+                bytes: 4096,
+            },
+        );
+        wizard.mode = StorageMode::MaximumSpace;
+        wizard.baseline_load = "1000".into();
+        wizard.candidate_load = "1050".into();
+        wizard.allocated_before = "4096".into();
+        wizard.allocated_after = "2048".into();
+        for check in [
+            crate::qualification::Check::Bytes,
+            crate::qualification::Check::Metadata,
+            crate::qualification::Check::Update,
+            crate::qualification::Check::Restore,
+            crate::qualification::Check::Launch,
+        ] {
+            wizard.check(check, true);
+        }
+        wizard.report()
+    }
+
     #[test]
     fn stored_reports_have_no_titles_or_paths() -> TestResult {
+        let game = manual_game();
+        let built = built_report(&game).ctx("build a report for a manual game")?;
         let dir = tempfile::tempdir().ctx("temporary report folder")?;
         let store = Store::open(dir.path().join("compatibility")).ctx("open report store")?;
-        let path = store.save(&report()).ctx("save report")?;
+        let path = store.save(&built).ctx("save report")?;
         let json = std::fs::read_to_string(path).ctx("read report")?;
         check(!json.contains("Private title"), "title is absent")?;
         check(!json.contains("/home/person"), "install path is absent")?;
+        check(!json.contains("person"), "user name is absent")?;
+        check(
+            built.qualifies(&game, &"a".repeat(64), Policy::default()),
+            "the hashed key still matches the game it came from",
+        )?;
+        let mut other = manual_game();
+        other.id = GameId::new(Launcher::Manual, "/home/person/Games/other");
+        check(
+            !built.qualifies(&other, &"a".repeat(64), Policy::default()),
+            "a different folder does not match",
+        )?;
         let loaded = store.load().ctx("load reports")?;
-        check_eq(loaded, vec![report()], "stored report round trip")?;
+        check_eq(loaded, vec![built.clone()], "stored report round trip")?;
         std::fs::write(
             dir.path().join("compatibility/broken.json"),
             b"{ not a report",
         )
         .ctx("malformed file")?;
         let loaded = store.load().ctx("load beside a malformed file")?;
-        check_eq(loaded, vec![report()], "a malformed file hides nothing")
+        check_eq(loaded, vec![built], "a malformed file hides nothing")
+    }
+
+    #[test]
+    fn a_report_that_carries_a_path_is_rejected_and_never_loads() -> TestResult {
+        let mut old = report();
+        old.game.launcher = Launcher::Manual;
+        old.game.key = "/home/person/Games/private".into();
+        check(old.validate().is_err(), "a path key fails validation")?;
+        let dir = tempfile::tempdir().ctx("temporary report folder")?;
+        let root = dir.path().join("compatibility");
+        let store = Store::open(&root).ctx("open report store")?;
+        std::fs::write(
+            root.join("old.json"),
+            serde_json::to_vec(&old).ctx("serialise an old report")?,
+        )
+        .ctx("plant an old report")?;
+        check(
+            store.load().ctx("load beside an old report")?.is_empty(),
+            "an old path-keyed report is skipped on load",
+        )?;
+        check(
+            !old.qualifies(&manual_game(), &"a".repeat(64), Policy::default()),
+            "and would never match",
+        )?;
+        let mut long = report();
+        long.game.build = "7".repeat(MAX_TEXT_LEN + 1);
+        check(long.validate().is_err(), "an over-long build is rejected")?;
+        let mut windows = report();
+        windows.game.build = "C:\\Games".into();
+        check(windows.validate().is_err(), "a backslash is rejected")?;
+        check(
+            report().validate().is_ok(),
+            "control: the plain report is valid",
+        )
+    }
+
+    #[test]
+    fn the_load_check_cannot_be_passed_by_overflowing_values() -> TestResult {
+        let mut huge = report();
+        huge.checks.baseline_load_ms = 2_000_000_000_000_000;
+        huge.checks.candidate_load_ms = u64::MAX;
+        check(
+            !huge.qualifies(&game(), &"a".repeat(64), Policy::default()),
+            "a huge baseline does not excuse a huge candidate",
+        )?;
+        let mut slow = report();
+        slow.checks.candidate_load_ms = 1100;
+        check(
+            slow.qualifies(&game(), &"a".repeat(64), Policy::default()),
+            "control: exactly ten percent slower still qualifies",
+        )
+    }
+
+    #[test]
+    fn upper_case_corpus_hashes_are_read_as_lower_case() -> TestResult {
+        let mut upper = report();
+        upper.corpus.sha256 = "A".repeat(64);
+        let json = serde_json::to_string(&upper).ctx("serialise")?;
+        let read: Report = serde_json::from_str(&json).ctx("parse")?;
+        check_eq(read.corpus.sha256, "a".repeat(64), "folded on read")
     }
 }
 
