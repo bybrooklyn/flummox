@@ -71,9 +71,15 @@ pub struct MountEntry {
 }
 
 impl MountEntry {
-    /// Whether the mount is read-only.
+    /// Whether the mount or its superblock is read-only.
+    ///
+    /// A filesystem that flipped read-only after an error shows `rw` on the
+    /// mount and `ro` on the superblock.
     pub fn read_only(&self) -> bool {
-        self.options.iter().any(|o| o == "ro")
+        self.options
+            .iter()
+            .chain(self.super_options.iter())
+            .any(|o| o == "ro")
     }
 }
 
@@ -94,7 +100,16 @@ pub struct FsInfo {
     pub read_only: bool,
 }
 
+/// The mount source of the FUSE mount that serves a pack-tier game.
+pub const PACK_MOUNT_SOURCE: &str = "flummox-pack";
+
 impl FsInfo {
+    /// Whether this is the FUSE mount of a `flummox-pack` game, which sits
+    /// over the game's own folder and says nothing about the drive below it.
+    pub fn is_pack_mount(&self) -> bool {
+        self.magic == magic::FUSE && self.source == PACK_MOUNT_SOURCE
+    }
+
     /// The mount's transparent-compression setting, if any.
     ///
     /// Returns the algorithm and its level, e.g. `compress=zstd:1` →
@@ -257,24 +272,72 @@ fn unescape_octal(s: &str) -> String {
     out
 }
 
+/// Probes the drive under `path`, looking through `flummox-pack` mounts.
+///
+/// A pack-tier game is a FUSE mount on the game's folder. The tier, free
+/// space and mount options of that folder are those of the drive it sits on,
+/// so a pack mount is replaced by a probe of its parent folder.
+pub fn probe_underlying(path: &Path) -> io::Result<FsInfo> {
+    underlying_with(path, &probe)
+}
+
+fn underlying_with(path: &Path, probe: &dyn Fn(&Path) -> io::Result<FsInfo>) -> io::Result<FsInfo> {
+    let mut fs = probe(path)?;
+    while fs.is_pack_mount() {
+        let parent = fs
+            .mountpoint
+            .parent()
+            .ok_or_else(|| io::Error::other("a pack mount has no parent folder"))?
+            .to_path_buf();
+        fs = probe(&parent)?;
+    }
+    Ok(fs)
+}
+
+/// The type name `mountinfo` uses, folded to what `statfs` can tell apart.
+fn fs_family(name: &str) -> &str {
+    match name {
+        "ext2" | "ext3" | "ext4" => "ext4",
+        "fuse" | "fuseblk" => "fuse",
+        n if n.starts_with("fuse.") => "fuse",
+        "nfs" | "nfs4" => "nfs",
+        "cifs" | "smb3" | "smbfs" => "cifs",
+        "vfat" | "msdos" => "vfat",
+        "ntfs" | "ntfs3" => "ntfs3",
+        "devtmpfs" => "tmpfs",
+        other => other,
+    }
+}
+
+/// The mount that holds `path`: the longest mount point above it whose type
+/// agrees with the `statfs` magic, when the magic is one we know.
+///
+/// A mount hidden by a later mount over its parent matches by prefix but is
+/// not the filesystem `statfs` reported.
+fn select_mount<'a>(mounts: &'a [MountEntry], path: &Path, magic: i64) -> Option<&'a MountEntry> {
+    let expected = fstype_from_magic(magic).map(fs_family);
+    mounts
+        .iter()
+        .filter(|m| path.starts_with(&m.mountpoint))
+        .filter(|m| expected.is_none_or(|kind| fs_family(&m.fstype) == kind))
+        .max_by_key(|m| m.mountpoint.as_os_str().len())
+}
+
 /// Probes the filesystem holding `path`.
 pub fn probe(path: &Path) -> io::Result<FsInfo> {
     let canonical = path.canonicalize()?;
     let magic = statfs_magic(&canonical)?;
-    let entry = mounts()?
-        .into_iter()
-        .filter(|m| canonical.starts_with(&m.mountpoint))
-        .max_by_key(|m| m.mountpoint.as_os_str().len());
-    Ok(match entry {
+    let all = mounts()?;
+    Ok(match select_mount(&all, &canonical, magic) {
         Some(m) => {
             let mut options = m.options.clone();
             options.extend(m.super_options.iter().cloned());
             FsInfo {
-                fstype: m.fstype,
+                fstype: m.fstype.clone(),
                 magic,
-                mountpoint: m.mountpoint,
-                source: m.source,
-                read_only: m.options.iter().any(|o| o == "ro"),
+                mountpoint: m.mountpoint.clone(),
+                source: m.source.clone(),
+                read_only: m.read_only(),
                 options,
             }
         }
@@ -474,6 +537,99 @@ pub fn statfs_magic(path: &Path) -> io::Result<i64> {
 mod tests {
     use super::*;
     use crate::testutil::{Ctx, TestResult, check, check_eq};
+
+    fn entry(mountpoint: &str, fstype: &str) -> MountEntry {
+        MountEntry {
+            mountpoint: PathBuf::from(mountpoint),
+            fstype: fstype.to_owned(),
+            source: "dev".to_owned(),
+            options: vec!["rw".to_owned()],
+            super_options: vec!["rw".to_owned()],
+        }
+    }
+
+    #[test]
+    fn a_shadowed_longer_mount_is_not_the_filesystem_statfs_saw() -> TestResult {
+        // /mnt/a/b was mounted first, then /mnt/a was mounted over it.
+        let mounts = [entry("/mnt/a/b", "ext4"), entry("/mnt/a", "btrfs")];
+        let path = Path::new("/mnt/a/b/game");
+        check_eq(
+            select_mount(&mounts, path, magic::BTRFS).map(|m| m.fstype.as_str()),
+            Some("btrfs"),
+            "the magic says btrfs, so the hidden ext4 entry loses",
+        )?;
+        check_eq(
+            select_mount(&mounts, path, magic::EXT4).map(|m| m.fstype.as_str()),
+            Some("ext4"),
+            "control: with an ext4 magic the longer entry wins",
+        )?;
+        check_eq(
+            select_mount(&mounts, path, 0x1234).map(|m| m.fstype.as_str()),
+            Some("ext4"),
+            "an unknown magic falls back to the longest prefix",
+        )?;
+        check(
+            select_mount(&mounts, path, magic::XFS).is_none(),
+            "no entry agrees with the magic, so none is chosen",
+        )
+    }
+
+    #[test]
+    fn mountinfo_names_that_share_a_magic_agree() -> TestResult {
+        let mounts = [entry("/data", "ext3"), entry("/mnt", "fuse.sshfs")];
+        check(
+            select_mount(&mounts, Path::new("/data/x"), magic::EXT4).is_some(),
+            "ext3 reports the ext4 magic",
+        )?;
+        check(
+            select_mount(&mounts, Path::new("/mnt/x"), magic::FUSE).is_some(),
+            "fuse.sshfs reports the FUSE magic",
+        )
+    }
+
+    #[test]
+    fn a_superblock_that_went_read_only_is_read_only() -> TestResult {
+        let mounts = parse_mountinfo(
+            "31 26 0:24 / /home rw,noatime shared:2 - btrfs /dev/nvme0n1p2 ro,compress=zstd:1",
+        );
+        let home = mounts.first().ctx("the fixture line")?;
+        check(
+            !home.options.iter().any(|o| o == "ro"),
+            "control: the mount itself is rw",
+        )?;
+        check(home.read_only(), "the superblock options say ro")
+    }
+
+    #[test]
+    fn a_pack_mount_is_replaced_by_the_drive_below_it() -> TestResult {
+        let fs = |mountpoint: &str, source: &str, magic: i64| FsInfo {
+            fstype: "fuse".to_owned(),
+            magic,
+            mountpoint: PathBuf::from(mountpoint),
+            source: source.to_owned(),
+            options: Vec::new(),
+            read_only: false,
+        };
+        let probe = |path: &Path| -> io::Result<FsInfo> {
+            Ok(if path == Path::new("/lib/common/Game") {
+                fs("/lib/common/Game", PACK_MOUNT_SOURCE, magic::FUSE)
+            } else {
+                fs("/lib/common", "/dev/sda1", magic::EXT4)
+            })
+        };
+        let under = underlying_with(Path::new("/lib/common/Game"), &probe).ctx("look through")?;
+        check_eq(
+            under.mountpoint.as_path(),
+            Path::new("/lib/common"),
+            "the pack mount gives way to its parent",
+        )?;
+        check(!under.is_pack_mount(), "and the result is not a pack mount")?;
+        let other_fuse = fs("/mnt/x", "sshfs", magic::FUSE);
+        check(
+            !other_fuse.is_pack_mount(),
+            "control: another FUSE mount is not a pack mount",
+        )
+    }
 
     const REAL_LINES: &str = "\
 26 1 0:24 / / rw,noatime shared:1 - btrfs /dev/nvme0n1p2 rw,compress=zstd:1,ssd,subvol=/@

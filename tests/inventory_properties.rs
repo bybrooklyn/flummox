@@ -2,22 +2,16 @@
 //!
 //! [`decide`] runs once per file on a walk of an install directory, hundreds
 //! of thousands of times on a full Steam library, and every `Compress` it
-//! returns becomes a file the tool rewrites. Two of its rules exist purely to
-//! stop work that cannot pay off, and both are easy to break in a way no
-//! example test would notice:
+//! returns becomes a file the tool rewrites. It applies one rule, the size
+//! floor, which is easy to break in a way no example test would notice. Below
+//! the floor, compressing costs more than it saves: on the pack tier the
+//! file's own store object outweighs the gain, and on a native filesystem a
+//! file too small to free a whole sector frees nothing.
 //!
-//! * the size floor. Below it, compressing costs more than it saves: on the
-//!   pack tier the file's own store object outweighs the gain, and on a native
-//!   filesystem a file too small to free a whole sector frees nothing. A file
-//!   that slips under the floor is not a wrong number, it is wasted I/O and a
-//!   pointlessly rewritten extent.
-//! * the already-compressed extension list. Running zstd over an `.mp4` or a
-//!   `.flac` burns CPU and, because compression rewrites every extent, can
-//!   leave a snapshotted subvolume *fuller* than it started.
-//!
-//! The properties below quantify over both floors at once, because the two
-//! tiers share this function and a change made for one must not quietly alter
-//! the other.
+//! Already-compressed formats are not decided here. Content sampling judges
+//! them later, so the extension list only hints and must never override the
+//! size rule. The properties below quantify over both floors, because the two
+//! tiers share this function.
 
 #![cfg(target_os = "linux")]
 
@@ -202,13 +196,31 @@ proptest! {
         );
     }
 
-    /// Every decision carries a reason the user can be shown.
+    /// The reason shown for a decision is the reason the size rule gave.
     ///
-    /// The Games page lists skipped files with a cause. A blank or duplicated
-    /// reason turns "12,431 files skipped" into something nobody can act on.
+    /// The Games page lists skipped files with a cause. Swapping the two
+    /// strings, or showing the same one for both, fails here.
     #[test]
-    fn every_decision_explains_itself(path in any_path(), size in file_sizes(), opts in floors()) {
-        let reason = decide(&path, size, &opts).reason();
-        prop_assert!(!reason.is_empty(), "a decision with no reason cannot be displayed");
+    fn the_reason_matches_the_decision(path in any_path(), size in file_sizes(), opts in floors()) {
+        let expected = if size <= opts.min_size { "too small" } else { "compress" };
+        prop_assert_eq!(decide(&path, size, &opts).reason(), expected);
     }
+}
+
+/// Each kind of decision has its own non-empty reason.
+#[test]
+fn every_kind_of_decision_has_a_distinct_reason() -> flummox::testutil::TestResult {
+    let reasons = [
+        Action::Compress.reason(),
+        Action::SkipTiny.reason(),
+        Action::SkipPrecompressed.reason(),
+    ];
+    for (index, reason) in reasons.iter().enumerate() {
+        flummox::testutil::check(!reason.is_empty(), "a reason cannot be blank")?;
+        flummox::testutil::check(
+            !reasons.iter().skip(index + 1).any(|other| other == reason),
+            format!("{reason:?} is shown for two different decisions"),
+        )?;
+    }
+    Ok(())
 }

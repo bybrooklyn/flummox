@@ -1,11 +1,52 @@
 //! Landlock enforcement in a fresh executable, without inheriting live FUSE locks.
 
 #![cfg(target_os = "linux")]
+// One test calls a raw syscall to see whether the seccomp filter refuses it.
+#![allow(unsafe_code)]
 
 use flummox::{
     sandbox::{SandboxPlan, deny_sockets, restrict},
-    testutil::{Ctx, TestResult, check},
+    testutil::{Ctx, TestResult, check, check_eq, check_ne},
 };
+
+/// The errno of `io_uring_setup(0, NULL)`: EPERM from the filter, otherwise
+/// whatever the kernel says about the bad arguments.
+fn io_uring_setup_errno() -> i32 {
+    // SAFETY: a zero entry count makes the kernel reject the call with EINVAL
+    // before it reads the null parameter pointer, so nothing is dereferenced.
+    let result =
+        unsafe { libc::syscall(libc::SYS_io_uring_setup, 0u32, std::ptr::null_mut::<u8>()) };
+    if result == -1 {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+/// A skip, or a failure on a machine that is supposed to have Landlock.
+fn skipped(why: &str) -> TestResult {
+    check(
+        std::env::var_os("FLUMMOX_REQUIRE_LANDLOCK").is_none(),
+        format!("{why}, and FLUMMOX_REQUIRE_LANDLOCK is set"),
+    )?;
+    eprintln!("skipped: {why}");
+    Ok(())
+}
+
+/// Re-emits what a child test wrote, so its skips and failures show up in the
+/// parent's output, then checks that it succeeded.
+fn child_passed(name: &str, result: &std::process::Output) -> TestResult {
+    eprint!("{}", String::from_utf8_lossy(&result.stderr));
+    print!("{}", String::from_utf8_lossy(&result.stdout));
+    check(
+        result.status.success(),
+        format!(
+            "{name} child failed: {} {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        ),
+    )
+}
 
 #[test]
 fn enforcement_blocks_paths_outside_the_game() -> TestResult {
@@ -14,12 +55,19 @@ fn enforcement_blocks_paths_outside_the_game() -> TestResult {
         let game = root.join("game");
         let status = restrict(&SandboxPlan::for_paths(vec![game.clone()], Vec::new()));
         if !status.is_active() {
-            eprintln!("skipped: Landlock is unavailable");
-            return Ok(());
+            return skipped("Landlock is unavailable");
         }
         check(
             std::fs::read(game.join("inside.dat")).is_ok(),
             "sandbox permits the game",
+        )?;
+        check(
+            nix::unistd::mkfifo(
+                &game.join("after.fifo"),
+                nix::sys::stat::Mode::from_bits_truncate(0o600),
+            )
+            .is_err(),
+            "the game folder cannot be given a FIFO",
         )?;
         check(
             std::fs::read(root.join("secret.dat")).is_err(),
@@ -32,6 +80,12 @@ fn enforcement_blocks_paths_outside_the_game() -> TestResult {
     std::fs::create_dir(&game).ctx("game")?;
     std::fs::write(game.join("inside.dat"), b"game data").ctx("game bytes")?;
     std::fs::write(temp.path().join("secret.dat"), b"private data").ctx("outside bytes")?;
+    // Control: before restriction a FIFO can be made in the game folder.
+    nix::unistd::mkfifo(
+        &game.join("control.fifo"),
+        nix::sys::stat::Mode::from_bits_truncate(0o600),
+    )
+    .ctx("control FIFO")?;
     let result = std::process::Command::new(std::env::current_exe().ctx("test executable")?)
         .args([
             "--exact",
@@ -41,14 +95,7 @@ fn enforcement_blocks_paths_outside_the_game() -> TestResult {
         .env("FLUMMOX_SANDBOX_FIXTURE", temp.path())
         .output()
         .ctx("isolated sandbox test")?;
-    check(
-        result.status.success(),
-        format!(
-            "sandbox child failed: {} {}",
-            String::from_utf8_lossy(&result.stdout),
-            String::from_utf8_lossy(&result.stderr)
-        ),
-    )
+    child_passed("enforcement_blocks_paths_outside_the_game", &result)
 }
 
 #[test]
@@ -65,8 +112,7 @@ fn a_worker_reaches_its_database_and_not_the_coordinator() -> TestResult {
         let database = state.join("state.sqlite");
         let status = restrict(&SandboxPlan::for_worker(&root.join("game"), &database));
         if !status.is_active() {
-            eprintln!("skipped: Landlock is unavailable");
-            return Ok(());
+            return skipped("Landlock is unavailable");
         }
         check(append(&root.join("game/inside.dat")).is_ok(), "the game")?;
         check(append(&database).is_ok(), "the database")?;
@@ -129,13 +175,9 @@ fn a_worker_reaches_its_database_and_not_the_coordinator() -> TestResult {
         .env("FLUMMOX_WORKER_SANDBOX_FIXTURE", temp.path())
         .output()
         .ctx("isolated sandbox test")?;
-    check(
-        result.status.success(),
-        format!(
-            "sandbox child failed: {} {}",
-            String::from_utf8_lossy(&result.stdout),
-            String::from_utf8_lossy(&result.stderr)
-        ),
+    child_passed(
+        "a_worker_reaches_its_database_and_not_the_coordinator",
+        &result,
     )
 }
 
@@ -147,7 +189,17 @@ fn a_worker_cannot_reach_a_socket_by_path() -> TestResult {
             UnixStream::connect(&socket).is_ok(),
             "control: the socket accepts a connection before the filter",
         )?;
+        check_ne(
+            io_uring_setup_errno(),
+            libc::EPERM,
+            "control: io_uring_setup is not refused before the filter",
+        )?;
         deny_sockets().ctx("socket filter")?;
+        check_eq(
+            io_uring_setup_errno(),
+            libc::EPERM,
+            "io_uring_setup is refused after the filter",
+        )?;
         let refused = UnixStream::connect(&socket);
         check(
             refused
@@ -174,12 +226,52 @@ fn a_worker_cannot_reach_a_socket_by_path() -> TestResult {
         .env("FLUMMOX_SOCKET_FIXTURE", &socket)
         .output()
         .ctx("isolated socket test")?;
-    check(
-        result.status.success(),
-        format!(
-            "socket child failed: {} {}",
-            String::from_utf8_lossy(&result.stdout),
-            String::from_utf8_lossy(&result.stderr)
-        ),
-    )
+    child_passed("a_worker_cannot_reach_a_socket_by_path", &result)
+}
+
+#[test]
+fn a_sandboxed_scan_cannot_see_other_processes_but_a_prestarted_one_can() -> TestResult {
+    use flummox::busy::{BackgroundScan, ProcFs, Usage, usage};
+    const NAME: &str = "a_sandboxed_scan_cannot_see_other_processes_but_a_prestarted_one_can";
+    if let Some(dir) = std::env::var_os("FLUMMOX_PROC_FIXTURE") {
+        let dir = std::path::PathBuf::from(dir);
+        let parent = std::os::unix::process::parent_id();
+        let exe_link = format!("/proc/{parent}/exe");
+        let exe =
+            std::fs::read_link(&exe_link).ctx("control: the parent's exe before the sandbox")?;
+        let game = exe.parent().ctx("the parent's directory")?.to_path_buf();
+        check(
+            matches!(usage(&game, &ProcFs::new()), Usage::InUse(_)),
+            "control: a scan before the sandbox sees the parent",
+        )?;
+        let scan = BackgroundScan::start(game.clone(), std::time::Duration::from_millis(100));
+        let status = restrict(&SandboxPlan::for_paths(vec![dir], vec!["/proc".into()]));
+        if !status.is_active() {
+            return skipped("Landlock is unavailable");
+        }
+        check(
+            std::fs::read_link(&exe_link).is_err(),
+            "after the sandbox another process's exe link is unreadable",
+        )?;
+        check_eq(
+            usage(&game, &ProcFs::new()),
+            Usage::Unknown,
+            "an in-process scan reports that it cannot tell",
+        )?;
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        return check(
+            matches!(scan.latest(), Usage::InUse(_)),
+            format!(
+                "the scanner started before the sandbox still sees it: {:?}",
+                scan.latest()
+            ),
+        );
+    }
+    let temp = tempfile::tempdir().ctx("fixture")?;
+    let result = std::process::Command::new(std::env::current_exe().ctx("test executable")?)
+        .args(["--exact", NAME, "--nocapture"])
+        .env("FLUMMOX_PROC_FIXTURE", temp.path())
+        .output()
+        .ctx("isolated scan test")?;
+    child_passed(NAME, &result)
 }

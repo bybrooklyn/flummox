@@ -41,6 +41,16 @@ use landlock::{
 /// what it cannot honour and downgrades the reported status.
 const TARGET_ABI: ABI = ABI::V5;
 
+/// Rights a job never uses on the folders it writes: running programs from
+/// them, and creating devices, sockets or FIFOs in them.
+fn never_needed() -> landlock::BitFlags<AccessFs> {
+    AccessFs::Execute
+        | AccessFs::MakeChar
+        | AccessFs::MakeBlock
+        | AccessFs::MakeSock
+        | AccessFs::MakeFifo
+}
+
 /// How much of the sandbox the kernel actually applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxStatus {
@@ -158,8 +168,9 @@ impl SandboxPlan {
 /// Landlock governs files and does not cover connecting to a socket by path,
 /// so a sandboxed worker could still reach the coordinator's control socket
 /// and send it commands. A worker talks only over the pipes it was started
-/// with, so it loses `socket` altogether. Call it where [`restrict`] is
-/// called: before any other thread exists.
+/// with, so it loses `socket` altogether, and `io_uring_setup`, whose
+/// operations include opening sockets. Call it where [`restrict`] is called:
+/// before any other thread exists.
 pub fn deny_sockets() -> Result<(), String> {
     use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, apply_filter};
 
@@ -167,9 +178,13 @@ pub fn deny_sockets() -> Result<(), String> {
         .try_into()
         .map_err(|error| format!("seccomp does not know this processor: {error}"))?;
     // An empty rule list matches the call whatever its arguments.
-    let rules = [(libc::SYS_socket, vec![]), (libc::SYS_socketpair, vec![])]
-        .into_iter()
-        .collect();
+    let rules = [
+        (libc::SYS_socket, vec![]),
+        (libc::SYS_socketpair, vec![]),
+        (libc::SYS_io_uring_setup, vec![]),
+    ]
+    .into_iter()
+    .collect();
     let filter = SeccompFilter::new(
         rules,
         SeccompAction::Allow,
@@ -207,7 +222,7 @@ pub fn restrict(plan: &SandboxPlan) -> SandboxStatus {
         .and_then(|r| {
             r.add_rules(path_beneath_rules(
                 &plan.writable,
-                AccessFs::from_all(TARGET_ABI),
+                AccessFs::from_all(TARGET_ABI) & !never_needed(),
             ))
         })
         .and_then(|r| r.restrict_self());

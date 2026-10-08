@@ -62,6 +62,49 @@ impl ProcInfo {
 pub trait ProcSource {
     /// Every process this source can see.
     fn processes(&self) -> Vec<ProcInfo>;
+
+    /// [`processes`](Self::processes) plus whether the list can be trusted.
+    fn scan(&self) -> Scan {
+        Scan {
+            processes: self.processes(),
+            readable: true,
+        }
+    }
+}
+
+/// A process list and whether it says anything about what is running.
+#[derive(Debug, Clone, Default)]
+pub struct Scan {
+    /// The processes found.
+    pub processes: Vec<ProcInfo>,
+    /// False when `/proc` could not be listed, or when other processes of this
+    /// user exist and none of their links could be read.
+    pub readable: bool,
+}
+
+/// What a scan concluded about a directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Usage {
+    /// Nothing is using it.
+    Free,
+    /// This process is, described for the user.
+    InUse(String),
+    /// The scan could not see processes, so "free" would be a guess.
+    Unknown,
+}
+
+impl Usage {
+    /// The reason to stay paused, or `None` when work may continue.
+    ///
+    /// `Unknown` pauses, because a caller that treated it as free would
+    /// rewrite a running game's files.
+    pub fn blocking(&self) -> Option<String> {
+        match self {
+            Self::Free => None,
+            Self::InUse(who) => Some(who.clone()),
+            Self::Unknown => Some("process information is unavailable".to_owned()),
+        }
+    }
 }
 
 /// Reads processes from a `/proc` mount.
@@ -132,9 +175,10 @@ impl ProcFs {
 
 impl ProcSource for ProcFs {
     fn processes(&self) -> Vec<ProcInfo> {
-        // An empty list means "nothing is running", which is what lets a job
-        // start. If /proc cannot be read at all, that answer is a guess, so
-        // say so loudly instead of quietly clearing the way.
+        self.scan().processes
+    }
+
+    fn scan(&self) -> Scan {
         let entries = match std::fs::read_dir(&self.root) {
             Ok(entries) => entries,
             Err(e) => {
@@ -143,16 +187,117 @@ impl ProcSource for ProcFs {
                     error = %e,
                     "cannot read /proc, so a running game cannot be detected"
                 );
-                return Vec::new();
+                return Scan::default();
             }
         };
-        entries
+        let own = std::process::id() as i32;
+        let processes: Vec<ProcInfo> = entries
             .flatten()
             .filter_map(|entry| {
                 let pid: i32 = entry.file_name().to_str()?.parse().ok()?;
                 self.read_one(&entry.path(), pid)
             })
-            .collect()
+            .collect();
+        // Landlock refuses the ptrace-level check behind these links for every
+        // process outside the caller's domain, so a sandboxed caller reads
+        // its own links and nothing else's.
+        let seen = processes.iter().filter(|p| p.pid != own).count();
+        let readable = processes
+            .iter()
+            .filter(|p| p.pid != own)
+            .filter(|p| p.exe.is_some() || p.cwd.is_some() || p.root.is_some())
+            .count();
+        Scan {
+            processes,
+            readable: seen == 0 || readable > 0,
+        }
+    }
+}
+
+/// Who is using `dir`, or [`Usage::Unknown`] when the scan could not tell.
+pub fn usage(dir: &Path, source: &dyn ProcSource) -> Usage {
+    let own = std::process::id() as i32;
+    let scan = source.scan();
+    if let Some(p) = scan
+        .processes
+        .iter()
+        .find(|p| p.pid != own && p.uses_dir(dir))
+    {
+        return Usage::InUse(format!("{} (pid {})", p.name, p.pid));
+    }
+    if scan.readable {
+        Usage::Free
+    } else {
+        Usage::Unknown
+    }
+}
+
+/// Scans `/proc` on a background thread and keeps the latest answer.
+///
+/// Landlock applies to the calling thread and the threads it starts later, so
+/// a scanner started before [`crate::sandbox::restrict`] keeps its view of
+/// other processes. Start it first, then restrict, and have the job read
+/// [`latest`](Self::latest).
+pub struct BackgroundScan {
+    latest: std::sync::Arc<std::sync::Mutex<Usage>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BackgroundScan {
+    /// Scans once before returning, then again every `every`.
+    pub fn start(dir: PathBuf, every: std::time::Duration) -> Self {
+        use std::sync::atomic::Ordering;
+        use std::sync::{Arc, Mutex};
+        let latest = Arc::new(Mutex::new(usage(&dir, &ProcFs::new())));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = std::thread::Builder::new()
+            .name("busy-scan".to_owned())
+            .spawn({
+                let (latest, stop) = (Arc::clone(&latest), Arc::clone(&stop));
+                move || {
+                    let step = std::time::Duration::from_millis(100);
+                    while !stop.load(Ordering::Relaxed) {
+                        let mut waited = std::time::Duration::ZERO;
+                        while waited < every && !stop.load(Ordering::Relaxed) {
+                            std::thread::sleep(step);
+                            waited += step;
+                        }
+                        let now = usage(&dir, &ProcFs::new());
+                        if let Ok(mut slot) = latest.lock() {
+                            *slot = now;
+                        }
+                    }
+                }
+            })
+            .ok();
+        Self {
+            latest,
+            stop,
+            thread,
+        }
+    }
+
+    /// The newest scan result. `Unknown` when the thread could not start.
+    pub fn latest(&self) -> Usage {
+        if self.thread.is_none() {
+            return Usage::Unknown;
+        }
+        self.latest
+            .lock()
+            .map(|slot| slot.clone())
+            .unwrap_or(Usage::Unknown)
+    }
+}
+
+impl Drop for BackgroundScan {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            tracing::error!("the busy scanner thread panicked");
+        }
     }
 }
 
