@@ -60,16 +60,29 @@ fn installed(
         is_tool: false,
     })
 }
+/// Whether paths that differ only in case name the same folder.
+const FOLD_CASE: bool = cfg!(any(windows, target_os = "macos"));
+
+/// A string that is equal for paths naming the same folder. With `fold`,
+/// case, slash direction and a trailing slash do not matter, as with the
+/// registry's `c:/program files (x86)/steam` against `C:\Program Files (x86)\Steam`.
+fn path_key(path: &Path, fold: bool) -> String {
+    let text = path.to_string_lossy();
+    if !fold {
+        return text.into_owned();
+    }
+    text.replace('\\', "/").trim_end_matches('/').to_lowercase()
+}
 impl Catalog {
     /// Adds every game in the Steam libraries reachable from these install roots.
     /// Replaces `artwork_roots`.
     pub fn steam(&mut self, roots: Vec<PathBuf>) {
         self.artwork_roots = roots.clone();
         // A set, so a library listed by two roots is read once and in a fixed order.
-        let mut libraries = std::collections::BTreeSet::new();
+        let mut libraries = std::collections::BTreeMap::new();
         for root in roots {
             let steamapps = root.join("steamapps");
-            libraries.insert(steamapps.clone());
+            libraries.insert(path_key(&steamapps, FOLD_CASE), steamapps.clone());
             let manifest = steamapps.join("libraryfolders.vdf");
             if !manifest.exists() {
                 continue;
@@ -88,7 +101,10 @@ impl Catalog {
                     if let Some(path) = path
                         && Path::new(path).is_absolute()
                     {
-                        libraries.insert(PathBuf::from(path).join("steamapps"));
+                        let library = PathBuf::from(path).join("steamapps");
+                        libraries
+                            .entry(path_key(&library, FOLD_CASE))
+                            .or_insert(library);
                     }
                 }
                 Ok(())
@@ -97,7 +113,7 @@ impl Catalog {
                 self.warnings.push(format!("Steam libraries: {error}"));
             }
         }
-        for library in libraries {
+        for library in libraries.into_values() {
             if !library.exists() {
                 continue;
             }
@@ -350,6 +366,16 @@ fn heroic_game(key: String, item: &Value, launcher: Launcher) -> Result<Game> {
 mod tests {
     use super::*;
     use crate::testutil::{Ctx, TestResult, check, check_eq};
+    #[test]
+    fn registry_and_vdf_spellings_of_one_library_share_a_key() -> TestResult {
+        let a = path_key(Path::new("c:/program files (x86)/steam/"), true);
+        let b = path_key(Path::new("C:\\Program Files (x86)\\Steam"), true);
+        check_eq(a, b, "case, slash direction and trailing slash fold")?;
+        check(
+            path_key(Path::new("/Games"), false) != path_key(Path::new("/games"), false),
+            "folding is off where paths are case sensitive",
+        )
+    }
     #[test]
     fn steam_manifests_read_like_the_linux_reader() -> TestResult {
         let fixture = tempfile::tempdir().ctx("fixture")?;
