@@ -13,6 +13,7 @@
 // because `forbid` cannot be opted out of at all.
 #![deny(unsafe_code)]
 
+pub mod allocation;
 #[cfg(target_os = "linux")]
 pub mod backend;
 #[cfg(target_os = "linux")]

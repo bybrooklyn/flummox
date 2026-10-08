@@ -649,6 +649,8 @@ pub enum Message {
     QualificationField(crate::qualification::Field, String),
     QualificationCheck(crate::qualification::Check, bool),
     QualificationMode(crate::compatibility::StorageMode),
+    MeasureQualification,
+    QualificationMeasured(Result<crate::allocation::Allocation, String>),
     SaveQualification,
     CloseQualification,
     QualificationSaved(Result<PathBuf, String>),
@@ -883,9 +885,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             {
                 return Task::perform(
                     background(move || {
-                        crate::qualification::baseline(&game)
-                            .map(|corpus| crate::qualification::Wizard::new(game, corpus))
-                            .map_err(|error| error.to_string())
+                        crate::qualification::Wizard::start(game).map_err(|error| error.to_string())
                     }),
                     |result| Message::QualificationReady(result.and_then(|result| result)),
                 );
@@ -908,6 +908,31 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::QualificationMode(mode) => {
             if let Some(wizard) = &mut state.qualification {
                 wizard.mode = mode;
+            }
+        }
+        Message::MeasureQualification => {
+            if let Some(wizard) = &mut state.qualification {
+                let game = &wizard.game.install_dir;
+                let pack = state.snapshot.packs.iter().find(|p| p.game_path == *game);
+                let roots = match (pack, wizard.mode) {
+                    (Some(pack), _) => vec![pack.store_path.clone(), pack.writes_path.clone()],
+                    (None, crate::compatibility::StorageMode::MaximumSpace) => {
+                        wizard.measured(Err("Activate Maximum Space for this game first".into()));
+                        return Task::none();
+                    }
+                    (None, crate::compatibility::StorageMode::Native) => vec![game.clone()],
+                };
+                return Task::perform(
+                    background(move || {
+                        crate::allocation::measure(&roots).map_err(|error| format!("{error:#}"))
+                    }),
+                    |result| Message::QualificationMeasured(result.and_then(|result| result)),
+                );
+            }
+        }
+        Message::QualificationMeasured(result) => {
+            if let Some(wizard) = &mut state.qualification {
+                wizard.measured(result);
             }
         }
         Message::SaveQualification => {

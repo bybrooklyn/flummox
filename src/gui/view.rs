@@ -192,6 +192,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
                 Message::QualificationField,
                 Message::QualificationCheck,
                 Message::QualificationMode,
+                Message::MeasureQualification,
                 Message::SaveQualification,
                 Message::CloseQualification,
             ))
@@ -1618,9 +1619,10 @@ fn completed_job_row(job: &Job) -> Element<'_, Message> {
             column![
                 text(&job.game.title).size(15),
                 theme::muted(format!(
-                    "{} · {} files · {} · {}s",
+                    "{} · {} {} · {} · {}s",
                     kind,
                     job.files_done,
+                    if job.files_done == 1 { "file" } else { "files" },
                     size(job.bytes_done),
                     job.elapsed
                 ))

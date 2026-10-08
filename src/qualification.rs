@@ -36,6 +36,8 @@ pub struct Wizard {
     pub candidate_load: String,
     pub allocated_before: String,
     pub allocated_after: String,
+    /// What the last allocated-byte measurement covered, or why it failed.
+    pub measurement: Option<String>,
     pub checks: Checks,
 }
 impl Wizard {
@@ -49,6 +51,7 @@ impl Wizard {
             candidate_load: String::new(),
             allocated_before: String::new(),
             allocated_after: String::new(),
+            measurement: None,
             checks: Checks {
                 bytes_verified: false,
                 metadata_verified: false,
@@ -70,6 +73,38 @@ impl Wizard {
             Field::AllocationBefore => self.allocated_before = text,
             Field::AllocationAfter => self.allocated_after = text,
         }
+    }
+    /// Hashes the game and measures its folder as the uncompressed baseline.
+    pub fn start(game: Game) -> Result<Self> {
+        let corpus = baseline(&game)?;
+        let before = crate::allocation::measure(std::slice::from_ref(&game.install_dir));
+        let mut wizard = Self::new(game, corpus);
+        match before {
+            Ok(found) => {
+                wizard.allocated_before = found.allocated_bytes.to_string();
+                wizard.measurement = Some(format!(
+                    "Measured the game folder as the original: {} files, {} allocated bytes.",
+                    found.files, found.allocated_bytes
+                ));
+            }
+            Err(error) => {
+                wizard.measurement = Some(format!("Original not measured: {error:#}."));
+            }
+        }
+        Ok(wizard)
+    }
+    /// Records a measurement of the compressed copy, or why there is none.
+    pub fn measured(&mut self, result: Result<crate::allocation::Allocation, String>) {
+        self.measurement = Some(match result {
+            Ok(found) => {
+                self.allocated_after = found.allocated_bytes.to_string();
+                format!(
+                    "Measured the compressed copy: {} files, {} allocated bytes.",
+                    found.files, found.allocated_bytes
+                )
+            }
+            Err(error) => format!("Compressed copy not measured: {error}."),
+        });
     }
     pub fn check(&mut self, check: Check, value: bool) {
         match check {
@@ -190,6 +225,7 @@ pub fn view<'a, Message: Clone + 'a>(
     field: impl Fn(Field, String) -> Message + Clone + 'a,
     check: impl Fn(Check, bool) -> Message + Clone + 'a,
     mode: impl Fn(StorageMode) -> Message + 'a,
+    measure: Message,
     save: Message,
     cancel: Message,
 ) -> iced::Element<'a, Message> {
@@ -265,6 +301,10 @@ pub fn view<'a, Message: Clone + 'a>(
                 .on_toggle(move |value| check(kind, value)),
         );
     }
+    form = form.push(button("Measure compressed copy").on_press(measure));
+    if let Some(measurement) = &wizard.measurement {
+        form = form.push(text(measurement).size(12));
+    }
     form = form.push(text("Record actual allocated bytes; whole-drive free-space changes include other processes. Reports retain failed checks and do not claim untested games are compatible.").size(12));
     if let Err(error) = wizard.report() {
         form = form.push(text(error.to_string()).size(12));
@@ -307,6 +347,17 @@ mod tests {
             },
         );
         check(wizard.report().is_err(), "missing measurements must fail")?;
+        wizard.measured(Err("refused".into()));
+        check(
+            wizard.allocated_after.is_empty(),
+            "a failed measurement fills nothing in",
+        )?;
+        wizard.measured(Ok(crate::allocation::Allocation {
+            files: 1,
+            logical_bytes: 4096,
+            allocated_bytes: 1024,
+        }));
+        check_eq(wizard.allocated_after.as_str(), "1024", "measured value")?;
         wizard.field(Field::BaselineLoad, "1000".into());
         wizard.field(Field::CandidateLoad, "1500".into());
         wizard.field(Field::AllocationBefore, "4096".into());

@@ -20,7 +20,13 @@ For each native Linux, Proton, Windows, and Mac run:
    app's compatibility qualification on the ordinary disposable copy.
 2. Measure baseline loading with the same save, route, and settings. Record real
    allocated bytes. Btrfs estimates and whole-drive free-space deltas are not
-   allocated-byte measurements for a game.
+   allocated-byte measurements for a game. The qualification form measures
+   the game folder when it opens, and its Measure button reads the compressed
+   copy: the store and update layer for Maximum Space, the folder otherwise.
+   `flummox compatibility measure PATH...` prints the same figure. On btrfs it
+   refuses files that hold compressed extents, because the kernel reports
+   their uncompressed size. Decompress the disposable copy before the
+   baseline, or take Disk Usage from `sudo compsize -b`.
 3. Apply compression. On Linux, qualify Maximum Space; on Windows use WOF/LZX;
    on Mac use APFS. Check ordinary file reads, metadata, permissions, and signed
    executable bundles. Record allocated storage and compressed loading.

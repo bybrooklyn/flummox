@@ -294,6 +294,8 @@ enum Message {
     QualificationField(crate::qualification::Field, String),
     QualificationCheck(crate::qualification::Check, bool),
     QualificationMode(crate::compatibility::StorageMode),
+    MeasureQualification,
+    QualificationMeasured(std::result::Result<crate::allocation::Allocation, String>),
     SaveQualification,
     CloseQualification,
     QualificationSaved(std::result::Result<String, String>),
@@ -657,8 +659,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             {
                 return Task::perform(
                     background(move || {
-                        crate::qualification::baseline(&game)
-                            .map(|corpus| Box::new(crate::qualification::Wizard::new(game, corpus)))
+                        crate::qualification::Wizard::start(game)
+                            .map(Box::new)
                             .map_err(|error| error.to_string())
                     }),
                     Message::QualificationReady,
@@ -694,6 +696,22 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::CloseQualification => state.qualification = None,
+        Message::MeasureQualification => {
+            if let Some(wizard) = &state.qualification {
+                let roots = vec![wizard.game.install_dir.clone()];
+                return Task::perform(
+                    background(move || {
+                        crate::allocation::measure(&roots).map_err(|error| format!("{error:#}"))
+                    }),
+                    Message::QualificationMeasured,
+                );
+            }
+        }
+        Message::QualificationMeasured(result) => {
+            if let Some(wizard) = &mut state.qualification {
+                wizard.measured(result);
+            }
+        }
         Message::SaveQualification => {
             if let Some(wizard) = &state.qualification {
                 match wizard.report() {
@@ -1148,6 +1166,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
             Message::QualificationField,
             Message::QualificationCheck,
             Message::QualificationMode,
+            Message::MeasureQualification,
             Message::SaveQualification,
             Message::CloseQualification,
         ));
