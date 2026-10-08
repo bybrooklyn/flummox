@@ -25,44 +25,50 @@ fn size(bytes: u64) -> String {
 }
 /// The filled button for the main action of a row or page.
 fn action(label: impl Into<String>, message: Message) -> Element<'static, Message> {
-    action_maybe(label, Some(message))
+    theme::action(label, message)
 }
 /// As `action`, drawn disabled when `message` is `None`.
 fn action_maybe(label: impl Into<String>, message: Option<Message>) -> Element<'static, Message> {
-    button(text(label.into()))
-        .padding([10, 14])
-        .style(theme::action_button)
-        .on_press_maybe(message)
-        .into()
+    theme::action_maybe(label, message)
 }
 /// The outlined button for every other action.
 fn secondary(label: impl Into<String>, message: Message) -> Element<'static, Message> {
-    secondary_maybe(label, Some(message))
+    theme::secondary(label, message)
 }
 /// As `secondary`, drawn disabled when `message` is `None`.
 fn secondary_maybe(
     label: impl Into<String>,
     message: Option<Message>,
 ) -> Element<'static, Message> {
-    button(text(label.into()))
-        .padding([9, 12])
-        .style(theme::secondary_button)
-        .on_press_maybe(message)
-        .into()
+    theme::secondary_maybe(label, message)
 }
 fn panel<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    container(content)
-        .padding(16)
-        .width(Length::Fill)
-        .style(theme::panel)
-        .into()
+    theme::panel_card(content)
 }
 fn hero<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    container(content)
-        .padding(20)
-        .width(Length::Fill)
-        .style(theme::hero)
-        .into()
+    theme::hero_card(content)
+}
+/// A drop-down list in the window's style.
+fn picker<'a, T, L, V>(
+    options: L,
+    selected: Option<V>,
+    on_select: impl Fn(T) -> Message + 'a,
+) -> iced::widget::PickList<'a, T, L, V, Message>
+where
+    T: ToString + PartialEq + Clone + 'a,
+    L: std::borrow::Borrow<[T]> + 'a,
+    V: std::borrow::Borrow<T> + 'a,
+{
+    pick_list(options, selected, on_select)
+        .padding(theme::INPUT_PADDING)
+        .style(theme::pick_list)
+        .menu_style(theme::pick_menu)
+}
+/// A text input in the window's style.
+fn input<'a>(placeholder: &str, value: &str) -> iced::widget::TextInput<'a, Message> {
+    text_input(placeholder, value)
+        .padding(theme::INPUT_PADDING)
+        .style(theme::text_input)
 }
 
 /// Builds the whole window from `state`.
@@ -89,7 +95,11 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
     // the bottom and switches without animation.
     let mut nav = column![
         if compact {
-            Element::from(text("F").size(24))
+            Element::from(
+                container(text("F").size(24))
+                    .width(Length::Fill)
+                    .center_x(Length::Fill),
+            )
         } else {
             Element::from(text("Flummox").size(23))
         },
@@ -110,21 +120,24 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
                 .unwrap_or(0.)
         }
     };
-    for page in PAGES {
+    let nav_entry = |page: Page| -> Element<'_, Message> {
         let highlight = highlight_of(page);
+        // The icon sits in a box of one width so every label starts at the
+        // same x, and alone it is centred in the compact button.
+        let icon = text(page_icon(page))
+            .size(if compact { 20 } else { 18 })
+            .style(theme::nav_icon(highlight));
         let label: Element<'_, Message> = if compact {
-            text(page_icon(page))
-                .size(20)
-                .style(theme::nav_icon(highlight))
+            container(icon)
+                .width(Length::Fill)
+                .center_x(Length::Fill)
                 .into()
         } else {
             row![
-                text(page_icon(page))
-                    .size(18)
-                    .style(theme::nav_icon(highlight)),
+                container(icon).width(22).center_x(22),
                 text(page.label()).size(15)
             ]
-            .spacing(10)
+            .spacing(8)
             .align_y(Alignment::Center)
             .into()
         };
@@ -133,52 +146,25 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
             .padding(if compact { 11 } else { 12 })
             .style(theme::nav_button(highlight))
             .on_press(Message::GoTo(page));
-        nav = nav.push(if compact {
-            Element::from(tooltip(item, page.label(), tooltip::Position::Right))
+        if compact {
+            tooltip(item, page.label(), tooltip::Position::Right).into()
         } else {
-            Element::from(item)
-        });
-    }
-    let settings_highlight = highlight_of(Page::Settings);
-    let settings_label: Element<'_, Message> = if compact {
-        text(page_icon(Page::Settings))
-            .size(20)
-            .style(theme::nav_icon(settings_highlight))
-            .into()
-    } else {
-        row![
-            text(page_icon(Page::Settings))
-                .size(18)
-                .style(theme::nav_icon(settings_highlight)),
-            text(Page::Settings.label()).size(15)
-        ]
-        .spacing(10)
-        .align_y(Alignment::Center)
-        .into()
+            item.into()
+        }
     };
-    let settings = button(settings_label)
-        .width(Length::Fill)
-        .padding(if compact { 11 } else { 12 })
-        .style(theme::nav_button(settings_highlight))
-        .on_press(Message::GoTo(Page::Settings));
+    for page in PAGES {
+        nav = nav.push(nav_entry(page));
+    }
     nav = nav
         .push(Space::new().height(Length::Fill))
-        .push(if compact {
-            Element::from(tooltip(
-                settings,
-                Page::Settings.label(),
-                tooltip::Position::Right,
-            ))
-        } else {
-            Element::from(settings)
-        });
+        .push(nav_entry(Page::Settings));
     let sidebar = container(nav)
         .width(if compact { 72 } else { 208 })
         .height(Length::Fill)
         .style(theme::sidebar);
-    // The scan banner, the wizard and the plan each keep a slot in the column
-    // while absent. Widget state is matched by position, so a child that came
-    // and went would shift the page and reset its scrolling and focus.
+    // The scan banner, the wizard and the plan each keep a slot while absent.
+    // Widget state is matched by position, so a child that came and went would
+    // shift the page and reset its scrolling and focus.
     let absent = || Element::from(Space::new());
     // Banner shown while the worker is discovering games.
     let mut body = column![].spacing(0).width(Length::Fill);
@@ -193,30 +179,35 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
                     Space::new().width(Length::Fill),
                     secondary("Cancel scan", Message::Send(Command::CancelDiscovery))
                 ]
-                .spacing(12),
+                .spacing(12)
+                .align_y(Alignment::Center),
             )
-            .padding([8, 24]),
+            .padding(theme::page_gutter(compact)),
         ),
         None => absent(),
     });
-    body = body.push(match &state.qualification {
-        Some(wizard) => panel(
-            scrollable(crate::qualification::view(
-                wizard,
-                Message::QualificationField,
-                Message::QualificationCheck,
-                Message::QualificationMode,
-                Message::MeasureQualification,
-                Message::SaveQualification,
-                Message::CloseQualification,
-            ))
-            .height(Length::Fixed(420.0)),
-        ),
+    // The wizard and the plan sit at the top of the page column, inside the
+    // page gutter and under the page's own scrolling.
+    fn below(card: Element<'_, Message>) -> Element<'_, Message> {
+        container(card)
+            .padding(iced::Padding::default().bottom(theme::PAGE_GAP))
+            .into()
+    }
+    let wizard_slot = match &state.qualification {
+        Some(wizard) => below(panel(crate::qualification::view(
+            wizard,
+            Message::QualificationField,
+            Message::QualificationCheck,
+            Message::QualificationMode,
+            Message::MeasureQualification,
+            Message::SaveQualification,
+            Message::CloseQualification,
+        ))),
         None => absent(),
-    });
+    };
     // Space plan review. "Start job" is disabled while the plan's own check
     // fails, and the failure is shown above it.
-    if let Some((command, plan)) = &state.planned {
+    let plan_slot = if let Some((command, plan)) = &state.planned {
         let mut review = column![theme::section_title("Storage plan")].spacing(8);
         if let Some((work, title)) = command_words(command) {
             review = review.push(theme::muted(format!("{work} · {title}")));
@@ -238,6 +229,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
                 "The original is retained until you explicitly reclaim it.",
             ));
         }
+        let failed = plan.check().is_err();
         if let Err(error) = plan.check() {
             let short = shortfall(plan);
             review = review.push(theme::danger_text(if short > 0 {
@@ -257,20 +249,18 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
                 action("Check again", Message::StartPlanned),
                 secondary("Cancel", Message::CancelPlanned)
             ]
-            .spacing(8),
+            .spacing(8)
+            .wrap(),
         );
-        body = body.push(panel(review));
+        below(if failed {
+            theme::attention_card(review, true)
+        } else {
+            panel(review)
+        })
     } else {
-        body = body.push(absent());
-    }
-    let page = match state.page {
-        Page::Overview => overview(state, compact),
-        Page::Games => games(state, compact),
-        Page::Queue => queue(state),
-        Page::Drives => drives(state),
-        Page::Recovery => recovery(state),
-        Page::Settings => settings_page(state),
+        absent()
     };
+    let page = column![wizard_slot, plan_slot, page_content(state, compact)];
     // The page slides in over `distance` pixels as its reveal animation runs.
     // The scrollable's id and the surface key are both the main page's label,
     // which is what `scroll_to` in `app` and the surface's keyboard scrolling
@@ -292,7 +282,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
     body = body.push(super::surface::tracked_surface(
         scrollable(
             container(page)
-                .padding(if compact { 16 } else { 24 })
+                .padding(theme::page_gutter(compact))
                 .width(Length::Fill),
         )
         .id(iced::widget::Id::new(page_key.label()))
@@ -322,7 +312,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
                 .spacing(16)
                 .align_y(Alignment::Center),
             ))
-            .padding(iced::Padding::default().left(24).right(24).bottom(20)),
+            .padding(theme::page_gutter(compact).top(0)),
         );
     }
     let base: Element<'_, Message> = container(row![sidebar, body])
@@ -376,6 +366,18 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+}
+
+/// The body of the page `state.page` names.
+fn page_content(state: &State, compact: bool) -> Element<'_, Message> {
+    match state.page {
+        Page::Overview => overview(state),
+        Page::Games => games(state, compact),
+        Page::Queue => queue(state),
+        Page::Drives => drives(state, false),
+        Page::Recovery => recovery(state, false),
+        Page::Settings => settings_page(state),
+    }
 }
 
 /// The kind of work and the game's title for the command a storage plan is
@@ -486,9 +488,8 @@ fn page_icon(page: Page) -> &'static str {
 // Overview page.
 
 /// The Overview page: the saving so far with the main action, library totals,
-/// a count of things needing attention, drives, and recent jobs. Recent jobs
-/// are left out when `compact`.
-fn overview(state: &State, compact: bool) -> Element<'_, Message> {
+/// a count of things needing attention, drives, and recent jobs.
+fn overview(state: &State) -> Element<'_, Message> {
     let compressed = state
         .games
         .iter()
@@ -516,18 +517,18 @@ fn overview(state: &State, compact: bool) -> Element<'_, Message> {
     // predicted, is disabled while scanning or analysing, and otherwise
     // offers another scan.
     let mut content = column![
-        row![
-            theme::page_title("Overview").width(Length::Fill),
-            secondary(
+        theme::page_header(
+            "Overview",
+            None,
+            Some(secondary(
                 if state.scanning {
                     "Refreshing…"
                 } else {
                     "Refresh"
                 },
                 Message::Rescan
-            )
-        ]
-        .align_y(Alignment::Center),
+            ))
+        ),
         hero(
             column![
                 theme::muted(if current > 0 {
@@ -584,14 +585,16 @@ fn overview(state: &State, compact: bool) -> Element<'_, Message> {
             .spacing(36)
         )
     ]
-    .spacing(16);
+    .spacing(theme::PAGE_GAP);
     if attention > 0 || !state.warnings.is_empty() {
         // Scan warnings are listed here, since no game row carries them.
-        let mut notes = column![text(attention_title(attention + state.warnings.len())).size(16)]
-            .spacing(4)
-            .width(Length::Fill);
+        let mut notes = column![theme::section_text(attention_title(
+            attention + state.warnings.len()
+        ))]
+        .spacing(4)
+        .width(Length::Fill);
         for warning in state.warnings.iter().take(5) {
-            notes = notes.push(theme::muted(warning));
+            notes = notes.push(theme::warning_text(warning));
         }
         if state.warnings.len() > 5 {
             notes = notes.push(theme::muted(format!(
@@ -602,13 +605,15 @@ fn overview(state: &State, compact: bool) -> Element<'_, Message> {
         if attention > 0 {
             notes = notes.push(theme::muted("Review lists the games"));
         }
-        let mut card = row![notes].align_y(Alignment::Center);
+        let mut card = row![notes].spacing(12).align_y(Alignment::Center);
         if attention > 0 {
             card = card.push(secondary("Review", Message::ReviewAttention));
         }
-        content = content.push(panel(card));
+        content = content.push(theme::attention_card(card, false));
     }
-    content = content.push(theme::section_title("Drives"));
+    if !state.drives.is_empty() {
+        content = content.push(theme::section_title("Drives"));
+    }
     for drive in &state.drives {
         content = content.push(panel(
             row![
@@ -630,7 +635,8 @@ fn overview(state: &State, compact: bool) -> Element<'_, Message> {
                         .unwrap_or_else(|| "Drive unavailable".into())
                 )
             ]
-            .spacing(12),
+            .spacing(12)
+            .align_y(Alignment::Center),
         ));
     }
     let recent: Vec<_> = state
@@ -641,19 +647,21 @@ fn overview(state: &State, compact: bool) -> Element<'_, Message> {
         .filter(|j| j.operation != Operation::Analyze)
         .take(3)
         .collect();
-    if !recent.is_empty() && !compact {
+    if !recent.is_empty() {
         content = content.push(theme::section_title("Recent work"));
     }
-    if !compact {
-        for job in recent {
-            content = content.push(panel(row![
+    for job in recent {
+        content = content.push(panel(
+            row![
                 text(&job.game.title).width(Length::Fill),
                 theme::muted(match super::app::job_outcome(job) {
                     Some(outcome) => outcome_words(outcome),
                     None => format!("{} · {}", kind_words(job), job.phase.label()),
                 })
-            ]));
-        }
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center),
+        ));
     }
     content.into()
 }
@@ -668,13 +676,12 @@ fn games(state: &State, compact: bool) -> Element<'_, Message> {
     // The same three controls, stacked when compact and in one row otherwise.
     let search_and_sort: Element<'_, Message> = if compact {
         column![
-            text_input("Search your games", &state.query)
+            input("Search your games", &state.query)
                 .id("game-search")
                 .on_input(Message::Query)
-                .padding(10)
                 .width(Length::Fill),
             row![
-                pick_list(
+                picker(
                     [
                         Filter::All,
                         Filter::Ready,
@@ -685,24 +692,24 @@ fn games(state: &State, compact: bool) -> Element<'_, Message> {
                     Some(state.filter),
                     Message::Filter
                 ),
-                pick_list(
+                picker(
                     [Sort::Worth, Sort::Name, Sort::Size],
                     Some(state.sort),
                     Message::Sort
                 )
             ]
             .spacing(8)
+            .align_y(Alignment::Center)
         ]
         .spacing(8)
         .into()
     } else {
         row![
-            text_input("Search your games", &state.query)
+            input("Search your games", &state.query)
                 .id("game-search")
                 .on_input(Message::Query)
-                .padding(10)
                 .width(Length::Fill),
-            pick_list(
+            picker(
                 [
                     Filter::All,
                     Filter::Ready,
@@ -713,32 +720,32 @@ fn games(state: &State, compact: bool) -> Element<'_, Message> {
                 Some(state.filter),
                 Message::Filter
             ),
-            pick_list(
+            picker(
                 [Sort::Worth, Sort::Name, Sort::Size],
                 Some(state.sort),
                 Message::Sort
             )
         ]
         .spacing(8)
+        .align_y(Alignment::Center)
         .into()
     };
     let mut content = column![
-        row![
-            theme::page_title("Games"),
-            Space::new().width(Length::Fill),
-            secondary(
+        theme::page_header(
+            "Games",
+            None,
+            Some(secondary(
                 if state.scanning {
                     "Refreshing…"
                 } else {
                     "Refresh"
                 },
                 Message::Rescan
-            )
-        ]
-        .align_y(Alignment::Center),
+            ))
+        ),
         search_and_sort,
     ]
-    .spacing(12);
+    .spacing(theme::PAGE_GAP);
     // Drive and launcher filters. The first option of each stands for no
     // filter and is mapped back to `None` by comparing its label.
     let mut drive_options = vec!["All drives".to_owned()];
@@ -757,10 +764,10 @@ fn games(state: &State, compact: bool) -> Element<'_, Message> {
     }
     content = content.push(
         row![
-            pick_list(drive_options, Some(selected_drive), |value| {
+            picker(drive_options, Some(selected_drive), |value| {
                 Message::DriveFilter((value != "All drives").then(|| value.into()))
             }),
-            pick_list(
+            picker(
                 launcher_options,
                 Some(
                     state
@@ -771,7 +778,8 @@ fn games(state: &State, compact: bool) -> Element<'_, Message> {
                 |value| Message::LauncherFilter((value != "All launchers").then_some(value))
             )
         ]
-        .spacing(8),
+        .spacing(8)
+        .align_y(Alignment::Center),
     );
     let selected = state.actionable_selection().len();
     if selected > 0 {
@@ -785,7 +793,7 @@ fn games(state: &State, compact: bool) -> Element<'_, Message> {
     }
     if filtered.is_empty() {
         let (title, hint, way_out) = empty_games(state);
-        let mut message = column![text(title).size(18), theme::muted(hint)].spacing(10);
+        let mut message = column![theme::section_text(title), theme::muted(hint)].spacing(10);
         if let Some((label, press)) = way_out {
             message = message.push(secondary(label, press));
         }
@@ -835,6 +843,15 @@ fn games(state: &State, compact: bool) -> Element<'_, Message> {
     content.into()
 }
 
+/// The control that opens and closes a game's Advanced section.
+fn advanced_toggle<'a>(id: &str, open: bool) -> Element<'a, Message> {
+    theme::disclosure(
+        if open { "Hide advanced" } else { "Advanced" },
+        open,
+        Message::ToggleAdvanced(id.to_owned()),
+    )
+}
+
 /// The heading above a group of the Worth order, keyed by the group's name.
 /// The last group's heading carries the button that expands it.
 fn group_line<'a>(
@@ -860,7 +877,7 @@ fn group_line<'a>(
     };
     let line: Element<'_, Message> = if group == 3 {
         row![
-            text(summary).size(15).width(Length::Fill),
+            theme::section_text(summary).width(Length::Fill),
             secondary(
                 if state.show_low { "Hide" } else { "Show" },
                 Message::ToggleLow
@@ -869,7 +886,7 @@ fn group_line<'a>(
         .align_y(Alignment::Center)
         .into()
     } else {
-        text(summary).size(15).into()
+        theme::section_text(summary).into()
     };
     (*blake3::hash(name.as_bytes()).as_bytes(), line)
 }
@@ -971,58 +988,74 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
     let ready = !state.pending.contains(&id) && working.is_none();
     // Summary line: checkbox, artwork, title and status, size and saving,
     // then the main button. The button reads "Recheck" and queues an analysis
-    // once the game is compressed.
+    // once the game is compressed. A custom folder has no launcher size, so
+    // the analysis supplies it. When compact, the figures move under the
+    // title, where the row has the width for them.
+    let size_text = state
+        .size_of(game)
+        .map(size)
+        .unwrap_or_else(|| "Size pending".into());
     let check_id = id.clone();
+    let mut title = column![text(&game.title).size(16), theme::muted(status)].spacing(4);
+    if compact {
+        title = title.push(theme::muted(format!("{size_text} · {saving}")));
+    }
     let mut line = row![
         checkbox(state.selected.contains(&id)).on_toggle_maybe(
             (item.supported && game.state.is_idle() && !state.pending.contains(&id))
                 .then_some(move |value| Message::Select(check_id.clone(), value)),
         ),
         icon,
-        button(column![text(&game.title).size(16), theme::muted(status)].spacing(4))
+        button(title)
             .style(button::text)
             .width(Length::Fill)
             .on_press(Message::Expand(id.clone())),
-        column![
-            // A custom folder has no launcher size, so the analysis supplies it.
-            text(
-                state
-                    .size_of(game)
-                    .map(size)
-                    .unwrap_or_else(|| "Size pending".into())
-            ),
-            theme::muted(saving)
-        ]
-        .spacing(4)
-        .align_x(Alignment::End)
     ]
     .spacing(12)
     .align_y(Alignment::Center);
-    if item.supported {
-        // Compress is the main action. A compressed game only offers another
-        // analysis, which is not, so it gets the quieter button.
+    if !compact {
         line = line.push(
-            if state
-                .snapshot
-                .packs
-                .iter()
-                .any(|install| install.game_path == game.install_dir)
-            {
-                // A stored game's next step is in its details.
-                secondary("Details", Message::Expand(id.clone()))
-            } else if compressed {
-                secondary_maybe(
-                    "Analyze again",
-                    ready.then(|| Message::One(id.clone(), Operation::Analyze)),
-                )
-            } else {
-                action_maybe(
-                    "Compress",
-                    ready.then(|| Message::One(id.clone(), Operation::Compress)),
-                )
-            },
+            container(
+                column![text(size_text), theme::muted(saving)]
+                    .spacing(4)
+                    .align_x(Alignment::End),
+            )
+            .width(theme::TRAILING_WIDTH)
+            .align_x(Alignment::End),
         );
     }
+    // Compress is the main action. A compressed game only offers another
+    // analysis, which is not, so it gets the quieter button. The slot is
+    // there without a button so the figures keep their column.
+    let button_slot: Element<'_, Message> = if !item.supported {
+        Space::new().into()
+    } else if state
+        .snapshot
+        .packs
+        .iter()
+        .any(|install| install.game_path == game.install_dir)
+    {
+        // A stored game's next step is in its details.
+        secondary("Details", Message::Expand(id.clone()))
+    } else if compressed {
+        secondary_maybe(
+            "Analyze again",
+            ready.then(|| Message::One(id.clone(), Operation::Analyze)),
+        )
+    } else {
+        action_maybe(
+            "Compress",
+            ready.then(|| Message::One(id.clone(), Operation::Compress)),
+        )
+    };
+    line = line.push(if compact {
+        Element::from(button_slot)
+    } else {
+        container(button_slot)
+            .width(theme::ACTION_SLOT_WIDTH)
+            .align_x(Alignment::End)
+            .into()
+    });
     // Detail pane. It stays in the tree while its closing animation runs.
     let mut contents = column![line].spacing(12);
     if state.expanded.as_ref() == Some(&id)
@@ -1065,9 +1098,24 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
             .packs
             .iter()
             .any(|install| install.game_path == game.install_dir);
+        let advanced_open = state.advanced.contains(&id);
+        // One plain line about how far to trust the figures.
+        let confidence = state.estimate(game).and_then(|est| {
+            state.recommendation(game).map(|choice| {
+                if est.unsampled_files > 0 {
+                    format!(
+                        "{}. The largest files were sampled and the rest scaled in.",
+                        choice.confidence.label()
+                    )
+                } else {
+                    format!("{}.", choice.confidence.label())
+                }
+            })
+        });
         // A game that already runs from a store shows its Maximum card below
         // and none of this: its mode is settled, and the native Analyze and
         // Decompress do not apply to a mounted store.
+        let mut confidence_shown = false;
         if item.supported && !stored {
             let chosen = state.choice_for(game);
             let mut modes = row![].spacing(8);
@@ -1083,18 +1131,26 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                     Some(saving) => format!("{name} · about {}", size(saving)),
                     None => name.to_owned(),
                 };
-                // The chosen mode is the filled button. Pressing it again
+                // The chosen mode wears the selected style. Pressing it again
                 // changes nothing, which keeps it from looking disabled.
-                let pick = Message::Choice(id.clone(), choice);
-                modes = modes.push(if choice == chosen {
-                    action(label, pick)
-                } else {
-                    secondary(label, pick)
-                });
+                modes = modes.push(theme::choice(
+                    label,
+                    choice == chosen,
+                    Message::Choice(id.clone(), choice),
+                ));
+            }
+            let mut heading = row![theme::section_title("How to compress")]
+                .spacing(12)
+                .align_y(Alignment::Center);
+            if let Some(confidence) = &confidence {
+                confidence_shown = true;
+                heading = heading
+                    .push(Space::new().width(Length::Fill))
+                    .push(theme::muted(confidence.clone()));
             }
             details = details
-                .push(theme::muted("How to compress"))
-                .push(modes)
+                .push(heading)
+                .push(modes.wrap())
                 .push(theme::muted(match chosen {
                     StorageChoice::Standard => {
                         "Standard is quick, and the game's files stay exactly where they are."
@@ -1115,14 +1171,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                                 .then(|| Message::One(id.clone(), Operation::Decompress))
                         ),
                         Space::new().width(Length::Fill),
-                        button(text(if state.advanced.contains(&id) {
-                            "Hide advanced"
-                        } else {
-                            "Advanced"
-                        }))
-                        .style(button::text)
-                        .padding([9, 4])
-                        .on_press(Message::ToggleAdvanced(id.clone()))
+                        advanced_toggle(&id, advanced_open)
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center),
@@ -1130,12 +1179,12 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
         }
         // Advanced: the native preset, then the store controls.
         let preset_id = id.clone();
-        if item.native_supported && !stored && state.advanced.contains(&id) {
+        if item.native_supported && !stored && advanced_open {
             details = details
                 .push(
                     row![
                         theme::muted("Standard strength"),
-                        pick_list(
+                        picker(
                             [Preset::Fast, Preset::Balanced, Preset::Max],
                             Some(state.preset_for(&id)),
                             move |preset| Message::Preset(preset_id.clone(), preset)
@@ -1167,7 +1216,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                 let used = summary.archive_bytes.saturating_sub(summary.shared_bytes);
                 (summary.logical_bytes, used)
             });
-            details = details.push(text("Maximum").size(16));
+            details = details.push(theme::section_title("Maximum"));
             if install.phase != crate::pack::InstallPhase::Mounted {
                 details = details.push(theme::muted(format!(
                     "{} · {}",
@@ -1203,7 +1252,8 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                                 ready.then(|| queue(crate::jobs::PackTask::Restore)),
                             )
                         ]
-                        .spacing(8),
+                        .spacing(8)
+                        .wrap(),
                     )
                     .push(theme::muted(
                         "The store is checked in full before the original is deleted.",
@@ -1229,15 +1279,8 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                         "Decompressing needs free space for the whole game.",
                     ));
             }
-            details = details.push(secondary(
-                if state.advanced.contains(&id) {
-                    "Hide advanced"
-                } else {
-                    "Advanced"
-                },
-                Message::ToggleAdvanced(id.clone()),
-            ));
-            if state.advanced.contains(&id) {
+            details = details.push(advanced_toggle(&id, advanced_open));
+            if advanced_open {
                 details = details.push(theme::muted(format!(
                     "Store: {} · updates: {}",
                     install.store_path.display(),
@@ -1265,150 +1308,173 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                                     .then(|| queue(crate::jobs::PackTask::Prune)),
                             )
                         ]
-                        .spacing(8),
+                        .spacing(8)
+                        .wrap(),
                     );
                 }
             }
-        } else if item.pack_supported && state.advanced.contains(&id) {
+        } else if item.pack_supported && advanced_open {
             let path_id = id.clone();
             // The default path is the placeholder, so the field can be emptied.
             let default_store = state.store_path(game).display().to_string();
             let typed = state.pack_paths.get(&id).cloned().unwrap_or_default();
             details = details
-                    .push(text("Maximum Space storage").size(16))
-                    .push(theme::muted("Verified chunks can be shared across games"))
-                    .push(
-                        text_input(&default_store, &typed)
-                            .on_input(move |path| Message::PackPath(path_id.clone(), path))
-                            .padding(10),
-                    )
-                    .push(secondary_maybe("Choose storage folder…", (!state.picker_busy).then(|| Message::Browse(super::dialog::Target::Storage(id.clone())))))
-                    .push(theme::muted("1. Create and verify a store. 2. Play the game to test it. 3. Delete the original to save the space."))
-                    .push(theme::muted("Creation needs room for the store beside the original. Updates use more space, and decompressing later needs room for the whole game."))
-                    .push(
-                        row![
-                            action_maybe(
-                                "Create & activate",
-                                (!state.pending.contains(&id))
-                                    .then(|| Message::PackActivate(id.clone(), true))
-                            ),
-                            secondary_maybe("Create store only", (!state.pending.contains(&id)).then(|| Message::PackCreate(id.clone()))),
-                            secondary_maybe(
-                                "Activate existing",
-                                (!state.pending.contains(&id))
-                                    .then(|| Message::PackActivate(id.clone(), false))
-                            )
-                        ]
-                        .spacing(8),
-                    );
+                .push(theme::section_title("Maximum Space storage"))
+                .push(theme::muted("Verified chunks can be shared across games"))
+                .push(
+                    input(&default_store, &typed)
+                        .on_input(move |path| Message::PackPath(path_id.clone(), path)),
+                )
+                .push(secondary_maybe(
+                    "Choose storage folder…",
+                    (!state.picker_busy)
+                        .then(|| Message::Browse(super::dialog::Target::Storage(id.clone()))),
+                ))
+                .push(
+                    column![
+                        text("1. Create and verify a store.").size(13),
+                        text("2. Play the game to test it.").size(13),
+                        text("3. Delete the original to save the space.").size(13)
+                    ]
+                    .spacing(2),
+                )
+                .push(theme::muted("Creation needs room for the store beside the original. Updates use more space, and decompressing later needs room for the whole game."))
+                .push(
+                    row![
+                        secondary_maybe(
+                            "Create & activate",
+                            (!state.pending.contains(&id))
+                                .then(|| Message::PackActivate(id.clone(), true))
+                        ),
+                        secondary_maybe(
+                            "Create store only",
+                            (!state.pending.contains(&id))
+                                .then(|| Message::PackCreate(id.clone()))
+                        ),
+                        secondary_maybe(
+                            "Activate existing",
+                            (!state.pending.contains(&id))
+                                .then(|| Message::PackActivate(id.clone(), false))
+                        )
+                    ]
+                    .spacing(8)
+                    .wrap(),
+                );
         }
         if let Some(note) = &item.note {
             details = details.push(theme::muted(note));
         }
-        // One plain line about how far to trust the figures.
-        if let Some(est) = state.estimate(game)
-            && let Some(choice) = state.recommendation(game)
-        {
-            details = details.push(theme::muted(if est.unsampled_files > 0 {
-                format!(
-                    "{}. The largest files were sampled and the rest scaled in.",
-                    choice.confidence.label()
-                )
-            } else {
-                format!("{}.", choice.confidence.label())
-            }));
+        if !confidence_shown && let Some(confidence) = &confidence {
+            details = details.push(theme::muted(confidence.clone()));
         }
         // Advanced, continued: reports, exclusion, and what the analysis saw.
-        if state.advanced.contains(&id) {
-            details = details.push(
-                row![
-                    secondary_maybe(
-                        "Qualify compatibility",
-                        item.game
-                            .state
-                            .is_idle()
-                            .then(|| Message::Qualify(id.clone())),
-                    ),
-                    secondary_maybe(
-                        "Import compatibility report…",
-                        (!state.picker_busy)
-                            .then_some(Message::Browse(super::dialog::Target::Report)),
-                    ),
-                    secondary_maybe(
-                        "Choose artwork…",
-                        (!state.picker_busy)
-                            .then(|| Message::Browse(super::dialog::Target::Artwork(id.clone()))),
-                    ),
-                    secondary("Use default artwork", Message::ClearArtwork(id.clone())),
-                    secondary(
-                        "Exclude this game",
-                        Message::Send(Command::Exclude {
-                            id: id.clone(),
-                            excluded: true,
-                        }),
-                    )
-                ]
-                .spacing(8)
-                .wrap(),
-            );
+        if advanced_open {
+            let mut tools = row![
+                secondary_maybe(
+                    if state.qualifying {
+                        "Measuring…"
+                    } else {
+                        "Qualify compatibility"
+                    },
+                    (item.game.state.is_idle() && !state.qualifying)
+                        .then(|| Message::Qualify(id.clone())),
+                ),
+                secondary_maybe(
+                    "Import compatibility report…",
+                    (!state.picker_busy).then_some(Message::Browse(super::dialog::Target::Report)),
+                ),
+                secondary_maybe(
+                    "Choose artwork…",
+                    (!state.picker_busy)
+                        .then(|| Message::Browse(super::dialog::Target::Artwork(id.clone()))),
+                ),
+                secondary("Use default artwork", Message::ClearArtwork(id.clone())),
+                secondary(
+                    "Exclude this game",
+                    Message::Send(Command::Exclude {
+                        id: id.clone(),
+                        excluded: true,
+                    }),
+                )
+            ]
+            .spacing(8);
+            if state.qualifying {
+                tools = tools.push(secondary("Cancel", Message::CloseQualification));
+            }
+            details = details.push(tools.wrap());
             if let Some(est) = state.estimate(game) {
-                let mut facts = Vec::new();
+                let mut facts = column![].spacing(4);
                 if let Some(choice) = state.recommendation(game) {
-                    facts.push(format!(
-                        "Standard about {}{}",
-                        size(choice.native_saving),
-                        choice
-                            .maximum_saving
-                            .map(|saving| format!(" · Maximum sample about {}", size(saving)))
-                            .unwrap_or_default()
+                    facts = facts.push(theme::fact(
+                        "Savings",
+                        format!(
+                            "Standard about {}{}",
+                            size(choice.native_saving),
+                            choice
+                                .maximum_saving
+                                .map(|saving| format!(" · Maximum sample about {}", size(saving)))
+                                .unwrap_or_default()
+                        ),
                     ));
                 }
-                facts.push(format!(
-                    "Sampled {} from {} files · {} skipped · {} not sampled{}",
-                    size(est.sampled),
-                    est.inspected_files,
-                    est.skipped_files,
-                    est.unsampled_files,
-                    if est.already_compressed_mount {
-                        " · savings are on top of the drive's own compression"
-                    } else {
-                        ""
-                    }
+                facts = facts.push(theme::fact(
+                    "Sampled",
+                    format!(
+                        "{} from {} files · {} skipped · {} not sampled{}",
+                        size(est.sampled),
+                        est.inspected_files,
+                        est.skipped_files,
+                        est.unsampled_files,
+                        if est.already_compressed_mount {
+                            " · savings are on top of the drive's own compression"
+                        } else {
+                            ""
+                        }
+                    ),
                 ));
                 let evidence = est.format_evidence;
-                facts.push(format!(
-                    "Formats: {} known · {} unknown · {} encoded · {} containers · {} raw{}",
-                    evidence.recognized_files,
-                    evidence.unknown_files,
-                    evidence.encoded_files,
-                    evidence.container_files,
-                    evidence.raw_media_files,
-                    if evidence.encrypted_files > 0 {
-                        format!(" · {} encrypted", evidence.encrypted_files)
-                    } else {
-                        String::new()
-                    }
+                facts = facts.push(theme::fact(
+                    "Formats",
+                    format!(
+                        "{} known · {} unknown · {} encoded · {} containers · {} raw{}",
+                        evidence.recognized_files,
+                        evidence.unknown_files,
+                        evidence.encoded_files,
+                        evidence.container_files,
+                        evidence.raw_media_files,
+                        if evidence.encrypted_files > 0 {
+                            format!(" · {} encrypted", evidence.encrypted_files)
+                        } else {
+                            String::new()
+                        }
+                    ),
                 ));
                 if est.small_files.files > 0 {
-                    facts.push(format!(
-                        "Small files: {} in {} files · grouping would save {} more",
-                        size(est.small_files.bytes),
-                        est.small_files.files,
-                        size(est.small_files.extra_payload_saving)
+                    facts = facts.push(theme::fact(
+                        "Small files",
+                        format!(
+                            "{} in {} files · grouping would save {} more",
+                            size(est.small_files.bytes),
+                            est.small_files.files,
+                            size(est.small_files.extra_payload_saving)
+                        ),
                     ));
                 }
-                facts.push(if est.maximum_qualified {
-                    "A compatibility report matches this build and its files".into()
-                } else {
-                    "No compatibility report matches this build".into()
-                });
-                details = details.push(theme::muted(facts.join("\n")));
+                facts = facts.push(theme::fact(
+                    "Compatibility",
+                    if est.maximum_qualified {
+                        "A compatibility report matches this build and its files".into()
+                    } else {
+                        "No compatibility report matches this build".into()
+                    },
+                ));
+                details = details.push(facts);
             }
         }
         if let Some(job) = state.latest(game)
             && !job.errors.is_empty()
         {
-            details = details.push(theme::muted(job.errors.join("\n")));
+            details = details.push(theme::danger_text(job.errors.join("\n")));
         }
         let reveal = if state.reduced_motion {
             1.0
@@ -1439,13 +1505,19 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
 /// The Recovery section: jobs that failed, were partial or were interrupted,
 /// and pack installs that are not simply mounted or that still retain an
 /// original or a previous store.
-fn recovery(state: &State) -> Element<'_, Message> {
+fn recovery(state: &State, embedded: bool) -> Element<'_, Message> {
+    let subtitle = "Review interrupted jobs and retained storage before retrying or restoring.";
     let mut content = column![
-        theme::page_title("Recovery"),
-        theme::muted("Review interrupted jobs and retained storage before retrying or restoring."),
+        if embedded {
+            column![theme::section_title("Recovery"), theme::muted(subtitle)]
+                .spacing(4)
+                .into()
+        } else {
+            theme::page_header::<Message>("Recovery", Some(subtitle), None)
+        },
         secondary("Export local diagnostics", Message::ExportDiagnostics)
     ]
-    .spacing(14);
+    .spacing(theme::PAGE_GAP);
     let mut issues = 0;
     for job in state.snapshot.jobs.iter().filter(|job| {
         matches!(
@@ -1464,8 +1536,16 @@ fn recovery(state: &State) -> Element<'_, Message> {
             continue;
         }
         issues += 1;
+        let game = state
+            .games
+            .iter()
+            .find(|row| row.game.install_dir == install.game_path);
         let mut details = column![
-            text(install.game_path.display().to_string()).size(16),
+            theme::section_text(
+                game.map(|row| row.game.title.clone())
+                    .unwrap_or_else(|| install.game_path.display().to_string())
+            ),
+            theme::muted(install.game_path.display().to_string()),
             theme::muted(install.phase.label()),
             text(&install.message).size(13),
             theme::muted(format!(
@@ -1487,10 +1567,6 @@ fn recovery(state: &State) -> Element<'_, Message> {
                 previous.display()
             )));
         }
-        let game = state
-            .games
-            .iter()
-            .find(|row| row.game.install_dir == install.game_path);
         // True while any job for this game is active. Restore and verify are
         // offered only without one.
         let pending = state
@@ -1499,11 +1575,12 @@ fn recovery(state: &State) -> Element<'_, Message> {
             .iter()
             .any(|job| job.phase.active() && job.game.install_dir == install.game_path);
         if let Some(row) = game {
+            let mut actions = iced::widget::Row::new().spacing(8);
             if !pending
                 && row.game.state.is_idle()
                 && install.phase == crate::pack::InstallPhase::Mounted
             {
-                details = details.push(secondary(
+                actions = actions.push(secondary(
                     "Restore ordinary files",
                     Message::Send(Command::EnqueuePack {
                         game: row.game.clone(),
@@ -1515,7 +1592,7 @@ fn recovery(state: &State) -> Element<'_, Message> {
                 && row.game.state.is_idle()
                 && install.phase == crate::pack::InstallPhase::Attention
             {
-                details = details.push(secondary(
+                actions = actions.push(secondary(
                     "Verify restored files",
                     Message::Send(Command::EnqueuePack {
                         game: row.game.clone(),
@@ -1523,12 +1600,16 @@ fn recovery(state: &State) -> Element<'_, Message> {
                     }),
                 ));
             }
-            details = details.push(secondary(
+            actions = actions.push(secondary(
                 "Review game and storage",
                 Message::ReviewGame(row.game.id.to_string()),
             ));
+            details = details.push(actions.wrap());
         }
-        content = content.push(panel(details));
+        content = content.push(theme::attention_card(
+            details,
+            install.phase == crate::pack::InstallPhase::Attention,
+        ));
     }
     if issues == 0 {
         content = content.push(panel(theme::muted(
@@ -1580,10 +1661,23 @@ fn outcome_words(outcome: super::app::Outcome) -> String {
     }
 }
 
+/// How a job's bar and phase label are coloured: paused and partial work in
+/// the warning colour, failed and interrupted work in the danger colour.
+fn tone(phase: Phase) -> theme::Tone {
+    match phase {
+        Phase::Pausing | Phase::Paused | Phase::Partial => theme::Tone::Warning,
+        Phase::Failed | Phase::Interrupted => theme::Tone::Failed,
+        _ => theme::Tone::Normal,
+    }
+}
+
 /// A job's progress bar, by bytes when a byte total is known and by files
-/// otherwise. Empty when neither total is known.
+/// otherwise. Empty when neither total is known, and for a job that has not
+/// started, whose bar would be an empty track.
 fn progress<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
-    let fraction = if job.bytes_total > 0 {
+    let fraction = if job.phase == Phase::Queued {
+        return Space::new().height(0).into();
+    } else if job.bytes_total > 0 {
         job.bytes_done as f32 / job.bytes_total as f32
     } else if job.files_total > 0 {
         job.files_done as f32 / job.files_total as f32
@@ -1604,14 +1698,15 @@ fn progress<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
         .clamp(0., 1.),
     )
     .girth(5)
+    .style(theme::progress_bar(tone(job.phase)))
     .into()
 }
 /// A card for a job that is running, waiting or needs attention, with its
-/// controls.
+/// controls. A job that ended badly gets a card edged in the failure colour.
 fn job_row<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
     // Pause and Cancel for an active job, except a pack job in a step that
     // cannot be interrupted. Retry for a job that stopped short of completing.
-    let mut controls = row![].spacing(8);
+    let mut controls = iced::widget::Row::new().spacing(8);
     if job.phase.active() && (job.operation != Operation::Pack || job.pack_interruptible) {
         controls = controls
             .push(secondary(
@@ -1628,9 +1723,12 @@ fn job_row<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
     let kind = kind_words(job);
     let mut content = column![
         row![
-            text(&job.game.title).size(16).width(Length::Fill),
+            theme::section_text(&job.game.title).width(Length::Fill),
             theme::muted(format!("{kind} · {}", job.phase.label()))
-        ],
+                .style(theme::tone_text(tone(job.phase)))
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
         progress(state, job),
         theme::muted(&job.message),
         row![
@@ -1648,9 +1746,10 @@ fn job_row<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
                 format!("{}s elapsed", job.elapsed)
             })
             .width(Length::Fill),
-            controls
+            controls.wrap()
         ]
         .spacing(12)
+        .align_y(Alignment::Center)
     ]
     .spacing(10);
     // The free-space change covers the whole filesystem, so the label says
@@ -1663,27 +1762,35 @@ fn job_row<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
         )));
     }
     if !job.errors.is_empty() {
-        content = content.push(theme::muted(job.errors.join("\n")));
+        content = content.push(theme::danger_text(job.errors.join("\n")));
     }
-    panel(content)
+    match tone(job.phase) {
+        theme::Tone::Failed => theme::attention_card(content, true),
+        theme::Tone::Warning if job.phase == Phase::Partial => {
+            theme::attention_card(content, false)
+        }
+        _ => panel(content),
+    }
 }
 /// The Jobs section: connection state, then jobs grouped as running, waiting,
 /// needing attention and history, then recent activity. Analyses are not
 /// listed. History shows the newest 20.
 fn queue(state: &State) -> Element<'_, Message> {
-    let mut content = column![
-        theme::page_title("Jobs"),
-        theme::muted("Track running work, waiting games, and recent results")
-    ]
-    .spacing(14);
+    let mut content = column![theme::page_header::<Message>(
+        "Jobs",
+        Some("Track running work, waiting games, and recent results"),
+        None
+    )]
+    .spacing(theme::PAGE_GAP);
     if let Some(error) = &state.connection_error {
-        content = content.push(panel(
+        content = content.push(theme::attention_card(
             column![
-                text("Worker connection interrupted"),
-                theme::muted(error),
+                theme::section_text("Worker connection interrupted"),
+                theme::danger_text(error),
                 theme::muted("Showing the last received jobs. Reconnecting…")
             ]
             .spacing(6),
+            true,
         ));
     }
     if !state.snapshot_loaded && state.snapshot.jobs.is_empty() {
@@ -1715,7 +1822,7 @@ fn queue(state: &State) -> Element<'_, Message> {
                     }
             })
             .collect();
-        content = content.push(text(format!("{title} · {}", jobs.len())).size(17));
+        content = content.push(theme::section_text(format!("{title} · {}", jobs.len())));
         if jobs.is_empty() {
             content = content.push(theme::muted(match group {
                 0 => "No jobs running",
@@ -1744,23 +1851,29 @@ fn queue(state: &State) -> Element<'_, Message> {
 }
 /// The Locations section: the form that adds a folder, one card per library
 /// with its maintenance toggle, and the excluded games.
-fn drives(state: &State) -> Element<'_, Message> {
+fn drives(state: &State, embedded: bool) -> Element<'_, Message> {
+    let title = "Drives & libraries";
+    let subtitle = "Add games from any location and choose which libraries to maintain";
     let mut content = column![
-        theme::page_title("Drives & libraries"),
-        theme::muted("Add games from any location and choose which libraries to maintain"),
+        if embedded {
+            column![theme::section_title(title), theme::muted(subtitle)]
+                .spacing(4)
+                .into()
+        } else {
+            theme::page_header::<Message>(title, Some(subtitle), None)
+        },
         panel(
             column![
-                text("Add a location").size(17),
-                pick_list([FolderKind::Collection, FolderKind::Game], Some(state.folder_kind), Message::FolderKind),
+                theme::section_title("Add a location"),
+                picker([FolderKind::Collection, FolderKind::Game], Some(state.folder_kind), Message::FolderKind),
                 theme::muted(match state.folder_kind {
                     FolderKind::Collection => "Each immediate subfolder appears as a game. New subfolders appear when you refresh.",
                     FolderKind::Game => "Show this entire folder as one game."
                 }),
                 row![
-                    text_input("~/My Games or /mnt/games", &state.folder)
+                    input("~/My Games or /mnt/games", &state.folder)
                         .on_input(Message::Folder)
                         .on_submit(Message::AddFolder)
-                        .padding(10)
                         .width(Length::Fill),
                     secondary_maybe(
                         "Browse…",
@@ -1769,7 +1882,8 @@ fn drives(state: &State) -> Element<'_, Message> {
                     ),
                     action("Add folder", Message::AddFolder)
                 ]
-                .spacing(8),
+                .spacing(8)
+                .align_y(Alignment::Center),
                 if let Some(error) = &state.folder_error {
                     Element::from(theme::danger_text(error))
                 } else {
@@ -1779,7 +1893,7 @@ fn drives(state: &State) -> Element<'_, Message> {
             .spacing(10)
         )
     ]
-    .spacing(14);
+    .spacing(theme::PAGE_GAP);
     // Libraries the worker knows, followed by the parent folder of any game
     // that is in none of them. Those are listed as detected libraries.
     let mut paths: Vec<_> = state
@@ -1829,7 +1943,8 @@ fn drives(state: &State) -> Element<'_, Message> {
                         Space::new().into()
                     }
                 ]
-                .spacing(10),
+                .spacing(10)
+                .align_y(Alignment::Center),
                 checkbox(automatic)
                     .label("Maintain new installs and updates")
                     .on_toggle(move |enabled| Message::Send(Command::Library(Library {
@@ -1843,16 +1958,20 @@ fn drives(state: &State) -> Element<'_, Message> {
         ));
     }
     for id in &state.snapshot.excluded {
-        content = content.push(panel(row![
-            theme::muted(format!("Excluded: {}", state.title_of(id))).width(Length::Fill),
-            secondary(
-                "Restore",
-                Message::Send(Command::Exclude {
-                    id: id.clone(),
-                    excluded: false
-                })
-            )
-        ]));
+        content = content.push(panel(
+            row![
+                theme::muted(format!("Excluded: {}", state.title_of(id))).width(Length::Fill),
+                secondary(
+                    "Restore",
+                    Message::Send(Command::Exclude {
+                        id: id.clone(),
+                        excluded: false
+                    })
+                )
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center),
+        ));
     }
     content.into()
 }
@@ -1864,12 +1983,13 @@ fn drives(state: &State) -> Element<'_, Message> {
 fn settings_page(state: &State) -> Element<'_, Message> {
     let links = iced::widget::Row::with_children(
         [
-            ("Locations", "settings-locations"),
+            ("Drives & libraries", "settings-locations"),
             ("Recovery", "settings-recovery"),
-            ("Maintenance", "settings-maintenance"),
+            ("Background worker", "settings-worker"),
+            ("Automatic maintenance", "settings-maintenance"),
             ("Appearance", "settings-appearance"),
-            ("Reports", "settings-reports"),
-            ("About", "settings-about"),
+            ("Maximum Space compatibility", "settings-reports"),
+            ("About Flummox", "settings-about"),
         ]
         .into_iter()
         .map(|(label, section)| {
@@ -1886,13 +2006,13 @@ fn settings_page(state: &State) -> Element<'_, Message> {
     .spacing(8)
     .wrap();
     column![
-        theme::page_title("Settings"),
+        theme::page_header::<Message>("Settings", None, None),
         links,
-        container(drives(state)).id("settings-locations"),
-        container(recovery(state)).id("settings-recovery"),
+        container(drives(state, true)).id("settings-locations"),
+        container(recovery(state, true)).id("settings-recovery"),
         preferences(state),
     ]
-    .spacing(28)
+    .spacing(theme::PAGE_GAP * 2.0)
     .into()
 }
 /// The last Settings sections: worker restart, automatic maintenance,
@@ -1913,7 +2033,7 @@ fn preferences(state: &State) -> Element<'_, Message> {
         None
     };
     let mut worker = column![
-        text("Background worker").size(17),
+        theme::section_title("Background worker"),
         theme::muted("After an upgrade, restart when the queue is empty and Maximum Space games have been restored."),
     ]
     .spacing(10);
@@ -1927,11 +2047,11 @@ fn preferences(state: &State) -> Element<'_, Message> {
             .then_some(Message::Send(Command::Restart)),
     ));
     column![
-        panel(worker),
+        container(panel(worker)).id("settings-worker"),
         container(panel(
             row![
                 column![
-                    text("Automatic maintenance").size(17),
+                    theme::section_title("Automatic maintenance"),
                     theme::muted(if maintained == 0 {
                         "Off".into()
                     } else {
@@ -1951,12 +2071,12 @@ fn preferences(state: &State) -> Element<'_, Message> {
         )).id("settings-maintenance"),
         container(panel(
             column![
-                text("Appearance").size(17),
+                theme::section_title("Appearance"),
                 row![
                     column![text("Theme"), theme::muted("Use the desktop theme")]
                         .spacing(3)
                         .width(Length::Fill),
-                    pick_list(
+                    picker(
                         [
                             ThemePreference::System,
                             ThemePreference::Dark,
@@ -1983,7 +2103,7 @@ fn preferences(state: &State) -> Element<'_, Message> {
                     ]
                     .spacing(3)
                     .width(Length::Fill),
-                    pick_list(
+                    picker(
                         [
                             MotionPreference::Expressive,
                             MotionPreference::Subtle,
@@ -2000,14 +2120,14 @@ fn preferences(state: &State) -> Element<'_, Message> {
         )).id("settings-appearance"),
         container(panel(
             column![
-                text("Maximum Space compatibility").size(17),
+                theme::section_title("Maximum Space compatibility"),
                 theme::muted(format!("{} local reports. Analysis checks the exact build and installed files before enabling automatic activation.", state.reports.len())),
                 secondary_maybe("Import report…", (!state.picker_busy).then_some(Message::Browse(super::dialog::Target::Report)))
             ].spacing(8)
         )).id("settings-reports"),
         container(panel(
             column![
-                text("About Flummox").size(17),
+                theme::section_title("About Flummox"),
                 theme::muted(format!("Version {}", env!("CARGO_PKG_VERSION"))),
                 secondary("What changed", Message::OpenChangelog),
                 theme::muted(super::CHANGELOG_URL)
@@ -2015,7 +2135,7 @@ fn preferences(state: &State) -> Element<'_, Message> {
             .spacing(8)
         )).id("settings-about")
     ]
-    .spacing(16)
+    .spacing(theme::PAGE_GAP)
     .into()
 }
 
@@ -2025,12 +2145,11 @@ fn completed_job_row(job: &Job) -> Element<'_, Message> {
     let kind = kind_words(job);
     panel(
         row![
-            text(if job.phase == Phase::Completed {
-                "✓"
+            if job.phase == Phase::Completed {
+                Element::from(theme::accent_text("✓").size(18))
             } else {
-                "○"
-            })
-            .size(18),
+                Element::from(text("○").size(18))
+            },
             column![
                 text(&job.game.title).size(15),
                 theme::muted(match super::app::job_outcome(job) {
@@ -2096,6 +2215,22 @@ mod tests {
             "Finding your games…".to_owned(),
             "a scan in progress comes first",
         )
+    }
+
+    #[test]
+    fn a_job_phase_picks_the_colour_of_its_bar() -> TestResult {
+        use theme::Tone;
+        for (phase, expected) in [
+            (Phase::Running, Tone::Normal),
+            (Phase::Completed, Tone::Normal),
+            (Phase::Paused, Tone::Warning),
+            (Phase::Partial, Tone::Warning),
+            (Phase::Failed, Tone::Failed),
+            (Phase::Interrupted, Tone::Failed),
+        ] {
+            check_eq(tone(phase), expected, format!("{phase:?}"))?;
+        }
+        Ok(())
     }
 
     #[test]
