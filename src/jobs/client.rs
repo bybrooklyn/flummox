@@ -77,15 +77,33 @@ pub(super) fn exchange(command: Command, may_replace: bool) -> Result<Snapshot> 
     exchange_full(command, may_replace).map(|(snapshot, _)| snapshot)
 }
 
+/// How long a client waits for a coordinator to start answering.
+const STARTUP_WAIT: Duration = Duration::from_secs(5);
+
 /// [`exchange`] that also returns the items of a batch the coordinator refused.
+/// A coordinator that is still remounting stores answers [`STARTING`], and
+/// the request is sent again until [`STARTUP_WAIT`] has passed.
 fn exchange_full(command: Command, may_replace: bool) -> Result<(Snapshot, Vec<Refusal>)> {
+    let began = Instant::now();
+    loop {
+        match exchange_once(command.clone(), may_replace) {
+            Err(error) if error.to_string() == STARTING && began.elapsed() < STARTUP_WAIT => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// One attempt of [`exchange_full`].
+fn exchange_once(command: Command, may_replace: bool) -> Result<(Snapshot, Vec<Refusal>)> {
     let restarting = matches!(&command, Command::Restart);
     let dir = state_dir()?;
     let socket = dir.join("control.sock");
     let mut stream = match UnixStream::connect(&socket) {
         Ok(stream) => stream,
         // Nothing is listening. Start a coordinator in its own process group,
-        // so it outlives this client, and wait up to 5 seconds for its socket.
+        // so it outlives this client, and wait up to `STARTUP_WAIT` for its socket.
         Err(_) => {
             std::process::Command::new(binary()?)
                 .arg("__coordinator")
@@ -105,7 +123,7 @@ fn exchange_full(command: Command, may_replace: bool) -> Result<(Snapshot, Vec<R
                     break stream;
                 }
                 ensure!(
-                    started.elapsed() < Duration::from_secs(5),
+                    started.elapsed() < STARTUP_WAIT,
                     "The background worker did not start. See service.log in Flummox's state folder."
                 );
                 std::thread::sleep(Duration::from_millis(50));

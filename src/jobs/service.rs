@@ -108,6 +108,65 @@ fn mirror_exclusion(
     Ok(())
 }
 
+/// Answers clients that connect while start-up recovery holds the main
+/// thread, so they get [`STARTING`] at once instead of a timeout.
+struct StartupReplies {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl StartupReplies {
+    /// Starts answering on a clone of `listener`. Stops when dropped.
+    fn start(listener: &UnixListener) -> Result<Self> {
+        let listener = listener.try_clone()?;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = std::thread::spawn(move || {
+            while !stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        // The request is read first, since closing a socket
+                        // with unread data resets the client's connection.
+                        let _answered = (|| -> Result<()> {
+                            stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+                            stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+                            let _request: Request = read_message(&mut BufReader::new(Within {
+                                inner: &mut stream,
+                                until: Instant::now() + Duration::from_secs(2),
+                            }))?;
+                            serde_json::to_writer(
+                                &mut stream,
+                                &Response {
+                                    version: VERSION,
+                                    snapshot: None,
+                                    error: Some(STARTING.into()),
+                                    refused: Vec::new(),
+                                },
+                            )?;
+                            stream.write_all(b"\n")?;
+                            Ok(())
+                        })();
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+        });
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for StartupReplies {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _joined = thread.join();
+        }
+    }
+}
+
 /// Writes one control line to a worker's stdin and flushes it.
 fn send_control(input: &mut impl Write, control: Control) -> Result<()> {
     serde_json::to_writer(&mut *input, &control)?;
@@ -1867,6 +1926,8 @@ pub(super) fn run() -> Result<()> {
     }
     let listener = UnixListener::bind(&socket)?;
     listener.set_nonblocking(true)?;
+    // Clients that connect before the main loop runs are told to retry.
+    let startup_replies = StartupReplies::start(&listener)?;
     let (db, mut snapshot) = open_store(&dir.join("queue.sqlite"))?;
     // Startup: remount activated installs, reapply live compression, and
     // bring the login entry in line with the saved settings.
@@ -1892,6 +1953,7 @@ pub(super) fn run() -> Result<()> {
             )
         }),
     );
+    drop(startup_replies);
     let history =
         crate::db::Db::open(&crate::db::Db::default_path().context("Cannot locate history")?)?;
     // Import exclusions from older CLI-only installations and share future edits.
@@ -2586,6 +2648,51 @@ mod tests {
         check(
             !ran.get(),
             "a history failure leaves the in-memory exclusion unapplied",
+        )
+    }
+
+    #[test]
+    fn a_client_that_connects_during_recovery_is_told_the_worker_is_starting() -> TestResult {
+        let temp = tempfile::tempdir().ctx("socket folder")?;
+        let socket = temp.path().join("c.sock");
+        let listener = UnixListener::bind(&socket).ctx("bind")?;
+        listener.set_nonblocking(true).ctx("non-blocking")?;
+        let replies = StartupReplies::start(&listener).ctx("start")?;
+        // Nothing else services the listener, as during recovery.
+        let started = Instant::now();
+        let mut stream = std::os::unix::net::UnixStream::connect(&socket).ctx("connect")?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .ctx("timeout")?;
+        serde_json::to_writer(
+            &mut stream,
+            &Request {
+                version: VERSION,
+                command: Command::Snapshot,
+            },
+        )
+        .ctx("request")?;
+        stream.write_all(b"\n").ctx("newline")?;
+        let reply: Response = read_message(&mut BufReader::new(stream)).ctx("reply")?;
+        check_eq(
+            reply.error.as_deref(),
+            Some(STARTING),
+            "the reply says the worker is starting",
+        )?;
+        check(reply.snapshot.is_none(), "no snapshot is sent")?;
+        check(
+            started.elapsed() < Duration::from_secs(2),
+            "the reply is prompt",
+        )?;
+        drop(replies);
+        // Control: once start-up ends the listener is free for the main loop.
+        let accepted = listener.accept();
+        check(
+            accepted
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock),
+            "the helper leaves nothing queued and stops accepting",
         )
     }
 

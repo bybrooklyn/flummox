@@ -45,6 +45,19 @@ fn start(home: &Path) -> Result<Service, String> {
 }
 
 fn request(home: &Path, command: Request) -> Result<Snapshot, String> {
+    // A coordinator still remounting stores answers that it is starting.
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        match request_once(home, &command) {
+            Err(error) if error.contains("is starting") && Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            other => return other,
+        }
+    }
+}
+
+fn request_once(home: &Path, command: &Request) -> Result<Snapshot, String> {
     let socket = home.join("state/flummox/desktop/control.sock");
     let until = Instant::now() + Duration::from_secs(5);
     let mut stream = loop {
@@ -1335,6 +1348,59 @@ fn a_batch_request_queues_the_valid_items_and_lists_the_refused_ones() -> TestRe
         titles,
         vec!["first".to_string(), "second".to_string()],
         "both valid items are queued around the refused one",
+    )
+}
+
+#[test]
+fn a_client_retries_while_the_coordinator_is_starting() -> TestResult {
+    let temp = tempfile::tempdir().ctx("fixture")?;
+    let home = temp.path().join("home");
+    let dir = home.join("state/flummox/desktop");
+    std::fs::create_dir_all(&dir).ctx("state folder")?;
+    let listener = std::os::unix::net::UnixListener::bind(dir.join("control.sock")).ctx("bind")?;
+    let snapshot = serde_json::to_value(Snapshot::default()).ctx("snapshot")?;
+    let server = std::thread::spawn(move || -> Result<usize, String> {
+        let mut starting = 0;
+        loop {
+            let (mut stream, _) = listener.accept().ctx("accept")?;
+            let mut line = String::new();
+            BufReader::new(&stream)
+                .read_line(&mut line)
+                .ctx("request")?;
+            // Two replies that say the worker is starting, then a real one.
+            let reply = if starting < 2 {
+                starting += 1;
+                serde_json::json!({
+                    "version": flummox::jobs::VERSION,
+                    "snapshot": null,
+                    "error": "The background worker is starting…",
+                })
+            } else {
+                serde_json::json!({
+                    "version": flummox::jobs::VERSION,
+                    "snapshot": snapshot,
+                    "error": null,
+                })
+            };
+            serde_json::to_writer(&mut stream, &reply).ctx("reply")?;
+            stream.write_all(b"\n").ctx("newline")?;
+            if starting >= 2 {
+                return Ok(starting);
+            }
+        }
+    });
+    let output = jobs_command(&home, &["--json", "jobs"])?;
+    check(
+        output.status.success(),
+        format!(
+            "the command waits out the start-up replies: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )?;
+    check_eq(
+        server.join().map_err(|_| "server thread")??,
+        2,
+        "the client asked again after each reply that said the worker was starting",
     )
 }
 

@@ -451,6 +451,10 @@ pub(crate) struct Work {
 /// the whole wait. The coordinator requeues a job that fails with it.
 pub(crate) const LOCK_BUSY: &str = "Another Flummox process is working. Retry when it finishes.";
 
+/// Reply to a client that connects while the coordinator is still remounting
+/// stores. The client retries until its start-up wait ends.
+pub(crate) const STARTING: &str = "The background worker is starting…";
+
 /// How long [`operation_lock`] waits for the lock before giving up.
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
