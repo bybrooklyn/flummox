@@ -37,7 +37,7 @@ pub fn mark_pixels(size: usize) -> Vec<u32> {
     pixels
 }
 
-/// True when the pixel centre lies inside a square of `size` with rounded corners.
+/// True when the pixel centre is inside a square of `size` with rounded corners.
 fn inside_rounded_square(x: usize, y: usize, size: usize, radius: usize) -> bool {
     // Twice the distance from the nearest corner circle's centre, so that pixel
     // centres at half units stay in integers.
