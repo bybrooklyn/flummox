@@ -26,8 +26,9 @@ use windows_sys::Win32::{
     Storage::FileSystem::{
         FILE_PROVIDER_COMPRESSION_LZX, FILE_PROVIDER_COMPRESSION_XPRESS4K,
         FILE_PROVIDER_COMPRESSION_XPRESS8K, FILE_PROVIDER_COMPRESSION_XPRESS16K,
-        FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx,
-        WOF_FILE_COMPRESSION_INFO_V1, WOF_PROVIDER_FILE, WofIsExternalFile, WofSetFileDataLocation,
+        FILE_STANDARD_INFO, FileStandardInfo, GetCompressedFileSizeW, GetDiskFreeSpaceW,
+        GetFileInformationByHandleEx, WOF_FILE_COMPRESSION_INFO_V1, WOF_PROVIDER_FILE,
+        WofIsExternalFile, WofSetFileDataLocation,
     },
     System::{IO::DeviceIoControl, Ioctl::FSCTL_DELETE_EXTERNAL_BACKING},
 };
@@ -297,6 +298,82 @@ fn recovery_in(state: &Path) -> Result<Vec<Recovery>> {
     }
 }
 
+/// Bytes the file occupies according to `GetCompressedFileSizeW`, the documented
+/// size on disk of a compressed file.
+fn compressed_size(path: &Path) -> Result<u64> {
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut high = 0u32;
+    // SAFETY: wide is terminated and high is a writable DWORD.
+    let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
+    if low == u32::MAX {
+        // SAFETY: GetLastError reads this thread's error slot and takes no pointers.
+        let code = unsafe { GetLastError() };
+        ensure!(
+            code == 0,
+            "Windows could not read the compressed size of {} (error {code})",
+            path.display()
+        );
+    }
+    Ok(u64::from(high) << 32 | u64::from(low))
+}
+
+/// Bytes in one cluster of the volume holding `path`, or 4096 when it cannot be read.
+fn cluster_size(path: &Path) -> u64 {
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let (mut sectors, mut bytes) = (0u32, 0u32);
+    // SAFETY: wide is terminated and the two outputs are writable DWORDs. The
+    // unused outputs are null, which the call allows.
+    let result = unsafe {
+        GetDiskFreeSpaceW(
+            wide.as_ptr(),
+            &mut sectors,
+            &mut bytes,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    match u64::from(sectors) * u64::from(bytes) {
+        0 => 4096,
+        _ if result == 0 => 4096,
+        size => size,
+    }
+}
+
+/// Picks the size on disk from the two readings. When they differ by more than a
+/// cluster the compressed-file size wins. The flag says they disagreed.
+fn reconcile(allocation: u64, compressed: u64, cluster: u64) -> (u64, bool) {
+    if allocation.abs_diff(compressed) > cluster {
+        (compressed, true)
+    } else {
+        (allocation, false)
+    }
+}
+
+/// The size on disk of one file for the totals: `AllocationSize`, replaced by
+/// `GetCompressedFileSizeW` where the two differ by more than a cluster. Each
+/// disagreement is counted in `disagreed` and logged.
+fn size_on_disk(path: &Path, cluster: u64, disagreed: &mut u64) -> Result<u64> {
+    let allocation = allocation_size(path)?;
+    match compressed_size(path) {
+        Ok(compressed) => {
+            let (size, differs) = reconcile(allocation, compressed, cluster);
+            if differs {
+                *disagreed = disagreed.saturating_add(1);
+                tracing::debug!(
+                    path = %path.display(),
+                    allocation,
+                    compressed,
+                    "AllocationSize and GetCompressedFileSizeW disagree"
+                );
+            }
+            Ok(size)
+        }
+        Err(error) => {
+            tracing::debug!(%error, "Using AllocationSize alone");
+            Ok(allocation)
+        }
+    }
+}
 /// Resolves the journal for `folder` by restoring the whole folder to ordinary
 /// storage. `folder` must equal the journaled root exactly, on the same volume.
 pub fn recover_folder(folder: &Path) -> Result<()> {
@@ -395,6 +472,8 @@ fn visit_in(
     let mut found = Rejected::default();
     let mut summary = Progress::default();
     let mut failures = Failures::default();
+    let cluster = cluster_size(&root);
+    let mut disagreed = 0u64;
     let outcome = (|| -> Result<()> {
         for item in walkdir::WalkDir::new(&root).follow_links(false) {
             ensure!(!cancel.load(Ordering::Relaxed), "The job was stopped.");
@@ -422,7 +501,7 @@ fn visit_in(
             }
             summary.files = summary.files.saturating_add(1);
             summary.bytes = summary.bytes.saturating_add(metadata.len());
-            let before = match allocation_size(item.path()) {
+            let before = match size_on_disk(item.path(), cluster, &mut disagreed) {
                 Ok(before) => before,
                 Err(error) => {
                     note_failure(&mut failures, &error);
@@ -457,7 +536,7 @@ fn visit_in(
                             }
                         }
                     }
-                    allocation_size(item.path()).unwrap_or(before)
+                    size_on_disk(item.path(), cluster, &mut disagreed).unwrap_or(before)
                 }
                 Err(error) => {
                     // A stop request surfaces as an error from the operation.
@@ -476,6 +555,9 @@ fn visit_in(
         );
         Ok(())
     })();
+    if disagreed > 0 {
+        tracing::debug!(disagreed, files = summary.files, "Size readings disagreed");
+    }
     if !restore {
         // A stopped pass has not seen every file, so it keeps the older entries.
         let mut kept = if outcome.is_ok() {
@@ -759,6 +841,25 @@ mod tests {
         check_eq(calls, 1, "only the file that changed is tried again")
     }
 
+    #[test]
+    fn the_compressed_file_size_wins_only_past_one_cluster() -> TestResult {
+        check_eq(reconcile(8192, 8192, 4096), (8192, false), "equal readings")?;
+        check_eq(
+            reconcile(8192, 4096, 4096),
+            (8192, false),
+            "one cluster apart",
+        )?;
+        check_eq(
+            reconcile(1_048_576, 4096, 4096),
+            (4096, true),
+            "AllocationSize did not see the compression",
+        )?;
+        check_eq(
+            reconcile(4096, 1_048_576, 4096),
+            (1_048_576, true),
+            "the compressed-file size is preferred in either direction",
+        )
+    }
     #[test]
     fn allocation_falls_for_a_compressible_file_and_not_for_a_random_one() -> TestResult {
         let temp = tempfile::tempdir().ctx("fixture")?;
