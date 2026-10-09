@@ -60,8 +60,11 @@ pub trait UnitModel: Sync {
     /// Disk bytes used by one block, given its compressed size.
     fn disk_cost(&self, uncompressed: u32, compressed: u32) -> u64;
 
-    /// The zstd level to sample with.
-    fn level(&self) -> i32;
+    /// Whether the backend leaves files marked no-copy-on-write uncompressed.
+    /// Estimates for such a backend predict no saving for those files.
+    fn skips_nocow_files(&self) -> bool {
+        false
+    }
 }
 
 /// btrfs: 128 KiB blocks, 4 KiB sectors.
@@ -94,8 +97,8 @@ impl UnitModel for BtrfsModel {
         }
     }
 
-    fn level(&self) -> i32 {
-        self.level
+    fn skips_nocow_files(&self) -> bool {
+        true
     }
 }
 
@@ -125,10 +128,6 @@ impl UnitModel for PackModel {
         } else {
             rounded(compressed)
         }
-    }
-
-    fn level(&self) -> i32 {
-        self.level
     }
 }
 
@@ -365,6 +364,79 @@ impl DiskProbe for NoProbe {
     }
 }
 
+/// The `FS_IOC_GETFLAGS` read behind the no-copy-on-write check. It repeats the
+/// one in `backend/btrfs.rs`, which is private to that module.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+mod attributes {
+    use std::{fs::File, os::fd::AsRawFd};
+
+    nix::ioctl_read!(fs_ioc_getflags, b'f', 1, libc::c_long);
+
+    /// `FS_NOCOW_FL`: btrfs never compresses the file.
+    const FS_NOCOW_FL: libc::c_long = 0x0080_0000;
+
+    /// Whether the file is marked no-copy-on-write. A filesystem without the
+    /// ioctl answers false.
+    pub(super) fn is_nocow(file: &File) -> bool {
+        let mut flags: libc::c_long = 0;
+        // SAFETY: `file` is open and `flags` is writable for the whole call. A
+        // filesystem without the ioctl makes the kernel return ENOTTY.
+        let read = unsafe { fs_ioc_getflags(file.as_raw_fd(), &mut flags) };
+        read.is_ok() && flags & FS_NOCOW_FL != 0
+    }
+}
+
+/// How an open file sits on disk, as opposed to what its bytes would compress to.
+#[derive(Debug, Clone, Copy, Default)]
+struct Residency {
+    /// Bytes the filesystem has allocated, capped at the logical size. `None`
+    /// where the figure is not trusted: only Linux reports it reliably.
+    allocated: Option<u64>,
+    /// The file is marked no-copy-on-write.
+    nocow: bool,
+}
+
+impl Residency {
+    #[cfg(target_os = "linux")]
+    fn of(file: &std::fs::File, size: u64) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            allocated: file
+                .metadata()
+                .ok()
+                .map(|meta| meta.blocks().saturating_mul(512).min(size)),
+            nocow: attributes::is_nocow(file),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn of(_file: &std::fs::File, _size: u64) -> Self {
+        Self::default()
+    }
+
+    /// Prices what is on disk. A sparse file costs its allocated bytes, and the
+    /// saving shrinks in proportion, since sampling a hole reads zeros that
+    /// compress to nothing but were never stored.
+    fn price(&self, est: &mut FileEstimate) {
+        let Some(allocated) = self.allocated.filter(|a| *a < est.size && est.size > 0) else {
+            return;
+        };
+        let share = allocated as f64 / est.size as f64;
+        let saving = est.saving();
+        est.disk_now = est.disk_now.min(allocated).min((est.disk_now as f64 * share) as u64);
+        let kept = ((saving as f64 * share) as u64).min(est.disk_now);
+        est.disk_after = est.disk_now - kept;
+    }
+
+    /// Gives a file the filesystem will not compress no saving.
+    fn skip_nocow(&self, est: &mut FileEstimate) {
+        if self.nocow {
+            est.disk_after = est.disk_now;
+        }
+    }
+}
+
 /// Samples one file, guessing its current state from the mount options.
 pub fn estimate_file(
     path: &Path,
@@ -485,6 +557,11 @@ pub fn estimate_open_file(
     let scale = size as f64 / sampled_in as f64;
     est.disk_now = (sampled_now as f64 * scale) as u64;
     est.disk_after = (sampled_after as f64 * scale) as u64;
+    let residency = Residency::of(file, size);
+    residency.price(&mut est);
+    if model.skips_nocow_files() {
+        residency.skip_nocow(&mut est);
+    }
     Ok(est)
 }
 
@@ -605,6 +682,12 @@ pub(crate) fn estimate_open_file_pair(
     native_estimate.disk_after = (native_after as f64 * scale) as u64;
     maximum_estimate.disk_now = native_estimate.disk_now;
     maximum_estimate.disk_after = (maximum_after as f64 * scale) as u64;
+    let residency = Residency::of(file, size);
+    residency.price(&mut native_estimate);
+    residency.price(&mut maximum_estimate);
+    if preview.native.skips_nocow_files() {
+        residency.skip_nocow(&mut native_estimate);
+    }
     Ok((native_estimate, maximum_estimate))
 }
 
@@ -1188,6 +1271,132 @@ mod tests {
         let size = write_file(&random, noise(4 * 1024 * 1024))?;
         let est = estimate_file(&random, size, &model, &opts).ctx("estimate noise.dat")?;
         check(!est.worthwhile(), format!("{est:?}"))
+    }
+
+    /// A scratch folder beside the sources, which sits on the machine's real
+    /// disk rather than a temporary filesystem.
+    fn local_dir() -> Result<tempfile::TempDir, String> {
+        tempfile::tempdir_in(std::env::current_dir().ctx("working directory")?)
+            .ctx("scratch folder")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sparse_file_saves_no_more_than_it_has_allocated() -> TestResult {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = local_dir()?;
+        let model = BtrfsModel { level: 3 };
+        let opts = EstimateOpts {
+            level: 3,
+            mount_level: None,
+            floor: None,
+        };
+        let logical = 1024u64 * 1024 * 1024;
+        let sparse = tmp.path().join("sparse.bin");
+        let mut file = std::fs::File::create(&sparse).ctx("create the sparse file")?;
+        file.set_len(logical).ctx("extend the file")?;
+        io::Write::write_all(&mut file, &noise(1024 * 1024)).ctx("write the data")?;
+        file.sync_all().ctx("flush the data")?;
+        drop(file);
+        let allocated = std::fs::metadata(&sparse).ctx("stat")?.blocks() * 512;
+        check(
+            allocated < logical / 100,
+            format!("control: the file must be sparse here, but {allocated} bytes are allocated"),
+        )?;
+        let est = estimate_file(&sparse, logical, &model, &opts).ctx("estimate the sparse file")?;
+        check(
+            est.saving() <= allocated,
+            format!(
+                "saving {} exceeds the {allocated} bytes allocated: {est:?}",
+                est.saving()
+            ),
+        )?;
+        check(
+            est.disk_now <= allocated,
+            format!("disk_now {} exceeds the {allocated} allocated", est.disk_now),
+        )?;
+        let handle = std::fs::File::open(&sparse).ctx("reopen")?;
+        let preview = PreviewEstimate {
+            native: &model,
+            native_opts: &opts,
+            measured: None,
+            maximum: &PackModel { level: 3 },
+            maximum_opts: &opts,
+            byte_cap: 4 * 1024 * 1024,
+        };
+        let (native, maximum) =
+            estimate_open_file_pair(&handle, logical, preview).ctx("paired estimate")?;
+        check(
+            native.saving() <= allocated && maximum.saving() <= allocated,
+            format!("paired savings exceed the allocation: {native:?} {maximum:?}"),
+        )?;
+        let dense = tmp.path().join("dense.bin");
+        let size = write_file(&dense, vec![0u8; 4 * 1024 * 1024])?;
+        let est = estimate_file(&dense, size, &model, &opts).ctx("estimate the dense file")?;
+        check(
+            est.saving() > 3 * 1024 * 1024,
+            format!("control: a dense file of zeros still saves a lot: {est:?}"),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_nocow_file_is_given_no_saving_on_btrfs() -> TestResult {
+        let tmp = local_dir()?;
+        let fs = crate::fsprobe::probe(tmp.path()).ctx("probe the scratch folder")?;
+        if fs.fstype != "btrfs" {
+            check(
+                std::env::var_os("FLUMMOX_REQUIRE_BTRFS").is_none(),
+                format!(
+                    "the scratch folder is {}, not btrfs, and FLUMMOX_REQUIRE_BTRFS is set",
+                    fs.fstype
+                ),
+            )?;
+            eprintln!("skipped: the scratch folder is not btrfs");
+            return Ok(());
+        }
+        let model = BtrfsModel { level: 3 };
+        let opts = EstimateOpts {
+            level: 3,
+            mount_level: None,
+            floor: None,
+        };
+        let plain = tmp.path().join("plain.bin");
+        let cow = tmp.path().join("nocow.bin");
+        std::fs::File::create(&cow).ctx("create the empty file")?;
+        let status = std::process::Command::new("chattr")
+            .arg("+C")
+            .arg(&cow)
+            .status()
+            .ctx("run chattr")?;
+        check(status.success(), format!("chattr +C failed: {status}"))?;
+        for path in [&plain, &cow] {
+            std::fs::write(path, vec![0u8; 4 * 1024 * 1024]).ctx("write data")?;
+        }
+        let size = 4 * 1024 * 1024;
+        let normal = estimate_file(&plain, size, &model, &opts).ctx("estimate plain")?;
+        check(
+            normal.saving() > 1024 * 1024,
+            format!("control: the ordinary file saves space: {normal:?}"),
+        )?;
+        let marked = estimate_file(&cow, size, &model, &opts).ctx("estimate nocow")?;
+        check_eq(marked.saving(), 0, "a no-copy-on-write file saves nothing")?;
+        let handle = std::fs::File::open(&cow).ctx("reopen")?;
+        let preview = PreviewEstimate {
+            native: &model,
+            native_opts: &opts,
+            measured: None,
+            maximum: &PackModel { level: 3 },
+            maximum_opts: &opts,
+            byte_cap: 8 * 1024 * 1024,
+        };
+        let (native, maximum) =
+            estimate_open_file_pair(&handle, size, preview).ctx("paired estimate")?;
+        check_eq(native.saving(), 0, "the paired Standard estimate is zero too")?;
+        check(
+            maximum.saving() > 0,
+            "the pack tier is not affected by the attribute",
+        )
     }
 
     #[test]
