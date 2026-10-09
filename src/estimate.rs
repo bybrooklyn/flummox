@@ -364,29 +364,6 @@ impl DiskProbe for NoProbe {
     }
 }
 
-/// The `FS_IOC_GETFLAGS` read behind the no-copy-on-write check. It repeats the
-/// one in `backend/btrfs.rs`, which is private to that module.
-#[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
-mod attributes {
-    use std::{fs::File, os::fd::AsRawFd};
-
-    nix::ioctl_read!(fs_ioc_getflags, b'f', 1, libc::c_long);
-
-    /// `FS_NOCOW_FL`: btrfs never compresses the file.
-    const FS_NOCOW_FL: libc::c_long = 0x0080_0000;
-
-    /// Whether the file is marked no-copy-on-write. A filesystem without the
-    /// ioctl answers false.
-    pub(super) fn is_nocow(file: &File) -> bool {
-        let mut flags: libc::c_long = 0;
-        // SAFETY: `file` is open and `flags` is writable for the whole call. A
-        // filesystem without the ioctl makes the kernel return ENOTTY.
-        let read = unsafe { fs_ioc_getflags(file.as_raw_fd(), &mut flags) };
-        read.is_ok() && flags & FS_NOCOW_FL != 0
-    }
-}
-
 /// How an open file sits on disk, as opposed to what its bytes would compress to.
 #[derive(Debug, Clone, Copy, Default)]
 struct Residency {
@@ -406,7 +383,7 @@ impl Residency {
                 .metadata()
                 .ok()
                 .map(|meta| meta.blocks().saturating_mul(512).min(size)),
-            nocow: attributes::is_nocow(file),
+            nocow: crate::backend::btrfs::is_nocow(file).unwrap_or(false),
         }
     }
 

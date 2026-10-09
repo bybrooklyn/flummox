@@ -9,8 +9,7 @@
 
 // Eleven files carry `#![allow(unsafe_code)]`: `backend/btrfs.rs`, `busy.rs`,
 // `fsprobe.rs`, `macos.rs`, `safeio.rs`, `storage.rs` and five under
-// `windows/`. `estimate.rs` allows it in one small module that reads a file
-// attribute. Each opts out by name, so new `unsafe` cannot appear anywhere
+// `windows/`. Each opts out by name, so new `unsafe` cannot appear anywhere
 // else unnoticed. `deny` rather than `forbid`, because `forbid` cannot be
 // opted out of at all.
 #![deny(unsafe_code)]
