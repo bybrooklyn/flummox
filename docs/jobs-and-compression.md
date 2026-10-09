@@ -140,7 +140,7 @@ btrfs announce a skip on other filesystems.
 
 ## Updating the coordinator
 
-Settings exposes **Restart worker** under Background worker; the CLI equivalent is `flummox jobs restart`.
+Settings exposes **Restart background worker** under Background worker; the CLI equivalent is `flummox jobs restart`.
 The coordinator refuses to exit while jobs are active or a process is using the
 folder of a game that runs from its store; the refusal names the game. With
 those clear it unmounts each store, removes its socket and exits, and the next

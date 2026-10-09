@@ -9,7 +9,8 @@ Linux owns btrfs, FUSE stores, process detection and its durable coordinator.
 Windows owns NTFS WOF calls, launcher discovery, a separate durable coordinator
 and opt-in maintenance. Mac owns APFS compression and recovery; Mac GUI
 jobs currently run in the app instead of a durable coordinator. Targets without
-a safe backend show the shared shell with compression disabled. Linux system
+a safe backend show one titled page with a card that says compression is not
+available there. Linux system
 dependencies use `cfg(target_os = "linux")`, not the broader `cfg(unix)`, since
 Landlock, `/proc` and btrfs are Linux interfaces.
 

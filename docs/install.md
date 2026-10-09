@@ -46,7 +46,7 @@ and no game is using Maximum. It never replaces a newer worker with an
 older one. If the worker is busy, the message says what to finish first.
 
 To restart it yourself, finish or stop the waiting and running jobs and
-decompress the games that use Maximum, then use **Restart worker** under
+decompress the games that use Maximum, then use **Restart background worker** under
 Settings > Background worker or:
 
 ```sh

@@ -116,6 +116,11 @@ win-lint:
 mac-lint:
     CC_aarch64_apple_darwin="{{justfile_directory()}}/tools/zig-cc-macos" AR_aarch64_apple_darwin="{{justfile_directory()}}/tools/zig-ar" cargo clippy --target aarch64-apple-darwin --all-features --all-targets -- -D warnings
 
+# Type-check the page shown on systems with no backend, using FreeBSD as the
+# example. Needs zig and `rustup target add x86_64-unknown-freebsd`.
+other-lint:
+    CC_x86_64_unknown_freebsd="{{justfile_directory()}}/tools/zig-cc-freebsd" AR_x86_64_unknown_freebsd="{{justfile_directory()}}/tools/zig-ar" cargo clippy --target x86_64-unknown-freebsd --features gui --lib --bins -- -D warnings
+
 # Everything CI runs, in the order CI runs it.
 #
 # `prose` is in here so a push cannot go through with the style rules broken.
