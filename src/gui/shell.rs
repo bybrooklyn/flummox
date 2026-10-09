@@ -619,7 +619,6 @@ pub const JOB_GROUPS: [(&str, &str); 4] = [
 ];
 
 /// The Jobs page subtitle.
-#[cfg(any(target_os = "linux", windows))]
 pub const JOBS_SUBTITLE: &str = "Track running and waiting jobs, and see recent results.";
 
 /// The Locations section subtitle.

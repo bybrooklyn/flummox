@@ -109,7 +109,7 @@ fn native_pages_render_and_preferences_keep_motion_consistent() -> TestResult {
     // A toast over the page, informational and then an error.
     state.info("Found 2 games.");
     render_all(&mut state, &output, "Games-toast")?;
-    state.error("This game is excluded from jobs");
+    state.error("This game is excluded. Include it before running a job.");
     render_all(&mut state, &output, "Games-error-toast")?;
     // A plan that does not fit is reviewed above the page.
     state.planned = Some((game_path.clone(), true, failing_plan()));
@@ -154,7 +154,7 @@ fn a_toast_leaves_on_dismissal_and_a_scan_does_not_replace_an_error() -> TestRes
         ..Default::default()
     };
     state.preferences.motion = MotionChoice::Reduced;
-    state.error("Could not read the library");
+    state.error("Could not refresh the game list: the library is unreadable");
     let scan = Scan {
         #[cfg(windows)]
         stamp: (0, 0),
@@ -281,7 +281,7 @@ fn a_refused_command_is_a_toast_and_not_a_lost_connection() -> TestResult {
     let mut state = State::default();
     let _task = update(
         &mut state,
-        Message::Commanded(Err("This game is excluded from jobs".into())),
+        Message::Commanded(Err("This game is excluded. Include it before running a job.".into())),
     );
     check(state.worker_error.is_none(), "not a connection error")?;
     check(

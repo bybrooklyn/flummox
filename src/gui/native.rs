@@ -36,6 +36,11 @@ const PLATFORM: &str = "macOS · APFS";
 const MODE: &str = "LZX";
 #[cfg(target_os = "macos")]
 const MODE: &str = "APFS";
+/// What does the compressing, in a few words for the Overview.
+#[cfg(windows)]
+const ENGINE: &str = "Windows' built-in LZX compression";
+#[cfg(target_os = "macos")]
+const ENGINE: &str = "macOS's built-in APFS compression";
 #[cfg(windows)]
 const FOLDER_HINT: &str = "C:\\Games\\Your game";
 #[cfg(target_os = "macos")]
@@ -44,10 +49,7 @@ const FOLDER_HINT: &str = "~/My Games/Your game";
 const LIBRARY_HINT: &str = "C:\\Games or D:\\Games";
 #[cfg(target_os = "macos")]
 const LIBRARY_HINT: &str = "~/My Games";
-#[cfg(windows)]
-const RECOVERY_ACTION: &str = "Restore ordinary storage";
-#[cfg(target_os = "macos")]
-const RECOVERY_ACTION: &str = "Restore retained original";
+const RECOVERY_ACTION: &str = "Decompress to ordinary files";
 
 /// What a finished background settings save hands back: the worker's new
 /// snapshot on Windows, nothing on macOS.
@@ -165,7 +167,7 @@ impl std::fmt::Display for GameFilter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::All => "All games",
-            Self::Updated => "Updated games",
+            Self::Updated => "Updated",
             Self::Attention => "Needs attention",
         })
     }
@@ -561,9 +563,9 @@ fn start(state: &mut State, folder: PathBuf, optimize: bool) -> Task<Message> {
     let cancel = Arc::new(AtomicBool::new(false));
     state.cancel = Some(cancel.clone());
     state.info(if optimize {
-        format!("Compressing worthwhile files with {MODE}…")
+        "Compressing files that will shrink…".to_owned()
     } else {
-        "Restoring ordinary storage…".to_owned()
+        "Decompressing…".to_owned()
     });
     let stream = iced::stream::channel(32, async move |sender| {
         std::thread::spawn(move || {
@@ -741,7 +743,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
         #[cfg(windows)]
         Message::Queued(title, result) => match result {
             Ok(snapshot) => {
-                state.info(format!("Added {title} to the jobs."));
+                state.info(format!("Added a job for {title}."));
                 return apply_snapshot(state, snapshot);
             }
             Err(error) => state.refuse(error),
@@ -756,7 +758,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                 }
                 Err(text) => {
                     state.preferences_error = Some(text.clone());
-                    state.error(text);
+                    state.error(format!("Could not load preferences: {text}"));
                 }
             }
         }
@@ -769,7 +771,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                     state.preferences = state.saved_preferences.clone();
                     state.preferences_dirty = false;
                     state.refresh_after_save = false;
-                    state.error(text);
+                    state.error(format!("Could not save preferences: {text}"));
                 }
                 Ok(saved) => {
                     if let Some(written) = written {
@@ -879,7 +881,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                     }
                 }
                 Ok(None) => {}
-                Err(text) => state.error(text),
+                Err(text) => state.error(format!("Could not open the folder picker: {text}")),
             }
         }
         Message::ArtworkVisible(source) => state.artwork_cache.request(source),
@@ -915,7 +917,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                     );
                 }
                 Ok(None) => {}
-                Err(text) => state.error(text),
+                Err(text) => state.error(format!("Could not open the file picker: {text}")),
             }
         }
         Message::ArtworkSaved(result) => match result {
@@ -923,7 +925,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                 state.refreshing = true;
                 return update(state, Message::Refresh);
             }
-            Err(text) => state.error(text),
+            Err(text) => state.error(format!("Could not change the artwork: {text}")),
         },
         Message::Jump(section) => {
             // `GoTo` can return artwork decodes it has already marked as
@@ -1010,7 +1012,9 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
             if std::mem::take(&mut state.qualifying) {
                 match result {
                     Ok(wizard) => state.qualification = Some(*wizard),
-                    Err(error) => state.error(error),
+                    Err(error) => state.error(format!(
+                        "Could not start the compatibility test: {error}"
+                    )),
                 }
             }
         }
@@ -1062,13 +1066,17 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                             background(move || {
                                 crate::compatibility::Store::local()
                                     .and_then(|store| store.save(&report))
-                                    .map(|path| format!("Report saved to {}", path.display()))
+                                    .map(|path| {
+                                        format!("Compatibility report saved to {}", path.display())
+                                    })
                                     .map_err(|error| error.to_string())
                             }),
                             Message::QualificationSaved,
                         );
                     }
-                    Err(error) => state.error(error.to_string()),
+                    Err(error) => state.error(format!(
+                        "Could not save the compatibility report: {error}"
+                    )),
                 }
             }
         }
@@ -1076,7 +1084,9 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
             state.stop_qualifying();
             match result {
                 Ok(text) => state.info(text),
-                Err(text) => state.error(text),
+                Err(text) => state.error(format!(
+                    "Could not save the compatibility report: {text}"
+                )),
             }
         }
         Message::Folder(folder) => {
@@ -1090,7 +1100,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
             return navigation;
         }
         // Tab and Shift+Tab move focus. Escape closes the plan. The command key with
-        // F searches and with R scans again.
+        // F searches and with R refreshes.
         Message::Key(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
             if let Some(focus) = shell::tab_focus(&key, modifiers) {
                 return focus;
@@ -1161,7 +1171,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                     state.covers = scan.covers;
                 }
                 Err(error) => {
-                    state.error(error);
+                    state.error(format!("Could not refresh the game list: {error}"));
                     return Task::none();
                 }
             }
@@ -1193,11 +1203,11 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                     // plan was computed.
                     match plan.recheck() {
                         Ok(()) => return start(state, folder, optimize),
-                        Err(error) => state.error(error.to_string()),
+                        Err(error) => state.error(format!("Could not start the job: {error}")),
                     }
                 }
                 Ok(plan) => state.planned = Some((folder, optimize, plan)),
-                Err(error) => state.error(error),
+                Err(error) => state.error(format!("Could not check free space: {error}")),
             }
         }
         Message::StartPlanned => {
@@ -1222,7 +1232,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
         Message::Recover(folder) => {
             state.working = true;
             state.job_folder = None;
-            state.info("Recovering the retained original…");
+            state.info("Recovering the kept original…");
             return Task::perform(
                 background(move || {
                     backend::recover_folder(&folder)
@@ -1234,7 +1244,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::RecoveryScanned(result) => match result {
             Ok(records) => state.recovery = records,
-            Err(error) => state.error(error),
+            Err(error) => state.error(format!("Could not read the recovery records: {error}")),
         },
         Message::Stop => {
             // Windows cancels the selected folder's job. macOS raises the flag its
@@ -1265,7 +1275,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
             match (stopped, result) {
                 (true, _) => state.info("Stopped. Files already processed remain valid."),
                 (false, Ok(text)) => state.info(text),
-                (false, Err(text)) => state.error(text),
+                (false, Err(text)) => state.error(format!("The job failed: {text}")),
             }
             return Task::perform(
                 background(|| backend::recovery().map_err(|error| error.to_string())),
@@ -1403,7 +1413,7 @@ fn refresh_button(state: &State) -> Element<'_, Message> {
 }
 
 /// The Overview page: what the window will do, the totals, anything that needs a
-/// look, and the work in progress.
+/// look, and the job in progress.
 fn overview(state: &State) -> Element<'_, Message> {
     let finding = state.scanning && state.games.is_empty();
     let attention = state
@@ -1418,10 +1428,12 @@ fn overview(state: &State) -> Element<'_, Message> {
                 text(if finding {
                     "Finding your games…".to_owned()
                 } else {
-                    format!("Save space with {MODE}")
+                    "Compress your games".to_owned()
                 })
                 .size(27),
-                theme::muted("Games stay in place and launch normally"),
+                theme::muted(format!(
+                    "Uses {ENGINE}. Games stay in place and launch normally."
+                )),
                 row![
                     theme::stat(
                         if finding {
@@ -1431,7 +1443,7 @@ fn overview(state: &State) -> Element<'_, Message> {
                         },
                         "Games"
                     ),
-                    theme::stat(MODE.into(), "Mode")
+                    theme::stat(MODE.into(), "Compression")
                 ]
                 .spacing(32),
                 row![
@@ -1452,7 +1464,7 @@ fn overview(state: &State) -> Element<'_, Message> {
             Some(Message::ReviewAttention),
         ));
     }
-    content = content.push(theme::section_title("Running now"));
+    content = content.push(theme::section_title("Running jobs"));
     content = content.push(theme::panel_card(text(current_work(state))));
     content.into()
 }
@@ -1493,25 +1505,25 @@ fn empty_games(state: &State) -> (&'static str, &'static str, Option<(&'static s
     if state.games.is_empty() && state.scanning {
         (
             "Finding your games…",
-            "This can take a moment on a large library",
+            "This can take a moment on a large library.",
             None,
         )
     } else if state.games.is_empty() {
         (
             "No games found",
-            "Add a folder that holds your games",
-            Some(("Add a folder", Message::Jump("settings-locations"))),
+            "Add a location that holds your games.",
+            Some(("Add location", Message::Jump("settings-locations"))),
         )
     } else if !state.query.trim().is_empty() {
         (
             "No games match your search",
-            "Try fewer letters or clear the search",
+            "Try fewer letters or clear the search.",
             Some(("Clear search", Message::Query(String::new()))),
         )
     } else {
         (
             "No games match these filters",
-            "The filters hide every game",
+            "The filters hide every game.",
             Some(("Show all games", Message::ClearFilters)),
         )
     }
@@ -1555,7 +1567,7 @@ fn game_row<'a>(state: &'a State, game: &'a crate::model::Game) -> Element<'a, M
 fn library(state: &State) -> Element<'_, Message> {
     let filtered = filtered_games(state);
     let mut list = column![theme::section_text(format!(
-        "Library · {}",
+        "Your games · {}",
         shell::games_count(state.games.len())
     ))]
     .spacing(10);
@@ -1581,8 +1593,10 @@ fn progress_box<'a>(title: String, totals: Totals, note: &'a str) -> Element<'a,
     let mut content = column![
         theme::section_text(title),
         text(format!(
-            "{} files processed · {} changed · {} skipped",
-            totals.files, totals.changed, totals.skipped
+            "{} processed · {} changed · {} skipped",
+            shell::files_count(totals.files),
+            totals.changed,
+            totals.skipped
         ))
         .size(13),
         theme::muted(format!(
@@ -1637,7 +1651,7 @@ fn selected_progress(state: &State) -> Option<Element<'_, Message>> {
             allocation_after: progress.allocation_after,
         };
         Some(progress_box(
-            format!("Working on {}", state.folder.trim()),
+            format!("Working on {}", folder_title(state, &state.selected_path())),
             totals,
             "",
         ))
@@ -1668,7 +1682,7 @@ fn controls(state: &State) -> Element<'_, Message> {
         ]
         .spacing(8)
         .align_y(Alignment::Center),
-        theme::muted("Compress skips files the filesystem cannot shrink"),
+        theme::muted("Compress skips files the filesystem cannot shrink."),
         row![
             theme::action_maybe(
                 "Compress",
@@ -1676,7 +1690,7 @@ fn controls(state: &State) -> Element<'_, Message> {
             ),
             theme::secondary_maybe("Stop", state.can_stop().then_some(Message::Stop)),
             theme::secondary_maybe(
-                "Remember this folder",
+                "Add as a location",
                 (idle && !folder_empty && state.preferences_loaded).then_some(Message::Remember)
             ),
         ]
@@ -1718,7 +1732,7 @@ fn controls(state: &State) -> Element<'_, Message> {
                 if state.qualifying {
                     "Measuring…"
                 } else {
-                    "Qualify compatibility"
+                    "Test compatibility"
                 },
                 (!state.qualifying && rules::qualify_block(game).is_none())
                     .then_some(Message::Qualify)
@@ -1763,7 +1777,7 @@ fn controls(state: &State) -> Element<'_, Message> {
             panel = panel.push(
                 row![
                     theme::secondary_maybe(
-                        "Choose local artwork…",
+                        "Choose artwork…",
                         (!state.picker_busy).then(|| Message::BrowseArtwork(game.id.to_string()))
                     ),
                     theme::secondary(
@@ -2030,11 +2044,11 @@ fn settings_page(state: &State) -> Element<'_, Message> {
     // Each id here must match the `.id(...)` of a container in `content` below.
     let jumps = iced::widget::Row::with_children(
         [
-            ("Drives & libraries", "settings-locations"),
+            ("Locations", "settings-locations"),
             ("Recovery", "settings-recovery"),
             ("Maintenance", "settings-maintenance"),
             ("Appearance", "settings-appearance"),
-            ("Reports", "settings-reports"),
+            ("Compatibility reports", "settings-reports"),
             ("About Flummox", "settings-about"),
         ]
         .into_iter()
@@ -2097,7 +2111,7 @@ fn settings_page(state: &State) -> Element<'_, Message> {
             container(theme::panel_card(section(
                 "Compatibility reports",
                 column![
-                    theme::muted("Create a local report from a selected game after testing launch, gameplay, updates and restoration"),
+                    theme::muted("Create a compatibility report from a selected game after testing launch, gameplay, updates and decompression."),
                     theme::secondary("Choose a game", Message::GoTo(Page::Games)),
                 ]
                 .spacing(8),
@@ -2163,8 +2177,8 @@ fn locations_card(state: &State) -> Element<'_, Message> {
     }
     let mut content = column![
         column![
-            theme::section_title("Drives & libraries"),
-            theme::muted("Add games from any location and choose which libraries to maintain"),
+            theme::section_title("Locations"),
+            theme::muted(shell::LOCATIONS_SUBTITLE),
         ]
         .spacing(4),
         theme::panel_card(form),
@@ -2216,7 +2230,7 @@ fn locations_card(state: &State) -> Element<'_, Message> {
         content = content.push(theme::panel_card(
             row![
                 theme::muted(format!("Excluded: {}", title.0)).width(Length::Fill),
-                theme::secondary("Restore", Message::Exclude(title.1, id.clone(), false))
+                theme::secondary("Include", Message::Exclude(title.1, id.clone(), false))
             ]
             .spacing(12)
             .align_y(Alignment::Center),
@@ -2225,14 +2239,12 @@ fn locations_card(state: &State) -> Element<'_, Message> {
     content.into()
 }
 
-/// Interrupted jobs and retained originals, with the button that restores each.
+/// Interrupted jobs and kept originals, with the button that decompresses each.
 fn recovery_card(state: &State) -> Element<'_, Message> {
     let mut content = column![
         column![
             theme::section_title("Recovery"),
-            theme::muted(
-                "Review interrupted jobs and retained storage before retrying or restoring."
-            ),
+            theme::muted(shell::RECOVERY_SUBTITLE),
         ]
         .spacing(4),
     ]
@@ -2254,14 +2266,13 @@ fn recovery_card(state: &State) -> Element<'_, Message> {
         })
         .collect();
     if records.is_empty() {
-        content = content.push(theme::panel_card(theme::muted(
-            "No interrupted jobs need recovery",
-        )));
+        content = content.push(theme::panel_card(theme::muted(shell::RECOVERY_EMPTY)));
     }
     for record in records {
         content = content.push(theme::attention_card(
             column![
-                text(record.root.display().to_string()),
+                theme::section_text(folder_title(state, &record.root)),
+                theme::muted(record.root.display().to_string()),
                 theme::secondary_maybe(
                     RECOVERY_ACTION,
                     (!state.busy()).then(|| Message::Recover(record.root.clone()))
@@ -2289,9 +2300,9 @@ fn maintenance_card(state: &State) -> Element<'_, Message> {
         let active = rules::active_jobs(&state.worker.jobs);
         let mut card = column![
             theme::section_title("Maintenance"),
-            theme::muted("Enable maintenance separately for each location. Existing games establish a baseline; new installs and changed builds can be queued. Closing the window keeps the worker running."),
+            theme::muted("Enable maintenance separately for each location. Existing games are noted without being compressed, and new installs and changed builds can be queued. Closing the window keeps the background worker running."),
             theme::secondary_maybe(
-                if state.worker.maintenance_paused { "Resume background work" } else { "Pause background work" },
+                if state.worker.maintenance_paused { "Resume maintenance" } else { "Pause maintenance" },
                 state.worker_enabled.then_some(Message::WorkerCommand(
                     coordinator::Command::Maintenance(!state.worker.maintenance_paused)
                 )),
@@ -2300,17 +2311,21 @@ fn maintenance_card(state: &State) -> Element<'_, Message> {
         .spacing(10);
         if !state.worker_enabled {
             card = card.push(theme::muted(
-                "The worker is stopped, so there is nothing to pause.",
+                "The background worker is stopped, so there is nothing to pause.",
             ));
         }
         if state.confirm_stop_worker {
             card = card.push(theme::muted(format!(
-                "Stopping the worker cancels {active} job{} and exits after the current file.",
-                if active == 1 { "" } else { "s" }
+                "Stopping the background worker stops {} and exits after the current file.",
+                crate::text::count(
+                    u64::try_from(active).unwrap_or(u64::MAX),
+                    "job",
+                    "jobs"
+                )
             )));
             card = card.push(
                 row![
-                    theme::action("Stop worker", Message::StopWorker),
+                    theme::action("Stop background worker", Message::StopWorker),
                     theme::secondary("Keep running", Message::KeepWorker),
                 ]
                 .spacing(8),
@@ -2339,41 +2354,24 @@ fn maintenance_card(state: &State) -> Element<'_, Message> {
 fn jobs_page(state: &State) -> Element<'_, Message> {
     let mut content = column![theme::page_header::<Message>(
         "Jobs",
-        Some("Track running work, waiting games, and recent results"),
+        Some(shell::JOBS_SUBTITLE),
         None
     )]
     .spacing(theme::PAGE_GAP);
     #[cfg(windows)]
     {
-        use crate::desktop_jobs::Phase;
         if let Some(error) = &state.worker_error {
-            content = content.push(theme::attention_card(
-                column![
-                    theme::section_text("Worker connection interrupted"),
-                    theme::danger_text(error),
-                    theme::muted("Showing the last received jobs. Reconnecting…")
-                ]
-                .spacing(6),
-                true,
-            ));
+            content = content.push(shell::connection_lost(error));
         }
         if let Some(busy) = &state.worker.busy {
             content = content.push(theme::panel_card(text(format!("Paused: {busy}"))));
         }
-        let groups: [&[Phase]; 4] = [
-            &[Phase::Running, Phase::Paused],
-            &[Phase::Waiting],
-            &[Phase::Failed, Phase::Interrupted],
-            &[Phase::Completed, Phase::Cancelled],
-        ];
-        for (index, ((title, empty), phases)) in
-            shell::JOB_GROUPS.into_iter().zip(groups).enumerate()
-        {
+        for (index, (title, empty)) in shell::JOB_GROUPS.into_iter().enumerate() {
             let items: Vec<_> = state
                 .worker
                 .jobs
                 .iter()
-                .filter(|job| phases.contains(&job.phase))
+                .filter(|job| rules::job_group(job.phase) == index)
                 .collect();
             content = content.push(theme::section_text(format!("{title} · {}", items.len())));
             if items.is_empty() {
@@ -2382,7 +2380,7 @@ fn jobs_page(state: &State) -> Element<'_, Message> {
             let history = index == 3;
             if history && items.len() > shell::HISTORY_LIMIT {
                 content = content.push(theme::muted(format!(
-                    "Showing the latest {} jobs",
+                    "Showing the latest {} jobs.",
                     shell::HISTORY_LIMIT
                 )));
             }
@@ -2412,21 +2410,23 @@ fn jobs_page(state: &State) -> Element<'_, Message> {
     #[cfg(target_os = "macos")]
     {
         let mut card = column![theme::section_text(if state.working {
-            "A storage operation is running"
+            "A job is running"
         } else if state.planning {
             "Checking free space…"
         } else {
-            "No jobs running"
+            "No jobs running."
         })]
         .spacing(10);
         if let Some(progress) = &state.progress {
             card = card.push(theme::muted(format!(
-                "{} files processed · {} changed · {} skipped",
-                progress.files, progress.changed, progress.skipped
+                "{} processed · {} changed · {} skipped",
+                shell::files_count(progress.files),
+                progress.changed,
+                progress.skipped
             )));
         }
         if state.cancel.is_some() {
-            card = card.push(theme::secondary("Cancel job", Message::Stop));
+            card = card.push(theme::secondary("Stop", Message::Stop));
         }
         content = content.push(theme::panel_card(card));
     }
@@ -2438,7 +2438,7 @@ fn jobs_page(state: &State) -> Element<'_, Message> {
 fn job_card<'a>(state: &State, job: &'a crate::desktop_jobs::Job) -> Element<'a, Message> {
     let tone = rules::job_tone(job.phase);
     let mut controls = iced::widget::Row::new().spacing(8);
-    // Active jobs can be paused or cancelled. Failed, interrupted and stopped ones can
+    // Active jobs can be paused or stopped. Failed, interrupted and stopped ones can
     // be retried. Completed ones have no controls.
     if job.phase.active() {
         controls = controls
@@ -2452,7 +2452,7 @@ fn job_card<'a>(state: &State, job: &'a crate::desktop_jobs::Job) -> Element<'a,
                 )),
             ))
             .push(theme::secondary(
-                "Cancel",
+                "Stop",
                 Message::WorkerCommand(coordinator::Command::Cancel(job.id)),
             ));
     } else if job.phase != crate::desktop_jobs::Phase::Completed {
@@ -2481,8 +2481,10 @@ fn job_card<'a>(state: &State, job: &'a crate::desktop_jobs::Job) -> Element<'a,
         },
         row![
             theme::muted(format!(
-                "{} files · {} changed · {} skipped",
-                job.progress.files, job.progress.changed, job.progress.skipped
+                "{} · {} changed · {} skipped",
+                shell::files_count(job.progress.files),
+                job.progress.changed,
+                job.progress.skipped
             ))
             .width(Length::Fill),
             controls.wrap()
@@ -2512,9 +2514,9 @@ fn completed_row(job: &crate::desktop_jobs::Job) -> Element<'_, Message> {
             column![
                 text(&job.game.title).size(15),
                 theme::muted(format!(
-                    "{} · {} files · {} changed · {} skipped",
+                    "{} · {} · {} changed · {} skipped",
                     rules::operation_words(!job.restore),
-                    job.progress.files,
+                    shell::files_count(job.progress.files),
                     job.progress.changed,
                     job.progress.skipped
                 ))
@@ -2571,16 +2573,16 @@ fn current_work(state: &State) -> String {
             .iter()
             .find(|job| job.phase.active())
             .map(|job| format!("{} · {} · {}", job.game.title, job.phase, job.message))
-            .unwrap_or_else(|| "No jobs running".into())
+            .unwrap_or_else(|| "No jobs running.".into())
     }
     #[cfg(target_os = "macos")]
     {
         if state.working {
-            "A storage operation is running".into()
+            "A job is running".into()
         } else if state.planning {
             "Checking free space…".into()
         } else {
-            "No jobs running".into()
+            "No jobs running.".into()
         }
     }
 }

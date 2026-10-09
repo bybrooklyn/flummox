@@ -30,26 +30,26 @@ pub fn compress_block(
     excluded: bool,
 ) -> Option<&'static str> {
     if folder_empty {
-        Some("Choose a game folder first")
+        Some("Choose a game folder first.")
     } else if excluded {
-        Some("This game is excluded. Include it again to compress it")
+        Some("This game is excluded. Include it again to compress it.")
     } else if game.is_some_and(|game| !game.state.is_idle()) {
-        Some("This game is busy or updating. Try again when it is idle")
+        Some("This game is busy or updating. Try again when it is idle.")
     } else {
         None
     }
 }
 
-/// Why Decompress is unavailable. An excluded game can still be restored.
+/// Why Decompress is unavailable. An excluded game can still be decompressed.
 pub fn decompress_block(folder_empty: bool) -> Option<&'static str> {
-    folder_empty.then_some("Choose a game folder first")
+    folder_empty.then_some("Choose a game folder first.")
 }
 
 /// Why the compatibility form cannot open for the selected folder.
 pub fn qualify_block(game: Option<&Game>) -> Option<&'static str> {
     match game {
-        None => Some("Select a game from the list to qualify it"),
-        Some(game) if !game.state.is_idle() => Some("This game is busy or updating"),
+        None => Some("Select a game from the list to test its compatibility."),
+        Some(game) if !game.state.is_idle() => Some("This game is busy or updating."),
         Some(_) => None,
     }
 }
@@ -97,6 +97,18 @@ pub fn recovery_in_use(jobs: &[Job], root: &Path) -> bool {
 #[cfg(windows)]
 pub fn active_jobs(jobs: &[Job]) -> usize {
     jobs.iter().filter(|job| job.phase.active()).count()
+}
+
+/// The `shell::JOB_GROUPS` index a phase is listed under. A paused job keeps
+/// its place in the line, so it is listed as waiting.
+#[cfg(any(windows, all(test, target_os = "linux")))]
+pub fn job_group(phase: Phase) -> usize {
+    match phase {
+        Phase::Running => 0,
+        Phase::Waiting | Phase::Paused => 1,
+        Phase::Failed | Phase::Interrupted => 2,
+        Phase::Completed | Phase::Cancelled => 3,
+    }
 }
 
 /// The colour a job's phase label draws in.
@@ -189,12 +201,7 @@ pub fn is_excluded(excluded: &[String], ids: &[String]) -> bool {
 /// The line a finished scan announces, or `None` when it stays quiet. An
 /// error on screen is not replaced.
 pub fn scan_announcement(count: usize, quiet: bool, error_showing: bool) -> Option<String> {
-    (!quiet && !error_showing).then(|| {
-        format!(
-            "Found {count} game{}.",
-            if count == 1 { "" } else { "s" }
-        )
-    })
+    (!quiet && !error_showing).then(|| format!("Found {}.", super::shell::games_count(count)))
 }
 
 /// What stands in the way of changing preferences, if anything.
@@ -484,6 +491,31 @@ mod tests {
             0,
             "control: growth does not underflow",
         )
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn a_paused_job_is_listed_as_waiting_and_keeps_its_warning_colour() -> TestResult {
+        let titles: Vec<&str> = crate::gui::shell::JOB_GROUPS
+            .iter()
+            .map(|(title, _)| *title)
+            .collect();
+        for (phase, group) in [
+            (Phase::Running, "Running"),
+            (Phase::Waiting, "Waiting"),
+            (Phase::Paused, "Waiting"),
+            (Phase::Failed, "Needs attention"),
+            (Phase::Interrupted, "Needs attention"),
+            (Phase::Completed, "History"),
+            (Phase::Cancelled, "History"),
+        ] {
+            check_eq(
+                titles.get(job_group(phase)).copied(),
+                Some(group),
+                format!("{phase:?} is listed under {group}"),
+            )?;
+        }
+        check_eq(job_tone(Phase::Paused), Tone::Warning, "paused keeps its tint")
     }
 
     #[test]
