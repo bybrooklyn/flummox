@@ -26,8 +26,8 @@ These cannot be done from a commit.
    `HOMEBREW_DEPLOY_KEY` into the `release` environment and delete the
    repository-level copies (13, 1.1).
 2. Add a required reviewer and a `v*` tag ruleset (13, 1.1).
-3. Run CI on Windows and on a Mac before trusting those fixes. Reports 11 and
-   12 each end with a list of what to check on the real system.
+3. Try the Windows and Mac window by hand. CI ran their tests and drew their
+   previews. Reports 11 and 12 each end with a list of what to check.
 
 ## Decided and fixed in a second round
 
@@ -58,16 +58,39 @@ default if it is the wrong one.
 | 03 | 11 | Sidebar icons and the small marks are drawn from rectangles in `src/gui/icon.rs`. No glyph depends on a system font. |
 | 05 | unsupported page | Systems with no backend get a titled page with a card. `just other-lint` type-checks it for FreeBSD. |
 
-## Cannot be done from this machine
+## Run on real systems through CI
+
+The branch was pushed as draft pull request 13, and GitHub's runners built
+and tested it. The second run passed every job at commit `4505852`.
+
+| Job | What it showed |
+|---|---|
+| Windows native app | The Windows lint, 127 library tests with 0 failures and 1 ignored, the release build of both binaries, and the installer's install, upgrade and uninstall test all pass on Windows. |
+| macOS native APFS app | The Mac check, tests and build of both binaries pass on a Mac. |
+| Filesystem matrix (btrfs) | The whole library test binary runs from a btrfs mount with the btrfs tests required. |
+| Compressed store mount | The FUSE tests run with FUSE required. |
+| Minimum supported Rust version | The crate checks on the declared version. |
+| Build, test, lint and dependency policy | `just ci` passes with the Landlock tests required. |
+
+The first run failed two jobs, and both causes were in this branch: a test
+that assumed the repository as its working directory, and an installer that
+listed a notices file the CI build does not generate.
+
+Both runs uploaded previews of the Windows and Mac window drawn on those
+systems. They show the shared sidebar, the Jobs page, the storage plan panel
+and the toast with text in place. The sidebar highlight sat on Overview on
+every page, because the fixture set the page without running the highlight.
+The fixture now draws with reduced motion, and a local render under Wine
+shows the highlight on the page being drawn.
+
+## Still open
 
 | What | Why |
 |---|---|
 | Move the release secrets, add a reviewer and a tag rule | GitHub settings, owner only. |
-| Run the Windows compress and decompress pass | Wine has no WOF and, without a display, no drive lookup. 108 of 122 Windows tests pass under Wine. The 14 that fail are listed in the Windows round's report, and one of them was a test defect that is fixed. |
-| Run the Inno Setup script | Needs Windows. |
-| Run anything on a Mac, or link the Mac window | The Mac command line binary links with zig and has no undefined symbols. The window needs Apple's frameworks. Nothing can be run. |
-| Run the new CI and release workflow steps | They run on GitHub. `actionlint` reports nothing for them, and the scripts they call have unit tests. |
-| Confirm the Windows and Mac window on screen | The Linux window was run in a headless session with fixture games: see `docs/validation/2026-10-08-audit-live-window.md`. The other window cannot be drawn here. |
+| The release workflow | It runs on a tag. Nothing was tagged. `actionlint` reports nothing for it and its scripts have unit tests. |
+| A person using the Windows or Mac window | The tests and previews ran on those systems. Nobody has clicked through the window there. |
+| Real games | Every run above used fixtures. |
 
 ## Fixed in the first round
 

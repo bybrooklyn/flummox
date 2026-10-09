@@ -22,6 +22,9 @@ fn failing_plan() -> crate::storage::SpacePlan {
 
 /// Renders the current page of `state` in both themes wide and once narrow.
 fn render_all(state: &mut State, output: &Path, name: &str) -> TestResult {
+    // A fixture sets the page directly, so no highlight animation ran. Reduced
+    // motion makes the sidebar light the entry for the page being drawn.
+    let motion = std::mem::replace(&mut state.preferences.motion, MotionChoice::Reduced);
     for choice in [ThemeChoice::Dark, ThemeChoice::Light] {
         state.preferences.theme = choice;
         crate::gui::preview_renderer::render(
@@ -32,13 +35,15 @@ fn render_all(state: &mut State, output: &Path, name: &str) -> TestResult {
             &output.join(format!("{name}-{choice}.png")),
         )?;
     }
-    crate::gui::preview_renderer::render(
+    let narrow = crate::gui::preview_renderer::render(
         view(state),
         theme(state),
         740,
         900,
         &output.join(format!("{name}-narrow.png")),
-    )
+    );
+    state.preferences.motion = motion;
+    narrow
 }
 
 #[test]
