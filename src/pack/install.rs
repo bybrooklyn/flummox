@@ -367,7 +367,7 @@ mod enabled {
                 "The original game folder is missing"
             );
             std::fs::rename(&install.game_path, backup)
-                .context("Moving the original game to its rollback path")?;
+                .context("Moving the original game aside")?;
         }
         if !install.game_path.exists() {
             std::fs::DirBuilder::new()
@@ -478,10 +478,10 @@ mod enabled {
             ensure!(
                 *backup == backup_for(&install.game_path)?
                     && std::fs::symlink_metadata(backup)?.is_dir(),
-                "{} is not this game's retained original, so it was left alone",
+                "{} is not this game's kept original, so it was left alone",
                 backup.display()
             );
-            std::fs::remove_dir_all(backup).context("Removing the rollback copy")?;
+            std::fs::remove_dir_all(backup).context("Removing the kept original")?;
         }
         install.backup_path = None;
         install.phase = InstallPhase::Mounted;

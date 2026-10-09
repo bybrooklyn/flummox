@@ -114,11 +114,11 @@ pub fn verify_restored(
     let actual_bytes = crate::compatibility::corpus(&install.game_path, cancel, observer)?;
     ensure!(
         expected_bytes == actual_bytes,
-        "Ordinary files differ from the retained store and updates; all copies retained"
+        "Ordinary files differ from the store and updates; every copy is kept"
     );
     ensure!(
         metadata(&expected, observer)? == metadata(&install.game_path, observer)?,
-        "Ordinary metadata differs from the retained store and updates; all copies retained"
+        "Ordinary metadata differs from the store and updates; every copy is kept"
     );
     Ok(())
 }

@@ -913,12 +913,12 @@ impl Reader {
         cancel: &AtomicBool,
         observer: &dyn super::Observer,
     ) -> Result<()> {
-        observer.started(self.index.chunks.len() as u64, 0, "Verifying stored chunks");
+        observer.started(self.index.chunks.len() as u64, 0, "Verifying stored chunks…");
         for id in 0..self.index.chunks.len() {
             observer.checkpoint()?;
             ensure!(!cancel.load(Ordering::Relaxed), "Verification cancelled");
             self.decode(u32::try_from(id)?)?;
-            observer.progress(id as u64 + 1, 0, "Verifying stored chunks");
+            observer.progress(id as u64 + 1, 0, "Verifying stored chunks…");
         }
         Ok(())
     }
@@ -944,7 +944,7 @@ impl Reader {
         observer.started(
             self.index.entries.len() as u64,
             0,
-            "Comparing the store with installed files",
+            "Comparing the store with installed files…",
         );
         let mut seen = 0usize;
         let mut identities = Vec::new();
@@ -1036,7 +1036,7 @@ impl Reader {
                 }
             }
             seen = seen.saturating_add(1);
-            observer.progress(seen as u64, 0, "Comparing the store with installed files");
+            observer.progress(seen as u64, 0, "Comparing the store with installed files…");
         }
         ensure!(
             seen == self.entries().len(),

@@ -1697,14 +1697,14 @@ fn run_pack_task(
                     "The game files changed, so the switch to Maximum was stopped. Try again."
                 );
             }
-            control.transaction("Switching to Maximum. The original is kept.")?;
+            control.transaction("Switching to Maximum… The original is kept.")?;
             activate_prepared(snapshot, db, mounts, install)
         }
         PackTask::Compact => {
             pack_compact_observed(snapshot, db, mounts, &game.install_dir, control)
         }
         PackTask::Restore => {
-            control.transaction("Decompressing. This step must finish before the job can stop.")?;
+            control.transaction("Decompressing… This step must finish before the job can stop.")?;
             pack_rollback(snapshot, db, mounts, &game.install_dir)
         }
         PackTask::VerifyRestored => {
@@ -1724,13 +1724,13 @@ fn run_pack_task(
         }
         PackTask::Reclaim => {
             control.transaction(
-                "Deleting the original. This step must finish before the job can stop.",
+                "Deleting the original… This step must finish before the job can stop.",
             )?;
             pack_reclaim(snapshot, db, &game.install_dir)
         }
         PackTask::Prune => {
             control.transaction(
-                "Deleting the previous version. This step must finish before the job can stop.",
+                "Deleting the previous version… This step must finish before the job can stop.",
             )?;
             pack_prune(snapshot, db, &game.install_dir)
         }
