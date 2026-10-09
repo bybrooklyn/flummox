@@ -267,6 +267,10 @@ struct State {
     /// The wizard's hash is running.
     qualifying: bool,
     qualify_cancel: Arc<AtomicBool>,
+    /// Id of the newest compatibility run. A result with another id is dropped.
+    qualify_run: u64,
+    /// Something was typed or ticked in the compatibility form since it opened.
+    qualify_dirty: bool,
 }
 
 impl Default for State {
@@ -326,6 +330,8 @@ impl Default for State {
             qualification: None,
             qualifying: false,
             qualify_cancel: Default::default(),
+            qualify_run: 0,
+            qualify_dirty: false,
         }
     }
 }
@@ -408,6 +414,7 @@ impl State {
         self.qualify_cancel.store(true, Ordering::Relaxed);
         self.qualifying = false;
         self.qualification = None;
+        self.qualify_dirty = false;
     }
 }
 
@@ -497,7 +504,7 @@ enum Message {
     /// Add the selected folder to the locations as one game.
     Remember,
     Qualify,
-    QualificationReady(std::result::Result<Box<crate::qualification::Wizard>, String>),
+    QualificationReady(u64, std::result::Result<Box<crate::qualification::Wizard>, String>),
     QualificationField(crate::qualification::Field, String),
     QualificationCheck(crate::qualification::Check, bool),
     QualificationMode(crate::compatibility::StorageMode),
@@ -991,6 +998,8 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
             }
             if let Some(game) = game {
                 state.qualifying = true;
+                state.qualify_run += 1;
+                let run = state.qualify_run;
                 state.qualify_cancel = Default::default();
                 let cancel = state.qualify_cancel.clone();
                 return Task::perform(
@@ -1003,15 +1012,20 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                         .map(Box::new)
                         .map_err(|error| error.to_string())
                     }),
-                    Message::QualificationReady,
+                    move |result| Message::QualificationReady(run, result),
                 );
             }
         }
-        Message::QualificationReady(result) => {
-            // A result that arrives after the user cancelled is dropped.
-            if std::mem::take(&mut state.qualifying) {
+        Message::QualificationReady(run, result) => {
+            // A result that arrives after the user cancelled, or that belongs
+            // to an earlier run, is dropped.
+            if shell::run_is_current(state.qualifying, state.qualify_run, run) {
+                state.qualifying = false;
                 match result {
-                    Ok(wizard) => state.qualification = Some(*wizard),
+                    Ok(wizard) => {
+                        state.qualification = Some(*wizard);
+                        state.qualify_dirty = false;
+                    }
                     Err(error) => state.error(format!(
                         "Could not start the compatibility test: {error}"
                     )),
@@ -1020,16 +1034,19 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::QualificationField(field, text) => {
             if let Some(wizard) = &mut state.qualification {
+                state.qualify_dirty = true;
                 wizard.field(field, text);
             }
         }
         Message::QualificationCheck(check, value) => {
             if let Some(wizard) = &mut state.qualification {
+                state.qualify_dirty = true;
                 wizard.check(check, value);
             }
         }
         Message::QualificationMode(mode) => {
             if let Some(wizard) = &mut state.qualification {
+                state.qualify_dirty = true;
                 wizard.mode = mode;
             }
         }
@@ -1055,6 +1072,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::QualificationMeasured(result) => {
             if let Some(wizard) = &mut state.qualification {
+                state.qualify_dirty = true;
                 wizard.measured(result);
             }
         }
@@ -1117,7 +1135,16 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                 None => {}
             }
             if key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) {
-                state.planned = None;
+                match shell::escape_step(
+                    state.planned.is_some(),
+                    state.qualification.is_some(),
+                    state.qualify_dirty,
+                ) {
+                    shell::Escape::ClosePlan => state.planned = None,
+                    shell::Escape::CloseForm => state.stop_qualifying(),
+                    shell::Escape::KeepForm => state.info(shell::DISCARD_NOTICE),
+                    shell::Escape::Other => {}
+                }
             }
         }
         Message::Key(_) => {}

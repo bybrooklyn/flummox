@@ -319,6 +319,10 @@ pub struct State {
     pub qualifying: bool,
     /// Set to stop that hash, which reads the whole install.
     pub qualify_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Id of the newest compatibility run. A result with another id is dropped.
+    pub qualify_run: u64,
+    /// Something was typed or ticked in the compatibility form since it opened.
+    pub qualify_dirty: bool,
     // Navigation and scrolling.
     /// The highlight animation of each sidebar entry.
     pub nav: Vec<(Page, Animation<bool>)>,
@@ -441,6 +445,8 @@ impl State {
             qualification: None,
             qualifying: false,
             qualify_cancel: Default::default(),
+            qualify_run: 0,
+            qualify_dirty: false,
             nav: PAGES
                 .into_iter()
                 .chain(std::iter::once(Page::Settings))
@@ -824,6 +830,7 @@ impl State {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.qualifying = false;
         self.qualification = None;
+        self.qualify_dirty = false;
     }
     /// What `choice` is predicted to save for this game. `None` until it has
     /// been analyzed, and zero when the saving is too small to bother with
@@ -1253,7 +1260,8 @@ pub enum Message {
     CancelPlanned,
     ExportDiagnostics,
     Qualify(String),
-    QualificationReady(Result<crate::qualification::Wizard, String>),
+    /// The run id it was started with, then the form or the reason it failed.
+    QualificationReady(u64, Result<crate::qualification::Wizard, String>),
     QualificationField(crate::qualification::Field, String),
     QualificationCheck(crate::qualification::Check, bool),
     QualificationMode(crate::compatibility::StorageMode),
@@ -1682,6 +1690,8 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                 .map(|row| row.game.clone())
             {
                 state.qualifying = true;
+                state.qualify_run += 1;
+                let run = state.qualify_run;
                 state.qualify_cancel = Default::default();
                 let cancel = state.qualify_cancel.clone();
                 return Task::perform(
@@ -1693,15 +1703,22 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                         )
                         .map_err(|error| error.to_string())
                     }),
-                    |result| Message::QualificationReady(result.and_then(|result| result)),
+                    move |result| {
+                        Message::QualificationReady(run, result.and_then(|result| result))
+                    },
                 );
             }
         }
-        Message::QualificationReady(result) => {
-            // A result that arrives after the user cancelled is dropped.
-            if std::mem::take(&mut state.qualifying) {
+        Message::QualificationReady(run, result) => {
+            // A result that arrives after the user cancelled, or that belongs
+            // to an earlier run, is dropped.
+            if super::shell::run_is_current(state.qualifying, state.qualify_run, run) {
+                state.qualifying = false;
                 match result {
-                    Ok(wizard) => state.qualification = Some(wizard),
+                    Ok(wizard) => {
+                        state.qualification = Some(wizard);
+                        state.qualify_dirty = false;
+                    }
                     Err(error) => state.show_status(Status::error(format!(
                         "Could not start the compatibility test: {error}"
                     ))),
@@ -1710,16 +1727,19 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::QualificationField(field, text) => {
             if let Some(wizard) = &mut state.qualification {
+                state.qualify_dirty = true;
                 wizard.field(field, text);
             }
         }
         Message::QualificationCheck(check, value) => {
             if let Some(wizard) = &mut state.qualification {
+                state.qualify_dirty = true;
                 wizard.check(check, value);
             }
         }
         Message::QualificationMode(mode) => {
             if let Some(wizard) = &mut state.qualification {
+                state.qualify_dirty = true;
                 wizard.mode = mode;
             }
         }
@@ -1747,6 +1767,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::QualificationMeasured(result) => {
             if let Some(wizard) = &mut state.qualification {
+                state.qualify_dirty = true;
                 wizard.measured(result);
             }
         }
@@ -2556,12 +2577,22 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                 }
                 (_, Some(Shortcut::Rescan)) => return update(state, Message::Rescan),
                 (Key::Named(Named::Escape), None) => {
-                    // An open storage plan is closed first and nothing else.
-                    if state.planned.take().is_some() {
-                        return Task::none();
+                    use super::shell::Escape;
+                    match super::shell::escape_step(
+                        state.planned.is_some(),
+                        state.qualification.is_some(),
+                        state.qualify_dirty,
+                    ) {
+                        Escape::ClosePlan => state.planned = None,
+                        Escape::CloseForm => state.stop_qualifying(),
+                        Escape::KeepForm => {
+                            state.show_status(Status::info(super::shell::DISCARD_NOTICE));
+                        }
+                        Escape::Other => {
+                            state.close_detail();
+                            state.selected.clear();
+                        }
                     }
-                    state.close_detail();
-                    state.selected.clear();
                 }
                 _ => {}
             }
@@ -3534,6 +3565,62 @@ mod tests {
         check(state.planned.is_none(), "Escape dismisses the plan")
     }
 
+    fn open_form(state: &mut State) {
+        state.qualification = Some(crate::qualification::Wizard::new(
+            named("a", true).game,
+            crate::compatibility::Corpus {
+                sha256: "a".repeat(64),
+                files: 1,
+                bytes: 1,
+            },
+        ));
+    }
+
+    #[test]
+    fn escape_closes_an_untouched_compatibility_form_and_keeps_a_filled_one() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        open_form(&mut state);
+        let _task = update(&mut state, Message::Keyboard(escape()));
+        check(state.qualification.is_none(), "an untouched form closes")?;
+        open_form(&mut state);
+        let _task = update(
+            &mut state,
+            Message::QualificationField(crate::qualification::Field::Build, "1.2".into()),
+        );
+        let _task = update(&mut state, Message::Keyboard(escape()));
+        check(state.qualification.is_some(), "a form with an entry stays")?;
+        check_eq(
+            state.toast.status.as_ref().map(|status| status.text.clone()),
+            Some("Press Close to discard the compatibility test.".to_owned()),
+            "and says how to leave",
+        )?;
+        let _task = update(&mut state, Message::CloseQualification);
+        open_form(&mut state);
+        let _task = update(&mut state, Message::Keyboard(escape()));
+        check(
+            state.qualification.is_none(),
+            "closing cleared the flag for the next form",
+        )
+    }
+
+    #[test]
+    fn a_cancelled_compatibility_run_cannot_clear_the_next_ones_busy_flag() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        state.qualifying = true;
+        state.qualify_run = 2;
+        let _task = update(
+            &mut state,
+            Message::QualificationReady(1, Err("old run".into())),
+        );
+        check(state.qualifying, "the older run's result is ignored")?;
+        check(state.toast.status.is_none(), "and says nothing")?;
+        let _task = update(
+            &mut state,
+            Message::QualificationReady(2, Err("this run".into())),
+        );
+        check(!state.qualifying, "control: the current run's result ends it")
+    }
+
     #[test]
     fn adding_a_folder_does_not_touch_the_disk_on_the_window_thread() -> TestResult {
         let mut state = State::new(Env::from_home("/fixture"));
@@ -3934,7 +4021,7 @@ mod tests {
         check(!state.qualifying, "the button is available again")?;
         let _late = update(
             &mut state,
-            Message::QualificationReady(Err("Compatibility verification stopped".into())),
+            Message::QualificationReady(0, Err("Compatibility verification stopped".into())),
         );
         check(
             state.toast.status.is_none(),

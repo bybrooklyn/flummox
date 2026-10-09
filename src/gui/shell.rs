@@ -266,6 +266,43 @@ pub fn shortcut(key: &Key, modifiers: Modifiers) -> Option<Shortcut> {
     }
 }
 
+/// What Escape does, from what is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Escape {
+    /// Close the storage plan and do nothing else.
+    ClosePlan,
+    /// Close the compatibility form, which holds nothing the user entered.
+    CloseForm,
+    /// Leave the form open and show [`DISCARD_NOTICE`].
+    KeepForm,
+    /// Nothing modal is open, so Escape closes the details and the selection.
+    Other,
+}
+
+/// Shown when Escape meets a compatibility form with entries in it.
+pub const DISCARD_NOTICE: &str = "Press Close to discard the compatibility test.";
+
+/// Picks what Escape does. The plan closes first. A compatibility form closes
+/// only while `form_dirty` is false, since closing discards what was typed or
+/// ticked.
+pub fn escape_step(plan_open: bool, form_open: bool, form_dirty: bool) -> Escape {
+    if plan_open {
+        Escape::ClosePlan
+    } else if form_open && form_dirty {
+        Escape::KeepForm
+    } else if form_open {
+        Escape::CloseForm
+    } else {
+        Escape::Other
+    }
+}
+
+/// Whether the result of compatibility run `arrived` is the one the window
+/// still waits for. A run that was cancelled has an older id than the next.
+pub fn run_is_current(waiting: bool, latest: u64, arrived: u64) -> bool {
+    waiting && latest == arrived
+}
+
 /// Starts a background decode for each source the cache hands out. A failed
 /// decode is reported as `None`, which the cache records.
 pub fn artwork_tasks<M: Send + 'static>(
@@ -805,6 +842,31 @@ mod tests {
             None,
             "another letter",
         )
+    }
+
+    #[test]
+    fn escape_closes_a_form_only_while_it_holds_nothing() -> TestResult {
+        for (plan, form, dirty, want) in [
+            (true, true, true, Escape::ClosePlan),
+            (false, true, false, Escape::CloseForm),
+            (false, true, true, Escape::KeepForm),
+            (false, false, true, Escape::Other),
+            (false, false, false, Escape::Other),
+        ] {
+            check_eq(
+                escape_step(plan, form, dirty),
+                want,
+                format!("plan {plan}, form {form}, dirty {dirty}"),
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_cancelled_run_cannot_answer_for_the_next_one() -> TestResult {
+        check(run_is_current(true, 2, 2), "the run being waited for")?;
+        check(!run_is_current(true, 2, 1), "an older run")?;
+        check(!run_is_current(false, 2, 2), "nothing is waited for")
     }
 
     #[test]
