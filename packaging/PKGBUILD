@@ -16,12 +16,14 @@ license=('AGPL-3.0-or-later')
 # The command-line tool needs nothing beyond libc: it talks to btrfs through
 # ioctls rather than through btrfs-progs. The rest are what the GUI links
 # against for its window, input and text.
-depends=('gcc-libs' 'libxkbcommon' 'libxkbcommon-x11' 'wayland' 'libx11' 'libxcursor'
+depends=('glibc' 'gcc-libs' 'libxkbcommon' 'libxkbcommon-x11' 'wayland' 'libx11' 'libxcursor'
          'libxi' 'libxrandr' 'fontconfig')
 makedepends=('cargo' 'git')
-# FUSE runs Maximum Space mounts; either dialog helper enables folder browsing.
+# FUSE runs Maximum stores. The Vulkan loader gives the window GPU rendering.
+# Either dialog helper enables folder browsing.
 optdepends=('btrfs-progs: for inspecting compression'
-            'fuse3: for Maximum Space mounts'
+            'fuse3: for Maximum stores'
+            'vulkan-icd-loader: for GPU rendering in the window'
             'zenity: for native folder and report selection'
             'kdialog: for native folder and report selection on KDE')
 options=('!lto')  # LTO is already configured in the release profile.
@@ -64,8 +66,8 @@ package() {
     install -Dm644 "packaging/$pkgname-watch.service" \
         "$pkgdir/usr/lib/systemd/user/$pkgname-watch.service"
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 docs/usage.md "$pkgdir/usr/share/doc/$pkgname/usage.md"
+    install -Dm644 docs/status.md "$pkgdir/usr/share/doc/$pkgname/status.md"
     install -Dm644 docs/install.md "$pkgdir/usr/share/doc/$pkgname/install.md"
-    install -Dm644 docs/next-steps.md "$pkgdir/usr/share/doc/$pkgname/next-steps.md"
-    install -Dm644 docs/release-readiness.md "$pkgdir/usr/share/doc/$pkgname/release-readiness.md"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

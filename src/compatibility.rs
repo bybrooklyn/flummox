@@ -17,12 +17,53 @@ pub struct GameBuild {
     pub build: String,
 }
 
+/// Longest key a report may carry.
+const MAX_KEY_LEN: usize = 256;
+/// Longest build or tool version a report may carry.
+const MAX_TEXT_LEN: usize = 128;
+
 impl GameBuild {
+    /// The build record for `id` at `build`, with the key made path-free.
+    pub fn new(id: &GameId, build: &str) -> Self {
+        Self {
+            launcher: id.launcher,
+            key: Self::key_for(id),
+            build: build.trim().into(),
+        }
+    }
+
+    /// The key a report stores for `id`.
+    ///
+    /// A manual game is keyed by its install path, and a path names the
+    /// user's folders, so manual keys, and any key holding a path separator,
+    /// are stored as a BLAKE3 hash of the key. Other keys are stored as given.
+    pub fn key_for(id: &GameId) -> String {
+        if id.launcher == Launcher::Manual || id.key.contains(['/', '\\']) {
+            let hex = blake3::hash(id.key.as_bytes()).to_hex();
+            format!("hash-{}", hex.chars().take(32).collect::<String>())
+        } else {
+            id.key.clone()
+        }
+    }
+
+    /// Rewrites the key of a custom-folder report to its hashed form and says
+    /// whether it changed. A key already shaped `hash-` and 32 hex digits stays.
+    fn hash_manual_key(&mut self) -> bool {
+        let hashed = self.key.strip_prefix("hash-").is_some_and(|rest| {
+            rest.len() == 32 && rest.bytes().all(|b| b.is_ascii_hexdigit())
+        });
+        if self.launcher != Launcher::Manual || hashed {
+            return false;
+        }
+        self.key = Self::key_for(&GameId::new(Launcher::Manual, self.key.as_str()));
+        true
+    }
+
     /// Whether `game` is this launcher entry at this build. A game whose
     /// build is unknown never matches.
     pub fn matches(&self, game: &Game) -> bool {
         self.launcher == game.id.launcher
-            && self.key == game.id.key
+            && self.key == Self::key_for(&game.id)
             && game.build.as_deref() == Some(self.build.as_str())
     }
 
@@ -32,12 +73,19 @@ impl GameBuild {
     }
 }
 
+/// Reads a string and folds it to lower case, so a hand-edited report with an
+/// upper-case hash compares equal to the walk's own output.
+fn lowercase<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    String::deserialize(deserializer).map(|text| text.to_ascii_lowercase())
+}
+
 /// Stable source identity produced by a verified full-corpus walk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Corpus {
     /// Hex SHA-256 over every file in path order: path length, path bytes,
-    /// file size, then content.
+    /// file size, then content. Read back in lower case.
+    #[serde(deserialize_with = "lowercase")]
     pub sha256: String,
     /// Regular files hashed.
     pub files: u64,
@@ -56,8 +104,8 @@ pub enum StorageMode {
 impl std::fmt::Display for StorageMode {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::Native => "Native compression",
-            Self::MaximumSpace => "Maximum Space",
+            Self::Native => "Standard",
+            Self::MaximumSpace => "Maximum",
         })
     }
 }
@@ -132,6 +180,28 @@ pub struct Report {
     pub storage: StorageResult,
     /// Version of the Flummox build that wrote the report.
     pub flummox_version: String,
+    /// The commit that build was made from, when CI recorded one: 40
+    /// lowercase hex digits. It names source, not a host. Local builds and
+    /// reports written before this field have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flummox_commit: Option<String>,
+}
+
+/// Whether `text` is a full commit id: 40 lowercase hex digits.
+fn is_commit_id(text: &str) -> bool {
+    text.len() == 40 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The commit this binary was built from, from `GITHUB_SHA` at compile time.
+/// `None` for a local build, or when the variable is not a full commit id.
+pub fn build_commit() -> Option<String> {
+    commit_from(option_env!("GITHUB_SHA"))
+}
+
+fn commit_from(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::to_ascii_lowercase)
+        .filter(|text| is_commit_id(text))
 }
 
 /// Thresholds a valid report must meet before it qualifies a game.
@@ -167,6 +237,14 @@ impl Report {
             !self.game.key.is_empty() && !self.game.build.is_empty(),
             "Compatibility report game identity is incomplete"
         );
+        let path_free =
+            |text: &str, limit: usize| text.len() <= limit && !text.contains(['/', '\\']);
+        ensure!(
+            path_free(&self.game.key, MAX_KEY_LEN)
+                && path_free(&self.game.build, MAX_TEXT_LEN)
+                && path_free(&self.flummox_version, MAX_TEXT_LEN),
+            "Compatibility report identity holds a path separator or is too long"
+        );
         ensure!(
             self.corpus.sha256.len() == 64
                 && self
@@ -187,6 +265,10 @@ impl Report {
         ensure!(
             self.checks.baseline_load_ms > 0 && self.checks.candidate_load_ms > 0,
             "Compatibility report load measurements are missing"
+        );
+        ensure!(
+            self.flummox_commit.as_deref().is_none_or(is_commit_id),
+            "Compatibility report build commit is not a 40-digit lowercase hex id"
         );
         ensure!(
             !self.flummox_version.trim().is_empty(),
@@ -212,10 +294,9 @@ impl Report {
             && self.checks.launched
             && !self.checks.anti_cheat_issue
             && !self.checks.gameplay_issue
-            && self.checks.candidate_load_ms.saturating_mul(10_000)
-                <= self.checks.baseline_load_ms.saturating_mul(
-                    10_000u64.saturating_add(u64::from(policy.maximum_load_regression_bps)),
-                )
+            && u128::from(self.checks.candidate_load_ms) * 10_000
+                <= u128::from(self.checks.baseline_load_ms)
+                    * (10_000 + u128::from(policy.maximum_load_regression_bps))
     }
 
     /// The content-derived file name a valid report is stored under.
@@ -276,7 +357,12 @@ impl Store {
                 continue;
             }
             match Self::read(&path) {
-                Ok(report) => reports.push(report),
+                Ok((report, migrated)) => {
+                    if migrated && let Err(error) = self.rewrite(&path, &report) {
+                        tracing::warn!(path = %path.display(), %error, "could not rewrite a migrated compatibility report");
+                    }
+                    reports.push(report);
+                }
                 Err(error) => {
                     tracing::warn!(path = %path.display(), %error, "skipped a compatibility report");
                 }
@@ -285,16 +371,38 @@ impl Store {
         Ok(reports)
     }
 
-    /// Reads and validates one report file of at most 1 MiB.
-    fn read(path: &Path) -> Result<Report> {
+    /// Replaces an old report with its migrated form. The new file is staged
+    /// beside the store, synced and renamed to its content name, and only then
+    /// is the old file removed, so a crash leaves a complete report either way.
+    fn rewrite(&self, old: &Path, report: &Report) -> Result<()> {
+        use std::io::Write;
+        let target = self.root.join(report.filename()?);
+        let mut staged = tempfile::NamedTempFile::new_in(&self.root)?;
+        staged.write_all(&serde_json::to_vec_pretty(report)?)?;
+        staged.as_file().sync_all()?;
+        staged.persist(&target)?;
+        #[cfg(unix)]
+        std::fs::File::open(&self.root)?.sync_all()?;
+        if target != old {
+            std::fs::remove_file(old)?;
+        }
+        Ok(())
+    }
+
+    /// Reads and validates one report file of at most 1 MiB. The flag says the
+    /// key of a custom-folder report was rewritten to its hashed form, which
+    /// reports saved before the key was hashed need. An imported report is
+    /// never migrated.
+    fn read(path: &Path) -> Result<(Report, bool)> {
         ensure!(
             std::fs::metadata(path)?.len() <= 1024 * 1024,
             "Compatibility report exceeds 1 MiB"
         );
         let bytes = std::fs::read(path).context("Reading the report")?;
-        let report: Report = serde_json::from_slice(&bytes).context("Parsing the report")?;
+        let mut report: Report = serde_json::from_slice(&bytes).context("Parsing the report")?;
+        let migrated = report.game.hash_manual_key();
         report.validate()?;
-        Ok(report)
+        Ok((report, migrated))
     }
 }
 
@@ -496,6 +604,7 @@ mod tests {
                 random_read_p95_ns: Some(50_000),
             },
             flummox_version: "0.1.0".into(),
+            flummox_commit: None,
         }
     }
 
@@ -534,23 +643,188 @@ mod tests {
         )
     }
 
+    fn manual_game() -> Game {
+        Game {
+            id: GameId::new(Launcher::Manual, "/home/person/Games/private"),
+            also: vec![],
+            title: "Private title".into(),
+            install_dir: "/home/person/Games/private".into(),
+            build: Some("7".into()),
+            size_hint: Some(4096),
+            state: InstallState::Idle,
+            is_tool: false,
+        }
+    }
+
+    /// A report for `game` made by the form's own builder.
+    fn built_report(game: &Game) -> Result<Report, anyhow::Error> {
+        let mut wizard = crate::qualification::Wizard::new(
+            game.clone(),
+            Corpus {
+                sha256: "a".repeat(64),
+                files: 2,
+                bytes: 4096,
+            },
+        );
+        wizard.mode = StorageMode::MaximumSpace;
+        wizard.baseline_load = "1000".into();
+        wizard.candidate_load = "1050".into();
+        wizard.allocated_before = "4096".into();
+        wizard.allocated_after = "2048".into();
+        for check in [
+            crate::qualification::Check::Bytes,
+            crate::qualification::Check::Metadata,
+            crate::qualification::Check::Update,
+            crate::qualification::Check::Restore,
+            crate::qualification::Check::Launch,
+        ] {
+            wizard.check(check, true);
+        }
+        wizard.report()
+    }
+
     #[test]
     fn stored_reports_have_no_titles_or_paths() -> TestResult {
+        let game = manual_game();
+        let built = built_report(&game).ctx("build a report for a manual game")?;
         let dir = tempfile::tempdir().ctx("temporary report folder")?;
         let store = Store::open(dir.path().join("compatibility")).ctx("open report store")?;
-        let path = store.save(&report()).ctx("save report")?;
+        let path = store.save(&built).ctx("save report")?;
         let json = std::fs::read_to_string(path).ctx("read report")?;
         check(!json.contains("Private title"), "title is absent")?;
         check(!json.contains("/home/person"), "install path is absent")?;
+        check(!json.contains("person"), "user name is absent")?;
+        check(
+            built.qualifies(&game, &"a".repeat(64), Policy::default()),
+            "the hashed key still matches the game it came from",
+        )?;
+        let mut other = manual_game();
+        other.id = GameId::new(Launcher::Manual, "/home/person/Games/other");
+        check(
+            !built.qualifies(&other, &"a".repeat(64), Policy::default()),
+            "a different folder does not match",
+        )?;
         let loaded = store.load().ctx("load reports")?;
-        check_eq(loaded, vec![report()], "stored report round trip")?;
+        check_eq(loaded, vec![built.clone()], "stored report round trip")?;
         std::fs::write(
             dir.path().join("compatibility/broken.json"),
             b"{ not a report",
         )
         .ctx("malformed file")?;
         let loaded = store.load().ctx("load beside a malformed file")?;
-        check_eq(loaded, vec![report()], "a malformed file hides nothing")
+        check_eq(loaded, vec![built], "a malformed file hides nothing")
+    }
+
+    #[test]
+    fn a_report_that_carries_a_path_is_rejected_on_import_and_migrated_on_load() -> TestResult {
+        let mut old = report();
+        old.game.launcher = Launcher::Manual;
+        old.game.key = "/home/person/Games/private".into();
+        check(old.validate().is_err(), "a path key fails validation")?;
+        let dir = tempfile::tempdir().ctx("temporary report folder")?;
+        let root = dir.path().join("compatibility");
+        let store = Store::open(&root).ctx("open report store")?;
+        std::fs::write(
+            root.join("old.json"),
+            serde_json::to_vec(&old).ctx("serialise an old report")?,
+        )
+        .ctx("plant an old report")?;
+        let loaded = store.load().ctx("load an old report")?;
+        let migrated = loaded.first().ctx("the migrated report")?;
+        check(
+            migrated.qualifies(&manual_game(), &"a".repeat(64), Policy::default()),
+            "the migrated report matches the game it was made for",
+        )?;
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(&root).ctx("list the store")? {
+            let path = entry.ctx("entry")?.path();
+            let text = std::fs::read_to_string(&path).ctx("read a stored file")?;
+            check(
+                !text.contains("/home/person"),
+                "no stored file keeps the path",
+            )?;
+            files.push((path, text));
+        }
+        check_eq(files.len(), 1, "one file remains and no temp file is left")?;
+        let again = store.load().ctx("load again")?;
+        check_eq(again, loaded, "a second load returns the same report")?;
+        let mut after = Vec::new();
+        for entry in std::fs::read_dir(&root).ctx("list again")? {
+            let path = entry.ctx("entry")?.path();
+            let text = std::fs::read_to_string(&path).ctx("read again")?;
+            after.push((path, text));
+        }
+        check_eq(after, files, "a second load writes nothing")?;
+        let mut long = report();
+        long.game.build = "7".repeat(MAX_TEXT_LEN + 1);
+        check(long.validate().is_err(), "an over-long build is rejected")?;
+        let mut windows = report();
+        windows.game.build = "C:\\Games".into();
+        check(windows.validate().is_err(), "a backslash is rejected")?;
+        check(
+            report().validate().is_ok(),
+            "control: the plain report is valid",
+        )
+    }
+
+    #[test]
+    fn the_load_check_cannot_be_passed_by_overflowing_values() -> TestResult {
+        let mut huge = report();
+        huge.checks.baseline_load_ms = 2_000_000_000_000_000;
+        huge.checks.candidate_load_ms = u64::MAX;
+        check(
+            !huge.qualifies(&game(), &"a".repeat(64), Policy::default()),
+            "a huge baseline does not excuse a huge candidate",
+        )?;
+        let mut slow = report();
+        slow.checks.candidate_load_ms = 1100;
+        check(
+            slow.qualifies(&game(), &"a".repeat(64), Policy::default()),
+            "control: exactly ten percent slower still qualifies",
+        )
+    }
+
+    #[test]
+    fn the_build_commit_is_optional_and_must_be_a_full_lower_case_id() -> TestResult {
+        let mut with = report();
+        with.flummox_commit = Some("0123456789abcdef0123456789abcdef01234567".into());
+        check(with.validate().is_ok(), "a full commit id is accepted")?;
+        for bad in [
+            "",
+            "0123456789ABCDEF0123456789abcdef01234567",
+            "0123456789abcdef",
+            "g123456789abcdef0123456789abcdef01234567",
+            "0123456789abcdef0123456789abcdef012345678",
+        ] {
+            let mut changed = report();
+            changed.flummox_commit = Some(bad.into());
+            check(changed.validate().is_err(), format!("{bad:?} is refused"))?;
+        }
+        check(report().validate().is_ok(), "control: absent is accepted")?;
+        let json = serde_json::to_string(&report()).ctx("serialise")?;
+        check(
+            !json.contains("flummox_commit"),
+            "an absent commit is not written",
+        )?;
+        let read: Report = serde_json::from_str(&json).ctx("a report from before the field")?;
+        check_eq(read.flummox_commit, None, "old reports still load")?;
+        let id = "0123456789ABCDEF0123456789abcdef01234567";
+        check_eq(
+            commit_from(Some(id)),
+            Some(id.to_ascii_lowercase()),
+            "the build variable is folded to lower case",
+        )?;
+        check_eq(commit_from(Some("abc")), None, "a short value is dropped")?;
+        check_eq(commit_from(None), None, "a local build has none")
+    }
+
+    #[test]
+    fn upper_case_corpus_hashes_are_read_as_lower_case() -> TestResult {
+        let mut upper = report();
+        upper.corpus.sha256 = "A".repeat(64);
+        let json = serde_json::to_string(&upper).ctx("serialise")?;
+        let read: Report = serde_json::from_str(&json).ctx("parse")?;
+        check_eq(read.corpus.sha256, "a".repeat(64), "folded on read")
     }
 }
 

@@ -54,6 +54,9 @@ pub struct Progress {
     /// Allocated size of the visited files before each was processed, and after.
     pub allocation_before: u64,
     pub allocation_after: u64,
+    /// Files the pass could not process and went on without.
+    #[serde(default)]
+    pub failed: u64,
 }
 /// One queued or finished storage operation on one game folder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,14 +92,46 @@ pub struct Queue {
     /// Hashed paths of the automatic locations as of the last healthy scan. A game
     /// first seen under one of them counts as a new install.
     pub initialized_locations: HashSet<String>,
+    /// The drive each automatic location was on at the last healthy scan, keyed
+    /// like `initialized_locations`. A location missing here has not been seen yet.
+    pub initialized_volumes: HashMap<String, String>,
+    /// Why the last scan set a new starting point for a location. The window shows
+    /// these once and the worker clears them.
+    #[serde(skip)]
+    pub notices: Vec<String>,
+    /// For each baseline key, the automatic location that covered the game when the
+    /// key was recorded. A key without one is never removed.
+    pub baseline_homes: HashMap<String, String>,
 }
 impl Queue {
     /// Loads the queue from `root`, or an empty one if the file does not exist. Jobs
     /// saved as running or paused become `Interrupted`, as do waiting jobs saved
     /// without a volume.
     pub fn load(root: &Path) -> Result<Self> {
+        Self::load_inner(&root.join("native-queue.json"))
+    }
+    /// `load`, except that a file which cannot be parsed is renamed aside and an
+    /// empty queue is returned with a note saying where the old one went. A file
+    /// that cannot be read at all is still an error, since nothing was set aside.
+    pub fn load_or_quarantine(root: &Path) -> Result<(Self, Option<String>)> {
         let path = root.join("native-queue.json");
-        let mut queue: Self = match crate::desktop::read_bounded(&path, 16 * 1024 * 1024) {
+        match Self::load_inner(&path) {
+            Ok(queue) => Ok((queue, None)),
+            Err(error) if error.downcast_ref::<serde_json::Error>().is_some() => {
+                let aside = crate::desktop::quarantine(&path)?;
+                Ok((
+                    Self::default(),
+                    Some(format!(
+                        "The job history could not be read ({error}). It was kept as {}.",
+                        aside.display()
+                    )),
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+    fn load_inner(path: &Path) -> Result<Self> {
+        let mut queue: Self = match crate::desktop::read_bounded(path, 16 * 1024 * 1024) {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
             Err(error)
                 if error
@@ -109,14 +144,14 @@ impl Queue {
         };
         ensure!(
             queue.jobs.len() <= 1000,
-            "Native job history exceeds its limit"
+            "The job history is too large to read."
         );
         for job in &mut queue.jobs {
             if matches!(job.phase, Phase::Running | Phase::Paused)
                 || (job.phase == Phase::Waiting && job.volume.is_none())
             {
                 job.phase = Phase::Interrupted;
-                job.message = "Worker stopped. Review recovery before retrying.".into();
+                job.message = "The background worker stopped. Review the job under Recovery before trying again.".into();
             }
         }
         // Guards against a file whose `next_id` is behind its own jobs.
@@ -136,7 +171,7 @@ impl Queue {
         let bytes = serde_json::to_vec(self)?;
         ensure!(
             bytes.len() <= 16 * 1024 * 1024,
-            "Native job history exceeds 16 MiB"
+            "The job history is too large to save."
         );
         let mut file = tempfile::NamedTempFile::new_in(root)?;
         file.write_all(&bytes)?;
@@ -152,7 +187,7 @@ impl Queue {
     pub fn enqueue(&mut self, game: Game, restore: bool) -> Result<u64> {
         ensure!(
             game.state.is_idle(),
-            "Wait for the launcher or game to finish"
+            "Wait for the launcher or game to finish."
         );
         if let Some(job) = self
             .jobs
@@ -161,13 +196,13 @@ impl Queue {
         {
             ensure!(
                 job.restore == restore,
-                "Cancel the existing job before switching between compression and restoration"
+                "Stop the existing job before switching between compressing and decompressing."
             );
             return Ok(job.id);
         }
         ensure!(
             self.jobs.iter().filter(|job| job.phase.active()).count() < 200,
-            "The queue is full"
+            "Too many jobs are waiting. Let some finish first."
         );
         // History is capped at 1000 jobs. Room is made by dropping the oldest completed
         // or cancelled job. Failed and interrupted jobs are never dropped this way.
@@ -179,7 +214,9 @@ impl Queue {
             {
                 self.jobs.remove(index);
             } else {
-                anyhow::bail!("Review the retained job history before adding more jobs");
+                anyhow::bail!(
+                    "Too many jobs need attention. Retry or finish some before adding more."
+                );
             }
         }
         self.next_id = self
@@ -197,7 +234,7 @@ impl Queue {
             phase: Phase::Waiting,
             user_paused: false,
             progress: Progress::default(),
-            message: "Waiting to start".into(),
+            message: "Waiting to start…".into(),
         });
         Ok(id)
     }
@@ -208,31 +245,34 @@ impl Queue {
             .jobs
             .iter()
             .find(|job| job.id == id)
-            .ok_or_else(|| anyhow::anyhow!("Job no longer exists"))?;
-        ensure!(!old.phase.active(), "The job is already active");
+            .ok_or_else(|| anyhow::anyhow!("That job no longer exists."))?;
+        ensure!(
+            !old.phase.active(),
+            "That job is already running or waiting."
+        );
         ensure!(
             self.jobs.iter().filter(|job| job.phase.active()).count() < 200,
-            "The queue is full"
+            "Too many jobs are waiting. Let some finish first."
         );
         ensure!(
             !self
                 .jobs
                 .iter()
                 .any(|job| job.phase.active() && job.game.install_dir == old.game.install_dir),
-            "This game already has an active job"
+            "This game already has a job."
         );
         let job = self
             .jobs
             .iter_mut()
             .find(|job| job.id == id)
-            .ok_or_else(|| anyhow::anyhow!("Job no longer exists"))?;
+            .ok_or_else(|| anyhow::anyhow!("That job no longer exists."))?;
         if job.volume.is_none() {
             job.volume = Some(crate::storage::volume(&job.game.install_dir)?);
         }
         job.phase = Phase::Waiting;
         job.user_paused = false;
         job.progress = Progress::default();
-        job.message = "Waiting to retry".into();
+        job.message = "Waiting to retry…".into();
         Ok(())
     }
     /// `enqueue` for a compression that maintenance asked for. Only a job this call
@@ -250,8 +290,27 @@ impl Queue {
     }
     /// Records the game's current build as handled, so `observe` stops reporting it.
     pub fn acknowledge(&mut self, game: &Game) {
-        self.baseline
-            .insert(game.id.to_string(), (game.build.clone(), true));
+        for key in baseline_keys(game) {
+            self.baseline.insert(key, (game.build.clone(), true));
+        }
+    }
+    /// Records the build of a finished automatic compression as handled, so
+    /// `observe` stops reporting it. A job that was stopped by a shutdown, or that
+    /// is still waiting or running, leaves the game due. A failed job counts as
+    /// handled, because the user can retry it and an automatic retry loop would not end.
+    pub fn settle(&mut self, id: u64, shutting_down: bool) {
+        let Some(job) = self.jobs.iter().find(|job| job.id == id) else {
+            return;
+        };
+        let handled = match job.phase {
+            Phase::Completed | Phase::Failed => true,
+            Phase::Cancelled => !shutting_down,
+            _ => false,
+        };
+        if job.automatic && !job.restore && handled {
+            let game = job.game.clone();
+            self.acknowledge(&game);
+        }
     }
     /// Returns the games maintenance should compress now: under an automatic
     /// location, not excluded, idle, and either updated or newly installed. A due
@@ -263,21 +322,84 @@ impl Queue {
         preferences: &Preferences,
         healthy: bool,
     ) -> Vec<Game> {
+        self.observe_on(
+            games,
+            preferences,
+            healthy,
+            &crate::desktop::volume_identity,
+        )
+    }
+    /// `observe` with the drive lookup supplied, so a test can swap a drive.
+    ///
+    /// A location whose drive differs from the one saved is a different location:
+    /// its games get a new baseline and none is queued, and `notices` says why.
+    pub fn observe_on(
+        &mut self,
+        games: &[Game],
+        preferences: &Preferences,
+        healthy: bool,
+        volume_of: &dyn Fn(&Path) -> Option<String>,
+    ) -> Vec<Game> {
         let mut due = vec![];
         if !healthy {
             return due;
         }
+        let mut volumes = HashMap::new();
+        let mut moved: Vec<&Path> = vec![];
+        for location in preferences.locations.iter().filter(|l| l.automatic) {
+            let key = location_key(&location.path);
+            let saved = self
+                .initialized_volumes
+                .get(&key)
+                .or_else(|| preferences.location_volumes.get(&key));
+            match (volume_of(&location.path), saved) {
+                (Some(now), Some(before)) if now != *before => {
+                    moved.push(&location.path);
+                    self.notices.push(format!(
+                        "{} is on a different drive than when Flummox last checked it. Its games were not queued, and Flummox will compare future updates against what is there now.",
+                        location.path.display()
+                    ));
+                    volumes.insert(key, now);
+                }
+                (Some(now), _) => {
+                    volumes.insert(key, now);
+                }
+                (None, Some(before)) => {
+                    volumes.insert(key, before.clone());
+                }
+                (None, None) => {}
+            }
+        }
         for game in games {
+            if let Some(location) = preferences
+                .locations
+                .iter()
+                .find(|l| l.automatic && game.install_dir.starts_with(&l.path))
+            {
+                for key in baseline_keys(game) {
+                    self.baseline_homes
+                        .insert(key, location_key(&location.path));
+                }
+            }
+            if moved.iter().any(|path| game.install_dir.starts_with(path)) {
+                let enabled = !game
+                    .ids()
+                    .any(|id| preferences.excluded.contains(&id.to_string()));
+                for key in baseline_keys(game) {
+                    self.baseline.insert(key, (game.build.clone(), enabled));
+                }
+                continue;
+            }
             let enabled =
                 preferences.locations.iter().any(|location| {
                     location.automatic && game.install_dir.starts_with(&location.path)
                 }) && !game
                     .ids()
                     .any(|id| preferences.excluded.contains(&id.to_string()));
-            let key = game.id.to_string();
+            let keys = baseline_keys(game);
             // Updated: the build differs from a baseline taken while the game was
             // covered. A change made while it was not covered does not count.
-            let previous = self.baseline.get(&key).cloned();
+            let previous = keys.iter().find_map(|key| self.baseline.get(key)).cloned();
             let changed = previous
                 .as_ref()
                 .is_some_and(|(build, was_enabled)| *was_enabled && *build != game.build);
@@ -303,7 +425,9 @@ impl Queue {
             if enabled && (changed || newly_installed) {
                 continue;
             }
-            self.baseline.insert(key, (game.build.clone(), enabled));
+            for key in keys {
+                self.baseline.insert(key, (game.build.clone(), enabled));
+            }
         }
         self.initialized_locations = preferences
             .locations
@@ -311,15 +435,81 @@ impl Queue {
             .filter(|location| location.automatic)
             .map(|location| location_key(&location.path))
             .collect();
+        self.initialized_volumes = volumes;
+        // A healthy scan that no longer lists a game forgets it, so a reinstall is
+        // new. Only while the location it was under is configured, reachable and on
+        // the drive it was on.
+        let listed: HashSet<String> = games.iter().flat_map(baseline_keys).collect();
+        let reachable: HashSet<String> = preferences
+            .locations
+            .iter()
+            .filter(|l| l.automatic && l.path.is_dir() && !moved.contains(&l.path.as_path()))
+            .map(|l| location_key(&l.path))
+            .collect();
+        let forgotten: Vec<String> = self
+            .baseline_homes
+            .iter()
+            .filter(|(key, home)| !listed.contains(*key) && reachable.contains(*home))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in forgotten {
+            self.baseline.remove(&key);
+            self.baseline_homes.remove(&key);
+        }
+        self.baseline_homes
+            .retain(|key, _| self.baseline.contains_key(key));
         due
     }
 }
-/// A fixed-length key for a location path, used in `initialized_locations`.
-fn location_key(path: &Path) -> String {
-    blake3::hash(path.as_os_str().as_encoded_bytes())
-        .to_hex()
-        .to_string()
+/// The baseline keys of a game: one per id, and one for its install directory.
+/// The directory key lets a folder that loses its launcher record, and comes back
+/// under a manual id, keep its baseline.
+fn baseline_keys(game: &Game) -> Vec<String> {
+    let mut keys: Vec<String> = game.ids().map(ToString::to_string).collect();
+    keys.push(format!("dir:{}", location_key(&game.install_dir)));
+    keys
 }
+use crate::desktop::location_key;
+/// Files that Windows reported would not shrink, keyed by path inside the game
+/// folder, with the size and modification time seen then. A file that still has
+/// both is skipped on the next pass. Losing the record only costs a recompression.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Rejected {
+    files: HashMap<String, (u64, u64)>,
+}
+impl Rejected {
+    /// The record at `path`, or an empty one if it is missing or unreadable.
+    pub fn load(path: &Path) -> Self {
+        crate::desktop::read_bounded(path, 16 * 1024 * 1024)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+    /// Whether `relative` was rejected at exactly this size and modification time.
+    pub fn contains(&self, relative: &str, length: u64, modified: u64) -> bool {
+        self.files.get(relative) == Some(&(length, modified))
+    }
+    pub fn insert(&mut self, relative: String, length: u64, modified: u64) {
+        self.files.insert(relative, (length, modified));
+    }
+    /// Adds every entry of `other`, replacing entries for the same path.
+    pub fn merge(&mut self, other: Self) {
+        self.files.extend(other.files);
+    }
+    /// Replaces the record atomically.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let directory = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Record path has no folder"))?;
+        let mut file = tempfile::NamedTempFile::new_in(directory)?;
+        file.write_all(&serde_json::to_vec(self)?)?;
+        file.as_file().sync_all()?;
+        file.persist(path)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +676,307 @@ mod tests {
             queue.observe(&[game], &settings, true).len(),
             1,
             "reconnected new installation remains due",
+        )
+    }
+    fn automatic_fixture() -> (Preferences, Game, Queue) {
+        let library = std::path::PathBuf::from("/games");
+        let mut game = crate::desktop::manual_game("One".into(), library.join("One"));
+        game.build = Some("1".into());
+        let preferences = Preferences {
+            locations: vec![Location {
+                path: library,
+                kind: LocationKind::Collection,
+                automatic: true,
+            }],
+            ..Default::default()
+        };
+        let mut queue = Queue::default();
+        queue.observe(&[game.clone()], &preferences, true);
+        game.build = Some("2".into());
+        (preferences, game, queue)
+    }
+    fn queue_job(queue: &mut Queue, game: &Game, phase: Phase) -> TestResult {
+        // Not `enqueue`: the fixture folder does not exist, so no volume can be read.
+        queue.next_id += 1;
+        queue.jobs.push(Job {
+            id: queue.next_id,
+            game: game.clone(),
+            restore: false,
+            automatic: true,
+            volume: None,
+            phase,
+            user_paused: false,
+            progress: Progress::default(),
+            message: String::new(),
+        });
+        Ok(())
+    }
+    #[test]
+    fn only_a_finished_or_user_stopped_job_settles_the_update() -> TestResult {
+        let (preferences, game, mut queue) = automatic_fixture();
+        check_eq(
+            queue
+                .observe(std::slice::from_ref(&game), &preferences, true)
+                .len(),
+            1,
+            "control: the updated build is due",
+        )?;
+        queue_job(&mut queue, &game, Phase::Waiting)?;
+        queue.settle(queue.next_id, false);
+        check_eq(
+            queue
+                .observe(std::slice::from_ref(&game), &preferences, true)
+                .len(),
+            1,
+            "a waiting job leaves the update due",
+        )?;
+        queue.jobs.last_mut().ctx("job")?.phase = Phase::Cancelled;
+        queue.settle(queue.next_id, true);
+        check_eq(
+            queue
+                .observe(std::slice::from_ref(&game), &preferences, true)
+                .len(),
+            1,
+            "a job stopped by a shutdown leaves the update due",
+        )?;
+        queue.settle(queue.next_id, false);
+        check(
+            queue
+                .observe(std::slice::from_ref(&game), &preferences, true)
+                .is_empty(),
+            "a job the user cancelled settles the update",
+        )?;
+        let (preferences, game, mut queue) = automatic_fixture();
+        queue_job(&mut queue, &game, Phase::Completed)?;
+        queue.settle(queue.next_id, false);
+        check(
+            queue.observe(&[game], &preferences, true).is_empty(),
+            "a completed job settles the update",
+        )
+    }
+    /// A library at `/games` that sits on the drive named by `drive`.
+    fn drive_fixture() -> (Preferences, Game, Queue) {
+        let (mut preferences, game, mut queue) = automatic_fixture();
+        let one = |_: &Path| Some("drive-a".to_owned());
+        preferences.record_volumes(&one);
+        let mut seen = game.clone();
+        seen.build = Some("1".into());
+        queue.observe_on(&[seen], &preferences, true, &one);
+        queue.notices.clear();
+        (preferences, game, queue)
+    }
+    #[test]
+    fn a_library_on_another_drive_gets_a_new_baseline_and_queues_nothing() -> TestResult {
+        let (preferences, game, mut queue) = drive_fixture();
+        let other = |_: &Path| Some("drive-b".to_owned());
+        let mut fresh = crate::desktop::manual_game("Two".into(), "/games/Two".into());
+        fresh.build = Some("9".into());
+        // The game now has build 2 and "Two" is unknown: both look due on drive-a.
+        let games = [game.clone(), fresh.clone()];
+        check(
+            queue
+                .observe_on(&games, &preferences, true, &other)
+                .is_empty(),
+            "a different drive at the same path queues nothing",
+        )?;
+        check_eq(queue.notices.len(), 1, "the reason is reported once")?;
+        check(
+            queue
+                .observe_on(&games, &preferences, true, &other)
+                .is_empty(),
+            "the new baseline holds on the next scan",
+        )?;
+        check_eq(queue.notices.len(), 1, "and the reason is not repeated")?;
+        let mut update = game;
+        update.build = Some("3".into());
+        check_eq(
+            queue
+                .observe_on(&[update], &preferences, true, &other)
+                .len(),
+            1,
+            "control: a later update on the new drive is queued",
+        )
+    }
+    #[test]
+    fn an_unreadable_drive_and_an_unchanged_one_do_not_reset_the_baseline() -> TestResult {
+        let (preferences, game, mut queue) = drive_fixture();
+        let gone = |_: &Path| None;
+        check_eq(
+            queue
+                .observe_on(std::slice::from_ref(&game), &preferences, true, &gone)
+                .len(),
+            1,
+            "an offline drive does not hide an update",
+        )?;
+        check(queue.notices.is_empty(), "and gives no reason")?;
+        let same = |_: &Path| Some("drive-a".to_owned());
+        check_eq(
+            queue.observe_on(&[game], &preferences, true, &same).len(),
+            1,
+            "control: the same drive still queues the update",
+        )
+    }
+    #[test]
+    fn a_saved_location_drive_decides_when_the_queue_has_none() -> TestResult {
+        let (mut preferences, game, _) = drive_fixture();
+        let other = |_: &Path| Some("drive-b".to_owned());
+        let mut queue = Queue::default();
+        queue.observe_on(std::slice::from_ref(&game), &preferences, true, &other);
+        check_eq(
+            queue.notices.len(),
+            1,
+            "the saved drive of the location is compared",
+        )?;
+        preferences.location_volumes.clear();
+        let mut queue = Queue::default();
+        queue.observe_on(std::slice::from_ref(&game), &preferences, true, &other);
+        check(
+            queue.notices.is_empty(),
+            "control: a location never seen before is recorded, not reported",
+        )?;
+        check_eq(
+            queue.initialized_volumes.len(),
+            1,
+            "and its drive is remembered",
+        )
+    }
+    #[test]
+    fn locations_and_queues_saved_before_drive_identity_still_load() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        std::fs::write(
+            temp.path().join("desktop.json"),
+            br#"{"locations":[{"path":"/x","kind":"collection","automatic":true}]}"#,
+        )
+        .ctx("old preferences")?;
+        let preferences = Preferences::load(temp.path()).ctx("load preferences")?;
+        check(preferences.location_volumes.is_empty(), "no identity yet")?;
+        std::fs::write(
+            temp.path().join("native-queue.json"),
+            br#"{"jobs":[],"baseline":{},"next_id":0,"initialized_locations":["a"]}"#,
+        )
+        .ctx("old queue")?;
+        let queue = Queue::load(temp.path()).ctx("load queue")?;
+        check_eq(queue.initialized_locations.len(), 1, "locations kept")?;
+        check(queue.initialized_volumes.is_empty(), "no drives yet")
+    }
+    #[test]
+    fn a_game_missing_from_a_healthy_scan_is_new_when_it_returns() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let library = temp.path().join("Games");
+        std::fs::create_dir(&library).ctx("library")?;
+        let preferences = Preferences {
+            locations: vec![Location {
+                path: library.clone(),
+                kind: LocationKind::Collection,
+                automatic: true,
+            }],
+            ..Default::default()
+        };
+        let mut game = crate::desktop::manual_game("One".into(), library.join("One"));
+        game.build = Some("1".into());
+        let mut queue = Queue::default();
+        queue.observe(&[game.clone()], &preferences, true);
+        check(
+            queue.observe(&[], &preferences, false).is_empty(),
+            "an unhealthy scan queues nothing",
+        )?;
+        check(
+            !queue.baseline.is_empty(),
+            "and does not forget a game it failed to list",
+        )?;
+        queue.observe(&[], &preferences, true);
+        check(
+            queue.baseline.is_empty() && queue.baseline_homes.is_empty(),
+            "a healthy scan without the game forgets it",
+        )?;
+        check_eq(
+            queue.observe(&[game], &preferences, true).len(),
+            1,
+            "the reinstalled game at the same build is new",
+        )
+    }
+    #[test]
+    fn a_game_under_an_unreachable_location_is_not_forgotten() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let library = temp.path().join("Gone");
+        let preferences = Preferences {
+            locations: vec![Location {
+                path: library.clone(),
+                kind: LocationKind::Collection,
+                automatic: true,
+            }],
+            ..Default::default()
+        };
+        let mut game = crate::desktop::manual_game("One".into(), library.join("One"));
+        game.build = Some("1".into());
+        let mut queue = Queue::default();
+        queue.observe(&[game.clone()], &preferences, true);
+        queue.observe(&[], &preferences, true);
+        check(
+            !queue.baseline.is_empty(),
+            "an offline library keeps its baseline",
+        )?;
+        std::fs::create_dir(&library).ctx("library comes back")?;
+        check(
+            queue.observe(&[game], &preferences, true).is_empty(),
+            "control: the game is not new when the drive returns",
+        )
+    }
+    #[test]
+    fn a_game_that_changes_launcher_id_keeps_its_baseline() -> TestResult {
+        let (preferences, game, mut queue) = automatic_fixture();
+        // The same folder, now known only by a different id.
+        let mut renamed = game.clone();
+        renamed.id = crate::model::GameId::new(crate::model::Launcher::Steam, "1234");
+        renamed.build = Some("1".into());
+        check(
+            queue.observe(&[renamed], &preferences, true).is_empty(),
+            "a known folder under a new id is not a new install",
+        )?;
+        let fresh = crate::desktop::manual_game("Two".into(), "/games/Two".into());
+        check_eq(
+            queue.observe(&[fresh], &preferences, true).len(),
+            1,
+            "control: an unknown folder is a new install",
+        )
+    }
+    #[test]
+    fn an_unparseable_queue_is_set_aside_and_an_unreadable_one_is_not() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let path = temp.path().join("native-queue.json");
+        std::fs::write(&path, b"{ not json").ctx("write")?;
+        check(Queue::load(temp.path()).is_err(), "control: load fails")?;
+        let (queue, note) = Queue::load_or_quarantine(temp.path()).ctx("quarantine")?;
+        check(queue.jobs.is_empty(), "starts empty")?;
+        check(note.is_some(), "the note says where the file went")?;
+        check(
+            temp.path().join("native-queue.json.corrupt").exists(),
+            "the old file is kept",
+        )?;
+        check(!path.exists(), "the name is free for a new queue")?;
+        let (_, note) = Queue::load_or_quarantine(temp.path()).ctx("second load")?;
+        check(
+            note.is_none(),
+            "a missing file is an empty queue, not damage",
+        )
+    }
+    #[test]
+    fn rejected_files_match_only_at_the_same_size_and_time() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let path = temp.path().join("rejected.json");
+        let mut record = Rejected::default();
+        record.insert("a.pak".into(), 100, 7);
+        record.save(&path).ctx("save")?;
+        let record = Rejected::load(&path);
+        check(record.contains("a.pak", 100, 7), "same size and time")?;
+        check(!record.contains("a.pak", 101, 7), "size changed")?;
+        check(!record.contains("a.pak", 100, 8), "time changed")?;
+        check(!record.contains("b.pak", 100, 7), "other path")?;
+        std::fs::write(&path, b"garbage").ctx("damage")?;
+        check_eq(
+            Rejected::load(&path),
+            Rejected::default(),
+            "an unreadable record is empty",
         )
     }
     #[test]

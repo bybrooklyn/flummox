@@ -55,6 +55,15 @@ pub fn busy(games: &[crate::model::Game]) -> Result<Option<String>> {
     if count == 0 {
         return Ok(None);
     }
+    // Game folders are resolved once per check, and each distinct process path once,
+    // since many processes share an executable. A folder that no longer resolves
+    // cannot hold a running process and is left out.
+    let roots: Vec<(&crate::model::Game, std::path::PathBuf)> = games
+        .iter()
+        .filter_map(|game| Some((game, game.install_dir.canonicalize().ok()?)))
+        .collect();
+    let mut resolved: std::collections::HashMap<std::path::PathBuf, std::path::PathBuf> =
+        std::collections::HashMap::new();
     // SAFETY: the successful API call allocated count initialized WTS_PROCESS_INFOW entries.
     let processes = unsafe { std::slice::from_raw_parts(pointer, usize::try_from(count)?) };
     for process in processes {
@@ -90,12 +99,15 @@ pub fn busy(games: &[crate::model::Game]) -> Result<Option<String>> {
                 .ok_or_else(|| anyhow::anyhow!("Process path exceeds buffer"))?,
         )?);
         // Both forms come from Windows final paths; this also normalizes verbatim prefixes.
-        let path = path.canonicalize()?;
-        if let Some(game) = games.iter().find(|game| {
-            game.install_dir
-                .canonicalize()
-                .is_ok_and(|root| path.starts_with(root))
-        }) {
+        let path = match resolved.get(&path) {
+            Some(known) => known.clone(),
+            None => {
+                let canonical = path.canonicalize()?;
+                resolved.insert(path, canonical.clone());
+                canonical
+            }
+        };
+        if let Some((game, _)) = roots.iter().find(|(_, root)| path.starts_with(root)) {
             return Ok(Some(format!("{} is running", game.title)));
         }
         let executable = path

@@ -22,10 +22,13 @@ loading or play, and it is not one of the acceptance runs `0.0.2.json` needs.
 
 The drive's data counter fell by 1,531,133,952 bytes during that pass and by
 1,815,007,232 during a second decompress and compress later in the session.
-The counter covers the whole drive. It moved by 0 and by 12,095,488 bytes in
-two idle 20-second windows beside the second pass, so other activity does not
-explain the difference between the two passes, and the saving is best read as
-1.5 to 1.8 GB of 4.27 GB.
+The counter covers the whole drive and includes other processes' writes, so
+these falls are not the saving of the job. It moved by 0 and by 12,095,488
+bytes in two idle 20-second windows beside the second pass, which shows how
+quiet the drive was in those windows and does not turn the counter into a
+measurement. The sizes of the copy before and after a pass need `compsize`,
+which needs privileges Flummox does not ask for, so this record has no
+measured saving for the native tier.
 
 ## Estimates against that pass
 

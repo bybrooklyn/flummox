@@ -16,9 +16,16 @@ public static class FlummoxAllocation {
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern uint GetCompressedFileSizeW(string name, out uint high);
 
+    // The extended-length form lifts the MAX_PATH limit, so deep game trees are measured.
+    private static string Long(string path) {
+        if (path.StartsWith(@"\\?\")) return path;
+        if (path.StartsWith(@"\\")) return @"\\?\UNC\" + path.Substring(2);
+        return @"\\?\" + path;
+    }
+
     public static ulong Bytes(string path) {
         uint high;
-        uint low = GetCompressedFileSizeW(path, out high);
+        uint low = GetCompressedFileSizeW(Long(path), out high);
         if (low == 0xffffffff && Marshal.GetLastWin32Error() != 0) {
             throw new Win32Exception(Marshal.GetLastWin32Error(), path);
         }
@@ -79,6 +86,34 @@ $drive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($scratchPath))
 if ($drive.DriveFormat -ne 'NTFS') {
     throw 'The Windows WOF scratch directory must be on NTFS'
 }
+# Controls: the harness must be able to fail. Zeros must shrink under compact.exe and
+# random bytes must not. If either is wrong the numbers below mean nothing.
+$controlPath = Join-Path $scratchPath ("flummox-wof-control-" + [Guid]::NewGuid().ToString('N'))
+[IO.Directory]::CreateDirectory($controlPath) | Out-Null
+try {
+    [IO.File]::WriteAllBytes((Join-Path $controlPath 'zeros.bin'), [byte[]]::new(4MB))
+    $noise = [byte[]]::new(4MB)
+    [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($noise)
+    [IO.File]::WriteAllBytes((Join-Path $controlPath 'random.bin'), $noise)
+    $zerosBefore = [FlummoxAllocation]::Bytes((Join-Path $controlPath 'zeros.bin'))
+    $noiseBefore = [FlummoxAllocation]::Bytes((Join-Path $controlPath 'random.bin'))
+    & compact.exe /c "/s:$controlPath" /a /f /exe:lzx |
+        ForEach-Object { [Console]::Error.WriteLine($_) }
+    if ($LASTEXITCODE -ne 0) {
+        throw "compact.exe failed on the control files with exit code $LASTEXITCODE"
+    }
+    $zerosAfter = [FlummoxAllocation]::Bytes((Join-Path $controlPath 'zeros.bin'))
+    $noiseAfter = [FlummoxAllocation]::Bytes((Join-Path $controlPath 'random.bin'))
+    if ($zerosAfter -ge $zerosBefore) {
+        throw "Control failed: a file of zeros did not shrink ($zerosBefore -> $zerosAfter)"
+    }
+    if ($noiseAfter -lt $noiseBefore) {
+        throw "Control failed: random data shrank ($noiseBefore -> $noiseAfter)"
+    }
+} finally {
+    Remove-Item -LiteralPath $controlPath -Recurse -Force
+}
+
 $copyPath = Join-Path $scratchPath ("flummox-wof-" + [Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($copyPath) | Out-Null
 
@@ -90,7 +125,7 @@ try {
     }
     $before = Get-Corpus $copyPath
     $started = [Diagnostics.Stopwatch]::StartNew()
-    & compact.exe /c "/s:$copyPath" /a /i /f /exe:lzx |
+    & compact.exe /c "/s:$copyPath" /a /f /exe:lzx |
         ForEach-Object { [Console]::Error.WriteLine($_) }
     if ($LASTEXITCODE -ne 0) {
         throw "compact.exe failed with exit code $LASTEXITCODE"

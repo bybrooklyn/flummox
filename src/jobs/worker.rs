@@ -44,7 +44,7 @@ impl BusyCheck for Pause {
     fn in_use_by(&self) -> Option<String> {
         self.0
             .load(Ordering::Relaxed)
-            .then(|| "Paused. Work continues when resumed or gaming ends.".into())
+            .then(|| "Paused. The job continues when you resume it or stop playing.".into())
     }
 }
 
@@ -64,7 +64,33 @@ impl crate::pack::Observer for AnalysisObserver<'_> {
     }
 }
 
-/// Runs one job through to its `Done` event. `run` reports an `Err` as `Failed`.
+/// Source bytes analysis may read across all files of one job.
+const ANALYSIS_BUDGET: u64 = 32 * 1024 * 1024;
+/// Source bytes analysis may read from one file.
+const FILE_SAMPLE_CAP: u64 = 2 * 1024 * 1024;
+/// Whether the remaining `budget` is too small to judge a file of `size`. A
+/// sliver of a few sectors cannot show a saving, so the file is left to the
+/// scaled-in remainder, unless the sliver still covers all of it.
+fn budget_spent(budget: u64, size: u64) -> bool {
+    budget < estimate::MIN_SAMPLE_BUDGET && size > budget
+}
+
+/// The level to record after a compress pass. A pass that had nothing to do
+/// reports none, and the record keeps the level it already had.
+fn recorded_level(effective: Option<i32>, previous: Option<i32>) -> i32 {
+    effective.or(previous).unwrap_or(0)
+}
+
+/// This pass's share of its estimated saving. A cancelled pass rewrote only
+/// part of the planned bytes, and a resumed pass estimates the rest.
+fn pass_saving(saving: u64, planned: u64, rewritten: u64, cancelled: bool) -> u64 {
+    if cancelled {
+        estimate::scaled_saving(saving, rewritten, planned)
+    } else {
+        saving
+    }
+}
+
 /// The saving to record after a pass: this pass's estimate plus the share of
 /// the earlier figure that belongs to bytes this pass did not rewrite.
 fn carried_saving(earlier: u64, install_bytes: u64, rewritten: u64, this_pass: u64) -> u64 {
@@ -78,7 +104,10 @@ fn carried_saving(earlier: u64, install_bytes: u64, rewritten: u64, this_pass: u
 }
 
 fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Result<()> {
-    ensure!(work.version == VERSION, "Worker version mismatch");
+    ensure!(
+        work.version == VERSION,
+        "The background worker is from another version. Restart Flummox."
+    );
     let job = work.job;
     // Checks that need the whole filesystem come first. The sandbox below
     // narrows this process to the game folder.
@@ -88,8 +117,9 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
     }
     let path = validate_folder(&job.game.install_dir)?;
     let fs = crate::fsprobe::probe(&path)?;
-    // Analysis also runs on a drive with no native backend. It then samples
-    // with the btrfs backend's model.
+    // A drive on the pack tier uses the pack backend's model. Analysis also
+    // runs on a drive with no backend at all, and then samples with the btrfs
+    // backend's model.
     let kind = crate::fsprobe::tier_for(&fs)
         .backend()
         .or_else(|| {
@@ -103,11 +133,17 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
         output.send(WorkerEvent::SpacePlan(plan.clone()));
         plan.recheck()?;
     }
+    // Before the property, the receipts or the history change, learn whether
+    // this kernel can undo compression at all.
+    if job.operation == Operation::Decompress && matches!(kind, crate::fsprobe::BackendKind::Btrfs)
+    {
+        crate::backend::btrfs::probe_decompress(&path, &super::state_dir()?)?;
+    }
     let mut db = Db::open(&Db::default_path().context("Cannot locate state database")?)?;
     for id in job.game.ids() {
         ensure!(
             !db.is_excluded(id)?,
-            "This game is excluded. Restore it before processing."
+            "This game is excluded. Include it before running a job."
         );
     }
     // Receipts stored under this job's policy name files an earlier attempt
@@ -125,7 +161,7 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
         |r| r.get::<_, String>(0),
     )? {
         let (entry, level): (inventory::FileEntry, i32) = serde_json::from_str(&row?)?;
-        if job.operation == Operation::Decompress || level >= job.options.level_plan().floor() {
+        if job.operation == Operation::Decompress || level >= job.options.attainable_floor() {
             completed.insert(entry.rel.clone(), (entry, level));
         }
     }
@@ -222,7 +258,7 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
     let anchor = Anchor::open(&path)?;
     ensure!(
         anchor.fully_resolved(),
-        "This kernel cannot safely resolve game paths. Update Linux before using GUI jobs."
+        "This kernel cannot safely resolve game paths. Update Linux before running jobs."
     );
     let mut summary = Estimate {
         install_bytes: full.total_bytes(),
@@ -255,7 +291,7 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
             observer.output.event(Event::Progress {
                 files_done: 0,
                 bytes_done: 0,
-                current: "Checking Maximum Space compatibility".into(),
+                current: "Checking the compatibility report…".into(),
             });
             let corpus = crate::compatibility::corpus(&path, &cancel, &observer)?;
             if let Some(report) = candidates.iter().find(|report| report.corpus == corpus) {
@@ -283,8 +319,6 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
         let model = backend.model(&job.options);
         let opts = EstimateOpts::new(job.options.btrfs_level(), &fs);
         let probe = backend.disk_probe();
-        const ANALYSIS_BUDGET: u64 = 32 * 1024 * 1024;
-        const FILE_SAMPLE_CAP: u64 = 1024 * 1024;
         let observer = AnalysisObserver {
             output,
             ctx: &ctx,
@@ -293,7 +327,7 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
         output.event(Event::Progress {
             files_done: 0,
             bytes_done: 0,
-            current: "Sampling small-file grouping".into(),
+            current: "Sampling small files…".into(),
         });
         summary.small_files =
             crate::pack::sample_small_files(&path, &full, 4 * 1024 * 1024, &cancel, &observer)?;
@@ -312,7 +346,7 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
                 summary.skipped_files += 1;
                 continue;
             }
-            if budget == 0 {
+            if budget_spent(budget, entry.size) {
                 unsampled_size = unsampled_size.saturating_add(entry.size);
                 candidates.push(entry.clone());
                 continue;
@@ -335,6 +369,7 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
                         maximum_opts: &EstimateOpts {
                             level: 19,
                             mount_level: None,
+                            floor: None,
                         },
                         byte_cap: sample_cap,
                     },
@@ -396,7 +431,7 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
                 Event::Progress {
                     files_done: 0,
                     bytes_done: 0,
-                    current: format!("Analyzing {}", entry.rel.display()),
+                    current: format!("Analyzing {}…", entry.rel.display()),
                 }
             });
         }
@@ -433,6 +468,7 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
         });
         return Ok(());
     }
+    let planned = inv.total_bytes();
     let outcome = if job.operation == Operation::Decompress {
         backend.decompress(&path, &inv, &ctx)?
     } else {
@@ -459,19 +495,23 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
         );
         record.build = job.game.build.clone();
         record.install_bytes = full.total_bytes();
-        record.level = outcome.effective_level.unwrap_or(0);
+        let previous = db.game(&job.game.id)?;
+        record.level = recorded_level(
+            outcome.effective_level,
+            previous.as_ref().map(|previous| previous.level),
+        );
         // The number describes analysis, never a measured receipt. A pass
         // after an update analyses only the files that changed, so the share
         // of the earlier figure that belongs to untouched files is kept.
         // Without it the recorded saving shrank to the latest pass alone.
-        let earlier = db.game(&job.game.id)?.map_or(0, |previous| {
+        let earlier = previous.map_or(0, |previous| {
             u64::try_from(previous.est_saving).unwrap_or(0)
         });
         record.est_saving = i64::try_from(carried_saving(
             earlier,
             record.install_bytes,
             outcome.bytes,
-            summary.saving(),
+            pass_saving(summary.saving(), planned, outcome.bytes, outcome.cancelled),
         ))
         .unwrap_or(i64::MAX);
         let mut confirmed = outcome.completed.clone();
@@ -507,8 +547,152 @@ pub(super) fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::carried_saving;
-    use crate::testutil::{TestResult, check_eq};
+    use super::*;
+    use crate::estimate::{BtrfsModel, EstimateOpts};
+    use crate::testutil::{Ctx, TestResult, check, check_eq};
+
+    /// Pseudo-random bytes that zstd cannot shrink.
+    fn noise(len: usize) -> Vec<u8> {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            out.extend_from_slice(&(z ^ (z >> 31)).to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    #[test]
+    fn a_compressible_head_and_tail_do_not_make_an_incompressible_body_look_small() -> TestResult {
+        let dir = tempfile::tempdir().ctx("fixture")?;
+        let path = dir.path().join("archive.pak");
+        let edge = 600 * 1024;
+        let body = 15 * 1024 * 1024;
+        let mut bytes = vec![0u8; edge];
+        bytes.extend(noise(body));
+        bytes.extend(vec![0u8; edge]);
+        std::fs::write(&path, &bytes).ctx("write archive")?;
+        let size = bytes.len() as u64;
+        let file = std::fs::File::open(&path).ctx("open archive")?;
+        let native_opts = EstimateOpts {
+            level: 3,
+            mount_level: None,
+            floor: None,
+        };
+        let maximum_opts = EstimateOpts {
+            level: 19,
+            mount_level: None,
+            floor: None,
+        };
+        let (native, maximum) = estimate::estimate_open_file_pair(
+            &file,
+            size,
+            PreviewEstimate {
+                native: &BtrfsModel { level: 3 },
+                native_opts: &native_opts,
+                measured: None,
+                maximum: &PackModel { level: 19 },
+                maximum_opts: &maximum_opts,
+                byte_cap: FILE_SAMPLE_CAP,
+            },
+        )
+        .ctx("estimate")?;
+        check_eq(native.size, size, "the estimate is for the whole file")?;
+        check(
+            native.sampled <= FILE_SAMPLE_CAP,
+            format!("the read stays within the cap: {}", native.sampled),
+        )?;
+        let kept = native.disk_after as f64 / size as f64;
+        check(
+            kept > 0.6,
+            format!("most of the file is noise and stays: kept {kept:.3}"),
+        )?;
+        let kept = maximum.disk_after as f64 / size as f64;
+        check(
+            kept > 0.6,
+            format!("the same holds for the pack model: kept {kept:.3}"),
+        )?;
+        let zeros = dir.path().join("zeros.bin");
+        std::fs::write(&zeros, vec![0u8; 16 * 1024 * 1024]).ctx("write zeros")?;
+        let (flat, _) = estimate::estimate_open_file_pair(
+            &std::fs::File::open(&zeros).ctx("open zeros")?,
+            16 * 1024 * 1024,
+            PreviewEstimate {
+                native: &BtrfsModel { level: 3 },
+                native_opts: &native_opts,
+                measured: None,
+                maximum: &PackModel { level: 19 },
+                maximum_opts: &maximum_opts,
+                byte_cap: FILE_SAMPLE_CAP,
+            },
+        )
+        .ctx("estimate zeros")?;
+        check(
+            (flat.disk_after as f64) < 0.1 * 16.0 * 1024.0 * 1024.0,
+            format!("control: zeros shrink to almost nothing: {flat:?}"),
+        )
+    }
+
+    #[test]
+    fn a_cancelled_pass_records_only_the_share_it_rewrote() -> TestResult {
+        check_eq(
+            pass_saving(1000, 100, 1, true),
+            10,
+            "cancelled at one percent",
+        )?;
+        check_eq(
+            pass_saving(1000, 100, 100, true),
+            1000,
+            "cancelled at the end",
+        )?;
+        check_eq(
+            pass_saving(1000, 100, 1, false),
+            1000,
+            "control: a finished pass",
+        )?;
+        check_eq(pass_saving(1000, 0, 0, true), 1000, "nothing planned")?;
+        // Cancelled at one percent of a game estimated to save 300: the record
+        // says 3, not 300, and the resumed pass adds the rest.
+        let first = carried_saving(0, 1000, 10, pass_saving(300, 1000, 10, true));
+        check_eq(first, 3, "the cancelled pass records its own share")?;
+        let second = carried_saving(first, 1000, 990, 297);
+        check(
+            (297..=300).contains(&second),
+            format!("the resumed pass completes the total once: {second}"),
+        )
+    }
+
+    #[test]
+    fn a_sliver_of_budget_is_not_spent_on_a_large_file() -> TestResult {
+        check(
+            budget_spent(2048, 2_000_000_000),
+            "a 2 KiB sliver on a 2 GB file",
+        )?;
+        check(budget_spent(0, 1), "nothing left")?;
+        check(
+            !budget_spent(2048, 2048),
+            "control: a file the sliver covers whole",
+        )?;
+        check(
+            !budget_spent(estimate::MIN_SAMPLE_BUDGET, 2_000_000_000),
+            "control: a workable remainder is used",
+        )
+    }
+
+    #[test]
+    fn a_pass_with_nothing_to_do_keeps_the_recorded_level() -> TestResult {
+        check_eq(recorded_level(None, Some(9)), 9, "kept")?;
+        check_eq(
+            recorded_level(Some(15), Some(9)),
+            15,
+            "control: a real pass wins",
+        )?;
+        check_eq(recorded_level(None, None), 0, "nothing known")
+    }
 
     #[test]
     fn a_later_pass_keeps_the_saving_on_files_it_did_not_touch() -> TestResult {

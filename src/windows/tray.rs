@@ -1,7 +1,13 @@
 //! Worker tray controls run on a separate Win32 message thread.
 #![allow(unsafe_code)]
 use anyhow::{Result, ensure};
-use std::{cell::RefCell, sync::mpsc};
+use std::{
+    cell::RefCell,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+};
 use windows_sys::Win32::{
     Foundation::*,
     System::LibraryLoader::GetModuleHandleW,
@@ -24,6 +30,11 @@ thread_local! {
     static ICON: RefCell<Option<NOTIFYICONDATAW>> = const { RefCell::new(None) };
     static TASKBAR_CREATED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
+/// Raised by `Tray::drop` before it closes the window, so a WM_CLOSE from anywhere
+/// else can be told apart and treated as a request to exit.
+static CLOSING: AtomicBool = AtomicBool::new(false);
+/// Timer that retries adding the icon until the shell accepts it.
+const RETRY_TIMER: usize = 1;
 /// The message the shell posts for mouse events on the icon, with the event in `lparam`.
 const CALLBACK: u32 = WM_APP + 1;
 /// Posted by `Tray::set_paused`. `wparam` is nonzero when maintenance is paused.
@@ -61,6 +72,7 @@ impl Drop for Tray {
         unsafe {
             Shell_NotifyIconW(NIM_DELETE, &data);
         }
+        CLOSING.store(true, Ordering::Relaxed);
         // SAFETY: PostMessage accepts this thread-owned window handle and value-only parameters.
         unsafe {
             PostMessageW(self.window as HWND, WM_CLOSE, 0, 0);
@@ -85,17 +97,22 @@ unsafe extern "system" fn procedure(
     // Explorer broadcasts TaskbarCreated when it restarts, having lost every icon.
     // Add ours again. The id is registered at run time, so it cannot be a match arm.
     if TASKBAR_CREATED.with(|slot| slot.get() == message && message != 0) {
-        ICON.with(|slot| {
-            if let Some(data) = slot.borrow().as_ref() {
-                // SAFETY: the owning message thread retains live icon data and its window.
-                unsafe {
-                    Shell_NotifyIconW(NIM_ADD, data);
-                }
-            }
-        });
+        add_icon(window);
         return 0;
     }
     match message {
+        // The timer set after a failed first add. It stops once an add succeeds.
+        WM_TIMER if wparam == RETRY_TIMER => {
+            add_icon(window);
+            0
+        }
+        // Logoff or shutdown: ask the coordinator to stop after the current file.
+        WM_ENDSESSION => {
+            if wparam != 0 {
+                publish(Action::Exit);
+            }
+            0
+        }
         PAUSE_STATE => {
             PAUSED.with(|slot| slot.set(wparam != 0));
             0
@@ -112,9 +129,15 @@ unsafe extern "system" fn procedure(
             0
         }
         WM_CLOSE => {
-            // SAFETY: this is the live window receiving WM_CLOSE on its owning thread.
-            unsafe {
-                DestroyWindow(window);
+            if CLOSING.load(Ordering::Relaxed) {
+                // SAFETY: this is the live window receiving WM_CLOSE on its owning thread.
+                unsafe {
+                    DestroyWindow(window);
+                }
+            } else {
+                // Someone else closed the window, for example `taskkill` without
+                // /F. The coordinator decides, and drops the tray when it exits.
+                publish(Action::Exit);
             }
             0
         }
@@ -131,6 +154,29 @@ unsafe extern "system" fn procedure(
         }
     }
 }
+/// Adds the icon to the notification area. Success stops the retry timer and a
+/// failure starts it, so the icon appears once the shell accepts it. Called on the
+/// tray thread.
+fn add_icon(window: HWND) {
+    let added = ICON.with(|slot| {
+        slot.borrow().as_ref().is_some_and(|data| {
+            // SAFETY: the owning message thread retains live icon data and its window.
+            unsafe { Shell_NotifyIconW(NIM_ADD, data) != 0 }
+        })
+    });
+    if added {
+        // SAFETY: the timer belongs to this thread's window and the call takes no pointers.
+        unsafe {
+            KillTimer(window, RETRY_TIMER);
+        }
+    } else {
+        // SAFETY: window is live on this thread and the timer needs no callback.
+        unsafe {
+            SetTimer(window, RETRY_TIMER, 5000, None);
+        }
+    }
+}
+
 /// Shows the tray menu at the cursor and publishes the chosen action. Blocks the
 /// tray thread until the menu closes.
 fn popup(window: HWND) -> Result<()> {
@@ -152,9 +198,9 @@ fn popup(window: HWND) -> Result<()> {
     for (id, label) in [
         (1, "Open Flummox"),
         if PAUSED.with(|slot| slot.get()) {
-            (3, "Resume background work")
+            (3, "Resume background jobs")
         } else {
-            (2, "Pause background work")
+            (2, "Pause background jobs")
         },
         (4, "Exit"),
     ] {
@@ -263,8 +309,12 @@ fn run(
         )
     };
     ensure!(!window.is_null(), "Cannot create tray window");
-    // SAFETY: IDI_APPLICATION is a system-owned resource identifier and null selects system resources.
-    let icon = unsafe { LoadIconW(std::ptr::null_mut(), IDI_APPLICATION) };
+    // The drawn mark, or the generic system icon when Windows refuses to build it.
+    let drawn = crate::windows::icon::create();
+    let icon = drawn.unwrap_or_else(|| {
+        // SAFETY: IDI_APPLICATION is a system-owned resource identifier and null selects system resources.
+        unsafe { LoadIconW(std::ptr::null_mut(), IDI_APPLICATION) }
+    });
     let mut data = NOTIFYICONDATAW {
         cbSize: u32::try_from(std::mem::size_of::<NOTIFYICONDATAW>())?,
         hWnd: window,
@@ -281,10 +331,10 @@ fn run(
     {
         *unit = character;
     }
-    // SAFETY: the icon data points to a live window and its terminated tooltip is in the zero-initialized buffer.
-    let added = unsafe { Shell_NotifyIconW(NIM_ADD, &data) };
-    ensure!(added != 0, "Cannot create worker tray icon");
     ICON.with(|slot| *slot.borrow_mut() = Some(data));
+    // The shell may refuse the first add while Explorer is still starting. A
+    // failure starts a timer that retries every 5 seconds.
+    add_icon(window);
     let _sent = ready.send(Ok(window as isize));
     let mut message = MSG::default();
     // GetMessageW returns 0 for WM_QUIT and -1 for an error. Both end the loop.
@@ -306,6 +356,13 @@ fn run(
     // SAFETY: this removes only the tray icon identified by this worker's window and ID.
     unsafe {
         Shell_NotifyIconW(NIM_DELETE, &data);
+    }
+    if let Some(icon) = drawn {
+        // SAFETY: the icon was created by `icon::create` for this thread and the shell
+        // entry that used it was deleted above.
+        unsafe {
+            DestroyIcon(icon);
+        }
     }
     Ok(())
 }

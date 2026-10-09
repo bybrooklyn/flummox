@@ -16,10 +16,12 @@ use std::{
 //   files/      the upper tree, mirroring game paths; an entry here wins
 //               over the store's entry at the same path
 //   trash/      where a removed upper entry is moved before it is deleted
+//   staging/    where a copy-up is built before it is published into files/
 //   owner.lock  locked for as long as an `Overlay` is open
 const STATE: &str = "state.json";
 const FILES: &str = "files";
 const TRASH: &str = "trash";
+const STAGING: &str = "staging";
 
 #[derive(Serialize, Deserialize)]
 struct Deleted(#[serde(with = "crate::path_serde")] PathBuf);
@@ -45,6 +47,9 @@ pub(super) struct Overlay {
     _owner: File,
 }
 
+/// How long opening a layer waits for its lock before calling it in use.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl Overlay {
     /// Whether `path` is a real folder laid out as an update layer.
     pub fn is_layer(path: &Path) -> bool {
@@ -55,7 +60,10 @@ impl Overlay {
 
     /// Opens or creates a layer and takes its lock, failing if another mount
     /// or commit holds it. A new layer is created only in an empty folder.
-    pub fn open(path: &Path) -> Result<Self> {
+    /// `store` is the store the layer was written over. With it, a whiteout
+    /// dropped because its upper folder exists gets whiteouts over the store
+    /// children it hid.
+    pub fn open(path: &Path, store: Option<&Reader>) -> Result<Self> {
         if !path.exists() {
             std::fs::create_dir(path)?;
         }
@@ -69,10 +77,17 @@ impl Overlay {
             .truncate(false)
             .mode(0o600)
             .open(root.join("owner.lock"))?;
-        ensure!(
-            owner.try_lock().is_ok(),
-            "This update layer is already mounted or being committed"
-        );
+        // A process forked while the last mount was open keeps a copy of the
+        // lock until it execs, so a lock seen held right after an unmount may
+        // clear within milliseconds.
+        let waited_from = std::time::Instant::now();
+        while owner.try_lock().is_err() {
+            ensure!(
+                waited_from.elapsed() < LOCK_WAIT,
+                "This update layer is already mounted or being committed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         let files = root.join(FILES);
         let trash = root.join(TRASH);
         let state = root.join(STATE);
@@ -97,24 +112,37 @@ impl Overlay {
             journal.version == 1 && files.is_dir(),
             "Unsupported update layer"
         );
-        if !trash.exists() {
-            std::fs::create_dir(&trash)?;
+        // Both hold only work in flight. The layer lock is held, so anything
+        // found here was left by a process that died. Removal is best effort.
+        let staging = root.join(STAGING);
+        for scratch in [&trash, &staging] {
+            if !scratch.exists() {
+                std::fs::create_dir(scratch)?;
+            }
+            for entry in std::fs::read_dir(scratch)? {
+                let path = entry?.path();
+                let _removed = if path.is_dir() {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+            }
         }
         let mut deleted = HashSet::new();
         for Deleted(path) in journal.deleted {
             ensure!(safe_path(&path), "Unsafe path in update journal");
             deleted.insert(path);
         }
-        // A whiteout whose path exists in the upper tree is dropped. That
-        // pair is what a crash leaves between an upper change and the journal
-        // write that follows it, and the upper entry is taken as current.
-        deleted.retain(|path| std::fs::symlink_metadata(files.join(path)).is_err());
-        let overlay = Self {
+        let mut overlay = Self {
             root,
             files,
             deleted,
             _owner: owner,
         };
+        // A whiteout whose path exists in the upper tree is dropped. That
+        // pair is what a crash leaves between an upper change and the journal
+        // write that follows it, and the upper entry is taken as current.
+        overlay.drop_stale(store);
         overlay.persist()?;
         Ok(overlay)
     }
@@ -238,7 +266,7 @@ impl Overlay {
                 // never leaves a partial file under the real name. Zero
                 // chunks are skipped with a seek and become holes.
                 let parent = output.parent().context("Missing update parent")?;
-                let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+                let mut staged = tempfile::NamedTempFile::new_in(self.root.join(STAGING))?;
                 for id in chunks {
                     if let Some(length) = reader.zero_chunk_len(*id)? {
                         staged.seek(SeekFrom::Current(i64::from(length)))?;
@@ -247,10 +275,10 @@ impl Overlay {
                     }
                 }
                 staged.as_file().set_len(*size)?;
+                super::restore::apply_xattrs(staged.path(), &entry.xattrs)?;
                 staged
                     .as_file()
                     .set_permissions(std::fs::Permissions::from_mode(entry.mode))?;
-                super::restore::apply_xattrs(staged.path(), &entry.xattrs)?;
                 staged
                     .as_file()
                     .set_times(
@@ -282,12 +310,12 @@ impl Overlay {
             }
             Kind::SlicedFile { size, .. } => {
                 let parent = output.parent().context("Missing update parent")?;
-                let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+                let mut staged = tempfile::NamedTempFile::new_in(self.root.join(STAGING))?;
                 staged.write_all(&reader.read(path, 0, usize::try_from(*size)?)?)?;
+                super::restore::apply_xattrs(staged.path(), &entry.xattrs)?;
                 staged
                     .as_file()
                     .set_permissions(std::fs::Permissions::from_mode(entry.mode))?;
-                super::restore::apply_xattrs(staged.path(), &entry.xattrs)?;
                 staged
                     .as_file()
                     .set_times(
@@ -314,11 +342,16 @@ impl Overlay {
                     }
                 }
             }
-            Kind::Symlink { target } => symlink(target, &output)?,
+            Kind::Symlink { target } => {
+                symlink(target, &output)?;
+                File::open(output.parent().context("Missing update parent")?)?.sync_all()?;
+            }
             Kind::Directory => {
                 std::fs::create_dir(&output)?;
-                std::fs::set_permissions(&output, std::fs::Permissions::from_mode(entry.mode))?;
                 super::restore::apply_xattrs(&output, &entry.xattrs)?;
+                std::fs::set_permissions(&output, std::fs::Permissions::from_mode(entry.mode))?;
+                File::open(&output)?.sync_all()?;
+                File::open(output.parent().context("Missing update parent")?)?.sync_all()?;
             }
         }
         Ok(output)
@@ -597,7 +630,8 @@ impl Overlay {
         deleted.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
         for rel in deleted {
             let path = destination.join(rel);
-            if !parents_are_directories(&destination, rel)? {
+            // A parent that is now a file holds nothing to remove.
+            if !parents_are_directories(&destination, rel, true)? {
                 continue;
             }
             if let Ok(metadata) = std::fs::symlink_metadata(&path) {
@@ -623,7 +657,7 @@ impl Overlay {
             let output = destination.join(rel);
             let metadata = std::fs::symlink_metadata(entry.path())?;
             ensure!(
-                parents_are_directories(&destination, rel)?,
+                parents_are_directories(&destination, rel, false)?,
                 "The folder for {} is missing from the destination",
                 rel.display()
             );
@@ -631,7 +665,12 @@ impl Overlay {
                 // A link or file where the layer holds a folder is replaced.
                 // Creating through it would write wherever the link points.
                 match std::fs::symlink_metadata(&output) {
-                    Ok(old) if old.is_dir() => {}
+                    // The final pass puts the layer's mode back. Until then
+                    // the owner needs write access to add attributes.
+                    Ok(old) if old.is_dir() => std::fs::set_permissions(
+                        &output,
+                        std::fs::Permissions::from_mode(old.permissions().mode() | 0o700),
+                    )?,
                     Ok(_) => {
                         std::fs::remove_file(&output)?;
                         std::fs::create_dir(&output)?;
@@ -655,9 +694,16 @@ impl Overlay {
                 } else if let Some(target) = hardlinks.get(&(metadata.dev(), metadata.ino())) {
                     std::fs::hard_link(target, &output)?;
                 } else {
-                    std::fs::copy(entry.path(), &output)?;
-                    std::fs::set_permissions(&output, metadata.permissions())?;
+                    // Created owner-writable: `fs::copy` would give it the
+                    // source's mode, and a read-only file takes no attribute.
+                    let mut copy = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(&output)?;
+                    std::io::copy(&mut File::open(entry.path())?, &mut copy)?;
                     super::restore::copy_xattrs(entry.path(), &output)?;
+                    std::fs::set_permissions(&output, metadata.permissions())?;
                     File::open(&output)?
                         .set_times(std::fs::FileTimes::new().set_modified(metadata.modified()?))?;
                     hardlinks.insert((metadata.dev(), metadata.ino()), output.clone());
@@ -665,33 +711,71 @@ impl Overlay {
             }
         }
         for (path, metadata) in directories.into_iter().rev() {
-            std::fs::set_permissions(&path, metadata.permissions())?;
             super::restore::copy_xattrs(&self.files.join(path.strip_prefix(&destination)?), &path)?;
+            std::fs::set_permissions(&path, metadata.permissions())?;
             File::open(path)?
                 .set_times(std::fs::FileTimes::new().set_modified(metadata.modified()?))?;
         }
         Ok(())
     }
 
-    /// Makes `path` visible again after something was created or moved there.
-    ///
-    /// The whiteout on `path` also hid everything the store holds below it.
-    /// Those children get whiteouts of their own, so a folder recreated or
-    /// moved here starts with only what the update layer holds. Whiteouts
-    /// below `path` that now have an upper entry are dropped for the same
-    /// reason `open` drops them: the upper entry is current.
-    fn reveal(&mut self, reader: &Reader, path: &Path) {
-        if self.deleted.remove(path) {
-            for entry in reader.entries() {
-                if entry.path.parent() == Some(path) {
-                    self.deleted.insert(entry.path.clone());
+    // Drops every whiteout that has an upper entry. The store children of a
+    // dropped folder get whiteouts, which are checked in turn.
+    fn drop_stale(&mut self, store: Option<&Reader>) {
+        loop {
+            let stale: Vec<PathBuf> = self
+                .deleted
+                .iter()
+                .filter(|hidden| std::fs::symlink_metadata(self.files.join(hidden)).is_ok())
+                .cloned()
+                .collect();
+            if stale.is_empty() {
+                return;
+            }
+            for hidden in stale {
+                self.deleted.remove(&hidden);
+                if let Some(store) = store {
+                    self.hide_children(store, &hidden);
                 }
             }
         }
-        let files = &self.files;
-        self.deleted.retain(|hidden| {
-            !hidden.starts_with(path) || std::fs::symlink_metadata(files.join(hidden)).is_err()
-        });
+    }
+
+    /// Makes `path` visible again after something was created or moved there.
+    /// Store children the old whiteout hid get whiteouts of their own. A
+    /// whiteout below `path` that now has an upper entry is dropped and
+    /// replaced by whiteouts over that entry's store children.
+    fn reveal(&mut self, reader: &Reader, path: &Path) {
+        if self.deleted.remove(path) {
+            self.hide_children(reader, path);
+        }
+        loop {
+            let stale: Vec<PathBuf> = self
+                .deleted
+                .iter()
+                .filter(|hidden| {
+                    hidden.starts_with(path)
+                        && std::fs::symlink_metadata(self.files.join(hidden)).is_ok()
+                })
+                .cloned()
+                .collect();
+            if stale.is_empty() {
+                return;
+            }
+            for hidden in stale {
+                self.deleted.remove(&hidden);
+                self.hide_children(reader, &hidden);
+            }
+        }
+    }
+
+    // Whiteouts for every store child of `path`.
+    fn hide_children(&mut self, reader: &Reader, path: &Path) {
+        for entry in reader.entries() {
+            if entry.path.parent() == Some(path) {
+                self.deleted.insert(entry.path.clone());
+            }
+        }
     }
 
     // Writes the whole whiteout set to the journal, sorted.
@@ -734,7 +818,8 @@ pub(super) fn commit(
     options: super::Options,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<super::Summary> {
-    let overlay = Overlay::open(writes)?;
+    let reader = Reader::open(store)?;
+    let overlay = Overlay::open(writes, Some(&reader))?;
     let temporary = match scratch {
         Some(path) => tempfile::tempdir_in(path)?,
         None => tempfile::tempdir()?,
@@ -751,13 +836,16 @@ pub(super) fn commit(
 
 /// Whether every folder between `root` and `rel` exists as a real directory.
 ///
-/// Fails when one of them is a symlink or a file, because a write or removal
-/// below it would land outside `root`. `false` means a folder is missing.
-fn parents_are_directories(root: &Path, rel: &Path) -> Result<bool> {
+/// Fails when one of them is a symlink, because a write or removal below it
+/// would land outside `root`. A plain file there fails too, unless
+/// `file_is_gone` makes it count like a missing folder. `false` means a
+/// folder is missing.
+fn parents_are_directories(root: &Path, rel: &Path, file_is_gone: bool) -> Result<bool> {
     let mut current = root.to_path_buf();
     for part in rel.parent().into_iter().flat_map(Path::components) {
         current.push(part);
         match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if file_is_gone && metadata.is_file() => return Ok(false),
             Ok(metadata) => ensure!(
                 metadata.is_dir(),
                 "{} is not a folder, so updates below it were not applied",
@@ -786,7 +874,7 @@ mod tests {
         symlink("../outside", game.join("l")).ctx("destination symlink")?;
         // The layer a game leaves after replacing that link with a folder.
         let layer = temp.path().join("layer");
-        drop(Overlay::open(&layer).ctx("new layer")?);
+        drop(Overlay::open(&layer, None).ctx("new layer")?);
         std::fs::create_dir(layer.join(FILES).join("l")).ctx("layer folder")?;
         std::fs::write(layer.join(FILES).join("l/x"), b"planted").ctx("layer file")?;
 
@@ -794,7 +882,7 @@ mod tests {
         // execs, so the layer can look held for an instant after the drop.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let reopened = loop {
-            match Overlay::open(&layer) {
+            match Overlay::open(&layer, None) {
                 Ok(reopened) => break reopened,
                 Err(error) => check(
                     std::time::Instant::now() < deadline,
@@ -820,5 +908,302 @@ mod tests {
             b"planted".to_vec(),
             "the update landed inside the game",
         )
+    }
+
+    // A layer is reopened after another handle drops it. Another test forking
+    // a child shares the lock until that child execs.
+    fn reopen(layer: &Path) -> Result<Overlay, String> {
+        reopen_over(layer, None)
+    }
+
+    fn reopen_over(layer: &Path, store: Option<&Reader>) -> Result<Overlay, String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match Overlay::open(layer, store) {
+                Ok(reopened) => return Ok(reopened),
+                Err(error) => check(
+                    std::time::Instant::now() < deadline,
+                    format!("layer: {error}"),
+                )?,
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn store_from(temp: &Path, files: &[&str]) -> Result<Reader, String> {
+        let source = temp.join("source");
+        for file in files {
+            let path = source.join(file);
+            std::fs::create_dir_all(path.parent().ctx("parent")?).ctx("source folder")?;
+            std::fs::write(&path, b"store bytes").ctx("source file")?;
+        }
+        let store = temp.join("game.flumpack");
+        crate::pack::create(
+            &source,
+            &store,
+            crate::pack::Options::default(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .ctx("store")?;
+        Reader::open(&store).ctx("reader")
+    }
+
+    #[test]
+    fn a_folder_moved_onto_a_removed_subfolder_does_not_bring_back_store_files() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let reader = store_from(temp.path(), &["data/sub/deep.bin"])?;
+        let mut overlay = Overlay::open(&temp.path().join("layer"), None).ctx("layer")?;
+        overlay
+            .rename(
+                &reader,
+                Path::new("data/sub"),
+                Path::new("elsewhere"),
+                false,
+            )
+            .ctx("move the store folder away")?;
+        overlay
+            .mkdir(&reader, Path::new("newdata"), 0o755)
+            .ctx("new folder")?;
+        overlay
+            .mkdir(&reader, Path::new("newdata/sub"), 0o755)
+            .ctx("new subfolder")?;
+        drop(
+            overlay
+                .create_file(&reader, Path::new("newdata/sub/new.bin"), 0o644)
+                .ctx("new file")?,
+        );
+        overlay
+            .rename(&reader, Path::new("newdata"), Path::new("data"), false)
+            .ctx("move the new folder over the emptied one")?;
+        check(
+            overlay.visible(&reader, Path::new("data/sub/new.bin")),
+            "the new file is visible",
+        )?;
+        check(
+            !overlay.visible(&reader, Path::new("data/sub/deep.bin")),
+            "the store file moved away stays gone",
+        )?;
+        check_eq(
+            overlay
+                .children(&reader, Path::new("data/sub"))
+                .ctx("listing")?,
+            vec![PathBuf::from("data/sub/new.bin")],
+            "only the new file is listed",
+        )?;
+        drop(overlay);
+        let reopened = reopen(&temp.path().join("layer"))?;
+        check(
+            !reopened.visible(&reader, Path::new("data/sub/deep.bin")),
+            "the whiteout survives a reopen",
+        )
+    }
+
+    #[test]
+    fn a_crash_between_mkdir_and_the_journal_keeps_store_children_hidden() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let reader = store_from(temp.path(), &["data/sub/deep.bin", "data/sub/inner/x.bin"])?;
+        let layer = temp.path().join("layer");
+        let mut overlay = Overlay::open(&layer, None).ctx("layer")?;
+        overlay
+            .rename(
+                &reader,
+                Path::new("data/sub"),
+                Path::new("elsewhere"),
+                false,
+            )
+            .ctx("move the store folder away")?;
+        drop(overlay);
+        // The state a crash leaves: the folder was created in the upper tree
+        // but the journal still holds only the whiteout over the folder.
+        std::fs::create_dir_all(layer.join(FILES).join("data/sub")).ctx("upper folder")?;
+        let without_store = reopen_over(&layer, None)?;
+        check(
+            without_store.visible(&reader, Path::new("data/sub/deep.bin")),
+            "control: opened without the store, the stale file reappears",
+        )?;
+        drop(without_store);
+        // Put the crash state back, since the open above rewrote the journal.
+        let mut again = reopen_over(&layer, Some(&reader))?;
+        again.deleted.insert(PathBuf::from("data/sub"));
+        again.persist().ctx("journal")?;
+        drop(again);
+        let reopened = reopen_over(&layer, Some(&reader))?;
+        for stale in [
+            "data/sub/deep.bin",
+            "data/sub/inner",
+            "data/sub/inner/x.bin",
+        ] {
+            check(
+                !reopened.visible(&reader, Path::new(stale)),
+                format!("{stale} stays hidden after the crash"),
+            )?;
+        }
+        check_eq(
+            reopened
+                .children(&reader, Path::new("data/sub"))
+                .ctx("listing")?,
+            Vec::<PathBuf>::new(),
+            "the recreated folder is empty",
+        )?;
+        drop(reopened);
+        let third = reopen_over(&layer, Some(&reader))?;
+        check(
+            !third.visible(&reader, Path::new("data/sub/deep.bin")),
+            "the repaired journal keeps them hidden on the next open",
+        )
+    }
+
+    #[test]
+    fn a_lock_released_a_moment_later_does_not_refuse_the_layer() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let layer = temp.path().join("layer");
+        drop(Overlay::open(&layer, None).ctx("new layer")?);
+        // A process forked while the last mount was open holds a copy of the
+        // lock until it execs. This stands in for it.
+        let holder = std::fs::File::open(layer.join("owner.lock")).ctx("lock file")?;
+        holder.try_lock().ctx("take the lock")?;
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(holder);
+        });
+        let opened = Overlay::open(&layer, None).map(drop);
+        release.join().ok().ctx("release thread")?;
+        opened.ctx("a lock that clears within the wait")?;
+        let held = Overlay::open(&layer, None).ctx("the layer's own lock")?;
+        check(
+            Overlay::open(&layer, None).is_err(),
+            "control: a lock that stays held still refuses the layer",
+        )?;
+        drop(held);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_trash_is_emptied_when_a_layer_opens() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let layer = temp.path().join("layer");
+        drop(Overlay::open(&layer, None).ctx("new layer")?);
+        let stale = layer.join(TRASH).join("removed-left-behind");
+        std::fs::create_dir(&stale).ctx("stale folder")?;
+        std::fs::write(stale.join("entry"), b"half deleted").ctx("stale entry")?;
+        let _reopened = reopen(&layer)?;
+        check(
+            std::fs::read_dir(layer.join(TRASH))
+                .ctx("trash")?
+                .next()
+                .is_none(),
+            "the trash is empty after opening",
+        )
+    }
+
+    #[test]
+    fn copy_up_builds_files_outside_the_visible_tree() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let reader = store_from(temp.path(), &["a", "dir/b"])?;
+        let layer = temp.path().join("layer");
+        let mut overlay = Overlay::open(&layer, None).ctx("layer")?;
+        // A copy-up that died after staging leaves its temporary file here.
+        let stale = layer.join(STAGING).join(".tmpleftover");
+        std::fs::write(&stale, b"partial").ctx("stale staging file")?;
+        overlay
+            .copy_up(&reader, Path::new("dir/b"))
+            .ctx("copy up")?;
+        drop(overlay);
+        let _reopened = reopen(&layer)?;
+        check(!stale.exists(), "staging is emptied when the layer opens")?;
+        let mut visible = Vec::new();
+        for entry in walkdir::WalkDir::new(layer.join(FILES)) {
+            visible.push(entry.ctx("walk")?.into_path());
+        }
+        check_eq(
+            visible.len(),
+            3,
+            "the upper tree holds its root, one folder and the copied file",
+        )
+    }
+
+    #[test]
+    fn applying_whiteouts_skips_a_path_whose_parent_became_a_file() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let mut overlay = Overlay::open(&temp.path().join("layer"), None).ctx("layer")?;
+        overlay.deleted.insert(PathBuf::from("D/a"));
+        overlay.persist().ctx("journal")?;
+        let destination = temp.path().join("dest");
+        std::fs::create_dir(&destination).ctx("destination")?;
+        std::fs::write(destination.join("D"), b"now a file").ctx("replaced folder")?;
+        overlay
+            .apply_to(&destination)
+            .ctx("a whiteout under a file is already satisfied")?;
+        check_eq(
+            std::fs::read(destination.join("D")).ctx("file")?,
+            b"now a file".to_vec(),
+            "the file is untouched",
+        )?;
+        // Control: a symlink parent still stops the replay.
+        std::fs::remove_file(destination.join("D")).ctx("remove file")?;
+        symlink("..", destination.join("D")).ctx("link")?;
+        check(
+            overlay.apply_to(&destination).is_err(),
+            "a symlink parent is refused",
+        )
+    }
+
+    #[test]
+    fn read_only_store_entries_keep_their_attributes_when_copied_up_and_applied() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(source.join("rd")).ctx("source folder")?;
+        std::fs::write(source.join("ro"), b"read only").ctx("source file")?;
+        std::fs::write(source.join("rd/inner"), b"inner").ctx("source inner")?;
+        for path in ["ro", "rd"] {
+            xattr::set(source.join(path), "user.flummox-test", b"kept").ctx("source xattr")?;
+        }
+        std::fs::set_permissions(source.join("ro"), std::fs::Permissions::from_mode(0o444))
+            .ctx("file mode")?;
+        std::fs::set_permissions(source.join("rd"), std::fs::Permissions::from_mode(0o555))
+            .ctx("folder mode")?;
+        let store = temp.path().join("game.flumpack");
+        let created = crate::pack::create(
+            &source,
+            &store,
+            crate::pack::Options::default(),
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        let layer = temp.path().join("layer");
+        let destination = temp.path().join("dest");
+        let outcome = (|| -> TestResult {
+            created.ctx("store")?;
+            let reader = Reader::open(&store).ctx("reader")?;
+            let mut overlay = Overlay::open(&layer, None).ctx("layer")?;
+            for path in ["ro", "rd"] {
+                let upper = overlay.copy_up(&reader, Path::new(path)).ctx("copy up")?;
+                check_eq(
+                    xattr::get(&upper, "user.flummox-test").ctx("upper xattr")?,
+                    Some(b"kept".to_vec()),
+                    format!("{path} keeps its attribute in the layer"),
+                )?;
+            }
+            crate::pack::restore(
+                &store,
+                &destination,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .ctx("restore")?;
+            overlay.apply_to(&destination).ctx("apply")?;
+            for path in ["ro", "rd"] {
+                check_eq(
+                    xattr::get(destination.join(path), "user.flummox-test").ctx("applied xattr")?,
+                    Some(b"kept".to_vec()),
+                    format!("{path} keeps its attribute after the replay"),
+                )?;
+            }
+            Ok(())
+        })();
+        // Write access back, so the temporary folder can be removed.
+        for root in [source.clone(), layer.join(FILES), destination.clone()] {
+            let _restored =
+                std::fs::set_permissions(root.join("rd"), std::fs::Permissions::from_mode(0o755));
+        }
+        outcome
     }
 }

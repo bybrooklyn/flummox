@@ -26,6 +26,147 @@ struct Active {
     paused: bool,
 }
 
+/// Logs a failed per-pass step and carries on, so that one bad write does
+/// not end the coordinator and unmount every game. The same message is
+/// logged at most once every ten seconds, because a pass repeats every 50 ms.
+fn survive<T>(what: &str, result: Result<T>) -> Option<T> {
+    static LAST: std::sync::Mutex<Option<(String, Instant)>> = std::sync::Mutex::new(None);
+    match result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            let line = format!("{what}: {error:#}");
+            if let Ok(mut last) = LAST.lock()
+                && last.as_ref().is_none_or(|(text, at)| {
+                    *text != line || at.elapsed() >= Duration::from_secs(10)
+                })
+            {
+                eprintln!("{line}");
+                *last = Some((line, Instant::now()));
+            }
+            None
+        }
+    }
+}
+
+/// Whether a request from a client of `version` is served. Commands that
+/// let a user recover after an upgrade are served at any version.
+fn version_accepted(version: u32, command: &Command) -> bool {
+    version == VERSION
+        || matches!(
+            command,
+            Command::Restart | Command::Cancel(_) | Command::Pause { .. } | Command::Snapshot
+        )
+}
+
+/// Whether `Restart` may proceed. Refused while a job is active, and while a
+/// process uses the folder of a game running from its store.
+fn restart_allowed(
+    jobs_active: bool,
+    snapshot: &Snapshot,
+    source: &dyn crate::busy::ProcSource,
+) -> Result<()> {
+    ensure!(
+        !jobs_active,
+        "Finish or stop the jobs before restarting the background worker."
+    );
+    for install in &snapshot.packs {
+        if let Some(user) = crate::busy::process_using(&install.game_path, source) {
+            let title = game_title(snapshot, &install.game_path);
+            bail!(
+                "{title} is running from its store ({user}). Close it before restarting the background worker."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Runs `apply` and mirrors the exclusion into the history database in the
+/// same step, so the two agree whether either fails. The history write comes
+/// first; an `apply` that then fails puts the history entry back.
+fn mirror_exclusion(
+    history: &crate::db::Db,
+    id: &crate::model::GameId,
+    title: &str,
+    excluded: bool,
+    apply: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let before = history.is_excluded(id)?;
+    if excluded {
+        history.exclude(id, title)?;
+    } else {
+        history.unexclude(id)?;
+    }
+    if let Err(error) = apply() {
+        let restored = if before {
+            history.exclude(id, title)
+        } else {
+            history.unexclude(id).map(|_| ())
+        };
+        survive("restoring the exclusion history", restored.map_err(Into::into));
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Answers clients that connect while start-up recovery holds the main
+/// thread, so they get [`STARTING`] at once instead of a timeout.
+struct StartupReplies {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl StartupReplies {
+    /// Starts answering on a clone of `listener`. Stops when dropped.
+    fn start(listener: &UnixListener) -> Result<Self> {
+        let listener = listener.try_clone()?;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = std::thread::spawn(move || {
+            while !stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        // The request is read first, since closing a socket
+                        // with unread data resets the client's connection.
+                        let _answered = (|| -> Result<()> {
+                            stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+                            stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+                            let _request: Request = read_message(&mut BufReader::new(Within {
+                                inner: &mut stream,
+                                until: Instant::now() + Duration::from_secs(2),
+                            }))?;
+                            serde_json::to_writer(
+                                &mut stream,
+                                &Response {
+                                    version: VERSION,
+                                    snapshot: None,
+                                    error: Some(STARTING.into()),
+                                    refused: Vec::new(),
+                                },
+                            )?;
+                            stream.write_all(b"\n")?;
+                            Ok(())
+                        })();
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+        });
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for StartupReplies {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _joined = thread.join();
+        }
+    }
+}
+
 /// Writes one control line to a worker's stdin and flushes it.
 fn send_control(input: &mut impl Write, control: Control) -> Result<()> {
     serde_json::to_writer(&mut *input, &control)?;
@@ -83,6 +224,196 @@ impl Observations {
             let _changed = self.observe(game, libraries, false);
         }
     }
+
+    /// Records only the games no earlier observation covers. A library
+    /// enabled before discovery had listed everything in it takes the games
+    /// the next scan adds as already there, not as new installs.
+    fn baseline_unseen(&mut self, games: &[Game], libraries: &[Library]) {
+        for game in games {
+            if !self.0.contains_key(&game.id.to_string()) {
+                let _changed = self.observe(game, libraries, false);
+            }
+        }
+    }
+}
+
+/// Queues compression for the games `known` reports as new or updated. A
+/// game with a mounted store is recorded and not queued, since a mount is
+/// not a drive native compression supports. When the enqueue fails, the
+/// game's earlier observation is put back so the next scan tries again.
+fn queue_maintenance(
+    known: &mut Observations,
+    snapshot: &mut Snapshot,
+    games: &[Game],
+    initialized: bool,
+    db: &Connection,
+) {
+    for game in games {
+        let key = game.id.to_string();
+        let previous = known.0.get(&key).cloned();
+        if !known.observe(game, &snapshot.libraries, initialized)
+            || snapshot
+                .packs
+                .iter()
+                .any(|install| install.game_path == game.install_dir)
+        {
+            continue;
+        }
+        if let Err(error) = enqueue(
+            snapshot,
+            game.clone(),
+            Operation::Compress,
+            CompressOpts::default(),
+            db,
+        ) {
+            tracing::warn!(%error, game = %game.title, "maintenance job was not queued");
+            // An excluded game is refused every time, so it keeps its record.
+            if !is_excluded(game, &snapshot.excluded) {
+                match previous {
+                    Some(stamp) => known.0.insert(key, stamp),
+                    None => known.0.remove(&key),
+                };
+            }
+        }
+    }
+}
+
+/// Cancels queued and user-paused jobs that can never start: those whose game
+/// is excluded and, when `games` holds a finished scan, those whose game left
+/// discovery. `running` lists the jobs a worker or storage thread owns.
+fn cancel_unrunnable(
+    snapshot: &mut Snapshot,
+    games: Option<&[Game]>,
+    running: &[i64],
+    db: &Connection,
+) {
+    let excluded = snapshot.excluded.clone();
+    for job in snapshot
+        .jobs
+        .iter_mut()
+        .filter(|job| job.phase.active() && !running.contains(&job.id))
+    {
+        let reason = if is_excluded(&job.game, &excluded) {
+            "This game is excluded, so the job was stopped."
+        } else if games.is_some_and(|games| current_game(&job.game, games).is_none()) {
+            "This game is no longer installed, so the job was stopped."
+        } else {
+            continue;
+        };
+        job.phase = Phase::Cancelled;
+        job.message = reason.into();
+        survive("saving a job", save(db, job));
+    }
+}
+
+/// How long one discovery scan may run before the coordinator stops waiting
+/// for it.
+const SCAN_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Stops waiting for a scan that has run past `deadline`.
+///
+/// A scan stuck reading a dead network mount never finishes, and no new one
+/// starts while it is current. The worker moves to `abandoned`, a warning is
+/// raised, and every game in `games` becomes not idle, so no job starts or
+/// continues on states no scan has confirmed. Returns whether it gave up.
+fn abandon_slow_scan(
+    discovery: &mut Option<crate::launchers::scan_job::Worker>,
+    started: Instant,
+    now: Instant,
+    deadline: Duration,
+    abandoned: &mut Vec<crate::launchers::scan_job::Worker>,
+    snapshot: &mut Snapshot,
+    games: &mut [Game],
+) -> bool {
+    if now.saturating_duration_since(started) < deadline {
+        return false;
+    }
+    let Some(worker) = discovery.take() else {
+        return false;
+    };
+    worker.cancel();
+    abandoned.push(worker);
+    snapshot.scan_source = None;
+    snapshot.scan_warnings.push(format!(
+        "Finding games has not finished in {}. Game states are unknown until it does, so no job will start. Refresh to try again.",
+        crate::text::duration(deadline.as_secs())
+    ));
+    for game in games {
+        game.state = crate::model::InstallState::Broken {
+            detail: "Finding games is not responding. Refresh to try again.".into(),
+        };
+    }
+    true
+}
+
+/// Drops the abandoned scans whose threads have ended.
+fn prune_abandoned(abandoned: &mut Vec<crate::launchers::scan_job::Worker>) {
+    abandoned.retain(|worker| {
+        !worker
+            .events()
+            .iter()
+            .any(|event| matches!(event, crate::launchers::scan_job::Event::Finished(_)))
+    });
+}
+
+/// Records that the game called `title` has run from a store with updates
+/// folded in, which lets upkeep delete the previous version.
+///
+/// A process that merely has the folder open, such as a shell or a client
+/// verifying files, does not count. Only code running from the game folder
+/// does.
+fn mark_played(
+    snapshot: &Snapshot,
+    games: &[Game],
+    title: &str,
+    source: &dyn crate::busy::ProcSource,
+    upkeep: &mut std::collections::HashMap<String, Upkeep>,
+) {
+    for install in snapshot
+        .packs
+        .iter()
+        .filter(|install| install.previous_store_path.is_some())
+    {
+        if games
+            .iter()
+            .any(|game| game.install_dir == install.game_path && game.title == title)
+            && crate::busy::played_from(&install.game_path, source)
+        {
+            upkeep
+                .entry(install.game_path.to_string_lossy().into_owned())
+                .or_default()
+                .played = true;
+        }
+    }
+}
+
+/// Whether the loop has work to watch for: a running worker or storage
+/// thread, or a job that can be started. A job the user paused before it
+/// started waits for the user and needs neither.
+fn has_runnable_work(snapshot: &Snapshot, running: bool) -> bool {
+    running
+        || snapshot
+            .jobs
+            .iter()
+            .any(|job| job.phase.active() && job.phase != Phase::Paused)
+}
+
+/// The wait before the next attempt to remount missing stores. It doubles up
+/// to five minutes while attempts fail and returns to five seconds once they
+/// succeed.
+fn next_recovery_delay(current: Duration, recovered: bool) -> Duration {
+    if recovered {
+        Duration::from_secs(5)
+    } else {
+        (current * 2).min(Duration::from_secs(300))
+    }
+}
+
+/// The epoch for a new coordinator run: the wall clock, but always above the
+/// previous run's, so a clock that stepped back cannot make clients discard
+/// the new run's snapshots.
+fn next_epoch(previous: u64, now: u64) -> u64 {
+    now.max(previous.saturating_add(1))
 }
 
 /// What automatic upkeep remembers about one Maximum Space install, keyed by
@@ -110,7 +441,7 @@ const UPKEEP_LAYER_BYTES: u64 = 256 * 1024 * 1024;
 fn upkeep_due(
     install: &crate::pack::Install,
     build: Option<&str>,
-    layer_bytes: u64,
+    layer_bytes: impl FnOnce() -> u64,
     record: &mut Upkeep,
 ) -> Option<PackTask> {
     if install.phase != crate::pack::InstallPhase::Mounted || install.backup_path.is_some() {
@@ -123,6 +454,7 @@ fn upkeep_due(
         .summary
         .as_ref()
         .map_or(0, |summary| summary.archive_bytes);
+    let layer_bytes = layer_bytes();
     let large = layer_bytes >= UPKEEP_LAYER_BYTES.max(store / 20);
     let rebuilt = match (&record.build, build) {
         (Some(recorded), Some(current)) => recorded != current && layer_bytes > 0,
@@ -149,8 +481,9 @@ fn layer_bytes(writes: &Path) -> u64 {
 /// Queues the upkeep each install is due and records what was decided.
 ///
 /// A task is not queued while its game is busy or has a job waiting, or
-/// while the last attempt at the same task needs attention. That last rule
-/// keeps a failing task from being queued again every scan.
+/// while the last attempt at the same task needs attention or was cancelled
+/// for the same build. That last rule keeps a failing or declined task from
+/// being queued again every scan.
 fn run_upkeep(
     snapshot: &mut Snapshot,
     games: &[Game],
@@ -176,7 +509,7 @@ fn run_upkeep(
         let Some(task) = upkeep_due(
             install,
             game.build.as_deref(),
-            layer_bytes(&install.writes_path),
+            || layer_bytes(&install.writes_path),
             record,
         ) else {
             continue;
@@ -194,7 +527,7 @@ fn run_upkeep(
                 matches!(
                     job.phase,
                     Phase::Failed | Phase::Partial | Phase::Interrupted
-                )
+                ) || (job.phase == Phase::Cancelled && job.game.build == game.build)
             });
         if !game.state.is_idle() || stuck || jobs().any(|job| job.phase.active()) {
             continue;
@@ -311,7 +644,8 @@ fn open_store(path: &Path) -> Result<(Connection, Snapshot)> {
     let db = Connection::open(path)?;
     db.busy_timeout(Duration::from_secs(5))?;
     // Settings rows: 1 libraries and exclusions, 2 maintenance observations,
-    // 3 reduced motion, 4 pack installs, 5 theme, 6 motion, 7 store upkeep.
+    // 3 reduced motion, 4 pack installs, 5 theme, 6 motion, 7 store upkeep,
+    // 8 the last coordinator epoch.
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
         CREATE TABLE IF NOT EXISTS queue(id INTEGER PRIMARY KEY, data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS settings(id INTEGER PRIMARY KEY, data TEXT NOT NULL);
@@ -320,7 +654,12 @@ fn open_store(path: &Path) -> Result<(Connection, Snapshot)> {
     // Load the newest 500 jobs, then reverse them into oldest-first order.
     let mut stmt = db.prepare("SELECT data FROM queue ORDER BY id DESC LIMIT 500")?;
     for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
-        let mut job: Job = serde_json::from_str(&row?)?;
+        // A row from another version that no longer parses is skipped, so
+        // one old entry cannot stop the coordinator from starting.
+        let Ok(mut job) = serde_json::from_str::<Job>(&row?) else {
+            eprintln!("skipping a queue entry that cannot be read");
+            continue;
+        };
         // A job the user paused before it ever started has no work to lose.
         // It stays paused and starts when resumed.
         let never_started = job.phase == Phase::Paused
@@ -329,7 +668,8 @@ fn open_store(path: &Path) -> Result<(Connection, Snapshot)> {
             && job.elapsed == 0;
         if job.phase.active() && job.phase != Phase::Queued && !never_started {
             job.phase = Phase::Interrupted;
-            job.message = "Work was interrupted. Resume to finish the remaining files.".into();
+            job.message =
+                "The job was interrupted. Resume it to finish the remaining files.".into();
             save(&db, &job)?;
         }
         snapshot.jobs.push(job);
@@ -391,14 +731,15 @@ fn enqueue(
 ) -> Result<()> {
     ensure!(
         operation != Operation::Pack,
-        "Pack jobs require a storage task"
+        "Use the Maximum controls to start this job."
     );
     enqueue_job(snapshot, game, operation, options, None, db)
 }
 
 /// Validates a request and appends it to the queue and the database. Returns
-/// `Ok` without queueing when an active job already covers the same folder
-/// and operation. Refuses excluded games and a queue of 200 active jobs.
+/// `Ok` without queueing when an active job already covers the same folder,
+/// operation and storage task. Refuses excluded games, a folder that contains
+/// or sits inside another discovered game, and a queue of 200 active jobs.
 fn enqueue_job(
     snapshot: &mut Snapshot,
     game: Game,
@@ -410,31 +751,53 @@ fn enqueue_job(
     let path = validate_folder(&game.install_dir)?;
     ensure!(
         (1..=32).contains(&options.threads),
-        "Choose between 1 and 32 worker threads."
+        "Choose between 1 and 32 threads."
     );
     ensure!(
         options
             .level
             .is_none_or(|level| (-15..=15).contains(&level)),
-        "btrfs levels range from -15 to 15."
+        "Compression levels range from -15 to 15."
     );
     ensure!(
         !snapshot
             .excluded
             .iter()
             .any(|id| game.ids().any(|g| g.to_string() == *id)),
-        "This game is excluded. Restore it in Drives first."
+        "This game is excluded. Include it in Settings, under Locations, first."
     );
-    if snapshot
+    if let Some(existing) = snapshot
         .jobs
         .iter()
-        .any(|j| j.phase.active() && j.game.install_dir == path && j.operation == operation)
+        .find(|j| j.phase.active() && j.game.install_dir == path && j.operation == operation)
     {
+        // A storage job for the same folder with another task is a different
+        // request, so it is refused rather than reported as queued.
+        ensure!(
+            existing.pack == pack,
+            "{} is already waiting or running for this game. Wait for it to finish first.",
+            existing
+                .pack
+                .as_ref()
+                .map_or("A Maximum job", PackTask::label)
+        );
         return Ok(());
+    }
+    if let Some(other) = snapshot.discovered.iter().find(|other| {
+        let theirs = other
+            .install_dir
+            .canonicalize()
+            .unwrap_or_else(|_| other.install_dir.clone());
+        theirs != path && (theirs.starts_with(&path) || path.starts_with(&theirs))
+    }) {
+        bail!(
+            "This folder overlaps {}. Choose that game's own folder instead.",
+            other.title
+        );
     }
     ensure!(
         snapshot.jobs.iter().filter(|j| j.phase.active()).count() < 200,
-        "The queue is full. Let some jobs finish first."
+        "Too many jobs are waiting. Let some finish first."
     );
     let mut game = game;
     game.install_dir = path;
@@ -450,7 +813,7 @@ fn enqueue_job(
         files_total: 0,
         bytes_total: 0,
         estimate: None,
-        message: "Queued".into(),
+        message: "Waiting".into(),
         errors: vec![],
         created: now(),
         elapsed: 0,
@@ -479,6 +842,32 @@ fn enqueue_job(
     Ok(())
 }
 
+/// Applies each item as an `Enqueue` and returns the ones that were refused.
+/// A refusal for one item never stops the rest.
+fn enqueue_many(
+    items: Vec<(Game, Operation, CompressOpts)>,
+    snapshot: &mut Snapshot,
+    db: &Connection,
+    active: &mut Option<Active>,
+) -> Vec<Refusal> {
+    let mut refused = Vec::new();
+    for (game, operation, options) in items {
+        let title = game.title.clone();
+        let command = Command::Enqueue {
+            game,
+            operation,
+            options,
+        };
+        if let Err(error) = apply(command, snapshot, db, active, &mut Vec::new(), None) {
+            refused.push(Refusal {
+                title,
+                reason: error.to_string(),
+            });
+        }
+    }
+    refused
+}
+
 /// Cancels the running worker when its job is an analysis, so that work the
 /// user requested does not wait behind it.
 fn preempt_analysis(
@@ -494,8 +883,48 @@ fn preempt_analysis(
     {
         send_control(&mut worker.input, Control::Cancel)?;
         job.phase = Phase::Cancelling;
-        job.message = "Making room for your requested job".into();
+        job.message = "Stopping the analysis to run your job…".into();
         save(db, job)?;
+    }
+    Ok(())
+}
+
+/// Refuses a command that names a relative path. The coordinator keeps the
+/// working directory of whichever client started it, so a relative path
+/// would resolve against some other folder.
+fn require_absolute(command: &Command) -> Result<()> {
+    let mut paths: Vec<&Path> = Vec::new();
+    match command {
+        Command::Enqueue { game, .. } => paths.push(&game.install_dir),
+        Command::EnqueuePack { game, task } => {
+            paths.push(&game.install_dir);
+            if let PackTask::Create { store } | PackTask::Activate { store, .. } = task {
+                paths.push(store);
+            }
+        }
+        Command::Library(library) => paths.push(&library.path),
+        Command::RemoveLibrary(path) => paths.push(path),
+        Command::PackActivate {
+            game_path,
+            store_path,
+            writes_path,
+        } => paths.extend([
+            game_path.as_path(),
+            store_path.as_path(),
+            writes_path.as_path(),
+        ]),
+        Command::PackRollback { game_path }
+        | Command::PackReclaim { game_path }
+        | Command::PackCompact { game_path }
+        | Command::PackPrune { game_path } => paths.push(game_path),
+        _ => {}
+    }
+    for path in paths {
+        ensure!(
+            path.is_absolute(),
+            "Use a full path, not {}.",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -511,6 +940,7 @@ fn apply(
     mounts: &mut Vec<PackMount>,
     running_pack: Option<i64>,
 ) -> Result<()> {
+    require_absolute(&command)?;
     match command {
         // Rechecks the plan against the drives as they are now, applies the
         // inner command, then stores the plan on the newest active job for
@@ -524,7 +954,7 @@ fn apply(
                         ..
                     } | Command::EnqueuePack { .. }
                 ),
-                "Space plans apply only to storage jobs"
+                "Only jobs that change files need a storage plan."
             );
             plan.recheck()?;
             let (path, operation) = match &*command {
@@ -532,7 +962,7 @@ fn apply(
                     game, operation, ..
                 } => (game.install_dir.clone(), *operation),
                 Command::EnqueuePack { game, .. } => (game.install_dir.clone(), Operation::Pack),
-                _ => bail!("Storage command is missing"),
+                _ => bail!("Use the Maximum controls to start this job."),
             };
             apply(*command, snapshot, db, active, mounts, running_pack)?;
             // The enqueue may have joined an existing job. The plan belongs
@@ -551,6 +981,7 @@ fn apply(
         | Command::Restart
         | Command::RefreshDiscovery
         | Command::CancelDiscovery => {}
+        Command::EnqueueMany { .. } => bail!("Use a batch request to queue several jobs."),
         // The motion arms write rows 3 and 6 together, so the older boolean
         // and the newer preference always agree.
         Command::ReducedMotion(value) => {
@@ -603,7 +1034,7 @@ fn apply(
         Command::EnqueuePack { game, task } => {
             ensure!(
                 cfg!(feature = "pack-mount"),
-                "Maximum Space requires a build with pack mounting"
+                "This build of Flummox cannot use Maximum."
             );
             enqueue_job(
                 snapshot,
@@ -668,7 +1099,7 @@ fn apply(
                 .iter_mut()
                 .find(|j| j.id == id)
                 .context("Job no longer exists")?;
-            ensure!(!job.phase.active(), "This job is already queued");
+            ensure!(!job.phase.active(), "This job is already waiting.");
             let game = job.game.clone();
             let operation = job.operation;
             let options = job.options;
@@ -692,21 +1123,21 @@ fn apply(
                 .libraries
                 .iter()
                 .find(|l| l.path == path && l.custom)
-                .context("This custom location is no longer registered")?
+                .context("This location is no longer in the list.")?
                 .clone();
             ensure!(
                 !snapshot
                     .jobs
                     .iter()
                     .any(|job| job.phase.active() && job.game.install_dir.starts_with(&path)),
-                "Finish or cancel jobs in this location before removing it."
+                "Finish or stop the jobs in this location before removing it."
             );
             ensure!(
                 !snapshot
                     .packs
                     .iter()
                     .any(|install| install.game_path.starts_with(&path)),
-                "Restore Maximum Space games in this location before removing it."
+                "Decompress the games in this location that use Maximum before removing it."
             );
             if path.is_dir() {
                 update_live_compression(&Library {
@@ -720,7 +1151,6 @@ fn apply(
         // The id is removed and, when excluding, added back, so it is listed
         // once. Excluding also cancels every active job for the game.
         Command::Exclude { id, excluded } => {
-            snapshot.excluded.retain(|i| i != &id);
             if excluded {
                 for job in snapshot
                     .jobs
@@ -738,9 +1168,14 @@ fn apply(
                     } else {
                         job.phase = Phase::Cancelled;
                     }
-                    job.message = "Excluded from future work".into();
+                    job.message = "This game is excluded, so the job was stopped.".into();
                     save(db, job)?;
                 }
+            }
+            // The list changes only after the fallible steps above, so an
+            // error leaves it as the database has it.
+            snapshot.excluded.retain(|i| i != &id);
+            if excluded {
                 snapshot.excluded.push(id);
             }
             settings(db, snapshot)?;
@@ -820,7 +1255,7 @@ fn note_waiting(snapshot: &mut Snapshot, running: Option<i64>) {
     {
         match &holder {
             Some(reason) => job.message.clone_from(reason),
-            None if job.message.starts_with("Waiting for ") => job.message = "Queued".into(),
+            None if job.message.starts_with("Waiting for ") => job.message = "Waiting".into(),
             None => {}
         }
     }
@@ -833,19 +1268,43 @@ fn pause_reason(by_user: bool, playing: Option<&str>) -> String {
     } else if let Some(game) = playing {
         format!("Paused while you play {game}")
     } else {
-        "Waiting for the original drive or launcher activity to finish".into()
+        "Waiting for the game or its launcher to finish…".into()
     }
 }
 
 /// Spawns a worker child, writes the job to its stdin, and starts a thread
-/// that turns its stdout lines into events. The worker's stderr is discarded.
+/// that turns its stdout lines into events. The worker's stderr is appended
+/// to `service.log`. A child that cannot be set up is killed and reaped.
 fn start(job: &Job) -> Result<Active> {
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(state_dir()?.join("service.log"))?;
     let mut child = std::process::Command::new(binary()?)
         .arg("__worker")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(log)
         .spawn()?;
+    match connect(&mut child, job) {
+        Ok((input, events)) => Ok(Active {
+            id: job.id,
+            child,
+            input,
+            events,
+            started: Instant::now(),
+            paused: false,
+        }),
+        Err(error) => {
+            let _killed = child.kill();
+            let _reaped = child.wait();
+            Err(error)
+        }
+    }
+}
+
+/// Sends `job` to a spawned worker and starts the thread that reads its events.
+fn connect(child: &mut Child, job: &Job) -> Result<(ChildStdin, mpsc::Receiver<WorkerEvent>)> {
     let mut input = child.stdin.take().context("Worker stdin is unavailable")?;
     serde_json::to_writer(
         &mut input,
@@ -880,14 +1339,7 @@ fn start(job: &Job) -> Result<Active> {
             }
         }
     });
-    Ok(Active {
-        id: job.id,
-        child,
-        input,
-        events,
-        started: Instant::now(),
-        paused: false,
-    })
+    Ok((input, events))
 }
 
 /// Applies one worker event to its job. Returns `true` when the event ends
@@ -926,13 +1378,19 @@ fn event(job: &mut Job, event: WorkerEvent, db: &Connection) -> Result<bool> {
                         job.errors.push(message);
                     }
                 }
-                Event::Paused { by } => {
+                // A pause or resume that crosses a cancel must not undo it.
+                Event::Paused { by } if job.phase != Phase::Cancelling => {
                     job.phase = Phase::Paused;
                     job.message = by;
                 }
-                Event::Resumed => {
-                    job.phase = Phase::Running;
+                Event::Resumed if job.phase != Phase::Cancelling => {
+                    job.phase = if job.operation == Operation::Analyze {
+                        Phase::Analyzing
+                    } else {
+                        Phase::Running
+                    };
                 }
+                Event::Paused { .. } | Event::Resumed => {}
                 Event::Finished(_) => {}
             }
         }
@@ -951,13 +1409,21 @@ fn event(job: &mut Job, event: WorkerEvent, db: &Connection) -> Result<bool> {
             job.errors = errors.into_iter().take(20).collect();
             job.drive_change = drive_change;
             job.message = if cancelled {
-                "Stopped. Resume to finish the remaining files."
+                "Stopped. Resume the job to finish the remaining files."
             } else if job.errors.is_empty() {
                 "Finished"
             } else {
-                "Some files need another attempt."
+                "Some files need another attempt. See the errors below."
             }
             .into();
+            save(db, job)?;
+            return Ok(true);
+        }
+        // A job that found the operation lock taken goes back in the queue,
+        // since the process holding it will finish.
+        WorkerEvent::Failed(message) if message.contains(super::LOCK_BUSY) => {
+            job.phase = Phase::Queued;
+            job.message = "Waiting for another Flummox process to finish…".into();
             save(db, job)?;
             return Ok(true);
         }
@@ -995,29 +1461,44 @@ impl PackControl {
         use crate::pack::Observer;
         use std::sync::atomic::Ordering;
         self.checkpoint()?;
-        let _transition = self
-            .transition
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Storage control lock stopped"))?;
-        self.interruptible.store(false, Ordering::SeqCst);
-        ensure!(
-            !self.cancel.load(Ordering::SeqCst),
-            "Storage job stopped before switching files"
-        );
+        {
+            let _transition = self.transition.lock().map_err(|_| {
+                anyhow::anyhow!("The job controls stopped working. Restart the background worker.")
+            })?;
+            self.interruptible.store(false, Ordering::SeqCst);
+            ensure!(
+                !self.cancel.load(Ordering::SeqCst),
+                "The job was stopped before the files were switched."
+            );
+        }
+        // Sent after the lock is released: a full channel blocks this call,
+        // and a control request waiting on the lock would block with it.
         self.started(0, 0, message);
         Ok(())
+    }
+    /// Asks the task to stop, unless it is already in a step that must
+    /// finish. Returns whether the request was accepted.
+    fn cancel_if_interruptible(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let Ok(_transition) = self.transition.lock() else {
+            return false;
+        };
+        let accepted = self.interruptible.load(Ordering::SeqCst);
+        if accepted {
+            self.cancel.store(true, Ordering::SeqCst);
+        }
+        accepted
     }
     /// Applies a client's pause or cancel to the storage task, or fails once
     /// the task is past the point where it can stop.
     fn request_control(&self, command: &Command) -> Result<()> {
         use std::sync::atomic::Ordering;
-        let _transition = self
-            .transition
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Storage control lock stopped"))?;
+        let _transition = self.transition.lock().map_err(|_| {
+            anyhow::anyhow!("The job controls stopped working. Restart the background worker.")
+        })?;
         ensure!(
             self.interruptible.load(Ordering::SeqCst),
-            "The storage switch is finishing; controls return when it is safe"
+            "The job is finishing a step that cannot be interrupted. Try again in a moment."
         );
         match command {
             Command::Cancel(_) => self.cancel.store(true, Ordering::SeqCst),
@@ -1039,13 +1520,13 @@ impl crate::pack::Observer for PackControl {
     // every 50 ms, and a cancel ends the wait.
     fn checkpoint(&self) -> Result<()> {
         use std::sync::atomic::Ordering;
-        ensure!(!self.cancel.load(Ordering::Relaxed), "Storage job stopped");
+        ensure!(!self.cancel.load(Ordering::Relaxed), "The job was stopped.");
         if self.paused.load(Ordering::Relaxed) {
             self.emit(crate::backend::Event::Paused {
                 by: "Paused until resumed or launcher activity finishes".into(),
             });
             while self.paused.load(Ordering::Relaxed) {
-                ensure!(!self.cancel.load(Ordering::Relaxed), "Storage job stopped");
+                ensure!(!self.cancel.load(Ordering::Relaxed), "The job was stopped.");
                 std::thread::sleep(Duration::from_millis(50));
             }
             self.emit(crate::backend::Event::Resumed);
@@ -1089,10 +1570,12 @@ fn start_pack(
     job: &Job,
     packs: &[crate::pack::Install],
     libraries: &[Library],
-    mounts: Vec<PackMount>,
+    mounts: &mut Vec<PackMount>,
     database: &Path,
 ) -> Result<PackActive> {
-    let task = job.pack.clone().context("Storage task is missing")?;
+    let task = job.pack.clone().context("The job has no task to run.")?;
+    // Taken only now, so a job that fails validation leaves the mounts in place.
+    let mounts = std::mem::take(mounts);
     let expected_plan = job.space_plan.clone();
     let (send, events) = mpsc::sync_channel(128);
     let control = std::sync::Arc::new(PackControl {
@@ -1150,31 +1633,33 @@ fn start_pack(
 fn storage_parent(root: &Path, store: &Path) -> Result<PathBuf> {
     ensure!(
         store.is_absolute() && store.file_name().is_some(),
-        "Choose an absolute store path with a name"
+        "Choose a store location with a full path and a name."
     );
     ensure!(
         !store
             .components()
             .any(|part| matches!(part, std::path::Component::ParentDir)),
-        "The store path cannot contain parent-directory steps"
+        "The store location cannot contain \"..\"."
     );
-    let parent = store.parent().context("The store needs a parent folder")?;
+    let parent = store
+        .parent()
+        .context("The store needs to be inside a folder.")?;
     // The nearest existing ancestor is checked before anything is created,
     // and the created parent is checked again after symlinks resolve.
     let ancestor = parent
         .ancestors()
         .find(|path| path.exists())
-        .context("The storage drive is unavailable")?
+        .context("The drive for the store is not available.")?
         .canonicalize()?;
     ensure!(
         !ancestor.starts_with(root),
-        "Keep the store outside the game folder"
+        "Keep the store outside the game folder."
     );
     std::fs::create_dir_all(parent)?;
     let parent = parent.canonicalize()?;
     ensure!(
         !parent.starts_with(root),
-        "Keep the store outside the game folder"
+        "Keep the store outside the game folder."
     );
     Ok(parent)
 }
@@ -1223,13 +1708,13 @@ fn run_pack_task(
             let root = validate_folder(&game.install_dir)?;
             ensure!(
                 crate::busy::process_using(&root, &crate::busy::ProcFs::new()).is_none(),
-                "Close the game and launcher activity before activating storage"
+                "Close the game and its launcher, then switch this game to Maximum again."
             );
             // With a qualification report, the installed files are hashed
             // here and again just before the switch. Both hashes must equal
             // the report's corpus.
             if let Some(report) = qualification {
-                control.started(0, 0, "Checking game compatibility");
+                control.started(0, 0, "Checking the compatibility report…");
                 let corpus = crate::compatibility::corpus(&root, &control.cancel, control)?;
                 ensure!(
                     report.corpus == corpus
@@ -1238,7 +1723,7 @@ fn run_pack_task(
                             &corpus.sha256,
                             crate::compatibility::Policy::default()
                         ),
-                    "Compatibility no longer matches this game; analyze it again"
+                    "The compatibility report no longer matches this game. Analyze the game again."
                 );
             }
             let parent = storage_parent(&root, store)?;
@@ -1268,18 +1753,17 @@ fn run_pack_task(
                             &corpus.sha256,
                             crate::compatibility::Policy::default()
                         ),
-                    "Game files changed; automatic activation was stopped"
+                    "The game files changed, so the switch to Maximum was stopped. Try again."
                 );
             }
-            control
-                .transaction("Activating storage; the original remains available for rollback")?;
+            control.transaction("Switching to Maximum… The original is kept.")?;
             activate_prepared(snapshot, db, mounts, install)
         }
         PackTask::Compact => {
             pack_compact_observed(snapshot, db, mounts, &game.install_dir, control)
         }
         PackTask::Restore => {
-            control.transaction("Restoring files; this step must finish before stopping")?;
+            control.transaction("Decompressing… This step must finish before the job can stop.")?;
             pack_rollback(snapshot, db, mounts, &game.install_dir)
         }
         PackTask::VerifyRestored => {
@@ -1287,22 +1771,26 @@ fn run_pack_task(
                 .packs
                 .iter()
                 .position(|install| install.game_path == game.install_dir)
-                .context("Install record is missing")?;
+                .context("Flummox has no record of this game using Maximum.")?;
             let install = snapshot
                 .packs
                 .get(position)
-                .context("Install record is missing")?;
+                .context("Flummox has no record of this game using Maximum.")?;
             crate::pack::verify_restored(install, &control.cancel, control)?;
             // Verification closes only the record. Store, update layer, and backups remain.
             snapshot.packs.remove(position);
             save_packs(db, snapshot)
         }
         PackTask::Reclaim => {
-            control.transaction("Reclaiming the retained original; this step must finish")?;
+            control.transaction(
+                "Deleting the original… This step must finish before the job can stop.",
+            )?;
             pack_reclaim(snapshot, db, &game.install_dir)
         }
         PackTask::Prune => {
-            control.transaction("Reclaiming the previous version; this step must finish")?;
+            control.transaction(
+                "Deleting the previous version… This step must finish before the job can stop.",
+            )?;
             pack_prune(snapshot, db, &game.install_dir)
         }
     }
@@ -1317,7 +1805,7 @@ fn run_pack_task(
     _mounts: &mut Vec<PackMount>,
     _control: &PackControl,
 ) -> Result<()> {
-    bail!("Build Flummox with pack mounting to run storage jobs")
+    bail!("This build of Flummox cannot use Maximum.")
 }
 
 /// Drives the storage thread for one loop pass: passes on cancel and pause,
@@ -1335,15 +1823,19 @@ fn poll_pack(
             .jobs
             .iter_mut()
             .find(|job| job.id == running.id)
-            .context("Storage job is missing")?;
+            .context("The job is missing.")?;
+        // An exclusion marks the job without asking the task, so the request
+        // is made here. A step that must finish refuses it, and the job then
+        // ends as Failed or Completed rather than Cancelled.
         if job.phase == Phase::Cancelling || job.phase == Phase::Cancelled {
-            running.control.cancel.store(true, Ordering::SeqCst);
+            running.control.cancel_if_interruptible();
         }
         // The thread only acts on this flag at a checkpoint, so setting it
         // during a step that must finish has no effect.
         let paused = job.user_paused || snapshot.gaming.is_some() || !job.game.state.is_idle();
         running.control.paused.store(paused, Ordering::Relaxed);
         job.pack_interruptible = running.control.interruptible.load(Ordering::SeqCst);
+        let saved_elapsed = job.elapsed;
         for update in running.events.try_iter() {
             let _finished = event(job, WorkerEvent::Progress(update), db)?;
         }
@@ -1351,7 +1843,10 @@ fn poll_pack(
             job.message = pause_reason(job.user_paused, snapshot.gaming.as_deref());
         }
         job.elapsed = running.started.elapsed().as_secs();
-        save(db, job)?;
+        // Saved when the elapsed seconds change, so about once a second.
+        if job.elapsed != saved_elapsed {
+            save(db, job)?;
+        }
     }
     if active
         .as_ref()
@@ -1362,7 +1857,7 @@ fn poll_pack(
             .jobs
             .iter_mut()
             .find(|job| job.id == running.id)
-            .context("Storage job is missing")?;
+            .context("The job is missing.")?;
         // `Ok` means the thread returned. Its records and mounts replace the
         // coordinator's, whatever the task's own result. `Err` means it
         // panicked: the mounts it held were dropped with it and the
@@ -1371,21 +1866,30 @@ fn poll_pack(
             Ok(result) => {
                 snapshot.packs = result.packs;
                 *mounts = result.mounts;
+                let lock_busy = result
+                    .result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.to_string().contains(super::LOCK_BUSY));
                 job.phase = if result.result.is_ok() {
                     Phase::Completed
+                } else if lock_busy {
+                    Phase::Queued
                 } else if running.control.cancel.load(Ordering::SeqCst) {
                     Phase::Cancelled
                 } else {
                     Phase::Failed
                 };
                 job.message = match result.result {
-                    Ok(()) => "Storage job finished".into(),
+                    Ok(()) => "Finished".into(),
                     Err(error) => error.to_string(),
                 };
             }
             Err(_) => {
                 job.phase = Phase::Interrupted;
-                job.message = "Storage worker stopped; review recovery before retrying".into();
+                job.message =
+                    "The job stopped unexpectedly. Review it under Recovery before trying again."
+                        .into();
             }
         }
         job.pack_interruptible = false;
@@ -1422,11 +1926,16 @@ pub(super) fn run() -> Result<()> {
     }
     let listener = UnixListener::bind(&socket)?;
     listener.set_nonblocking(true)?;
+    // Clients that connect before the main loop runs are told to retry.
+    let startup_replies = StartupReplies::start(&listener)?;
     let (db, mut snapshot) = open_store(&dir.join("queue.sqlite"))?;
     // Startup: remount activated installs, reapply live compression, and
     // bring the login entry in line with the saved settings.
     let mut mounts: Vec<PackMount> = Vec::new();
-    recover_packs(&mut snapshot, &db, &mut mounts)?;
+    survive(
+        "recovering games that use Maximum",
+        recover_packs(&mut snapshot, &db, &mut mounts),
+    );
     for library in &snapshot.libraries {
         if library.automatic
             && let Err(error) = update_live_compression(library)
@@ -1434,10 +1943,17 @@ pub(super) fn run() -> Result<()> {
             tracing::warn!(%error, path = %library.path.display(), "live compression was not enabled");
         }
     }
-    super::autostart::configure(
-        &binary()?,
-        snapshot.libraries.iter().any(|library| library.automatic) || !snapshot.packs.is_empty(),
-    )?;
+    survive(
+        "configuring login startup",
+        binary().and_then(|binary| {
+            super::autostart::configure(
+                &binary,
+                snapshot.libraries.iter().any(|library| library.automatic)
+                    || !snapshot.packs.is_empty(),
+            )
+        }),
+    );
+    drop(startup_replies);
     let history =
         crate::db::Db::open(&crate::db::Db::default_path().context("Cannot locate history")?)?;
     // Import exclusions from older CLI-only installations and share future edits.
@@ -1453,18 +1969,40 @@ pub(super) fn run() -> Result<()> {
             history.exclude(&game, id)?;
         }
     }
+    cancel_unrunnable(&mut snapshot, None, &[], &db);
     let mut active: Option<Active> = None;
     let mut pack_active: Option<PackActive> = None;
     // Backdated so the first pass scans and checks for running games.
     let mut last_scan = Instant::now() - Duration::from_secs(60);
     let mut last_busy = Instant::now() - Duration::from_secs(60);
-    snapshot.worker_epoch = u64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_nanos(),
-    )?;
+    let previous_epoch: u64 = db
+        .query_row("SELECT data FROM settings WHERE id=8", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()?
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(0);
+    snapshot.worker_epoch = next_epoch(
+        previous_epoch,
+        u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos(),
+        )?,
+    );
+    survive(
+        "saving the coordinator epoch",
+        db.execute(
+            "INSERT OR REPLACE INTO settings(id,data) VALUES(8,?1)",
+            [snapshot.worker_epoch.to_string()],
+        )
+        .map_err(Into::into),
+    );
     snapshot.revision = 0;
     let mut discovery: Option<crate::launchers::scan_job::Worker> = None;
+    let mut discovery_started = Instant::now();
+    // Scans given up on that have not ended. None starts while one is here.
+    let mut abandoned: Vec<crate::launchers::scan_job::Worker> = Vec::new();
     let mut refresh_requested = false;
     // Maintenance observations from earlier runs. With none saved, the first
     // finished scan sets a baseline and queues nothing.
@@ -1473,43 +2011,56 @@ pub(super) fn run() -> Result<()> {
             r.get::<_, String>(0)
         })
         .optional()?
-        .map(|json| serde_json::from_str(&json))
-        .transpose()?
+        .and_then(|json| serde_json::from_str(&json).ok())
         .unwrap_or_default();
     let mut initialized = !known.0.is_empty();
+    let mut baseline_unseen = false;
     let mut upkeep: std::collections::HashMap<String, Upkeep> = db
         .query_row("SELECT data FROM settings WHERE id=7", [], |r| {
             r.get::<_, String>(0)
         })
         .optional()?
-        .map(|json| serde_json::from_str(&json))
-        .transpose()?
+        .and_then(|json| serde_json::from_str(&json).ok())
         .unwrap_or_default();
     let mut last_client = Instant::now();
     let mut games = Vec::new();
     let mut last_save = Instant::now();
     let mut last_pack_recovery = Instant::now();
+    let mut recovery_delay = Duration::from_secs(5);
     // Each pass runs the stages below in order, then sleeps 50 ms.
     loop {
         // Discovery scans. A scan starts on request, every 3 seconds while
-        // jobs are active, and every 30 seconds otherwise. It runs on its own
+        // a job is running or can start, and every 30 seconds otherwise. It runs on its own
         // thread and at most one runs at a time.
-        let scan_interval = if snapshot.jobs.iter().any(|job| job.phase.active()) {
-            3
-        } else {
-            30
-        };
+        let scan_interval =
+            if has_runnable_work(&snapshot, active.is_some() || pack_active.is_some()) {
+                3
+            } else {
+                30
+            };
+        prune_abandoned(&mut abandoned);
         if discovery.is_none()
+            && abandoned.is_empty()
             && (refresh_requested || last_scan.elapsed() >= Duration::from_secs(scan_interval))
         {
             last_scan = Instant::now();
             refresh_requested = false;
             if let Some(env) = crate::launchers::Env::current() {
                 snapshot.scan_generation = snapshot.scan_generation.saturating_add(1);
-                snapshot.scan_source = Some("Starting discovery".into());
+                snapshot.scan_source = Some("your launchers".into());
                 discovery = Some(crate::launchers::scan_job::Worker::start(env));
+                discovery_started = Instant::now();
             }
         }
+        abandon_slow_scan(
+            &mut discovery,
+            discovery_started,
+            Instant::now(),
+            SCAN_DEADLINE,
+            &mut abandoned,
+            &mut snapshot,
+            &mut games,
+        );
         // Drain the scan's events. Batches update the visible list as they
         // arrive, and the finished scan replaces it. Events from a cancelled
         // scan are dropped, except that `Finished` still clears `discovery`.
@@ -1538,7 +2089,7 @@ pub(super) fn run() -> Result<()> {
                 crate::launchers::scan_job::Event::Finished(result) => {
                     if !cancelled && result.is_none() {
                         snapshot.scan_warnings.push(
-                            "Discovery stopped unexpectedly; showing the previous library".into(),
+                            "Finding games stopped unexpectedly. The list shows the previous result. Refresh to try again.".into(),
                         );
                     }
                     if !cancelled && let Some(scan) = result {
@@ -1601,61 +2152,64 @@ pub(super) fn run() -> Result<()> {
             // A store with updates folded in counts as played once its game
             // is seen running. Upkeep deletes the previous version after that.
             if let Some(title) = &snapshot.gaming {
-                for install in snapshot
-                    .packs
-                    .iter()
-                    .filter(|install| install.previous_store_path.is_some())
-                {
-                    if games
-                        .iter()
-                        .any(|game| game.install_dir == install.game_path && game.title == *title)
-                    {
-                        upkeep
-                            .entry(install.game_path.to_string_lossy().into_owned())
-                            .or_default()
-                            .played = true;
-                    }
-                }
+                mark_played(
+                    &snapshot,
+                    &games,
+                    title,
+                    &crate::busy::ProcFs::new().with_maps(),
+                    &mut upkeep,
+                );
             }
         }
         // Maintenance, after each finished scan: queue compression for new
         // installs and settled updates in automatic libraries, and save the
         // observations when they changed.
         if completed_scan {
-            let before = serde_json::to_string(&known)?;
-            for game in &games {
-                if known.observe(game, &snapshot.libraries, initialized) {
-                    match enqueue(
-                        &mut snapshot,
-                        game.clone(),
-                        Operation::Compress,
-                        CompressOpts::default(),
-                        &db,
-                    ) {
-                        Ok(()) => {}
-                        Err(error) => {
-                            tracing::warn!(%error, game = %game.title, "maintenance job was not queued")
-                        }
-                    }
-                }
+            let before = serde_json::to_string(&known).unwrap_or_default();
+            // A library enabled before this scan took the games it already
+            // held as existing. Games this scan lists for the first time are
+            // part of that library too.
+            if std::mem::take(&mut baseline_unseen) {
+                known.baseline_unseen(&games, &snapshot.libraries);
             }
+            queue_maintenance(&mut known, &mut snapshot, &games, initialized, &db);
             initialized = true;
-            let after = serde_json::to_string(&known)?;
+            cancel_unrunnable(
+                &mut snapshot,
+                Some(&games),
+                &[
+                    active.as_ref().map(|a| a.id),
+                    pack_active.as_ref().map(|p| p.id),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+                &db,
+            );
+            let after = serde_json::to_string(&known).unwrap_or_default();
             if before != after {
-                db.execute(
-                    "INSERT OR REPLACE INTO settings(id,data) VALUES(2,?1)",
-                    [after],
-                )?;
+                survive(
+                    "saving maintenance observations",
+                    db.execute(
+                        "INSERT OR REPLACE INTO settings(id,data) VALUES(2,?1)",
+                        [after],
+                    )
+                    .map_err(Into::into),
+                );
             }
             // Store upkeep, on the same fresh game list.
-            let before = serde_json::to_string(&upkeep)?;
+            let before = serde_json::to_string(&upkeep).unwrap_or_default();
             run_upkeep(&mut snapshot, &games, &mut upkeep, &db);
-            let after = serde_json::to_string(&upkeep)?;
+            let after = serde_json::to_string(&upkeep).unwrap_or_default();
             if before != after {
-                db.execute(
-                    "INSERT OR REPLACE INTO settings(id,data) VALUES(7,?1)",
-                    [after],
-                )?;
+                survive(
+                    "saving store upkeep",
+                    db.execute(
+                        "INSERT OR REPLACE INTO settings(id,data) VALUES(7,?1)",
+                        [after],
+                    )
+                    .map_err(Into::into),
+                );
             }
         }
         // Accept at most one client per pass. The listener does not block,
@@ -1663,31 +2217,31 @@ pub(super) fn run() -> Result<()> {
         match listener.accept() {
             Ok((mut stream, _)) => {
                 last_client = Instant::now();
-                stream.set_read_timeout(Some(Duration::from_millis(500)))?;
-                stream.set_write_timeout(Some(Duration::from_secs(2)))?;
                 let mut restart = false;
+                let mut refused = Vec::new();
                 let result = (|| -> Result<()> {
+                    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+                    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
                     let message: Request = read_message(&mut BufReader::new(Within {
                         inner: &mut stream,
                         until: Instant::now() + Duration::from_secs(2),
                     }))?;
-                    // `Restart` is accepted from any protocol version, so a
-                    // client from another release can replace this process.
                     ensure!(
-                        message.version == VERSION || matches!(&message.command, Command::Restart),
-                        "Worker protocol changed. Restart Flummox."
+                        version_accepted(message.version, &message.command),
+                        "The background worker is from another version. Restart Flummox."
                     );
                     if matches!(&message.command, Command::Restart) {
-                        ensure!(
-                            active.is_none()
-                                && pack_active.is_none()
-                                && !snapshot.jobs.iter().any(|job| job.phase.active()),
-                            "Finish or cancel queued jobs before restarting the background worker."
-                        );
-                        ensure!(
-                            snapshot.packs.is_empty(),
-                            "Restore mounted Maximum Space games before restarting the background worker."
-                        );
+                        restart_allowed(
+                            active.is_some()
+                                || pack_active.is_some()
+                                || snapshot.jobs.iter().any(|job| job.phase.active()),
+                            &snapshot,
+                            &crate::busy::ProcFs::new(),
+                        )?;
+                        // The next coordinator remounts these through
+                        // `recover_packs`. A store that stays mounted would
+                        // keep serving from the old executable.
+                        stop_mounts(&mut mounts, &snapshot)?;
                         restart = true;
                     }
                     // After these commands the maintenance baseline and the
@@ -1731,7 +2285,7 @@ pub(super) fn run() -> Result<()> {
                     ) {
                         ensure!(
                             active.is_none() && pack_active.is_none(),
-                            "A job is running. Wait for it to finish before changing storage."
+                            "A job is running. Wait for it to finish first."
                         );
                     }
                     // Pause and cancel for the running storage job go to its
@@ -1742,28 +2296,35 @@ pub(super) fn run() -> Result<()> {
                     {
                         running.control.request_control(&message.command)?;
                     }
-                    apply(
-                        message.command,
-                        &mut snapshot,
-                        &db,
-                        &mut active,
-                        &mut mounts,
-                        pack_active.as_ref().map(|running| running.id),
-                    )?;
-                    // Mirror the change into the history database, which
-                    // workers check before they process a game.
-                    if let Some((id, excluded)) = exclusion {
-                        if excluded {
-                            let title = games
-                                .iter()
-                                .find(|game| game.ids().any(|game_id| game_id == &id))
-                                .map(|game| game.title.as_str());
-                            history.exclude(&id, title.unwrap_or(&id.key))?;
-                        } else {
-                            history.unexclude(&id)?;
+                    let run_command = || -> Result<()> {
+                        match message.command {
+                            Command::EnqueueMany { items } => {
+                                refused = enqueue_many(items, &mut snapshot, &db, &mut active);
+                            }
+                            command => apply(
+                                command,
+                                &mut snapshot,
+                                &db,
+                                &mut active,
+                                &mut mounts,
+                                pack_active.as_ref().map(|running| running.id),
+                            )?,
                         }
+                        Ok(())
+                    };
+                    // Workers check the history database before they process
+                    // a game, so it changes in the same step as the queue.
+                    if let Some((id, excluded)) = exclusion {
+                        let title = games
+                            .iter()
+                            .find(|game| game.ids().any(|game_id| game_id == &id))
+                            .map_or_else(|| id.key.clone(), |game| game.title.clone());
+                        mirror_exclusion(&history, &id, &title, excluded, run_command)?;
+                    } else {
+                        run_command()?;
                     }
                     if startup_changed {
+                        baseline_unseen = true;
                         known.baseline(&games, &snapshot.libraries);
                         db.execute(
                             "INSERT OR REPLACE INTO settings(id,data) VALUES(2,?1)",
@@ -1774,7 +2335,7 @@ pub(super) fn run() -> Result<()> {
                             snapshot.libraries.iter().any(|l|l.automatic)
                                 || !snapshot.packs.is_empty(),
                         )
-                            .context("Library settings were saved, but login startup could not be configured")?;
+                            .context("Location settings were saved, but starting at login could not be set up")?;
                     }
                     Ok(())
                 })();
@@ -1786,17 +2347,25 @@ pub(super) fn run() -> Result<()> {
                     version: VERSION,
                     snapshot: result.as_ref().ok().map(|_| snapshot.clone()),
                     error: result.err().map(|e| e.to_string()),
+                    refused,
                 };
-                let _sent = serde_json::to_writer(&mut stream, &response)
+                let mut writer = std::io::BufWriter::new(&mut stream);
+                let _sent = serde_json::to_writer(&mut writer, &response)
                     .map_err(std::io::Error::other)
-                    .and_then(|_| stream.write_all(b"\n"));
+                    .and_then(|_| writer.write_all(b"\n"))
+                    .and_then(|_| writer.flush());
                 if restart {
-                    std::fs::remove_file(&socket)?;
+                    survive(
+                        "removing the socket",
+                        std::fs::remove_file(&socket).map_err(Into::into),
+                    );
                     return Ok(());
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                survive("accepting a client", Err::<(), _>(e.into()));
+            }
         }
         // Drive the active worker. It should be paused while the user asked
         // for that, a game is running, or its own game is missing from
@@ -1815,7 +2384,7 @@ pub(super) fn run() -> Result<()> {
                     // Closing stdin also asks an orphaned worker to stop.
                     finished = true;
                     job.phase = Phase::Interrupted;
-                    save(&db, job)?;
+                    survive("saving a job", save(&db, job));
                 } else {
                     a.paused = paused;
                     job.phase = if paused {
@@ -1829,11 +2398,32 @@ pub(super) fn run() -> Result<()> {
             }
             // Apply at most 256 queued events, so a busy worker cannot keep
             // the loop from reaching the next client.
+            // One transaction per pass, so a burst of finished files costs one
+            // sync and not one each.
+            let batch = survive(
+                "batching receipts",
+                db.unchecked_transaction().map_err(Into::into),
+            );
             for update in a.events.try_iter().take(256) {
-                if event(job, update, &db)? {
-                    finished = true;
-                    break;
+                match event(job, update, &db) {
+                    Ok(true) => {
+                        finished = true;
+                        break;
+                    }
+                    Ok(false) => {}
+                    // Progress cannot be recorded, so the job stops. Closing
+                    // the worker's input asks it to cancel.
+                    Err(error) => {
+                        job.phase = Phase::Failed;
+                        job.message = format!("Could not record progress: {error:#}");
+                        survive("saving a job", save(&db, job));
+                        finished = true;
+                        break;
+                    }
                 }
+            }
+            if let Some(batch) = batch {
+                survive("committing receipts", batch.commit().map_err(Into::into));
             }
             if a.paused && !finished && job.phase != Phase::Cancelling {
                 job.message = pause_reason(job.user_paused, snapshot.gaming.as_deref());
@@ -1842,7 +2432,7 @@ pub(super) fn run() -> Result<()> {
             // Progress reaches the database at most once a second. `event`
             // has already saved a job that ended.
             if last_save.elapsed() >= Duration::from_secs(1) {
-                save(&db, job)?;
+                survive("saving a job", save(&db, job));
                 last_save = Instant::now();
             }
         }
@@ -1862,19 +2452,14 @@ pub(super) fn run() -> Result<()> {
             if let Some(current) = current_game(&job.game, &games) {
                 job.game = current.clone();
             }
-            if is_excluded(&job.game, &snapshot.excluded)
-                && running
-                    .control
-                    .interruptible
-                    .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                running
-                    .control
-                    .cancel
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            if is_excluded(&job.game, &snapshot.excluded) {
+                running.control.cancel_if_interruptible();
             }
         }
-        poll_pack(&mut pack_active, &mut snapshot, &db, &mut mounts)?;
+        survive(
+            "driving the storage job",
+            poll_pack(&mut pack_active, &mut snapshot, &db, &mut mounts),
+        );
         note_waiting(
             &mut snapshot,
             active
@@ -1909,8 +2494,8 @@ pub(super) fn run() -> Result<()> {
                 } else {
                     Phase::Running
                 };
-                job.message = "Preparing files".into();
-                save(&db, job)?;
+                job.message = "Preparing files…".into();
+                survive("saving a job", save(&db, job));
                 // A pack job runs on a storage thread in this process and
                 // takes every mount with it. Other jobs get a worker process.
                 if job.operation == Operation::Pack {
@@ -1918,14 +2503,14 @@ pub(super) fn run() -> Result<()> {
                         job,
                         &snapshot.packs,
                         &snapshot.libraries,
-                        std::mem::take(&mut mounts),
+                        &mut mounts,
                         &dir.join("queue.sqlite"),
                     ) {
                         Ok(running) => pack_active = Some(running),
                         Err(error) => {
                             job.phase = Phase::Failed;
                             job.message = error.to_string();
-                            save(&db, job)?;
+                            survive("saving a job", save(&db, job));
                         }
                     }
                     continue;
@@ -1935,7 +2520,7 @@ pub(super) fn run() -> Result<()> {
                     Err(e) => {
                         job.phase = Phase::Failed;
                         job.message = e.to_string();
-                        save(&db, job)?;
+                        survive("saving a job", save(&db, job));
                     }
                 }
             }
@@ -1959,27 +2544,34 @@ pub(super) fn run() -> Result<()> {
                     .find(|install| install.game_path == path)
                 {
                     install.phase = crate::pack::InstallPhase::Attention;
-                    install.message = "The mount stopped; Flummox will retry it".into();
+                    install.message =
+                        "The game folder stopped working. Flummox will try again.".into();
                 }
             }
         }
         if pack_active.is_none()
             && mounts.len() < snapshot.packs.len()
-            && last_pack_recovery.elapsed() >= Duration::from_secs(5)
+            && last_pack_recovery.elapsed() >= recovery_delay
         {
-            recover_packs(&mut snapshot, &db, &mut mounts)?;
+            survive(
+                "recovering games that use Maximum",
+                recover_packs(&mut snapshot, &db, &mut mounts),
+            );
             last_pack_recovery = Instant::now();
+            recovery_delay =
+                next_recovery_delay(recovery_delay, mounts.len() >= snapshot.packs.len());
         }
-        // Idle exit: no running or active job, no automatic library, no
+        // Idle exit: no running or startable job, no automatic library, no
         // activated install, and no client for 60 seconds.
-        if active.is_none()
-            && pack_active.is_none()
-            && !snapshot.jobs.iter().any(|j| j.phase.active())
+        if !has_runnable_work(&snapshot, active.is_some() || pack_active.is_some())
             && !snapshot.libraries.iter().any(|l| l.automatic)
             && snapshot.packs.is_empty()
             && last_client.elapsed() >= Duration::from_secs(60)
         {
-            std::fs::remove_file(&socket)?;
+            survive(
+                "removing the socket",
+                std::fs::remove_file(&socket).map_err(Into::into),
+            );
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -2005,6 +2597,919 @@ mod tests {
             state: InstallState::Idle,
             is_tool: false,
         }
+    }
+
+    #[test]
+    fn an_exclusion_changes_both_stores_or_neither() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let path = temp.path().join("history.sqlite");
+        let history = crate::db::Db::open(&path).ctx("history")?;
+        let id = GameId::new(Launcher::Manual, "portal");
+        let done = std::cell::Cell::new(false);
+        let apply_ok = || {
+            done.set(true);
+            Ok(())
+        };
+        mirror_exclusion(&history, &id, "Portal", true, apply_ok).ctx("control: both succeed")?;
+        check(
+            done.get() && history.is_excluded(&id).ctx("read")?,
+            "control: the exclusion lands in both",
+        )?;
+        // The in-memory change fails, so the history entry must not remain.
+        let other = GameId::new(Launcher::Manual, "half-life");
+        let refused = mirror_exclusion(&history, &other, "Half-Life", true, || {
+            bail!("the queue could not be saved")
+        });
+        check(refused.is_err(), "the failure is reported")?;
+        check(
+            !history.is_excluded(&other).ctx("read")?,
+            "a failed apply leaves no history entry",
+        )?;
+        // Include again, with the in-memory change failing: the entry stays.
+        let refused = mirror_exclusion(&history, &id, "Portal", false, || {
+            bail!("the queue could not be saved")
+        });
+        check(refused.is_err(), "the second failure is reported")?;
+        check(
+            history.is_excluded(&id).ctx("read")?,
+            "a failed include keeps the history entry",
+        )?;
+        // The history write fails, so the in-memory change must not happen.
+        let breaker = Connection::open(&path).ctx("second connection")?;
+        breaker
+            .execute_batch("DROP TABLE hidden")
+            .ctx("break the history")?;
+        let ran = std::cell::Cell::new(false);
+        let refused = mirror_exclusion(&history, &other, "Half-Life", true, || {
+            ran.set(true);
+            Ok(())
+        });
+        check(refused.is_err(), "a history failure is reported")?;
+        check(
+            !ran.get(),
+            "a history failure leaves the in-memory exclusion unapplied",
+        )
+    }
+
+    #[test]
+    fn a_client_that_connects_during_recovery_is_told_the_worker_is_starting() -> TestResult {
+        let temp = tempfile::tempdir().ctx("socket folder")?;
+        let socket = temp.path().join("c.sock");
+        let listener = UnixListener::bind(&socket).ctx("bind")?;
+        listener.set_nonblocking(true).ctx("non-blocking")?;
+        let replies = StartupReplies::start(&listener).ctx("start")?;
+        // Nothing else services the listener, as during recovery.
+        let started = Instant::now();
+        let mut stream = std::os::unix::net::UnixStream::connect(&socket).ctx("connect")?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .ctx("timeout")?;
+        serde_json::to_writer(
+            &mut stream,
+            &Request {
+                version: VERSION,
+                command: Command::Snapshot,
+            },
+        )
+        .ctx("request")?;
+        stream.write_all(b"\n").ctx("newline")?;
+        let reply: Response = read_message(&mut BufReader::new(stream)).ctx("reply")?;
+        check_eq(
+            reply.error.as_deref(),
+            Some(STARTING),
+            "the reply says the worker is starting",
+        )?;
+        check(reply.snapshot.is_none(), "no snapshot is sent")?;
+        check(
+            started.elapsed() < Duration::from_secs(2),
+            "the reply is prompt",
+        )?;
+        drop(replies);
+        // Control: once start-up ends the listener is free for the main loop.
+        let accepted = listener.accept();
+        check(
+            accepted
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock),
+            "the helper leaves nothing queued and stops accepting",
+        )
+    }
+
+    #[test]
+    fn a_batch_queues_what_passes_and_names_what_was_refused() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let (db, mut snapshot) = open_store(&temp.path().join("jobs.sqlite")).ctx("store")?;
+        let folder = |name: &str| -> Result<PathBuf, String> {
+            let path = temp.path().join(name);
+            std::fs::create_dir(&path).ctx("game folder")?;
+            Ok(path)
+        };
+        let first = folder("first")?;
+        let blocked = folder("blocked")?;
+        let last = folder("last")?;
+        snapshot
+            .excluded
+            .push(game(&blocked, "blocked").id.to_string());
+        let mut relative = game(&first, "relative");
+        relative.install_dir = PathBuf::from("relative/path");
+        let item = |game: Game| (game, Operation::Compress, CompressOpts::default());
+        let refused = enqueue_many(
+            vec![
+                item(game(&first, "first")),
+                item(game(&blocked, "blocked")),
+                item(relative),
+                item(game(&last, "last")),
+            ],
+            &mut snapshot,
+            &db,
+            &mut None,
+        );
+        let queued: Vec<_> = snapshot
+            .jobs
+            .iter()
+            .map(|job| job.game.title.as_str())
+            .collect();
+        check_eq(queued, vec!["first", "last"], "items after a refusal are queued")?;
+        let titles: Vec<_> = refused.iter().map(|item| item.title.as_str()).collect();
+        check_eq(titles, vec!["blocked", "relative"], "each refusal names its game")?;
+        check(
+            refused
+                .first()
+                .is_some_and(|item| item.reason.contains("excluded")),
+            "the reason is the one Enqueue gives",
+        )?;
+        let again = enqueue_many(
+            vec![item(game(&first, "first"))],
+            &mut snapshot,
+            &db,
+            &mut None,
+        );
+        check(
+            again.is_empty() && snapshot.jobs.len() == 2,
+            "control: a repeat of an active job is not an error and queues nothing",
+        )
+    }
+
+    #[test]
+    fn a_batch_reply_carries_the_refusals_and_old_replies_still_parse() -> TestResult {
+        let response = Response {
+            version: VERSION,
+            snapshot: None,
+            error: None,
+            refused: vec![Refusal {
+                title: "Portal".into(),
+                reason: "This game is excluded.".into(),
+            }],
+        };
+        let text = serde_json::to_string(&response).ctx("encode")?;
+        let back: Response = serde_json::from_str(&text).ctx("decode")?;
+        check_eq(back.refused, response.refused, "the refusals round-trip")?;
+        let plain = serde_json::to_string(&Response {
+            refused: Vec::new(),
+            ..response
+        })
+        .ctx("encode plain")?;
+        check(!plain.contains("refused"), "an empty list is not sent")?;
+        let old: Response =
+            serde_json::from_str(&plain).ctx("a reply without the field still decodes")?;
+        check(old.refused.is_empty(), "the field defaults to empty")
+    }
+
+    #[test]
+    fn a_job_that_finds_the_operation_lock_taken_goes_back_in_the_queue() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let (db, mut snapshot) = open_store(&temp.path().join("jobs.sqlite")).ctx("store")?;
+        enqueue(
+            &mut snapshot,
+            game(temp.path(), "game"),
+            Operation::Compress,
+            CompressOpts::default(),
+            &db,
+        )
+        .ctx("job")?;
+        let job = snapshot.jobs.first_mut().ctx("job")?;
+        job.phase = Phase::Running;
+        let ended = event(
+            job,
+            WorkerEvent::Failed(format!("{:#}", anyhow::anyhow!(super::super::LOCK_BUSY))),
+            &db,
+        )
+        .ctx("lock busy")?;
+        check(ended && job.phase == Phase::Queued, "requeued, not failed")?;
+        let ended = event(job, WorkerEvent::Failed("disk on fire".into()), &db).ctx("failure")?;
+        check(
+            ended && job.phase == Phase::Failed,
+            "control: another failure still fails",
+        )
+    }
+
+    #[test]
+    fn the_coordinator_refuses_relative_paths() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let (db, mut snapshot) = open_store(&temp.path().join("jobs.sqlite")).ctx("store")?;
+        // `.` exists whatever directory the test runs from.
+        check(
+            Path::new(".").is_dir(),
+            "control: the relative folder exists",
+        )?;
+        let relative = apply(
+            Command::Enqueue {
+                game: game(Path::new("."), "relative"),
+                operation: Operation::Analyze,
+                options: CompressOpts::default(),
+            },
+            &mut snapshot,
+            &db,
+            &mut None,
+            &mut Vec::new(),
+            None,
+        );
+        check(
+            relative.is_err_and(|error| error.to_string().contains("full path")),
+            "a relative folder is refused by name",
+        )?;
+        check_eq(snapshot.jobs.len(), 0, "nothing was queued")?;
+        let reclaim = apply(
+            Command::PackReclaim {
+                game_path: ".".into(),
+            },
+            &mut snapshot,
+            &db,
+            &mut None,
+            &mut Vec::new(),
+            None,
+        );
+        check(
+            reclaim.is_err_and(|error| error.to_string().contains("full path")),
+            "a relative storage path is refused before it is resolved",
+        )
+    }
+
+    #[test]
+    fn a_different_storage_task_is_refused_and_the_same_one_is_not_duplicated() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let folder = temp.path().join("game");
+        std::fs::create_dir(&folder).ctx("game folder")?;
+        let (db, mut snapshot) = open_store(&temp.path().join("jobs.sqlite")).ctx("store")?;
+        let queue = |snapshot: &mut Snapshot, task: PackTask| {
+            enqueue_job(
+                snapshot,
+                game(&folder, "game"),
+                Operation::Pack,
+                CompressOpts::default(),
+                Some(task),
+                &db,
+            )
+        };
+        queue(&mut snapshot, PackTask::Compact).ctx("compact")?;
+        queue(&mut snapshot, PackTask::Compact).ctx("the same task again")?;
+        check_eq(snapshot.jobs.len(), 1, "the same task is not queued twice")?;
+        check(
+            queue(&mut snapshot, PackTask::Restore).is_err(),
+            "a restore is refused while a compaction waits",
+        )?;
+        check_eq(snapshot.jobs.len(), 1, "a refused task queues nothing")
+    }
+
+    struct FakeProcs(Vec<crate::busy::ProcInfo>);
+
+    impl crate::busy::ProcSource for FakeProcs {
+        fn processes(&self) -> Vec<crate::busy::ProcInfo> {
+            self.0.clone()
+        }
+    }
+
+    fn mounted_install(folder: &Path) -> crate::pack::Install {
+        crate::pack::Install {
+            game_path: folder.to_path_buf(),
+            store_path: folder.join("store"),
+            writes_path: folder.join("writes"),
+            backup_path: None,
+            previous_store_path: None,
+            previous_writes_path: None,
+            summary: None,
+            phase: crate::pack::InstallPhase::Mounted,
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn restart_waits_for_jobs_and_for_processes_using_a_mounted_game() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let folder = temp.path().join("Portal");
+        std::fs::create_dir(&folder).ctx("game folder")?;
+        let mut snapshot = Snapshot {
+            packs: vec![mounted_install(&folder)],
+            ..Snapshot::default()
+        };
+        let free = FakeProcs(Vec::new());
+        restart_allowed(false, &snapshot, &free)
+            .ctx("a mounted game that nothing uses does not block a restart")?;
+        let player = crate::busy::ProcInfo {
+            pid: 41,
+            name: "portal.bin".into(),
+            exe: Some(folder.join("portal.bin")),
+            ..crate::busy::ProcInfo::default()
+        };
+        let refused = restart_allowed(false, &snapshot, &FakeProcs(vec![player]))
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        check(
+            refused.contains("Portal") && refused.contains("Close"),
+            format!("the refusal names the game and says to close it: {refused}"),
+        )?;
+        let by_job = restart_allowed(true, &snapshot, &free)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        check(
+            by_job.contains("jobs"),
+            format!("an active job refuses the restart: {by_job}"),
+        )?;
+        snapshot.packs.clear();
+        restart_allowed(false, &snapshot, &free).ctx("control: no stores, no jobs")
+    }
+
+    #[test]
+    fn other_versions_may_restart_cancel_pause_and_read_but_not_enqueue() -> TestResult {
+        let other = VERSION.wrapping_add(1);
+        for command in [
+            Command::Restart,
+            Command::Cancel(1),
+            Command::Pause {
+                id: 1,
+                paused: true,
+            },
+            Command::Snapshot,
+        ] {
+            check(
+                version_accepted(other, &command),
+                format!("{command:?} is served at another version"),
+            )?;
+        }
+        check(
+            !version_accepted(other, &Command::Retry(1)),
+            "control: other commands are refused at another version",
+        )?;
+        check(
+            version_accepted(VERSION, &Command::Retry(1)),
+            "control: the current version is served",
+        )
+    }
+
+    #[test]
+    fn a_shell_in_the_game_folder_does_not_count_as_playing() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let folder = temp.path().join("game");
+        std::fs::create_dir(&folder).ctx("game folder")?;
+        let (_db, mut snapshot) = open_store(&temp.path().join("jobs.sqlite")).ctx("store")?;
+        snapshot.packs.push(crate::pack::Install {
+            game_path: folder.clone(),
+            store_path: temp.path().join("store"),
+            writes_path: temp.path().join("writes"),
+            backup_path: None,
+            previous_store_path: Some(temp.path().join("previous")),
+            previous_writes_path: None,
+            summary: None,
+            phase: crate::pack::InstallPhase::Mounted,
+            message: String::new(),
+        });
+        let games = [game(&folder, "game")];
+        let key = folder.to_string_lossy().into_owned();
+        let shell = crate::busy::ProcInfo {
+            pid: 30,
+            name: "bash".into(),
+            exe: Some("/usr/bin/bash".into()),
+            cwd: Some(folder.clone()),
+            ..crate::busy::ProcInfo::default()
+        };
+        let mut records = std::collections::HashMap::new();
+        mark_played(
+            &snapshot,
+            &games,
+            "game",
+            &FakeProcs(vec![shell]),
+            &mut records,
+        );
+        check(
+            records
+                .get(&key)
+                .is_none_or(|record: &Upkeep| !record.played),
+            "a shell with its working directory there has not played the game",
+        )?;
+        let player = crate::busy::ProcInfo {
+            pid: 31,
+            name: "game".into(),
+            exe: Some(folder.join("game.bin")),
+            ..crate::busy::ProcInfo::default()
+        };
+        mark_played(
+            &snapshot,
+            &games,
+            "game",
+            &FakeProcs(vec![player]),
+            &mut records,
+        );
+        check(
+            records.get(&key).is_some_and(|record| record.played),
+            "control: a process running from the folder has",
+        )
+    }
+
+    #[test]
+    fn a_scan_past_its_deadline_is_abandoned_and_games_stop_being_idle() -> TestResult {
+        let temp = tempfile::tempdir().ctx("home")?;
+        let folder = temp.path().join("game");
+        std::fs::create_dir(&folder).ctx("game folder")?;
+        let (_db, mut snapshot) = open_store(&temp.path().join("jobs.sqlite")).ctx("store")?;
+        let mut discovery = Some(crate::launchers::scan_job::Worker::start(
+            crate::launchers::Env::from_home(temp.path()),
+        ));
+        let started = Instant::now();
+        let deadline = Duration::from_secs(120);
+        let mut abandoned = Vec::new();
+        let mut games = vec![game(&folder, "game")];
+        let early = started.checked_add(Duration::from_secs(5)).ctx("early")?;
+        check(
+            !abandon_slow_scan(
+                &mut discovery,
+                started,
+                early,
+                deadline,
+                &mut abandoned,
+                &mut snapshot,
+                &mut games,
+            ),
+            "control: a scan inside its deadline keeps running",
+        )?;
+        check(discovery.is_some(), "control: the worker is kept")?;
+        check(
+            games.iter().all(|game| game.state.is_idle()),
+            "control: states are untouched",
+        )?;
+        let late = started.checked_add(deadline).ctx("late")?;
+        check(
+            abandon_slow_scan(
+                &mut discovery,
+                started,
+                late,
+                deadline,
+                &mut abandoned,
+                &mut snapshot,
+                &mut games,
+            ),
+            "a scan at its deadline is abandoned",
+        )?;
+        check(discovery.is_none(), "so a later scan may start")?;
+        check_eq(abandoned.len(), 1, "the worker is kept until it ends")?;
+        check_eq(snapshot.scan_warnings.len(), 1, "the user is told")?;
+        check(
+            games.iter().all(|game| !game.state.is_idle()),
+            "no game counts as idle until a scan completes",
+        )
+    }
+
+    #[test]
+    fn a_folder_overlapping_a_discovered_game_cannot_be_queued() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let library = temp.path().join("library");
+        let inside = library.join("game");
+        let nested = inside.join("bin");
+        let sibling = library.join("other");
+        for folder in [&nested, &sibling] {
+            std::fs::create_dir_all(folder).ctx("fixture folders")?;
+        }
+        let (db, mut snapshot) = open_store(&temp.path().join("jobs.sqlite")).ctx("store")?;
+        snapshot.discovered.push(game(&inside, "game"));
+        let queue = |snapshot: &mut Snapshot, folder: &Path| {
+            enqueue(
+                snapshot,
+                game(folder, "custom"),
+                Operation::Compress,
+                CompressOpts::default(),
+                &db,
+            )
+        };
+        check(
+            queue(&mut snapshot, &library).is_err(),
+            "a folder holding a discovered game is refused",
+        )?;
+        check(
+            queue(&mut snapshot, &nested).is_err(),
+            "a folder inside a discovered game is refused",
+        )?;
+        queue(&mut snapshot, &sibling).ctx("control: an unrelated sibling is accepted")?;
+        queue(&mut snapshot, &inside).ctx("control: the game's own folder is accepted")
+    }
+
+    #[test]
+    fn a_cancelled_upkeep_task_is_not_queued_again() -> TestResult {
+        let temp = tempfile::tempdir().ctx("upkeep fixture")?;
+        let folder = temp.path().join("game");
+        let writes = temp.path().join("updates");
+        std::fs::create_dir(&folder).ctx("game folder")?;
+        std::fs::create_dir_all(writes.join("files")).ctx("update layer")?;
+        // A sparse file of the size that counts as an update on its own.
+        std::fs::File::create(writes.join("files/patch.bin"))
+            .and_then(|file| file.set_len(UPKEEP_LAYER_BYTES))
+            .ctx("update")?;
+        let (db, mut snapshot) = open_store(&temp.path().join("queue.sqlite")).ctx("queue")?;
+        let game = game(&folder, "upkeep");
+        snapshot.packs.push(crate::pack::Install {
+            game_path: folder.clone(),
+            store_path: temp.path().join("store"),
+            writes_path: writes,
+            backup_path: None,
+            previous_store_path: None,
+            previous_writes_path: None,
+            summary: None,
+            phase: crate::pack::InstallPhase::Mounted,
+            message: String::new(),
+        });
+        let mut records = std::collections::HashMap::new();
+        run_upkeep(
+            &mut snapshot,
+            std::slice::from_ref(&game),
+            &mut records,
+            &db,
+        );
+        check_eq(snapshot.jobs.len(), 1, "the update queues one compaction")?;
+        snapshot.jobs.first_mut().ctx("job")?.phase = Phase::Cancelled;
+        for _scan in 0..3 {
+            run_upkeep(
+                &mut snapshot,
+                std::slice::from_ref(&game),
+                &mut records,
+                &db,
+            );
+        }
+        check_eq(
+            snapshot.jobs.len(),
+            1,
+            "a compaction the user cancelled stays cancelled",
+        )
+    }
+
+    #[test]
+    fn pause_and_resume_events_do_not_overwrite_a_cancel() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let (db, mut snapshot) = open_store(&temp.path().join("jobs.sqlite")).ctx("store")?;
+        enqueue(
+            &mut snapshot,
+            game(temp.path(), "game"),
+            Operation::Analyze,
+            CompressOpts::default(),
+            &db,
+        )
+        .ctx("job")?;
+        let job = snapshot.jobs.first_mut().ctx("job")?;
+        job.phase = Phase::Cancelling;
+        for progress in [
+            crate::backend::Event::Paused { by: "late".into() },
+            crate::backend::Event::Resumed,
+        ] {
+            event(job, WorkerEvent::Progress(progress), &db).ctx("event")?;
+            check_eq(job.phase, Phase::Cancelling, "a cancel stays a cancel")?;
+        }
+        job.phase = Phase::Paused;
+        event(
+            job,
+            WorkerEvent::Progress(crate::backend::Event::Resumed),
+            &db,
+        )
+        .ctx("resume")?;
+        check_eq(
+            job.phase,
+            Phase::Analyzing,
+            "resuming an analysis shows it as analyzing",
+        )?;
+        job.operation = Operation::Compress;
+        job.phase = Phase::Paused;
+        event(
+            job,
+            WorkerEvent::Progress(crate::backend::Event::Resumed),
+            &db,
+        )
+        .ctx("resume")?;
+        check_eq(job.phase, Phase::Running, "control: other jobs run")
+    }
+
+    #[test]
+    fn a_queue_row_that_no_longer_parses_does_not_stop_the_coordinator() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let path = temp.path().join("jobs.sqlite");
+        let (db, mut snapshot) = open_store(&path).ctx("store")?;
+        enqueue(
+            &mut snapshot,
+            game(temp.path(), "game"),
+            Operation::Compress,
+            CompressOpts::default(),
+            &db,
+        )
+        .ctx("job")?;
+        db.execute("INSERT INTO queue(id, data) VALUES(99, 'not a job')", [])
+            .ctx("damaged row")?;
+        drop(db);
+        let (_db, restored) = open_store(&path).ctx("reopen with a damaged row")?;
+        check_eq(restored.jobs.len(), 1, "the readable job is still loaded")
+    }
+
+    #[test]
+    fn a_cancel_is_accepted_only_while_the_task_can_still_stop() -> TestResult {
+        let stoppable = PackControl {
+            interruptible: std::sync::atomic::AtomicBool::new(true),
+            ..Default::default()
+        };
+        check(
+            stoppable.cancel_if_interruptible(),
+            "accepted before the switch",
+        )?;
+        check(
+            stoppable.cancel.load(std::sync::atomic::Ordering::SeqCst),
+            "the flag is set",
+        )?;
+        let committed = PackControl::default();
+        check(
+            !committed.cancel_if_interruptible(),
+            "refused during a step that must finish",
+        )?;
+        check(
+            !committed.cancel.load(std::sync::atomic::Ordering::SeqCst),
+            "a refused request leaves the flag alone, so a real failure is not reported as a stop",
+        )
+    }
+
+    #[cfg(feature = "pack-mount")]
+    #[test]
+    fn a_full_progress_channel_does_not_block_pause_and_cancel_requests() -> TestResult {
+        let (send, receive) = mpsc::sync_channel(1);
+        send.send(crate::backend::Event::Resumed)
+            .ctx("fill the channel")?;
+        let control = std::sync::Arc::new(PackControl {
+            interruptible: std::sync::atomic::AtomicBool::new(true),
+            events: Some(send),
+            ..Default::default()
+        });
+        let beginning = control.clone();
+        let transaction = std::thread::spawn(move || beginning.transaction("switching"));
+        let until = Instant::now() + Duration::from_secs(5);
+        while control
+            .interruptible
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            check(Instant::now() < until, "the transaction began")?;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (answer, answered) = mpsc::channel();
+        let asking = control.clone();
+        std::thread::spawn(move || {
+            let _sent = answer.send(asking.request_control(&Command::Cancel(1)).is_err());
+        });
+        let refused = answered.recv_timeout(Duration::from_secs(2));
+        // Drain the channel so the transaction thread can finish either way.
+        while receive.recv_timeout(Duration::from_millis(200)).is_ok() {}
+        transaction
+            .join()
+            .map_err(|_| "transaction thread panicked".to_string())?
+            .ctx("transaction")?;
+        check_eq(
+            refused.ctx("the cancel request answered while the channel was full")?,
+            true,
+            "a cancel is refused once the step must finish",
+        )
+    }
+
+    #[cfg(feature = "pack-mount")]
+    #[test]
+    fn mounts_survive_a_storage_job_that_fails_validation() -> TestResult {
+        if !Path::new("/dev/fuse").exists() {
+            check(
+                std::env::var_os("FLUMMOX_REQUIRE_FUSE").is_none(),
+                "FUSE is required for this test run",
+            )?;
+            eprintln!("skipped: a live mount requires /dev/fuse");
+            return Ok(());
+        }
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let folder = temp.path().join("game");
+        std::fs::create_dir(&folder).ctx("game folder")?;
+        std::fs::write(folder.join("data"), b"served").ctx("source")?;
+        let store = temp.path().join("game.flumpack");
+        let never = std::sync::atomic::AtomicBool::new(false);
+        crate::pack::create(&folder, &store, crate::pack::Options::default(), &never)
+            .ctx("store")?;
+        let install =
+            crate::pack::prepare(&folder, &store, &temp.path().join("updates"), &never)
+                .ctx("prepare")?;
+        let canonical = install.game_path.clone();
+        let (db, mut snapshot) = open_store(&temp.path().join("jobs.sqlite")).ctx("store")?;
+        let mut mounts = Vec::new();
+        activate_prepared(&mut snapshot, &db, &mut mounts, install).ctx("activate")?;
+        enqueue_job(
+            &mut snapshot,
+            game(&canonical, "game"),
+            Operation::Pack,
+            CompressOpts::default(),
+            Some(PackTask::Restore),
+            &db,
+        )
+        .ctx("job")?;
+        let mut job = snapshot.jobs.first().ctx("job")?.clone();
+        // A storage row with no task is the one input that fails validation.
+        job.pack = None;
+        let refused = start_pack(
+            &job,
+            &snapshot.packs,
+            &[],
+            &mut mounts,
+            &temp.path().join("jobs.sqlite"),
+        );
+        check(refused.is_err(), "a job with no task is refused")?;
+        check_eq(mounts.len(), 1, "the refusal leaves the mount with the caller")?;
+        check_eq(
+            std::fs::read(canonical.join("data")).ctx("read through the mount")?,
+            b"served".to_vec(),
+            "the folder still serves its files",
+        )?;
+        let mounted = take_mount(&mut mounts, &canonical).ctx("mount")?;
+        mounted.stop().ctx("unmount")
+    }
+
+    #[test]
+    fn upkeep_measures_the_update_layer_only_when_the_answer_needs_it() -> TestResult {
+        let mut install = crate::pack::Install {
+            game_path: "/fixture/game".into(),
+            store_path: "/fixture/store".into(),
+            writes_path: "/fixture/updates".into(),
+            backup_path: Some("/fixture/original".into()),
+            previous_store_path: None,
+            previous_writes_path: None,
+            summary: None,
+            phase: crate::pack::InstallPhase::Mounted,
+            message: String::new(),
+        };
+        let walks = std::cell::Cell::new(0);
+        let measure = || {
+            walks.set(walks.get() + 1);
+            0
+        };
+        upkeep_due(&install, None, measure, &mut Upkeep::default());
+        check_eq(walks.get(), 0, "an unconfirmed install skips the walk")?;
+        install.backup_path = None;
+        upkeep_due(&install, None, measure, &mut Upkeep::default());
+        check_eq(walks.get(), 1, "control: a confirmed install measures it")
+    }
+
+    #[test]
+    fn games_first_listed_after_enabling_a_library_are_not_new_installs() -> TestResult {
+        let temp = tempfile::tempdir().ctx("library")?;
+        let on = vec![Library {
+            path: temp.path().into(),
+            automatic: true,
+            custom: false,
+            folder_kind: FolderKind::Game,
+        }];
+        let mut seen = Observations::default();
+        let before = game(temp.path(), "listed before");
+        seen.baseline(std::slice::from_ref(&before), &on);
+        let late = game(temp.path(), "listed by the next scan");
+        seen.baseline_unseen(&[before.clone(), late.clone()], &on);
+        check(
+            !seen.observe(&late, &on, true),
+            "a game the earlier list missed does not queue",
+        )?;
+        let fresh = game(temp.path(), "installed afterwards");
+        check(
+            seen.observe(&fresh, &on, true),
+            "control: a game installed afterwards still queues",
+        )
+    }
+
+    #[test]
+    fn maintenance_skips_mounted_stores_and_retries_a_refused_enqueue() -> TestResult {
+        let temp = tempfile::tempdir().ctx("library")?;
+        let mounted = temp.path().join("mounted");
+        std::fs::create_dir(&mounted).ctx("mounted game")?;
+        let (db, mut snapshot) = open_store(&temp.path().join("queue.sqlite")).ctx("store")?;
+        snapshot.libraries.push(Library {
+            path: temp.path().into(),
+            automatic: true,
+            custom: false,
+            folder_kind: FolderKind::Game,
+        });
+        snapshot.packs.push(crate::pack::Install {
+            game_path: mounted.clone(),
+            store_path: temp.path().join("store"),
+            writes_path: temp.path().join("updates"),
+            backup_path: None,
+            previous_store_path: None,
+            previous_writes_path: None,
+            summary: None,
+            phase: crate::pack::InstallPhase::Mounted,
+            message: String::new(),
+        });
+        let gone = temp.path().join("gone");
+        let games = [game(&mounted, "mounted"), game(&gone, "gone")];
+        let mut known = Observations::default();
+        queue_maintenance(&mut known, &mut snapshot, &games, true, &db);
+        check_eq(
+            snapshot.jobs.len(),
+            0,
+            "nothing queues for a mounted store or a folder that is missing",
+        )?;
+        check(
+            !known.0.contains_key("manual:gone"),
+            "a refused enqueue does not use up the observation",
+        )?;
+        std::fs::create_dir(&gone).ctx("folder appears")?;
+        queue_maintenance(&mut known, &mut snapshot, &games, true, &db);
+        check_eq(snapshot.jobs.len(), 1, "the next scan queues it")
+    }
+
+    #[test]
+    fn jobs_that_can_never_start_are_cancelled_and_do_not_keep_the_loop_busy() -> TestResult {
+        let temp = tempfile::tempdir().ctx("library")?;
+        let (db, mut snapshot) = open_store(&temp.path().join("queue.sqlite")).ctx("store")?;
+        let folders: Vec<_> = ["excluded", "vanished", "present"]
+            .iter()
+            .map(|name| temp.path().join(name))
+            .collect();
+        for folder in &folders {
+            std::fs::create_dir(folder).ctx("folder")?;
+        }
+        let steam = |folder: &Path, id: &str| Game {
+            id: GameId::new(Launcher::Steam, id),
+            ..game(folder, id)
+        };
+        let games = [
+            steam(folders.first().ctx("excluded")?, "1"),
+            steam(folders.get(2).ctx("present")?, "3"),
+        ];
+        for (folder, id) in folders.iter().zip(["1", "2", "3"]) {
+            enqueue(
+                &mut snapshot,
+                steam(folder, id),
+                Operation::Compress,
+                CompressOpts::default(),
+                &db,
+            )
+            .ctx("queue")?;
+        }
+        snapshot.excluded.push("steam:1".into());
+        cancel_unrunnable(&mut snapshot, Some(&games), &[], &db);
+        let phases: Vec<_> = snapshot.jobs.iter().map(|job| job.phase).collect();
+        check_eq(
+            phases,
+            vec![Phase::Cancelled, Phase::Cancelled, Phase::Queued],
+            "excluded and vanished jobs are cancelled, a present one is kept",
+        )?;
+        check(
+            has_runnable_work(&snapshot, false),
+            "control: the queued job keeps the loop busy",
+        )?;
+        let queued = snapshot.jobs.last_mut().ctx("last job")?;
+        queued.phase = Phase::Paused;
+        queued.user_paused = true;
+        check(
+            !has_runnable_work(&snapshot, false),
+            "a job the user paused does not",
+        )?;
+        check(
+            has_runnable_work(&snapshot, true),
+            "a running worker always does",
+        )
+    }
+
+    #[test]
+    fn recovery_backs_off_while_it_fails_and_the_epoch_never_goes_back() -> TestResult {
+        let mut delay = Duration::from_secs(5);
+        for _attempt in 0..10 {
+            delay = next_recovery_delay(delay, false);
+        }
+        check_eq(
+            delay,
+            Duration::from_secs(300),
+            "the delay stops at five minutes",
+        )?;
+        check_eq(
+            next_recovery_delay(delay, true),
+            Duration::from_secs(5),
+            "control: success returns to five seconds",
+        )?;
+        check_eq(next_epoch(100, 50), 101, "a clock that stepped back")?;
+        check_eq(next_epoch(100, 500), 500, "control: a normal clock")
+    }
+
+    #[test]
+    fn survive_reports_the_value_and_swallows_the_error() -> TestResult {
+        check_eq(survive("fine", Ok(3)), Some(3), "a value passes through")?;
+        check_eq(
+            survive::<u8>("broken", Err(anyhow::anyhow!("disk full"))),
+            None,
+            "an error becomes None",
+        )
     }
 
     #[test]
@@ -2193,9 +3698,32 @@ mod tests {
             read_message::<Request>(&mut std::io::Cursor::new(b"{}".as_slice())).is_err(),
             "missing delimiter",
         )?;
-        let oversized = vec![b' '; LIMIT as usize + 2];
+        // A well-formed request padded past the limit and ending in a newline,
+        // so only its size can make it fail.
+        let padded = |padding: usize| -> Result<Vec<u8>, String> {
+            let mut line = serde_json::to_vec(&serde_json::json!({
+                "version": VERSION,
+                "command": "Snapshot",
+                "padding": "x".repeat(padding),
+            }))
+            .ctx("padded request")?;
+            line.push(b'\n');
+            Ok(line)
+        };
+        let base = padded(0)?.len();
+        let limit = usize::try_from(LIMIT).ctx("limit")?;
+        let at_limit = padded(limit - base)?;
+        check_eq(
+            at_limit.len(),
+            limit,
+            "control: the request is the limit to the byte",
+        )?;
+        read_message::<Request>(&mut std::io::Cursor::new(at_limit))
+            .ctx("control: a request at the limit parses")?;
+        let over = padded(limit - base + 1)?;
+        check_eq(over.len(), limit + 1, "one byte over, newline included")?;
         check(
-            read_message::<Request>(&mut std::io::Cursor::new(oversized)).is_err(),
+            read_message::<Request>(&mut std::io::Cursor::new(over)).is_err(),
             "bounded request",
         )?;
         let valid = serde_json::to_string(&Request {
@@ -2430,12 +3958,12 @@ mod tests {
         };
         let mut record = Upkeep::default();
         check_eq(
-            upkeep_due(&install, None, UPKEEP_LAYER_BYTES - 1, &mut record),
+            upkeep_due(&install, None, || UPKEEP_LAYER_BYTES - 1, &mut record),
             None,
             "saves and settings in the game folder are left alone",
         )?;
         check_eq(
-            upkeep_due(&install, None, UPKEEP_LAYER_BYTES, &mut record),
+            upkeep_due(&install, None, || UPKEEP_LAYER_BYTES, &mut record),
             Some(PackTask::Compact),
             "a layer this large is an update",
         )
@@ -2488,7 +4016,7 @@ mod tests {
         note_waiting(&mut snapshot, Some(first));
         check_eq(
             message(&snapshot)?.as_str(),
-            "Queued",
+            "Waiting",
             "control: the note goes when the pause does",
         )?;
         // A Pause that arrives after the job finished changes nothing and is

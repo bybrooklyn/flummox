@@ -1,6 +1,6 @@
 //! Detects whether anything is using an install directory.
 //!
-//! Launcher metadata is the first signal, but it lies: this machine has three
+//! Launcher metadata is the first signal, but it can be wrong: this machine has three
 //! Steam apps flagged "running" with nothing running. So before touching a
 //! directory we also look for a live process with a file open inside it.
 
@@ -25,6 +25,9 @@ pub struct ProcInfo {
     pub root: Option<PathBuf>,
     /// Open files, best effort.
     pub open_files: Vec<PathBuf>,
+    /// Files mapped with execute permission, best effort. A Wine game's
+    /// executable shows up here while the process itself is Wine's.
+    pub exec_maps: Vec<PathBuf>,
 }
 
 impl ProcInfo {
@@ -34,11 +37,23 @@ impl ProcInfo {
     /// gives paths relative to its own root, so the directory is also tried
     /// with that root stripped.
     pub fn uses_dir(&self, dir: &Path) -> bool {
-        let paths = self
-            .exe
-            .iter()
-            .chain(self.cwd.iter())
-            .chain(self.open_files.iter());
+        self.any_inside(
+            self.exe
+                .iter()
+                .chain(self.cwd.iter())
+                .chain(self.open_files.iter()),
+            dir,
+        )
+    }
+
+    /// Whether this process is executing code from `dir`: its executable or
+    /// a mapped executable file is inside it. A shell with its working
+    /// directory there, or a launcher reading the files, does not qualify.
+    pub fn runs_from(&self, dir: &Path) -> bool {
+        self.any_inside(self.exe.iter().chain(self.exec_maps.iter()), dir)
+    }
+
+    fn any_inside<'a>(&self, paths: impl Iterator<Item = &'a PathBuf>, dir: &Path) -> bool {
         for p in paths {
             if p.starts_with(dir) {
                 return true;
@@ -62,6 +77,49 @@ impl ProcInfo {
 pub trait ProcSource {
     /// Every process this source can see.
     fn processes(&self) -> Vec<ProcInfo>;
+
+    /// [`processes`](Self::processes) plus whether the list can be trusted.
+    fn scan(&self) -> Scan {
+        Scan {
+            processes: self.processes(),
+            readable: true,
+        }
+    }
+}
+
+/// A process list and whether it says anything about what is running.
+#[derive(Debug, Clone, Default)]
+pub struct Scan {
+    /// The processes found.
+    pub processes: Vec<ProcInfo>,
+    /// False when `/proc` could not be listed, or when other processes of this
+    /// user exist and none of their links could be read.
+    pub readable: bool,
+}
+
+/// What a scan concluded about a directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Usage {
+    /// Nothing is using it.
+    Free,
+    /// This process is, described for the user.
+    InUse(String),
+    /// The scan could not see processes, so "free" would be a guess.
+    Unknown,
+}
+
+impl Usage {
+    /// The reason to stay paused, or `None` when work may continue.
+    ///
+    /// `Unknown` pauses, because a caller that treated it as free would
+    /// rewrite a running game's files.
+    pub fn blocking(&self) -> Option<String> {
+        match self {
+            Self::Free => None,
+            Self::InUse(who) => Some(who.clone()),
+            Self::Unknown => Some("process information is unavailable".to_owned()),
+        }
+    }
 }
 
 /// Reads processes from a `/proc` mount.
@@ -71,6 +129,8 @@ pub struct ProcFs {
     /// Only processes with this uid are inspected; others' `fd` entries are
     /// unreadable anyway.
     uid: u32,
+    /// Whether to read `maps`, which costs a read per process.
+    maps: bool,
 }
 
 impl Default for ProcFs {
@@ -87,7 +147,15 @@ impl ProcFs {
         Self {
             root: PathBuf::from("/proc"),
             uid,
+            maps: false,
         }
+    }
+
+    /// Also reads each process's executable mappings into
+    /// [`ProcInfo::exec_maps`], which [`played_from`] needs.
+    #[must_use]
+    pub fn with_maps(self) -> Self {
+        Self { maps: true, ..self }
     }
 
     /// Reads a different `/proc`-shaped tree, for tests.
@@ -95,6 +163,7 @@ impl ProcFs {
         Self {
             root: root.into(),
             uid,
+            maps: false,
         }
     }
 
@@ -126,15 +195,81 @@ impl ProcFs {
             cwd: std::fs::read_link(dir.join("cwd")).ok(),
             root: std::fs::read_link(dir.join("root")).ok(),
             open_files,
+            exec_maps: if self.maps {
+                exec_maps(&dir.join("maps"))
+            } else {
+                Vec::new()
+            },
         })
     }
 }
 
+/// The files a process has mapped executable, from its `maps` file.
+///
+/// Lines read `start-end perms offset dev inode path`. Anonymous mappings and
+/// pseudo paths such as `[heap]` have no absolute path and are left out. A
+/// file that cannot be read gives an empty list.
+fn exec_maps(maps: &Path) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(maps) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.splitn(6, ' ');
+        let perms = fields.nth(1).unwrap_or_default();
+        let path = fields.nth(3).unwrap_or_default().trim_start();
+        if perms.contains('x') && path.starts_with('/') {
+            files.push(PathBuf::from(path.trim_end_matches(" (deleted)")));
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// Whether `dir` is a copy of this process that has not yet become the
+/// program it was started to run.
+///
+/// Between fork and exec a child still holds this process's open files and
+/// working directory, so it would be reported as something using a game.
+/// Such a child has this process as parent and the same program and
+/// arguments.
+fn is_unfinished_spawn(dir: &Path, own_dir: &Path, own: i32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(dir.join("stat")) else {
+        return false;
+    };
+    // The parent id is the second field after the name, which is in
+    // parentheses and may itself contain spaces or parentheses.
+    let parent = stat
+        .rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().nth(1))
+        .and_then(|field| field.parse::<i32>().ok());
+    if parent != Some(own) {
+        return false;
+    }
+    let same = |name: &str| match (
+        std::fs::read(dir.join(name)),
+        std::fs::read(own_dir.join(name)),
+    ) {
+        (Ok(theirs), Ok(ours)) => theirs == ours,
+        _ => false,
+    };
+    let same_program = match (
+        std::fs::read_link(dir.join("exe")),
+        std::fs::read_link(own_dir.join("exe")),
+    ) {
+        (Ok(theirs), Ok(ours)) => theirs == ours,
+        _ => false,
+    };
+    same_program && same("cmdline")
+}
+
 impl ProcSource for ProcFs {
     fn processes(&self) -> Vec<ProcInfo> {
-        // An empty list means "nothing is running", which is what lets a job
-        // start. If /proc cannot be read at all, that answer is a guess, so
-        // say so loudly instead of quietly clearing the way.
+        self.scan().processes
+    }
+
+    fn scan(&self) -> Scan {
         let entries = match std::fs::read_dir(&self.root) {
             Ok(entries) => entries,
             Err(e) => {
@@ -143,17 +278,140 @@ impl ProcSource for ProcFs {
                     error = %e,
                     "cannot read /proc, so a running game cannot be detected"
                 );
-                return Vec::new();
+                return Scan::default();
             }
         };
-        entries
+        let own = std::process::id() as i32;
+        let own_dir = self.root.join(own.to_string());
+        let processes: Vec<ProcInfo> = entries
             .flatten()
             .filter_map(|entry| {
                 let pid: i32 = entry.file_name().to_str()?.parse().ok()?;
+                if pid != own && is_unfinished_spawn(&entry.path(), &own_dir, own) {
+                    return None;
+                }
                 self.read_one(&entry.path(), pid)
             })
-            .collect()
+            .collect();
+        // Landlock refuses the ptrace-level check behind these links for every
+        // process outside the caller's domain, so a sandboxed caller reads
+        // its own links and nothing else's.
+        let seen = processes.iter().filter(|p| p.pid != own).count();
+        let readable = processes
+            .iter()
+            .filter(|p| p.pid != own)
+            .filter(|p| p.exe.is_some() || p.cwd.is_some() || p.root.is_some())
+            .count();
+        Scan {
+            processes,
+            readable: seen == 0 || readable > 0,
+        }
     }
+}
+
+/// Who is using `dir`, or [`Usage::Unknown`] when the scan could not tell.
+pub fn usage(dir: &Path, source: &dyn ProcSource) -> Usage {
+    let own = std::process::id() as i32;
+    let scan = source.scan();
+    if let Some(p) = scan
+        .processes
+        .iter()
+        .find(|p| p.pid != own && p.uses_dir(dir))
+    {
+        return Usage::InUse(format!("{} (pid {})", p.name, p.pid));
+    }
+    if scan.readable {
+        Usage::Free
+    } else {
+        Usage::Unknown
+    }
+}
+
+/// Scans `/proc` on a background thread and keeps the latest answer.
+///
+/// Landlock applies to the calling thread and the threads it starts later, so
+/// a scanner started before [`crate::sandbox::restrict`] keeps its view of
+/// other processes. Start it first, then restrict, and have the job read
+/// [`latest`](Self::latest).
+pub struct BackgroundScan {
+    latest: std::sync::Arc<std::sync::Mutex<Usage>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BackgroundScan {
+    /// Scans once before returning, then again every `every`.
+    pub fn start(dir: PathBuf, every: std::time::Duration) -> Self {
+        Self::start_with(dir, every, ProcFs::new())
+    }
+
+    /// [`start`](Self::start) reading processes from `source`.
+    pub fn start_with<S>(dir: PathBuf, every: std::time::Duration, source: S) -> Self
+    where
+        S: ProcSource + Send + 'static,
+    {
+        use std::sync::atomic::Ordering;
+        use std::sync::{Arc, Mutex};
+        let latest = Arc::new(Mutex::new(usage(&dir, &source)));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = std::thread::Builder::new()
+            .name("busy-scan".to_owned())
+            .spawn({
+                let (latest, stop) = (Arc::clone(&latest), Arc::clone(&stop));
+                move || {
+                    let step = std::time::Duration::from_millis(100);
+                    while !stop.load(Ordering::Relaxed) {
+                        let mut waited = std::time::Duration::ZERO;
+                        while waited < every && !stop.load(Ordering::Relaxed) {
+                            std::thread::sleep(step);
+                            waited += step;
+                        }
+                        let now = usage(&dir, &source);
+                        if let Ok(mut slot) = latest.lock() {
+                            *slot = now;
+                        }
+                    }
+                }
+            })
+            .ok();
+        Self {
+            latest,
+            stop,
+            thread,
+        }
+    }
+
+    /// The newest scan result. `Unknown` when the thread could not start.
+    pub fn latest(&self) -> Usage {
+        if self.thread.is_none() {
+            return Usage::Unknown;
+        }
+        self.latest
+            .lock()
+            .map(|slot| slot.clone())
+            .unwrap_or(Usage::Unknown)
+    }
+}
+
+impl Drop for BackgroundScan {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            tracing::error!("the busy scanner thread panicked");
+        }
+    }
+}
+
+/// Whether any process is running code from `dir`, as opposed to merely
+/// having a file or working directory there. This process is not counted.
+pub fn played_from(dir: &Path, source: &dyn ProcSource) -> bool {
+    let own = std::process::id() as i32;
+    source
+        .processes()
+        .iter()
+        .any(|p| p.pid != own && p.runs_from(dir))
 }
 
 /// The first process using `dir`, described for the user.
@@ -208,6 +466,146 @@ mod tests {
             process_using(Path::new("/games/Portal"), &src),
             None,
             "an unrelated directory should look free",
+        )
+    }
+
+    #[test]
+    fn only_a_process_running_game_code_counts_as_playing() -> TestResult {
+        let game = Path::new("/games/Terraria");
+        let shell = ProcInfo {
+            pid: 20,
+            name: "bash".to_owned(),
+            exe: Some(PathBuf::from("/usr/bin/bash")),
+            cwd: Some(game.to_path_buf()),
+            ..ProcInfo::default()
+        };
+        let verifier = ProcInfo {
+            pid: 21,
+            name: "steam".to_owned(),
+            exe: Some(PathBuf::from("/home/u/.steam/steam")),
+            open_files: vec![game.join("Terraria.bin.x86_64")],
+            ..ProcInfo::default()
+        };
+        let wine = ProcInfo {
+            pid: 22,
+            name: "wine64-preloader".to_owned(),
+            exe: Some(PathBuf::from("/opt/proton/files/bin/wine64-preloader")),
+            exec_maps: vec![game.join("Game.exe")],
+            ..ProcInfo::default()
+        };
+        let bystanders = Fake(vec![shell, verifier]);
+        check(
+            process_using(game, &bystanders).is_some(),
+            "control: both still count as using the folder",
+        )?;
+        check(
+            !played_from(game, &bystanders),
+            "a shell in the folder and a client reading it are not playing",
+        )?;
+        check(
+            played_from(game, &Fake(vec![wine])),
+            "a Wine process mapping the game's executable is playing",
+        )?;
+        let native = ProcInfo {
+            pid: 23,
+            exe: Some(game.join("Terraria.bin.x86_64")),
+            ..ProcInfo::default()
+        };
+        check(
+            played_from(game, &Fake(vec![native])),
+            "a native executable inside the folder is playing",
+        )
+    }
+
+    #[test]
+    fn executable_maps_are_read_from_a_maps_file() -> TestResult {
+        let tmp = tempfile::tempdir().ctx("make a temporary directory")?;
+        let maps = tmp.path().join("maps");
+        std::fs::write(
+            &maps,
+            "55d0-55e0 r-xp 00000000 08:01 11 /games/A/game.exe\n\
+             7f00-7f10 r--p 00000000 08:01 12 /games/A/data.pak\n\
+             7f20-7f30 rwxp 00000000 00:00 0 \n\
+             7ffc-7fff r-xp 00000000 00:00 0 [vdso]\n\
+             7f40-7f50 r-xp 00000000 08:01 13 /games/A/with space.so\n",
+        )
+        .ctx("write the fake maps file")?;
+        check_eq(
+            exec_maps(&maps),
+            vec![
+                PathBuf::from("/games/A/game.exe"),
+                PathBuf::from("/games/A/with space.so"),
+            ],
+            "only executable file mappings are kept",
+        )
+    }
+
+    #[test]
+    fn a_child_that_has_not_started_its_program_is_not_a_user_of_the_folder() -> TestResult {
+        let tmp = tempfile::tempdir().ctx("make a temporary directory")?;
+        let proc = tmp.path().join("proc");
+        let own = std::process::id() as i32;
+        let game = tmp.path().join("game");
+        std::fs::create_dir(&game).ctx("game folder")?;
+        // This process, a copy of it between fork and exec, and a child that
+        // has become another program. Both children sit in the game folder.
+        for (pid, program, arguments) in [
+            (own, "/bin/flummox", "flummox\0__coordinator\0"),
+            (own + 1, "/bin/flummox", "flummox\0__coordinator\0"),
+            (own + 2, "/bin/flummox", "flummox\0__worker\0"),
+        ] {
+            let dir = proc.join(pid.to_string());
+            std::fs::create_dir_all(&dir).ctx("fake process directory")?;
+            std::fs::write(
+                dir.join("stat"),
+                format!("{pid} (a name) with) S {own} 1 1"),
+            )
+            .ctx("stat")?;
+            std::fs::write(dir.join("cmdline"), arguments).ctx("cmdline")?;
+            std::os::unix::fs::symlink(program, dir.join("exe")).ctx("exe")?;
+            std::os::unix::fs::symlink(&game, dir.join("cwd")).ctx("cwd")?;
+        }
+        // SAFETY: getuid() takes no arguments and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let seen: Vec<i32> = ProcFs::with_root(proc, uid)
+            .processes()
+            .iter()
+            .filter(|p| p.uses_dir(&game))
+            .map(|p| p.pid)
+            .collect();
+        check(
+            seen.contains(&(own + 2)),
+            "control: a child running another command is still seen",
+        )?;
+        check(
+            !seen.contains(&(own + 1)),
+            "a copy of this process that has not started its program is left out",
+        )
+    }
+
+    #[test]
+    fn mappings_are_read_only_when_asked_for() -> TestResult {
+        let tmp = tempfile::tempdir().ctx("make a temporary directory")?;
+        let proc = tmp.path().join("proc/42");
+        std::fs::create_dir_all(&proc).ctx("create the fake process directory")?;
+        std::fs::write(
+            proc.join("maps"),
+            "1000-2000 r-xp 00000000 08:01 11 /games/A/game.exe\n",
+        )
+        .ctx("write the fake maps file")?;
+        // SAFETY: getuid() takes no arguments and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let plain = ProcFs::with_root(tmp.path().join("proc"), uid).processes();
+        check(
+            plain.iter().all(|p| p.exec_maps.is_empty()),
+            "the default scan does not read maps",
+        )?;
+        let mapped = ProcFs::with_root(tmp.path().join("proc"), uid)
+            .with_maps()
+            .processes();
+        check(
+            mapped.iter().any(|p| p.runs_from(Path::new("/games/A"))),
+            "the mapped executable places the process in the folder",
         )
     }
 

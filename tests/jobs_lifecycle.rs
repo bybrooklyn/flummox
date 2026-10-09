@@ -45,6 +45,19 @@ fn start(home: &Path) -> Result<Service, String> {
 }
 
 fn request(home: &Path, command: Request) -> Result<Snapshot, String> {
+    // A coordinator still remounting stores answers that it is starting.
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        match request_once(home, &command) {
+            Err(error) if error.contains("is starting") && Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            other => return other,
+        }
+    }
+}
+
+fn request_once(home: &Path, command: &Request) -> Result<Snapshot, String> {
     let socket = home.join("state/flummox/desktop/control.sock");
     let until = Instant::now() + Duration::from_secs(5);
     let mut stream = loop {
@@ -87,6 +100,33 @@ fn finished(home: &Path, id: i64) -> Result<flummox::jobs::Job, String> {
         }
         check(Instant::now() < deadline, format!("job timed out: {job:?}"))?;
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Whether `path` is on btrfs. When it is not, the test skips, unless
+/// `FLUMMOX_REQUIRE_BTRFS` is set, which turns the skip into a failure.
+fn on_btrfs(path: &Path, what: &str) -> Result<bool, String> {
+    let native = flummox::fsprobe::probe(path).ctx("filesystem")?.fstype == "btrfs";
+    if !native {
+        check(
+            std::env::var_os("FLUMMOX_REQUIRE_BTRFS").is_none(),
+            "btrfs is required for this test run",
+        )?;
+        eprintln!("skipped: {what} requires btrfs");
+    }
+    Ok(native)
+}
+
+fn fixture_game(path: &Path, key: &str) -> Game {
+    Game {
+        id: GameId::new(Launcher::Manual, key),
+        also: vec![],
+        title: key.into(),
+        install_dir: path.to_path_buf(),
+        build: None,
+        size_hint: None,
+        state: InstallState::Idle,
+        is_tool: false,
     }
 }
 
@@ -137,9 +177,57 @@ fn managed_pack_remounts_after_coordinator_restart_and_keeps_updates() -> TestRe
         source_volume.identity.clone(),
         "managed mount keeps the underlying library drive identity",
     )?;
+    // A process working in the mounted folder keeps the coordinator running.
+    let mut player = Command::new("sleep")
+        .arg("30")
+        .current_dir(&game)
+        .spawn()
+        .ctx("process in the game folder")?;
+    let refused = request(&home, Request::Restart);
+    let _killed = player.kill();
+    let _waited = player.wait();
     check(
-        request(&home, Request::Restart).is_err(),
-        "restart refuses to interrupt mounted game reads",
+        refused
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.contains("game") && error.contains("Close")),
+        format!("restart names the running game and says to close it: {refused:?}"),
+    )?;
+    check(
+        service.0.try_wait().ctx("coordinator state")?.is_none(),
+        "a refused restart leaves the coordinator running",
+    )?;
+    check_eq(
+        std::fs::read(game.join("data")).ctx("read after refusal")?,
+        b"base".to_vec(),
+        "the store still serves after a refusal",
+    )?;
+    // With nothing using the folder, restart unmounts and exits, and the
+    // next coordinator mounts the store again.
+    request(&home, Request::Restart).ctx("restart with an idle mounted game")?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = service.0.try_wait().ctx("reap restarted coordinator")? {
+            check(status.success(), "restart exits successfully")?;
+            break;
+        }
+        check(Instant::now() < deadline, "coordinator did not exit")?;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    check(
+        std::fs::read_dir(&game)
+            .ctx("unmounted folder")?
+            .next()
+            .is_none(),
+        "the store is unmounted before the coordinator exits",
+    )?;
+    let mut service = start(&home)?;
+    let snapshot = request(&home, Request::Snapshot)?;
+    check_eq(snapshot.packs.len(), 1, "the install is still recorded")?;
+    check_eq(
+        std::fs::read(game.join("data")).ctx("remounted after restart")?,
+        b"base".to_vec(),
+        "the next coordinator mounts the store again",
     )?;
     std::fs::write(game.join("data"), b"launcher update").ctx("mounted update")?;
     service.stop()?;
@@ -175,8 +263,8 @@ fn managed_pack_remounts_after_coordinator_restart_and_keeps_updates() -> TestRe
         refused
             .as_ref()
             .err()
-            .is_some_and(|error| error.contains("Reclaim the retained original")),
-        format!("compaction waits for the original to be reclaimed: {refused:?}"),
+            .is_some_and(|error| error.contains("Delete the original before folding in updates")),
+        format!("folding in updates waits for the original to be deleted: {refused:?}"),
     )?;
     request(
         &home,
@@ -273,12 +361,7 @@ fn managed_pack_remounts_after_coordinator_restart_and_keeps_updates() -> TestRe
 #[test]
 fn native_worker_reuses_receipts_and_reprocesses_a_changed_file() -> TestResult {
     let temp = tempfile::TempDir::new_in(std::env::current_dir().ctx("cwd")?).ctx("fixture")?;
-    if flummox::fsprobe::probe(temp.path())
-        .ctx("filesystem")?
-        .fstype
-        != "btrfs"
-    {
-        eprintln!("skipped: native worker round trip requires btrfs");
+    if !on_btrfs(temp.path(), "native worker round trip")? {
         return Ok(());
     }
     let home = temp.path().join("home");
@@ -318,6 +401,7 @@ fn native_worker_reuses_receipts_and_reprocesses_a_changed_file() -> TestResult 
         state: InstallState::Idle,
         is_tool: false,
     };
+    let mut levels = Vec::new();
     for (iteration, expected) in [(0, 1), (1, 0), (2, 1)] {
         if iteration == 2 {
             data.push(b'B');
@@ -355,7 +439,21 @@ fn native_worker_reuses_receipts_and_reprocesses_a_changed_file() -> TestResult 
             data.clone(),
             "all original bytes remain playable",
         )?;
+        let history =
+            flummox::db::Db::open(&home.join("state/flummox/state.sqlite")).ctx("open history")?;
+        levels.push(
+            history
+                .game(&game.id)
+                .ctx("read history")?
+                .ctx("game recorded")?
+                .level,
+        );
     }
+    check_eq(
+        levels.get(1),
+        levels.first(),
+        "a pass with nothing to do keeps the level the first pass recorded",
+    )?;
     for (operation, expected_files, should_be_compressed) in [
         (Operation::Decompress, 1, false),
         (Operation::Decompress, 0, false),
@@ -400,12 +498,7 @@ fn native_worker_reuses_receipts_and_reprocesses_a_changed_file() -> TestResult 
 #[test]
 fn a_compress_worker_reports_its_totals_once() -> TestResult {
     let temp = tempfile::TempDir::new_in(std::env::current_dir().ctx("cwd")?).ctx("fixture")?;
-    if flummox::fsprobe::probe(temp.path())
-        .ctx("filesystem")?
-        .fstype
-        != "btrfs"
-    {
-        eprintln!("skipped: worker progress requires btrfs");
+    if !on_btrfs(temp.path(), "worker progress")? {
         return Ok(());
     }
     let home = temp.path().join("home");
@@ -518,19 +611,14 @@ fn a_compress_worker_reports_its_totals_once() -> TestResult {
 #[test]
 fn analysis_scales_in_the_files_its_budget_did_not_reach() -> TestResult {
     let temp = tempfile::TempDir::new_in(std::env::current_dir().ctx("cwd")?).ctx("fixture")?;
-    if flummox::fsprobe::probe(temp.path())
-        .ctx("filesystem")?
-        .fstype
-        != "btrfs"
-    {
-        eprintln!("skipped: analysis scaling requires btrfs");
+    if !on_btrfs(temp.path(), "analysis scaling")? {
         return Ok(());
     }
     let home = temp.path().join("home");
     let path = temp.path().join("game");
     std::fs::create_dir_all(&home).ctx("fixture home")?;
     std::fs::create_dir_all(&path).ctx("fixture game")?;
-    // Analysis samples at most 1 MiB from a file and 32 MiB in all, so 48
+    // Analysis samples at most 2 MiB from a file and 32 MiB in all, so 48
     // files of this size leave a third of the game unsampled.
     let chunk = b"analysis fixture payload line\n".repeat(40_000);
     let anchor = flummox::safeio::Anchor::open(&path).ctx("anchor")?;
@@ -583,12 +671,7 @@ fn analysis_scales_in_the_files_its_budget_did_not_reach() -> TestResult {
 #[test]
 fn user_pause_holds_a_queued_job_and_resume_completes_it() -> TestResult {
     let temp = tempfile::TempDir::new_in(std::env::current_dir().ctx("cwd")?).ctx("fixture")?;
-    if flummox::fsprobe::probe(temp.path())
-        .ctx("filesystem")?
-        .fstype
-        != "btrfs"
-    {
-        eprintln!("skipped: pause round trip requires btrfs");
+    if !on_btrfs(temp.path(), "pause round trip")? {
         return Ok(());
     }
     let home = temp.path().join("home");
@@ -921,6 +1004,7 @@ fn automatic_storage_rejects_a_mismatched_qualification_before_creation() -> Tes
             random_read_p95_ns: None,
         },
         flummox_version: env!("CARGO_PKG_VERSION").into(),
+        flummox_commit: None,
     };
     let store = temp.path().join("storage/game.store");
     let snapshot = request(
@@ -941,8 +1025,9 @@ fn automatic_storage_rejects_a_mismatched_qualification_before_creation() -> Tes
         "mismatched corpus does not activate",
     )?;
     check(
-        job.message.contains("Compatibility no longer matches"),
-        format!("clear qualification error: {}", job.message),
+        job.message
+            .contains("The compatibility report no longer matches"),
+        format!("clear compatibility report error: {}", job.message),
     )?;
     check(
         !store.exists(),
@@ -1121,7 +1206,7 @@ fn other_version_coordinator(
             let error = if restart {
                 serde_json::Value::Null
             } else {
-                "Worker protocol changed. Restart Flummox.".into()
+                "The background worker is from another version. Restart Flummox.".into()
             };
             if restart {
                 std::fs::remove_file(&socket).ctx("remove socket")?;
@@ -1192,6 +1277,134 @@ fn an_older_idle_coordinator_is_replaced_and_a_newer_one_is_left_alone() -> Test
     check(
         String::from_utf8_lossy(&output.stderr).contains("newer Flummox"),
         format!("the error names the cause: {:?}", output),
+    )
+}
+
+#[test]
+fn a_batch_request_queues_the_valid_items_and_lists_the_refused_ones() -> TestResult {
+    let temp = tempfile::tempdir().ctx("fixture")?;
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).ctx("home")?;
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    std::fs::create_dir(&first).ctx("first game")?;
+    std::fs::create_dir(&second).ctx("second game")?;
+    let _service = start(&home)?;
+    let options = serde_json::to_value(flummox::backend::CompressOpts::default()).ctx("options")?;
+    let item = |game: Game| serde_json::json!([game, "Analyze", options]);
+    let mut relative = fixture_game(&first, "relative");
+    relative.install_dir = "not/absolute".into();
+    // The raw request below is sent once. `request` waits out the replies a
+    // worker gives while it starts.
+    request(&home, Request::Snapshot).ctx("the worker has started")?;
+    let reply = {
+        let socket = home.join("state/flummox/desktop/control.sock");
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            if let Ok(stream) = UnixStream::connect(&socket) {
+                break stream;
+            }
+            check(Instant::now() < until, "coordinator did not listen")?;
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .ctx("timeout")?;
+        serde_json::to_writer(
+            &mut stream,
+            &serde_json::json!({
+                "version": flummox::jobs::VERSION,
+                "command": {"EnqueueMany": {"items": [
+                    item(fixture_game(&first, "first")),
+                    item(relative),
+                    item(fixture_game(&second, "second")),
+                ]}}
+            }),
+        )
+        .ctx("request")?;
+        stream.write_all(b"\n").ctx("delimiter")?;
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).ctx("reply")?;
+        serde_json::from_str::<serde_json::Value>(&line).ctx("reply JSON")?
+    };
+    check(
+        reply.get("error").is_some_and(serde_json::Value::is_null),
+        format!("the batch itself succeeds: {reply}"),
+    )?;
+    let refused = reply.get("refused").and_then(serde_json::Value::as_array);
+    check_eq(refused.map(Vec::len), Some(1), "one item is refused")?;
+    check_eq(
+        refused
+            .and_then(|list| list.first())
+            .and_then(|item| item.get("title"))
+            .and_then(serde_json::Value::as_str),
+        Some("relative"),
+        "the refusal names the game",
+    )?;
+    let snapshot = request(&home, Request::Snapshot)?;
+    let mut titles: Vec<_> = snapshot
+        .jobs
+        .iter()
+        .map(|job| job.game.title.clone())
+        .collect();
+    titles.sort();
+    check_eq(
+        titles,
+        vec!["first".to_string(), "second".to_string()],
+        "both valid items are queued around the refused one",
+    )
+}
+
+#[test]
+fn a_client_retries_while_the_coordinator_is_starting() -> TestResult {
+    let temp = tempfile::tempdir().ctx("fixture")?;
+    let home = temp.path().join("home");
+    let dir = home.join("state/flummox/desktop");
+    std::fs::create_dir_all(&dir).ctx("state folder")?;
+    let listener = std::os::unix::net::UnixListener::bind(dir.join("control.sock")).ctx("bind")?;
+    let snapshot = serde_json::to_value(Snapshot::default()).ctx("snapshot")?;
+    let server = std::thread::spawn(move || -> Result<usize, String> {
+        let mut starting = 0;
+        loop {
+            let (mut stream, _) = listener.accept().ctx("accept")?;
+            let mut line = String::new();
+            BufReader::new(&stream)
+                .read_line(&mut line)
+                .ctx("request")?;
+            // Two replies that say the worker is starting, then a real one.
+            let reply = if starting < 2 {
+                starting += 1;
+                serde_json::json!({
+                    "version": flummox::jobs::VERSION,
+                    "snapshot": null,
+                    "error": "The background worker is starting…",
+                })
+            } else {
+                serde_json::json!({
+                    "version": flummox::jobs::VERSION,
+                    "snapshot": snapshot,
+                    "error": null,
+                })
+            };
+            serde_json::to_writer(&mut stream, &reply).ctx("reply")?;
+            stream.write_all(b"\n").ctx("newline")?;
+            if starting >= 2 {
+                return Ok(starting);
+            }
+        }
+    });
+    let output = jobs_command(&home, &["--json", "jobs"])?;
+    check(
+        output.status.success(),
+        format!(
+            "the command waits out the start-up replies: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )?;
+    check_eq(
+        server.join().map_err(|_| "server thread")??,
+        2,
+        "the client asked again after each reply that said the worker was starting",
     )
 }
 
@@ -1275,5 +1488,136 @@ fn custom_locations_persist_discover_games_and_remove_without_deletion() -> Test
         std::fs::read(game_path.join("save.dat")).ctx("save after removal")?,
         b"keep this save".to_vec(),
         "removal preserves files",
+    )
+}
+
+fn analysis_game(root: &Path, key: &str) -> Result<Game, String> {
+    let path = root.join(key);
+    std::fs::create_dir_all(&path).ctx("fixture game")?;
+    std::fs::write(
+        path.join("data.bin"),
+        b"lock fixture payload\n".repeat(20_000),
+    )
+    .ctx("fixture payload")?;
+    Ok(fixture_game(&path, key))
+}
+
+#[test]
+fn a_busy_operation_lock_delays_a_job_and_never_fails_it() -> TestResult {
+    let temp = tempfile::tempdir().ctx("fixture")?;
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).ctx("home")?;
+    let _service = start(&home)?;
+    request(&home, Request::Snapshot)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(home.join("state/flummox/desktop/operation.lock"))
+        .ctx("open operation.lock")?;
+    lock.lock().ctx("hold the lock like a long CLI run")?;
+    let first = request(
+        &home,
+        Request::Enqueue {
+            game: analysis_game(temp.path(), "first")?,
+            operation: Operation::Analyze,
+            options: Default::default(),
+        },
+    )?;
+    let first = first.jobs.last().ctx("first job")?.id;
+    // Longer than the worker waits for the lock, so the job gives up once.
+    let until = Instant::now() + Duration::from_secs(13);
+    while Instant::now() < until {
+        let job = finished_or_active(&home, first)?;
+        check(
+            job.phase != Phase::Failed,
+            format!("a busy lock must not fail the job: {job:?}"),
+        )?;
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    drop(lock);
+    let job = finished(&home, first)?;
+    check_eq(
+        job.phase,
+        Phase::Completed,
+        format!("the job runs once the lock is free: {job:?}"),
+    )?;
+    // Two jobs one after the other: the second starts while the first
+    // worker is still tearing down.
+    let second = analysis_game(temp.path(), "second")?;
+    let third = analysis_game(temp.path(), "third")?;
+    let mut ids = Vec::new();
+    for game in [second, third] {
+        let snapshot = request(
+            &home,
+            Request::Enqueue {
+                game,
+                operation: Operation::Analyze,
+                options: Default::default(),
+            },
+        )?;
+        ids.push(snapshot.jobs.last().ctx("queued")?.id);
+    }
+    for id in ids {
+        let job = finished(&home, id)?;
+        check_eq(
+            job.phase,
+            Phase::Completed,
+            format!("back-to-back jobs both complete: {job:?}"),
+        )?;
+    }
+    Ok(())
+}
+
+fn finished_or_active(home: &Path, id: i64) -> Result<flummox::jobs::Job, String> {
+    request(home, Request::Snapshot)?
+        .jobs
+        .into_iter()
+        .find(|job| job.id == id)
+        .ctx("job in snapshot")
+}
+
+#[test]
+fn unreadable_saved_rows_do_not_stop_the_coordinator_starting() -> TestResult {
+    let temp = tempfile::tempdir().ctx("fixture")?;
+    let home = temp.path().join("home");
+    let desktop = home.join("state/flummox/desktop");
+    std::fs::create_dir_all(&desktop).ctx("state folder")?;
+    let db = rusqlite::Connection::open(desktop.join("queue.sqlite")).ctx("seed database")?;
+    db.execute_batch(
+        "CREATE TABLE queue(id INTEGER PRIMARY KEY, data TEXT NOT NULL);
+         CREATE TABLE settings(id INTEGER PRIMARY KEY, data TEXT NOT NULL);
+         CREATE TABLE receipts(game TEXT NOT NULL, path TEXT NOT NULL, policy TEXT NOT NULL, entry TEXT NOT NULL, PRIMARY KEY(game,path));
+         INSERT INTO queue VALUES(1, 'not a job');
+         INSERT INTO settings VALUES(2, 'not observations');
+         INSERT INTO settings VALUES(7, 'not upkeep');",
+    )
+    .ctx("damaged rows")?;
+    drop(db);
+    let _service = start(&home)?;
+    let snapshot = request(&home, Request::Snapshot)?;
+    check(snapshot.jobs.is_empty(), "the damaged job is skipped")
+}
+
+#[test]
+fn an_argument_that_is_not_utf8_is_left_to_the_parser() -> TestResult {
+    use std::os::unix::ffi::OsStrExt;
+    let temp = tempfile::tempdir().ctx("fixture")?;
+    let output = Command::new(env!("CARGO_BIN_EXE_flummox"))
+        .arg(std::ffi::OsStr::from_bytes(b"\xff\xfe"))
+        .env("HOME", temp.path())
+        .env("XDG_STATE_HOME", temp.path().join("state"))
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
+        .output()
+        .ctx("run flummox")?;
+    let errors = String::from_utf8_lossy(&output.stderr).into_owned();
+    check(
+        !errors.contains("panicked") && output.status.code() != Some(101),
+        format!("the process must not panic: {:?} {errors}", output.status),
+    )?;
+    check(
+        !output.status.success(),
+        "control: the parser still rejects it",
     )
 }

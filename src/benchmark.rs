@@ -355,13 +355,7 @@ pub fn run(root: &Path, budget_mib: u64, cancel: &AtomicBool) -> Result<Report> 
                 break;
             }
             let length = left.min(FRAME as u64) as usize;
-            // One sample is taken from the middle of the file. Several are
-            // spaced evenly from the first byte towards the last.
-            let offset = if samples <= 1 {
-                (entry.size.saturating_sub(length as u64)) / 2
-            } else {
-                entry.size.saturating_sub(length as u64) / (samples - 1) * index
-            };
+            let offset = window_offset(index, samples, entry.size, total, length as u64);
             file.seek(SeekFrom::Start(offset))?;
             let mut bytes = vec![0; length];
             file.read_exact(&mut bytes)?;
@@ -383,10 +377,58 @@ pub fn run(root: &Path, budget_mib: u64, cancel: &AtomicBool) -> Result<Report> 
     Ok(report)
 }
 
+/// Start of sample `index` of `samples`, `length` bytes long, in a file of
+/// `size` bytes of which `total` are to be read.
+///
+/// When `total` covers the file the samples are consecutive frames and tile it
+/// exactly. Otherwise each sample is a distinct whole frame, spread evenly, so
+/// none overlaps another. A single sample comes from the middle.
+fn window_offset(index: u64, samples: u64, size: u64, total: u64, length: u64) -> u64 {
+    let frame = FRAME as u64;
+    let last_start = size.saturating_sub(length);
+    if total >= size {
+        return index.saturating_mul(frame).min(last_start);
+    }
+    if samples <= 1 {
+        return last_start / 2;
+    }
+    let slots = (size / frame).max(1);
+    (index.saturating_mul(slots) / samples)
+        .saturating_mul(frame)
+        .min(last_start)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::{Ctx, TestResult, check, check_eq};
+
+    #[test]
+    fn sample_windows_tile_a_file_that_fits_and_never_overlap_otherwise() -> TestResult {
+        let frame = FRAME as u64;
+        let size = 9 * 1024 * 1024;
+        let starts: Vec<u64> = (0..3)
+            .map(|i| window_offset(i, 3, size, size, frame.min(size - i * frame)))
+            .collect();
+        check_eq(
+            starts,
+            vec![0, frame, 2 * frame],
+            "a file within its budget is read once, end to end",
+        )?;
+        // Over budget: four of eleven frames, with a half-frame tail.
+        let size = 10 * frame + frame / 2;
+        let mut last_end = 0;
+        for i in 0..4 {
+            let start = window_offset(i, 4, size, 4 * frame, frame);
+            check(start >= last_end, format!("window {i} overlaps the last"))?;
+            check(start + frame <= size, "a window ends inside the file")?;
+            last_end = start + frame;
+        }
+        check(
+            window_offset(3, 4, size, 4 * frame, frame) >= 6 * frame,
+            "the last window is in the back of the file",
+        )
+    }
 
     fn candidate() -> Candidate {
         Candidate {

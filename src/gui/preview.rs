@@ -1,7 +1,7 @@
 //! Render fixture desktop states without a window or a game library.
 
 use super::{
-    app::{GameRow, Page, State},
+    app::{Filter, GameRow, Page, State, Status},
     view,
 };
 use crate::{
@@ -170,7 +170,7 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
             }))
             .ctx("store summary")?,
             phase: crate::pack::InstallPhase::Mounted,
-            message: "Writable compressed install is mounted".into(),
+            message: "Using Maximum.".into(),
         });
     }
     for row in [native, flat, unknown, kept, confirmed] {
@@ -210,6 +210,7 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
     let open = state.expanded.take();
     state.page = Page::Games;
     render(&state, 1100, 900, &output.join("games-groups.png"))?;
+    render(&state, 720, 900, &output.join("games-groups-narrow.png"))?;
     state.show_low = true;
     render(&state, 1100, 1000, &output.join("games-groups-all.png"))?;
     state.show_low = false;
@@ -240,7 +241,7 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
                 },
                 additional: 4_000_000_000,
                 headroom: 200_000_000,
-                reasons: vec!["Verified store; original retained".into()],
+                reasons: vec!["Store checked; original kept".into()],
             }],
         },
     ));
@@ -249,7 +250,7 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
     state.page = Page::Recovery;
     if let Some(job) = state.snapshot.jobs.first_mut() {
         job.phase = Phase::Interrupted;
-        job.message = "Worker stopped; original retained".into();
+        job.message = "The background worker stopped; original kept.".into();
     }
     render(&state, 1100, 720, &output.join("recovery.png"))?;
     state.page = Page::Games;
@@ -267,11 +268,11 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
     // step that offers no pause or cancel and reports no totals.
     state.snapshot.jobs.push(Job {
         id: 2,
-        game,
+        game: game.clone(),
         operation: Operation::Pack,
         pack: Some(PackTask::Compact),
         phase: Phase::Running,
-        message: "Building Maximum Space store".into(),
+        message: "Folding in updates".into(),
         files_done: 30,
         bytes_done: 800_000_000,
         files_total: 140,
@@ -350,6 +351,213 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
     }
     render(&state, 1100, 1800, &output.join("jobs-phases.png"))?;
     render(&state, 720, 1800, &output.join("jobs-phases-narrow.png"))?;
-    state.connection_error = Some("Worker disconnected; reconnecting".into());
-    render(&state, 1100, 1800, &output.join("jobs-disconnected.png"))
+    state.connection_error = Some("Background worker disconnected".into());
+    render(&state, 1100, 1800, &output.join("jobs-disconnected.png"))?;
+    state.connection_error = None;
+
+    // Notices and failures that sit over or inside the pages: a toast of each
+    // kind, the scan banner, a failed job with its errors, and the storage
+    // plan that failed its check.
+    state.page = Page::Overview;
+    state.show_status(Status::info(
+        "Diagnostics saved to /home/player/.local/share/flummox/diagnostics.json. They include local folder paths.",
+    ));
+    render(&state, 1100, 720, &output.join("toast.png"))?;
+    state.show_status(Status::error(
+        "This game is excluded. Include it in Settings, under Locations, first.",
+    ));
+    render(&state, 720, 720, &output.join("toast-error-narrow.png"))?;
+    state.toast.status = None;
+    state.toast.deadline = None;
+    state.page = Page::Games;
+    state.expanded = None;
+    state.snapshot.scan_source = Some("Steam".into());
+    render(&state, 1100, 720, &output.join("scan-banner.png"))?;
+    state.snapshot.scan_source = None;
+    if let Some(job) = state.snapshot.jobs.iter_mut().find(|job| job.id == 6) {
+        job.errors = vec![
+            "Could not rewrite data/pak1.pak: the file is in use".into(),
+            "Could not rewrite data/pak2.pak: permission denied".into(),
+        ];
+    }
+    // A job that failed outright, and one the coordinator lost.
+    let template = state
+        .snapshot
+        .jobs
+        .iter()
+        .find(|job| job.id == 6)
+        .cloned()
+        .ctx("fixture partial job")?;
+    for (id, title, phase) in [
+        (8, "Platformer", Phase::Failed),
+        (9, "Roguelike", Phase::Interrupted),
+    ] {
+        state.snapshot.jobs.push(Job {
+            id,
+            game: Game {
+                id: GameId::new(Launcher::Manual, format!("fixture-{id}")),
+                title: title.into(),
+                ..template.game.clone()
+            },
+            phase,
+            message: "The worker stopped before finishing".into(),
+            errors: vec!["Could not read data/level1.pak: input/output error".into()],
+            ..template.clone()
+        });
+    }
+    state.page = Page::Queue;
+    render(&state, 1100, 1800, &output.join("jobs-errors.png"))?;
+    state.snapshot.jobs.retain(|job| job.id < 8);
+    state.page = Page::Games;
+    // Selection bar, and the bar that offers to sort again.
+    state.selected.insert("manual:native".into());
+    render(&state, 1100, 720, &output.join("games-selection.png"))?;
+    state.order_stale = true;
+    render(&state, 1100, 720, &output.join("games-stale-order.png"))?;
+    state.selected.clear();
+    state.order_stale = false;
+    // A compatibility hash in progress disables its button.
+    state.expanded = Some(game.id.to_string());
+    state.qualifying = true;
+    render(&state, 1100, 1250, &output.join("games-qualifying.png"))?;
+    state.qualifying = false;
+    state.expanded = None;
+    // The three reasons the list can be empty.
+    state.query = "no such game".into();
+    render(&state, 1100, 720, &output.join("games-empty-search.png"))?;
+    state.query.clear();
+    state.filter = Filter::Compressed;
+    state.drive_filter = Some("/nonexistent".into());
+    render(
+        &state,
+        720,
+        720,
+        &output.join("games-empty-filters-narrow.png"),
+    )?;
+    state.filter = Filter::All;
+    state.drive_filter = None;
+    let rows = std::mem::take(&mut state.games);
+    render(&state, 1100, 720, &output.join("games-empty-library.png"))?;
+    state.scanning = true;
+    render(&state, 1100, 720, &output.join("games-empty-scanning.png"))?;
+    state.scanning = false;
+    state.games = rows;
+    // A plan that failed its check shows what is short, and checks again.
+    state.planned = Some((
+        crate::jobs::Command::Enqueue {
+            game: game.clone(),
+            operation: Operation::Compress,
+            options: Default::default(),
+        },
+        crate::storage::SpacePlan {
+            retained_original: false,
+            requirements: vec![crate::storage::Requirement {
+                volume: crate::storage::Volume {
+                    identity: "fixture".into(),
+                    path: "/Games".into(),
+                    available: 1_200_000_000,
+                },
+                additional: 4_000_000_000,
+                headroom: 200_000_000,
+                reasons: vec!["Compression rewrites each file once".into()],
+            }],
+        },
+    ));
+    render(&state, 1100, 720, &output.join("space-plan-short.png"))?;
+    state.planned = None;
+    // Warnings from the scan, with the attention count.
+    state.warnings = vec![
+        "Artwork preferences unavailable: permission denied".into(),
+        "History is unavailable: database is locked".into(),
+    ];
+    state.page = Page::Overview;
+    render(&state, 1100, 900, &output.join("overview-warnings.png"))
+}
+
+/// A toast or the scan banner changes which widgets the window holds. The
+/// page keeps its scroll offset through both.
+#[test]
+fn a_toast_or_scan_banner_leaves_the_page_where_it_was_scrolled() -> TestResult {
+    use iced::advanced::{Layout, layout, widget::Tree};
+    let temp = tempfile::tempdir().ctx("scroll fixture")?;
+    let mut state = State::new(Env::from_home(temp.path()));
+    state.reduced_motion = true;
+    state.page = Page::Games;
+    for number in 0..30 {
+        state.games.push(GameRow {
+            game: Game {
+                id: GameId::new(Launcher::Manual, format!("game-{number}")),
+                also: vec![],
+                title: format!("Game {number}"),
+                install_dir: temp.path().join(format!("game-{number}")),
+                state: InstallState::Idle,
+                size_hint: Some(1_000_000_000),
+                build: Some("1".into()),
+                is_tool: false,
+            },
+            filesystem: "btrfs".into(),
+            mountpoint: Some(temp.path().to_path_buf()),
+            supported: true,
+            native_supported: true,
+            pack_supported: false,
+            note: None,
+            artwork: None,
+            cover: None,
+        });
+    }
+    let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
+        super::theme::BODY_FONT,
+        iced::Pixels(16.0),
+    ));
+    let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(1100.0, 720.0));
+    // Lays the window out against the same widget tree and reads the page's
+    // offset, scrolling to `scroll_to` first when one is given.
+    let offset = |state: &State, tree: &mut Option<Tree>, scroll_to: Option<f32>| {
+        let mut element = view::view(state);
+        let tree = match tree {
+            Some(tree) => {
+                tree.diff(element.as_widget());
+                tree
+            }
+            None => tree.insert(Tree::new(element.as_widget())),
+        };
+        let node = element.as_widget_mut().layout(tree, &renderer, &limits);
+        if let Some(y) = scroll_to {
+            let mut scroll = iced::advanced::widget::operation::scrollable::scroll_to::<()>(
+                iced::widget::Id::new("Games"),
+                iced::widget::operation::AbsoluteOffset {
+                    x: None,
+                    y: Some(y),
+                },
+            );
+            element
+                .as_widget_mut()
+                .operate(tree, Layout::new(&node), &renderer, &mut scroll);
+        }
+        super::surface::offset(&mut element, tree, Layout::new(&node), &renderer)
+    };
+    let mut tree = None;
+    crate::testutil::check_eq(
+        offset(&state, &mut tree, Some(300.0)),
+        Some(300.0),
+        "control: the page scrolls to where it is sent",
+    )?;
+    state.show_status(super::app::Status::info("Saved"));
+    crate::testutil::check_eq(
+        offset(&state, &mut tree, None),
+        Some(300.0),
+        "a toast appearing keeps the offset",
+    )?;
+    state.toast.status = None;
+    crate::testutil::check_eq(
+        offset(&state, &mut tree, None),
+        Some(300.0),
+        "a toast leaving keeps the offset",
+    )?;
+    state.snapshot.scan_source = Some("Steam".into());
+    crate::testutil::check_eq(
+        offset(&state, &mut tree, None),
+        Some(300.0),
+        "the scan banner appearing keeps the offset",
+    )
 }

@@ -96,12 +96,22 @@ pub fn save_override(game: String, path: PathBuf) -> Result<()> {
     let mut items = overrides()?;
     items.retain(|item| item.game != game);
     items.push(Override { game, path });
-    // Write a temporary file in the same directory and rename it over the
-    // old one, so a reader never sees a partial list.
+    write_overrides(&items)
+}
+/// Removes the saved image for a game, so it goes back to its default
+/// artwork. Blocks on file I/O.
+pub fn clear_override(game: &str) -> Result<()> {
+    let mut items = overrides()?;
+    items.retain(|item| item.game != game);
+    write_overrides(&items)
+}
+/// Writes the list through a temporary file in the same directory, renamed
+/// over the old one, so a reader never sees a partial list.
+fn write_overrides(items: &[Override]) -> Result<()> {
     let root = crate::libraries::data_dir()?;
     crate::libraries::private_dir(&root)?;
     let mut file = tempfile::NamedTempFile::new_in(&root)?;
-    serde_json::to_writer(&mut file, &items)?;
+    serde_json::to_writer(&mut file, items)?;
     file.flush()?;
     file.as_file().sync_all()?;
     file.persist(root.join("artwork.json"))?;
@@ -270,14 +280,13 @@ impl Cache {
             })
     }
     /// Queues `source` for decoding unless it is cached, in flight or queued.
+    /// The newest request goes first, since it is the one on screen now.
     pub fn request(&mut self, source: Source) {
-        if self.entries.iter().any(|(key, _)| *key == source)
-            || self.pending.contains(&source)
-            || self.waiting.contains(&source)
-        {
+        if self.entries.iter().any(|(key, _)| *key == source) || self.pending.contains(&source) {
             return;
         }
-        self.waiting.push_back(source);
+        self.waiting.retain(|queued| *queued != source);
+        self.waiting.push_front(source);
     }
     /// Takes the next source to decode, or `None` while two are in flight.
     /// The caller must report each one back through `loaded`.
@@ -369,5 +378,27 @@ mod tests {
             cache.loaded(key, None);
         }
         check_eq(cache.entries.len(), 256, "cache remains bounded")
+    }
+
+    #[test]
+    fn the_newest_request_is_decoded_first() -> TestResult {
+        let source = |bytes: u64| Source {
+            path: "/fixture/art.png".into(),
+            modified: None,
+            bytes,
+            edge: 52,
+        };
+        let mut cache = Cache::default();
+        for number in 1..=4 {
+            cache.request(source(number));
+        }
+        // A request seen again moves to the front, so a row scrolled back
+        // into view is not queued behind everything that came after it.
+        cache.request(source(1));
+        let first = cache.next().ctx("first decode")?;
+        let second = cache.next().ctx("second decode")?;
+        check_eq(first.bytes, 1, "the row just shown goes first")?;
+        check_eq(second.bytes, 4, "then the next newest")?;
+        check(cache.next().is_none(), "two at a time")
     }
 }

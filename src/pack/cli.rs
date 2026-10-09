@@ -1,13 +1,13 @@
 //! Explicit commands for verified Maximum Space stores.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Subcommand;
 use std::{path::PathBuf, sync::atomic::AtomicBool, time::Instant};
 
 // The `///` lines in this enum are the help text clap prints.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Build and verify a new store; keep every source file.
+    /// Create and check a new store; every source file stays.
     Create {
         folder: PathBuf,
         store: PathBuf,
@@ -24,9 +24,9 @@ pub enum Command {
     Info { store: PathBuf },
     /// Verify every unique chunk, including data not read during play.
     Verify { store: PathBuf },
-    /// Restore files to a new folder, refusing to replace existing data.
+    /// Decompress a store to a new folder, refusing to replace existing data.
     Restore { store: PathBuf, folder: PathBuf },
-    /// Merge a stopped writable layer into a new verified store.
+    /// Fold a stopped update layer into a new checked store.
     Commit {
         store: PathBuf,
         writes: PathBuf,
@@ -60,7 +60,7 @@ pub enum Command {
         #[arg(long)]
         writes: Option<PathBuf>,
     },
-    /// Put a writable store at an existing launcher's game path.
+    /// Switch an installed game to Maximum, keeping the original.
     Activate {
         store: PathBuf,
         folder: PathBuf,
@@ -68,18 +68,26 @@ pub enum Command {
         #[arg(long)]
         writes: Option<PathBuf>,
     },
-    /// Stop using a store and restore ordinary files at the launcher path.
+    /// Stop using a store and decompress to ordinary files.
     Rollback { folder: PathBuf },
-    /// Delete the retained original after testing the activated game.
+    /// Delete the original after testing the game.
     Reclaim { folder: PathBuf },
-    /// Fold launcher updates into a newly verified store while it stays mounted.
+    /// Fold in launcher updates by building a new store while the game stays in use.
     Compact { folder: PathBuf },
-    /// Delete the previous store retained after a successful compaction.
+    /// Delete the previous version kept after folding in updates.
     Prune { folder: PathBuf },
     /// Delete pooled chunks that no game store still references.
     PoolPrune { pool: PathBuf },
-    /// List durable launcher-path activations.
+    /// List the games that use Maximum.
     Installs,
+}
+
+/// Resolves a path against this process's working directory.
+///
+/// The coordinator keeps the working directory of whichever client started
+/// it, so a relative path sent as typed would name a different folder there.
+fn absolute(path: PathBuf) -> Result<PathBuf> {
+    std::path::absolute(&path).with_context(|| format!("resolving {}", path.display()))
 }
 
 // `--maximum` replaces `--level`. clap rejects the two together.
@@ -115,24 +123,24 @@ pub fn run(command: Command, json: bool, cancel: &AtomicBool) -> Result<()> {
                 super::create(&folder, &store, options(level, maximum), cancel)?
             };
             eprintln!(
-                "Store verified. Source folder retained: {}",
+                "Store checked. The source folder stays: {}",
                 folder.display()
             );
             result
         }
         Command::Info { store } => {
-            eprintln!("Index validated. Run pack verify to check every payload.");
+            eprintln!("Index checked. Run pack verify to check every chunk.");
             super::Reader::open(&store)?.summary().clone()
         }
         Command::Verify { store } => {
             let reader = super::Reader::open(&store)?;
             reader.verify(cancel)?;
-            eprintln!("All unique chunks verified.");
+            eprintln!("All chunks checked.");
             reader.summary().clone()
         }
         Command::Restore { store, folder } => {
             let result = super::restore(&store, &folder, cancel)?;
-            eprintln!("Restored to {}", folder.display());
+            eprintln!("Decompressed to {}.", folder.display());
             result
         }
         Command::Commit {
@@ -154,7 +162,7 @@ pub fn run(command: Command, json: bool, cancel: &AtomicBool) -> Result<()> {
                     cancel,
                 )?;
                 eprintln!(
-                    "Replacement store verified at {}. The old store and update layer were retained.",
+                    "New store checked at {}. The old store and update layer are kept.",
                     new_store.display()
                 );
                 result
@@ -162,7 +170,9 @@ pub fn run(command: Command, json: bool, cancel: &AtomicBool) -> Result<()> {
             #[cfg(not(feature = "pack-mount"))]
             {
                 let _paths = (store, writes, new_store, scratch_dir, level, maximum);
-                anyhow::bail!("Build Flummox with --features pack-mount to commit updates");
+                anyhow::bail!(
+                    "This build of Flummox cannot fold in updates. Use a build with the pack-mount feature."
+                );
             }
         }
         Command::Benchmark {
@@ -299,7 +309,9 @@ pub fn run(command: Command, json: bool, cancel: &AtomicBool) -> Result<()> {
             #[cfg(not(feature = "pack-mount"))]
             {
                 let _paths = (store, folder, writes);
-                anyhow::bail!("Build Flummox with --features pack-mount to mount a store");
+                anyhow::bail!(
+                    "This build of Flummox cannot mount a store. Use a build with the pack-mount feature."
+                );
             }
         }
         Command::Activate {
@@ -308,11 +320,15 @@ pub fn run(command: Command, json: bool, cancel: &AtomicBool) -> Result<()> {
             writes,
         } => {
             // The default layer is a sibling of the store: its path plus `.writes`.
-            let writes = writes.unwrap_or_else(|| {
-                let mut name = store.as_os_str().to_os_string();
-                name.push(".writes");
-                PathBuf::from(name)
-            });
+            let (store, folder) = (absolute(store)?, absolute(folder)?);
+            let writes = writes.map_or_else(
+                || {
+                    let mut name = store.as_os_str().to_os_string();
+                    name.push(".writes");
+                    Ok(PathBuf::from(name))
+                },
+                absolute,
+            )?;
             let snapshot = crate::jobs::request(crate::jobs::Command::PackActivate {
                 game_path: folder.clone(),
                 store_path: store,
@@ -329,40 +345,43 @@ pub fn run(command: Command, json: bool, cancel: &AtomicBool) -> Result<()> {
                 println!("{}", install.message);
                 if let Some(backup) = &install.backup_path {
                     println!(
-                        "Test the game, then run `flummox pack reclaim {}` to free the retained original.",
+                        "Test the game, then run `flummox pack reclaim {}` to delete the original.",
                         install.game_path.display()
                     );
-                    println!("Rollback copy: {}", backup.display());
+                    println!("Original kept at: {}", backup.display());
                 }
             }
             return Ok(());
         }
         Command::Rollback { folder } => {
+            let folder = absolute(folder)?;
             let snapshot = crate::jobs::request(crate::jobs::Command::PackRollback {
                 game_path: folder.clone(),
             })?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&snapshot.packs)?);
             } else {
-                println!("Restored ordinary files at {}.", folder.display());
+                println!("Decompressed to ordinary files at {}.", folder.display());
             }
             return Ok(());
         }
         Command::Reclaim { folder } => {
+            let folder = absolute(folder)?;
             let snapshot = crate::jobs::request(crate::jobs::Command::PackReclaim {
                 game_path: folder.clone(),
             })?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&snapshot.packs)?);
             } else {
-                println!("Reclaimed the retained original for {}.", folder.display());
+                println!("Deleted the original for {}.", folder.display());
                 println!(
-                    "Rollback will reconstruct ordinary files from the store and update layer."
+                    "Decompressing will rebuild ordinary files from the store and its updates."
                 );
             }
             return Ok(());
         }
         Command::Compact { folder } => {
+            let folder = absolute(folder)?;
             let snapshot = crate::jobs::request(crate::jobs::Command::PackCompact {
                 game_path: folder.clone(),
             })?;
@@ -373,11 +392,11 @@ pub fn run(command: Command, json: bool, cancel: &AtomicBool) -> Result<()> {
                 .iter()
                 .find(|install| install.game_path == folder || install.game_path.ends_with(&folder))
             {
-                println!("Compacted updates for {}.", install.game_path.display());
+                println!("Folded in updates for {}.", install.game_path.display());
                 if let Some(previous) = &install.previous_store_path {
-                    println!("Previous store retained at {}.", previous.display());
+                    println!("Previous version kept at {}.", previous.display());
                     println!(
-                        "After testing the game, run `flummox pack prune {}` to reclaim it.",
+                        "After testing the game, run `flummox pack prune {}` to delete it.",
                         install.game_path.display()
                     );
                 }
@@ -385,16 +404,14 @@ pub fn run(command: Command, json: bool, cancel: &AtomicBool) -> Result<()> {
             return Ok(());
         }
         Command::Prune { folder } => {
+            let folder = absolute(folder)?;
             let snapshot = crate::jobs::request(crate::jobs::Command::PackPrune {
                 game_path: folder.clone(),
             })?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&snapshot.packs)?);
             } else {
-                println!(
-                    "Reclaimed the previous compacted version for {}.",
-                    folder.display()
-                );
+                println!("Deleted the previous version for {}.", folder.display());
             }
             return Ok(());
         }
@@ -404,8 +421,9 @@ pub fn run(command: Command, json: bool, cancel: &AtomicBool) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&summary)?);
             } else {
                 println!(
-                    "Removed {} unused pool objects and reclaimed {} bytes.",
-                    summary.objects, summary.reclaimed_bytes
+                    "Removed {} unused pool objects and freed {}.",
+                    summary.objects,
+                    humansize::format_size(summary.reclaimed_bytes, humansize::DECIMAL)
                 );
             }
             return Ok(());
@@ -415,7 +433,7 @@ pub fn run(command: Command, json: bool, cancel: &AtomicBool) -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&snapshot.packs)?);
             } else if snapshot.packs.is_empty() {
-                println!("No activated pack installs.");
+                println!("No games use Maximum.");
             } else {
                 for install in &snapshot.packs {
                     println!(
@@ -469,5 +487,26 @@ fn print(summary: &super::Summary) {
             "{:.2}% retained as serialized store bytes. This is not a drive free-space measurement.",
             summary.archive_bytes as f64 / summary.logical_bytes as f64 * 100.
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{Ctx, TestResult, check, check_eq};
+
+    #[test]
+    fn coordinator_requests_carry_absolute_paths() -> TestResult {
+        let relative = absolute(PathBuf::from("games/Portal")).ctx("relative path")?;
+        check(
+            relative.is_absolute(),
+            "a relative path gains its directory",
+        )?;
+        check(relative.ends_with("games/Portal"), "and keeps its tail")?;
+        check_eq(
+            absolute(PathBuf::from("/mnt/games/Portal")).ctx("absolute path")?,
+            PathBuf::from("/mnt/games/Portal"),
+            "an absolute path is unchanged",
+        )
     }
 }

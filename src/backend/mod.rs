@@ -125,6 +125,14 @@ impl CompressOpts {
             .unwrap_or_else(|| self.preset.level_plan())
     }
 
+    /// The plan's floor, lowered to what this kernel can apply.
+    ///
+    /// Compare recorded levels with this, not with `level_plan().floor()`, or
+    /// a kernel before 6.15 rewrites every file on every pass.
+    pub fn attainable_floor(&self) -> i32 {
+        btrfs::attainable_level(self.level_plan().floor())
+    }
+
     /// The level this job will use on btrfs.
     pub fn btrfs_level(&self) -> i32 {
         self.level.unwrap_or_else(|| self.preset.btrfs_level())
@@ -392,7 +400,7 @@ impl Backend for PackBackend {
     ) -> io::Result<Outcome> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "Maximum Space activation must use the verified pack transaction",
+            "Switching to Maximum must go through the Maximum controls.",
         ))
     }
 
@@ -404,7 +412,7 @@ impl Backend for PackBackend {
     ) -> io::Result<Outcome> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "Restore this game through its Maximum Space controls",
+            "Decompress this game through its Maximum controls.",
         ))
     }
 
@@ -668,7 +676,7 @@ impl std::fmt::Display for Preset {
         f.write_str(match self {
             Self::Fast => "Fast",
             Self::Balanced => "Balanced",
-            Self::Max => "Maximum",
+            Self::Max => "Max",
         })
     }
 }

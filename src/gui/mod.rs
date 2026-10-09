@@ -9,16 +9,24 @@ mod app;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod artwork;
 #[cfg(target_os = "linux")]
+mod desktop_theme;
+#[cfg(target_os = "linux")]
 mod dialog;
 #[cfg(any(windows, target_os = "macos"))]
 mod native;
+#[cfg(any(windows, target_os = "macos", all(test, target_os = "linux")))]
+mod native_rules;
 #[cfg(all(test, target_os = "linux"))]
 mod preview;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 mod preview_renderer;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+mod icon;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+mod shell;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod surface;
-mod theme;
+pub(crate) mod theme;
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod unsupported;
 #[cfg(target_os = "linux")]
@@ -64,12 +72,14 @@ use anyhow::Context;
 /// an inline closure gets inferred for one specific lifetime instead.
 #[cfg(target_os = "linux")]
 fn theme_of(state: &app::State) -> iced::Theme {
-    let dark = match state.theme {
-        crate::jobs::ThemePreference::System => state.system_theme != iced::theme::Mode::Light,
-        crate::jobs::ThemePreference::Dark => true,
-        crate::jobs::ThemePreference::Light => false,
-    };
-    theme::theme(dark)
+    shell::window_theme(
+        state.system_theme,
+        match state.theme {
+            crate::jobs::ThemePreference::System => None,
+            crate::jobs::ThemePreference::Dark => Some(true),
+            crate::jobs::ThemePreference::Light => Some(false),
+        },
+    )
 }
 
 /// Whether any animation held in the state is still running. Always false
@@ -78,12 +88,9 @@ fn theme_of(state: &app::State) -> iced::Theme {
 fn animation_pending(state: &app::State) -> bool {
     let now = std::time::Instant::now();
     !state.reduced_motion
-        && (state
-            .nav
-            .iter()
-            .any(|(_, animation)| animation.is_animating(now))
+        && (state.nav.animating(now)
             || state.page_reveal.is_animating(now)
-            || state.status_reveal.is_animating(now)
+            || state.toast.animating()
             || state.detail.is_animating(now)
             || state
                 .progress
@@ -101,9 +108,9 @@ fn animation_frames(state: &app::State) -> iced::Subscription<app::Message> {
         || state
             .scroll_redraw_until
             .is_some_and(|until| std::time::Instant::now() < until);
-    // A toast with a deadline also needs frames: `Tick` is what notices the
-    // deadline has passed.
-    let frames = if moving || state.status_deadline.is_some() {
+    // A toast's deadline is a timer started by `update`, not a reason for
+    // frames. Every frame is a message and rebuilds the page.
+    let frames = if moving {
         iced::window::frames().map(|_| app::Message::Tick)
     } else {
         iced::Subscription::none()
@@ -121,26 +128,34 @@ fn animation_frames(state: &app::State) -> iced::Subscription<app::Message> {
     ])
 }
 
+/// The log filter when `RUST_LOG` is not set. The graphics libraries log a
+/// warning for each EGL and Vulkan extension a driver lacks, which says
+/// nothing is wrong, so they are held to errors.
+#[cfg(target_os = "linux")]
+const DEFAULT_LOG_FILTER: &str = "warn,wgpu_hal=error,wgpu_core=error";
+
 /// Opens the window and runs until it closes. Logs go to stderr at `warn`
 /// unless `RUST_LOG` says otherwise.
 #[cfg(target_os = "linux")]
 pub fn run() -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER));
     let _started = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .try_init();
 
     let env = Env::current().context("HOME is not set, so no game library can be found")?;
+    let first_theme = desktop_theme::initial_mode();
 
     // `view::view` is passed as a function item, not wrapped in a closure. A
     // closure's return lifetime is inferred as a fresh one, and `ViewFn`
     // needs it tied to the argument for every lifetime.
-    iced::application(
+    let result = iced::application(
         // The first scan and the desktop theme query start with the window.
         move || {
             let mut state = app::State::new(env.clone());
+            state.system_theme = first_theme;
             let refresh = app::update(&mut state, app::Message::Refresh);
             let system_theme = iced::system::theme().map(app::Message::SystemTheme);
             (state, iced::Task::batch([refresh, system_theme]))
@@ -152,8 +167,15 @@ pub fn run() -> Result<()> {
     .subscription(animation_frames)
     .theme(theme_of)
     .default_font(theme::BODY_FONT)
-    .window_size((1100.0, 720.0))
-    .run()?;
+    .window(iced::window::Settings {
+        size: iced::Size::new(shell::WINDOW_SIZE.0, shell::WINDOW_SIZE.1),
+        min_size: Some(iced::Size::new(shell::MIN_WINDOW.0, shell::MIN_WINDOW.1)),
+        ..iced::window::Settings::default()
+    })
+    .run();
+    // A picker is its own process and outlives the window unless closed.
+    dialog::close_open_picker();
+    result?;
     Ok(())
 }
 
@@ -165,4 +187,23 @@ pub fn run() -> Result<()> {
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn run() -> Result<()> {
     unsupported::run()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::testutil::{TestResult, check};
+
+    #[test]
+    fn the_default_log_filter_quiets_the_graphics_libraries() -> TestResult {
+        let filter = tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER).to_string();
+        check(
+            filter.contains("wgpu_hal=error") && filter.contains("wgpu_core=error"),
+            format!("the probe warnings are held to errors: {filter}"),
+        )?;
+        check(
+            filter.contains("warn"),
+            format!("everything else stays at warn: {filter}"),
+        )
+    }
 }

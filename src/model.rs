@@ -2,7 +2,7 @@
 //! whether they can be touched right now.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -208,6 +208,273 @@ impl Game {
     }
 }
 
+/// Why a launcher-supplied install path must not be treated as one game.
+///
+/// Refuses a relative path, a path with `..`, a filesystem root, the home
+/// directory and every ancestor of it, and on Windows the system folders.
+/// `home` is compared both as given and canonicalized. The path is compared
+/// as given and, when it exists, canonicalized. Touches the filesystem only
+/// to canonicalize.
+pub fn refuse_install_path_with(path: &Path, home: Option<&Path>) -> Result<(), String> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return Err("Install path is not absolute".into());
+    }
+    if path.components().any(|part| part == Component::ParentDir) {
+        return Err("Install path contains `..`".into());
+    }
+    if path.parent().is_none() {
+        return Err("Install path is a filesystem root".into());
+    }
+    let canonical = path.canonicalize().ok();
+    let mut homes: Vec<PathBuf> = Vec::new();
+    if let Some(home) = home {
+        homes.push(home.to_path_buf());
+        if let Ok(real) = home.canonicalize() {
+            homes.push(real);
+        }
+    }
+    for home in &homes {
+        let covers = |candidate: &Path| home.starts_with(candidate);
+        if covers(path) || canonical.as_deref().is_some_and(covers) {
+            return Err("Install path is the home folder or contains it".into());
+        }
+    }
+    if canonical.as_deref().is_some_and(|c| c.parent().is_none()) {
+        return Err("Install path resolves to a filesystem root".into());
+    }
+    #[cfg(windows)]
+    for name in [
+        "SystemRoot",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramData",
+    ] {
+        if let Some(system) = std::env::var_os(name)
+            && Path::new(&system).starts_with(path)
+        {
+            return Err("Install path is a system folder or contains one".into());
+        }
+    }
+    Ok(())
+}
+
+/// [`refuse_install_path_with`] using the current user's home directory.
+pub fn refuse_install_path(path: &Path) -> Result<(), String> {
+    let home =
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+    refuse_install_path_with(path, home.as_deref())
+}
+
+/// Whether two install directories that cannot be resolved on disk name the
+/// same folder. On Windows case, slash direction and a trailing slash do not
+/// matter, so `c:/games/Foo` equals `C:\Games\Foo\`. Elsewhere the spelling
+/// must match.
+pub fn same_install_dir(a: &Path, b: &Path) -> bool {
+    same_install_dir_with(a, b, cfg!(windows))
+}
+
+/// [`same_install_dir`] with the case folding chosen by the caller.
+pub fn same_install_dir_with(a: &Path, b: &Path, fold: bool) -> bool {
+    if !fold {
+        return a == b;
+    }
+    let key = |path: &Path| {
+        path.to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_lowercase()
+    };
+    key(a) == key(b)
+}
+
+/// Marks every `Manual` game that would swallow other games as `Broken`.
+///
+/// A folder is refused when another discovered game lives inside it or when
+/// it holds a `steamapps` directory, since a job on it would rewrite those
+/// games without their launcher state or exclusions.
+pub fn flag_swallowing_games(games: &mut [Game]) {
+    let dirs: Vec<PathBuf> = games.iter().map(|g| g.install_dir.clone()).collect();
+    for game in games.iter_mut() {
+        if game.id.launcher != Launcher::Manual || !game.state.is_idle() {
+            continue;
+        }
+        let holds_games = dirs
+            .iter()
+            .any(|dir| dir != &game.install_dir && dir.starts_with(&game.install_dir));
+        if holds_games || game.install_dir.join("steamapps").is_dir() {
+            game.state = InstallState::Broken {
+                detail: "Folder holds other games or a Steam library; add the games' own folders"
+                    .into(),
+            };
+        }
+    }
+}
+
+/// Steam's `StateFlags` and what they mean, shared by every platform's reader.
+pub mod steam_state {
+    use super::{BusyReason, InstallState};
+    /// `StateFlags` bits from Steam's `EAppState`.
+    pub mod state_flags {
+        /// Not installed.
+        pub const UNINSTALLED: u32 = 1;
+        /// An update is required before the game can run.
+        pub const UPDATE_REQUIRED: u32 = 2;
+        /// Installed and complete.
+        pub const FULLY_INSTALLED: u32 = 4;
+        /// Encrypted.
+        pub const ENCRYPTED: u32 = 8;
+        /// Locked.
+        pub const LOCKED: u32 = 16;
+        /// Files are missing.
+        pub const FILES_MISSING: u32 = 32;
+        /// The game is running.
+        pub const APP_RUNNING: u32 = 64;
+        /// Files are corrupt.
+        pub const FILES_CORRUPT: u32 = 128;
+        /// An update is running.
+        pub const UPDATE_RUNNING: u32 = 256;
+        /// An update is paused.
+        pub const UPDATE_PAUSED: u32 = 512;
+        /// An update has started.
+        pub const UPDATE_STARTED: u32 = 1024;
+        /// Being uninstalled.
+        pub const UNINSTALLING: u32 = 2048;
+        /// A backup is running.
+        pub const BACKUP_RUNNING: u32 = 4096;
+        /// Being reconfigured.
+        pub const RECONFIGURING: u32 = 65536;
+        /// Being validated.
+        pub const VALIDATING: u32 = 131_072;
+        /// Files are being added.
+        pub const ADDING_FILES: u32 = 262_144;
+        /// Space is being preallocated.
+        pub const PREALLOCATING: u32 = 524_288;
+        /// Downloading.
+        pub const DOWNLOADING: u32 = 1_048_576;
+        /// Staging downloaded data.
+        pub const STAGING: u32 = 2_097_152;
+        /// Committing staged data.
+        pub const COMMITTING: u32 = 4_194_304;
+        /// An update is stopping.
+        pub const UPDATE_STOPPING: u32 = 8_388_608;
+    }
+
+    /// Flags that mean Steam is actively working on the files.
+    const WORKING_FLAGS: &[(u32, &str)] = &[
+        (state_flags::UPDATE_RUNNING, "updating"),
+        (state_flags::UPDATE_PAUSED, "update paused"),
+        (state_flags::UPDATE_STARTED, "update starting"),
+        (state_flags::UPDATE_STOPPING, "update stopping"),
+        (state_flags::UNINSTALLING, "uninstalling"),
+        (state_flags::BACKUP_RUNNING, "backing up"),
+        (state_flags::RECONFIGURING, "reconfiguring"),
+        (state_flags::VALIDATING, "validating"),
+        (state_flags::ADDING_FILES, "adding files"),
+        (state_flags::PREALLOCATING, "preallocating"),
+        (state_flags::DOWNLOADING, "downloading"),
+        (state_flags::STAGING, "staging"),
+        (state_flags::COMMITTING, "committing"),
+        (state_flags::LOCKED, "locked"),
+    ];
+
+    /// Whether Steam is still working on an app's files.
+    ///
+    /// Reads the same table the scan reports from, so a bit added there is
+    /// honoured here without a second list to keep in step.
+    pub fn is_working(flags: u32) -> bool {
+        WORKING_FLAGS.iter().any(|(bit, _)| flags & bit != 0)
+    }
+
+    /// Appids that are runtimes or redistributables rather than games.
+    ///
+    /// Compressing these would slow every game's startup for almost no gain, so
+    /// they are excluded unless the user asks for them by id.
+    pub const TOOL_APPIDS: &[u32] = &[
+        228_980,   // Steamworks Common Redistributables
+        1_070_560, // Steam Linux Runtime 1.0 (scout)
+        1_391_110, // Steam Linux Runtime 2.0 (soldier)
+        1_628_350, // Steam Linux Runtime 3.0 (sniper)
+        1_493_710, // Proton Experimental
+        2_180_100, // Proton Hotfix
+        1_826_330, // Proton EasyAntiCheat Runtime
+        1_887_720, // Proton 7.0
+        2_348_590, // Proton 8.0
+        2_805_730, // Proton 9.0
+    ];
+
+    /// Whether an app is a runtime or redistributable rather than a game.
+    ///
+    /// Matches the appid list, then exact name shapes. A game that merely starts
+    /// with "Proton" is not a tool.
+    pub fn is_tool(appid: u32, name: &str) -> bool {
+        if TOOL_APPIDS.contains(&appid) {
+            return true;
+        }
+        if matches!(
+            name,
+            "Proton Experimental"
+                | "Proton Hotfix"
+                | "Proton EasyAntiCheat Runtime"
+                | "Proton BattlEye Runtime"
+                | "Steamworks Common Redistributables"
+        ) {
+            return true;
+        }
+        let versioned = |prefix: &str| {
+            name.strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+        };
+        versioned("Proton ") || versioned("Steam Linux Runtime ")
+    }
+
+    /// Whether Steam left files in `steamapps/{downloading,temp}/<appid>`.
+    ///
+    /// Empty leftovers are normal; content means a transfer is in flight.
+    pub fn staging_in_progress(library: &std::path::Path, appid: u32) -> bool {
+        ["downloading", "temp"].iter().any(|sub| {
+            let dir = library.join("steamapps").join(sub).join(appid.to_string());
+            std::fs::read_dir(&dir).is_ok_and(|mut e| e.next().is_some())
+        })
+    }
+
+    /// The state a group of apps is in, from their combined `StateFlags`.
+    ///
+    /// `transfer` is true when Steam still has bytes to fetch or stage. A running
+    /// app is the caller's concern, since only the caller knows `RunningAppID`.
+    pub fn classify(union: u32, transfer: bool) -> InstallState {
+        if let Some((_, what)) = WORKING_FLAGS.iter().find(|(bit, _)| union & bit != 0) {
+            return InstallState::Busy(BusyReason::LauncherBusy((*what).to_owned()));
+        }
+        if transfer {
+            return InstallState::Busy(BusyReason::LauncherBusy("transfer in progress".to_owned()));
+        }
+        if union & state_flags::FILES_MISSING != 0 {
+            return InstallState::Broken {
+                detail: "files missing".to_owned(),
+            };
+        }
+        if union & state_flags::FILES_CORRUPT != 0 {
+            return InstallState::Broken {
+                detail: "files corrupt".to_owned(),
+            };
+        }
+        if union & state_flags::UPDATE_REQUIRED != 0 {
+            return InstallState::UpdatePending;
+        }
+        if union & state_flags::FULLY_INSTALLED == 0 {
+            return InstallState::Broken {
+                detail: "not fully installed".to_owned(),
+            };
+        }
+        // Steam sometimes leaves the running bit set after a crash.
+        if union & state_flags::APP_RUNNING != 0 {
+            return InstallState::Busy(BusyReason::StaleRunningFlag);
+        }
+        InstallState::Idle
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +557,28 @@ mod tests {
             serde_json::from_str(&json).map_err(|error| error.to_string())?,
             state,
             "broken state round trip",
+        )
+    }
+
+    #[test]
+    fn install_dirs_fold_case_and_slashes_only_when_asked() -> TestResult {
+        let registry = Path::new("c:/program files/Game/");
+        let picked = Path::new("C:\\Program Files\\game");
+        check(
+            same_install_dir_with(registry, picked, true),
+            "spellings of one Windows folder are equal",
+        )?;
+        check(
+            !same_install_dir_with(registry, picked, false),
+            "without folding the spellings differ",
+        )?;
+        check(
+            !same_install_dir_with(Path::new("C:/a"), Path::new("C:/b"), true),
+            "different folders stay different",
+        )?;
+        check(
+            same_install_dir(Path::new("/games/a"), Path::new("/games/a")),
+            "identical paths are equal",
         )
     }
 }

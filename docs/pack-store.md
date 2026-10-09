@@ -97,21 +97,21 @@ directory directly. Managed activations recognize their own disconnected
 store still matches every source path and byte before changing the launcher
 path. It records the transaction, renames the original folder to a hidden
 sibling, and mounts the writable store at the original path. The background
-coordinator owns the mount, restarts it after a coordinator restart or login,
-and stays running while any managed install exists. The GUI exposes the same
-create, activate, compact, reclaim, and restore actions in each expanded game
-row.
+worker owns the mount, restarts it after a worker restart or login,
+and stays running while any managed install exists. The window exposes the same
+actions in each expanded game: create the store, switch to Maximum, fold in
+updates, delete the original, and decompress.
 
-The original folder remains as a rollback copy until this explicit command:
+The original folder is kept until you delete it with this command:
 
 ```sh
 flummox pack reclaim /launcher/game/path
 ```
 
-Reclaiming is the step that releases the original folder's disk allocation.
-After reclaiming, `pack rollback` reconstructs ordinary files from the base
-store and persistent update layer. Before reclaiming, rollback merges launcher
-updates into the retained original and moves it back into place. Both paths
+Deleting the original is the step that frees its disk space.
+After that, `pack rollback` rebuilds ordinary files from the base
+store and persistent update layer. Before that, rollback merges launcher
+updates into the kept original and moves it back into place. Both paths
 keep downloaded patches and newly created files.
 
 Large launcher updates can be folded into a replacement store without taking
@@ -121,35 +121,35 @@ the game path offline for the full build:
 flummox pack compact /launcher/game/path
 ```
 
-Compaction reads the mounted merged view while normal reads and writes remain
+Folding in updates reads the mounted merged view while normal reads and writes remain
 available. The final switch briefly rejects new mutations with `EBUSY`. If any
 write occurred during the build, Flummox discards the replacement and asks for
 a retry, so a late launcher update cannot be lost. The current store and update
 layer are recorded before unmounting, and the replacement is recorded before
-remounting, allowing coordinator restart recovery on either side of the switch.
+remounting, allowing recovery after a background worker restart on either side of the switch.
 
-The previous store and update layer remain until the replacement has been
-tested. Reclaim them explicitly:
+The previous store and update layer are kept until the replacement has been
+tested. Delete them explicitly:
 
 ```sh
 flummox pack prune /launcher/game/path
 ```
 
-Only one previous version is retained. Another compaction is refused until it
-is pruned.
+Only one previous version is kept. Folding in updates again is refused until it
+is deleted.
 
-The coordinator does this upkeep by itself for a confirmed install. After each
-scan it queues a compaction when the game's build changed with updates in the
+The background worker does this upkeep by itself for a confirmed install. After each
+refresh it queues folding in updates when the game's build changed with updates in the
 layer, or when the layer has grown past 256 MiB or a twentieth of the store,
-whichever is larger. It queues the prune once the game has been seen running
+whichever is larger. It queues deleting the previous version once the game has been seen running
 since that compaction. Neither is queued while the game is busy or has a job
 waiting, and a task whose last attempt needs attention is not queued again.
-What it remembers for each install is private to the coordinator.
+What it remembers for each install is private to the background worker.
 
-Compaction is refused while the original from activation is still retained.
-Restoring from that original replays the update layer onto it, and compaction
+Folding in updates is refused while the original is still kept.
+Decompressing from that original replays the update layer onto it, and folding in
 empties the layer, so the original would come back without the updates the new
-store absorbed. Run `flummox pack reclaim` first. Reclaim verifies every chunk
+store absorbed. Run `flummox pack reclaim` first. It checks every chunk
 in the store before it deletes the original.
 
 For an unmanaged or already stopped writable layer, merge changes into a new

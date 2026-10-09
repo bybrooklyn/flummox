@@ -6,11 +6,10 @@ use fuser::{Errno, FileAttr, FileType, Filesystem, INodeNo, ReplyXattr};
 use std::{
     collections::HashMap,
     ffi::OsStr,
-    fs::{FileTimes, OpenOptions, Permissions},
-    io::{Seek, SeekFrom, Write},
+    fs::{File, FileTimes, OpenOptions, Permissions},
     os::unix::{
         ffi::OsStrExt,
-        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
     sync::{
@@ -26,8 +25,8 @@ const TTL: Duration = Duration::from_secs(1);
 // Inode numbers for the life of one mount. A store entry's inode is its index
 // plus one, which makes the root inode 1 as FUSE expects. Hard-link aliases
 // share their target's number. Paths created later take numbers from `next`.
-// Nothing is ever removed: a deleted path keeps its number, and a new file at
-// the same path reuses it.
+// Removing a name drops it from the table, so a file created at that path
+// later gets a number of its own.
 struct Nodes {
     paths: HashMap<PathBuf, u64>,
     inodes: HashMap<u64, Vec<PathBuf>>,
@@ -76,6 +75,15 @@ impl Nodes {
             .push(path.to_path_buf());
     }
 
+    // Drops a removed name. Other names of the same inode stay.
+    fn forget(&mut self, path: &Path) {
+        if let Some(inode) = self.paths.remove(path)
+            && let Some(paths) = self.inodes.get_mut(&inode)
+        {
+            paths.retain(|name| name != path);
+        }
+    }
+
     fn link_count(&self, inode: u64) -> u32 {
         self.inodes
             .get(&inode)
@@ -95,7 +103,14 @@ impl Nodes {
             .filter(|(path, _)| path.as_path() == from || path.starts_with(from))
             .filter_map(|(path, inode)| {
                 let suffix = path.strip_prefix(from).ok()?;
-                Some((path.clone(), to.join(suffix), *inode))
+                // Joining an empty suffix would leave a trailing slash, which
+                // no file path resolves through.
+                let moved = if suffix.as_os_str().is_empty() {
+                    to.to_path_buf()
+                } else {
+                    to.join(suffix)
+                };
+                Some((path.clone(), moved, *inode))
             })
             .collect();
         for (old, _, _) in &moved {
@@ -126,6 +141,18 @@ pub struct StoreFs {
     overlay: Option<Mutex<Overlay>>,
     nodes: Mutex<Nodes>,
     writes: Option<Arc<WriteControl>>,
+    handles: Mutex<HashMap<u64, Arc<Handle>>>,
+    next_handle: AtomicU64,
+}
+
+// State of one open file. `file` is the upper file the handle was opened on,
+// so reads and writes keep reaching that inode after its name is removed or
+// replaced. `base` is the store path of a handle opened on a store file that
+// had no upper copy, which stays readable after its name is gone.
+struct Handle {
+    file: Option<File>,
+    writable: bool,
+    base: Option<PathBuf>,
 }
 
 // Shared between the filesystem and compaction. Every mutating handler holds
@@ -229,13 +256,31 @@ impl StoreFs {
     ) -> Result<Self> {
         let reader = Reader::open(store)?;
         let nodes = Mutex::new(Nodes::new(reader.entries()));
-        let overlay = writes.map(Overlay::open).transpose()?.map(Mutex::new);
+        let overlay = writes
+            .map(|path| Overlay::open(path, Some(&reader)))
+            .transpose()?
+            .map(Mutex::new);
         Ok(Self {
             reader,
             overlay,
             nodes,
             writes: control,
+            handles: Mutex::new(HashMap::new()),
+            next_handle: AtomicU64::new(1),
         })
+    }
+
+    fn add_handle(&self, handle: Handle) -> Result<fuser::FileHandle> {
+        let number = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        self.handles
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Handle lock poisoned"))?
+            .insert(number, Arc::new(handle));
+        Ok(fuser::FileHandle(number))
+    }
+
+    fn handle(&self, handle: fuser::FileHandle) -> Option<Arc<Handle>> {
+        self.handles.lock().ok()?.get(&handle.0).cloned()
     }
 
     // Every handler that changes the layer calls this first and calls
@@ -402,7 +447,7 @@ impl StoreFs {
             .unwrap_or(Errno::EIO)
     }
 
-    // Shared body of unlink and rmdir. The inode table is left alone.
+    // Shared body of unlink and rmdir.
     fn remove(&self, parent: INodeNo, name: &OsStr, directory: bool, reply: fuser::ReplyEmpty) {
         let result = self.child(parent, name).and_then(|path| {
             let mutation = self.mutation()?;
@@ -412,6 +457,10 @@ impl StoreFs {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Update lock poisoned"))?
                 .remove(&self.reader, &path, directory)?;
+            self.nodes
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Node lock poisoned"))?
+                .forget(&path);
             mutation.committed();
             Ok(())
         });
@@ -419,6 +468,42 @@ impl StoreFs {
             Ok(()) => reply.ok(),
             Err(error) => reply.error(Self::errno(&error)),
         }
+    }
+}
+
+// Opens an upper file with the access the caller asked for, never following
+// a link. A mode that forbids an access is the kernel's to refuse.
+fn open_upper(upper: &Path, access: fuser::OpenAccMode) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(access != fuser::OpenAccMode::O_WRONLY)
+        .write(access != fuser::OpenAccMode::O_RDONLY)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(upper)
+}
+
+// A time as seconds and nanoseconds from the epoch, counting forward from a
+// whole second when the time is before it.
+fn timespec(time: SystemTime) -> rustix::fs::Timespec {
+    let (seconds, nanos) = match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(after) => (
+            i64::try_from(after.as_secs()).unwrap_or(i64::MAX),
+            i64::from(after.subsec_nanos()),
+        ),
+        Err(error) => {
+            let before = error.duration();
+            let back = i64::try_from(before.as_secs()).unwrap_or(i64::MAX);
+            match i64::from(before.subsec_nanos()) {
+                0 => (back.saturating_neg(), 0),
+                nanos => (
+                    back.saturating_add(1).saturating_neg(),
+                    1_000_000_000 - nanos,
+                ),
+            }
+        }
+    };
+    rustix::fs::Timespec {
+        tv_sec: seconds,
+        tv_nsec: nanos,
     }
 }
 
@@ -432,8 +517,8 @@ fn kind(entry: &Entry) -> FileType {
 
 // Handler rules. A handler that changes the layer takes `mutation()` before
 // touching it and calls `committed()` only after the change succeeded. It
-// never writes to the store. File handles carry no state: each request
-// resolves its inode to a path again and reopens the upper file.
+// never writes to the store. A handle opened on an upper file holds that file
+// open. Any other request resolves its inode to a path again.
 impl Filesystem for StoreFs {
     fn lookup(&self, _: &fuser::Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEntry) {
         let result = self
@@ -621,7 +706,8 @@ impl Filesystem for StoreFs {
     }
 
     // Opening for write or with O_TRUNC copies the file up at once, before
-    // any byte is written. A read-only open touches nothing.
+    // any byte is written. A file with an upper copy is held open from here
+    // on. A read-only open of a store file touches nothing.
     fn open(
         &self,
         _: &fuser::Request,
@@ -629,13 +715,16 @@ impl Filesystem for StoreFs {
         flags: fuser::OpenFlags,
         reply: fuser::ReplyOpen,
     ) {
-        let result = (|| -> Result<()> {
+        let result = (|| -> Result<fuser::FileHandle> {
             let path = self.path(ino)?;
             ensure!(
                 matches!(self.attr_path(&path)?.kind, FileType::RegularFile),
                 "Not a file"
             );
-            if flags.acc_mode() != fuser::OpenAccMode::O_RDONLY || flags.0 & libc::O_TRUNC != 0 {
+            let access = flags.acc_mode();
+            let writable = access != fuser::OpenAccMode::O_RDONLY;
+            let mut file = None;
+            if writable || flags.0 & libc::O_TRUNC != 0 {
                 let mutation = self.mutation()?;
                 let overlay = self.overlay.as_ref().context("Read-only store")?;
                 let mut overlay = overlay
@@ -646,18 +735,28 @@ impl Filesystem for StoreFs {
                     OpenOptions::new()
                         .write(true)
                         .truncate(true)
-                        .open(upper)?
+                        .open(&upper)?
                         .sync_all()?;
                 }
+                file = Some(open_upper(&upper, access)?);
                 mutation.committed();
+            } else if self.upper_metadata(&path)?.is_some()
+                && let Some(overlay) = &self.overlay
+            {
+                let upper = overlay
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Update lock poisoned"))?
+                    .checked_upper(&path)?;
+                file = Some(open_upper(&upper, access)?);
             }
-            Ok(())
+            self.add_handle(Handle {
+                file,
+                writable,
+                base: self.reader.entry(&path).map(|_| path.clone()),
+            })
         })();
         match result {
-            Ok(()) => reply.opened(
-                fuser::FileHandle(u64::from(ino)),
-                fuser::FopenFlags::FOPEN_KEEP_CACHE,
-            ),
+            Ok(handle) => reply.opened(handle, fuser::FopenFlags::FOPEN_KEEP_CACHE),
             Err(error) => reply.error(if self.overlay.is_none() {
                 Errno::EROFS
             } else {
@@ -666,27 +765,64 @@ impl Filesystem for StoreFs {
         }
     }
 
+    fn release(
+        &self,
+        _: &fuser::Request,
+        _: INodeNo,
+        fh: fuser::FileHandle,
+        _: fuser::OpenFlags,
+        _: Option<fuser::LockOwner>,
+        _: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        if let Ok(mut handles) = self.handles.lock() {
+            handles.remove(&fh.0);
+        }
+        reply.ok();
+    }
+
     // Takes no write gate, so reads continue while writes are frozen. Every
     // failure, a chunk that fails its hash included, is logged and
-    // returned as EIO.
+    // returned as EIO. A handle on an upper file reads that file. A handle on
+    // a store file whose name is gone reads the store entry it opened.
     fn read(
         &self,
         _: &fuser::Request,
         ino: INodeNo,
-        _: fuser::FileHandle,
+        fh: fuser::FileHandle,
         offset: u64,
         size: u32,
         _: fuser::OpenFlags,
         _: Option<fuser::LockOwner>,
         reply: fuser::ReplyData,
     ) {
-        let result = self.path(ino).and_then(|path| match &self.overlay {
-            Some(overlay) => overlay
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Update lock poisoned"))?
-                .read(&self.reader, &path, offset, size as usize),
-            None => self.reader.read(&path, offset, size as usize),
-        });
+        let handle = self.handle(fh);
+        let result = (|| -> Result<Vec<u8>> {
+            if let Some(file) = handle.as_ref().and_then(|handle| handle.file.as_ref()) {
+                let mut bytes = vec![0; size as usize];
+                let count = file.read_at(&mut bytes, offset)?;
+                bytes.truncate(count);
+                return Ok(bytes);
+            }
+            let current = self
+                .path(ino)
+                .ok()
+                .filter(|path| self.visible(path).unwrap_or(false));
+            match (
+                current,
+                handle.as_ref().and_then(|handle| handle.base.as_ref()),
+            ) {
+                (Some(path), _) => match &self.overlay {
+                    Some(overlay) => overlay
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("Update lock poisoned"))?
+                        .read(&self.reader, &path, offset, size as usize),
+                    None => self.reader.read(&path, offset, size as usize),
+                },
+                (None, Some(base)) => self.reader.read(base, offset, size as usize),
+                (None, None) => anyhow::bail!("File was deleted"),
+            }
+        })();
         match result {
             Ok(bytes) => reply.data(&bytes),
             Err(error) => {
@@ -700,7 +836,7 @@ impl Filesystem for StoreFs {
         &self,
         _: &fuser::Request,
         ino: INodeNo,
-        _: fuser::FileHandle,
+        fh: fuser::FileHandle,
         offset: u64,
         data: &[u8],
         _: fuser::WriteFlags,
@@ -710,18 +846,22 @@ impl Filesystem for StoreFs {
     ) {
         let result = (|| -> Result<usize> {
             let mutation = self.mutation()?;
-            let path = self.path(ino)?;
-            let overlay = self.overlay.as_ref().context("Read-only store")?;
-            let mut overlay = overlay
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Update lock poisoned"))?;
-            let upper = overlay.copy_up(&self.reader, &path)?;
-            let mut file = OpenOptions::new()
-                .write(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(upper)?;
-            file.seek(SeekFrom::Start(offset))?;
-            file.write_all(data)?;
+            let handle = self.handle(fh);
+            if let Some(file) = handle.as_ref().and_then(|handle| handle.file.as_ref()) {
+                file.write_all_at(data, offset)?;
+            } else {
+                let path = self.path(ino)?;
+                let overlay = self.overlay.as_ref().context("Read-only store")?;
+                let mut overlay = overlay
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Update lock poisoned"))?;
+                let upper = overlay.copy_up(&self.reader, &path)?;
+                OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(upper)?
+                    .write_all_at(data, offset)?;
+            }
             mutation.committed();
             Ok(data.len())
         })();
@@ -737,10 +877,21 @@ impl Filesystem for StoreFs {
         &self,
         _: &fuser::Request,
         ino: INodeNo,
-        _: fuser::FileHandle,
+        fh: fuser::FileHandle,
         _: fuser::LockOwner,
         reply: fuser::ReplyEmpty,
     ) {
+        if let Some(handle) = self.handle(fh)
+            && let Some(file) = &handle.file
+        {
+            match file.sync_all() {
+                Ok(()) => reply.ok(),
+                Err(error) => {
+                    reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO)))
+                }
+            }
+            return;
+        }
         let result = self
             .path(ino)
             .and_then(|path| self.upper_metadata(&path).map(|metadata| (path, metadata)))
@@ -787,7 +938,7 @@ impl Filesystem for StoreFs {
         _atime: Option<fuser::TimeOrNow>,
         mtime: Option<fuser::TimeOrNow>,
         _: Option<SystemTime>,
-        _: Option<fuser::FileHandle>,
+        fh: Option<fuser::FileHandle>,
         _: Option<SystemTime>,
         _: Option<SystemTime>,
         _: Option<SystemTime>,
@@ -802,10 +953,20 @@ impl Filesystem for StoreFs {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Update lock poisoned"))?;
             let upper = overlay.copy_up(&self.reader, &path)?;
+            let link = std::fs::symlink_metadata(&upper)?.is_symlink();
             if let Some(size) = size {
-                OpenOptions::new().write(true).open(&upper)?.set_len(size)?;
+                match fh.and_then(|fh| self.handle(fh)) {
+                    Some(handle) if handle.writable && handle.file.is_some() => {
+                        if let Some(file) = &handle.file {
+                            file.set_len(size)?;
+                        }
+                    }
+                    _ => OpenOptions::new().write(true).open(&upper)?.set_len(size)?,
+                }
             }
-            if let Some(mode) = mode {
+            if let Some(mode) = mode
+                && !link
+            {
                 std::fs::set_permissions(&upper, Permissions::from_mode(mode & 0o777))?;
             }
             if let Some(mtime) = mtime {
@@ -813,10 +974,27 @@ impl Filesystem for StoreFs {
                     fuser::TimeOrNow::SpecificTime(time) => time,
                     fuser::TimeOrNow::Now => SystemTime::now(),
                 };
-                OpenOptions::new()
-                    .read(true)
-                    .open(&upper)?
-                    .set_times(FileTimes::new().set_modified(time))?;
+                if link {
+                    // Opening a link follows it, which would date its target.
+                    rustix::fs::utimensat(
+                        rustix::fs::CWD,
+                        &upper,
+                        &rustix::fs::Timestamps {
+                            last_access: rustix::fs::Timespec {
+                                tv_sec: 0,
+                                tv_nsec: rustix::fs::UTIME_OMIT,
+                            },
+                            last_modification: timespec(time),
+                        },
+                        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                    )
+                    .map_err(std::io::Error::from)?;
+                } else {
+                    OpenOptions::new()
+                        .read(true)
+                        .open(&upper)?
+                        .set_times(FileTimes::new().set_modified(time))?;
+                }
             }
             drop(overlay);
             let attr = self.attr_path(&path)?;
@@ -839,25 +1017,30 @@ impl Filesystem for StoreFs {
         _flags: i32,
         reply: fuser::ReplyCreate,
     ) {
-        let result = (|| -> Result<FileAttr> {
+        let result = (|| -> Result<(FileAttr, fuser::FileHandle)> {
             let mutation = self.mutation()?;
             let path = self.child(parent, name)?;
             let overlay = self.overlay.as_ref().context("Read-only store")?;
-            overlay
+            let file = overlay
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Update lock poisoned"))?
-                .create_file(&self.reader, &path, mode & !umask)?
-                .sync_all()?;
+                .create_file(&self.reader, &path, mode & !umask)?;
+            file.sync_all()?;
             let attr = self.attr_path(&path)?;
+            let handle = self.add_handle(Handle {
+                file: Some(file),
+                writable: true,
+                base: None,
+            })?;
             mutation.committed();
-            Ok(attr)
+            Ok((attr, handle))
         })();
         match result {
-            Ok(attr) => reply.created(
+            Ok((attr, handle)) => reply.created(
                 &TTL,
                 &attr,
                 fuser::Generation(0),
-                fuser::FileHandle(u64::from(attr.ino)),
+                handle,
                 fuser::FopenFlags::empty(),
             ),
             Err(error) => reply.error(Self::errno(&error)),
@@ -938,12 +1121,11 @@ impl Filesystem for StoreFs {
     ) {
         let result = (|| -> Result<()> {
             let mutation = self.mutation()?;
-            ensure!(
-                !flags.contains(
-                    fuser::RenameFlags::RENAME_EXCHANGE | fuser::RenameFlags::RENAME_WHITEOUT
-                ),
-                "Unsupported rename flags"
-            );
+            if flags.intersects(
+                fuser::RenameFlags::RENAME_EXCHANGE | fuser::RenameFlags::RENAME_WHITEOUT,
+            ) {
+                return Err(std::io::Error::from_raw_os_error(libc::EINVAL).into());
+            }
             let from = self.child(parent, name)?;
             let to = self.child(newparent, newname)?;
             // The layer is renamed first. The inode table follows only on
@@ -1136,6 +1318,15 @@ pub fn mount(store: &Path, target: &Path, writes: Option<&Path>) -> Result<Sessi
         target.is_dir() && std::fs::read_dir(&target)?.next().is_none(),
         "Choose an empty mount folder"
     );
+    if let Some(writes) = writes {
+        // A layer under the mount point would be covered by the mount, and
+        // every request to it would wait on the thread serving the mount.
+        let layer = canonical_new(writes)?;
+        ensure!(
+            !layer.starts_with(&target) && !target.starts_with(&layer),
+            "Keep the update layer outside the mount folder"
+        );
+    }
     let control = writes.map(|_| Arc::new(WriteControl::default()));
     let fs = StoreFs::open(store, writes, control.clone())?;
     // No allow_other, so only the mounting user can reach the files. With
@@ -1157,4 +1348,74 @@ pub fn mount(store: &Path, target: &Path, writes: Option<&Path>) -> Result<Sessi
         inner,
         writes: control.map(WriteController),
     })
+}
+
+// Canonical form of a path whose last component may not exist yet.
+fn canonical_new(path: &Path) -> Result<PathBuf> {
+    match path.canonicalize() {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let name = path.file_name().context("The update layer has no name")?;
+            Ok(parent.canonicalize()?.join(name))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{Ctx, TestResult, check_eq};
+
+    fn names(nodes: &Nodes, inode: u64) -> Vec<std::ffi::OsString> {
+        nodes
+            .inodes
+            .get(&inode)
+            .map(|paths| paths.iter().map(|p| p.as_os_str().to_os_string()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_renamed_file_is_known_by_exactly_its_new_name() -> TestResult {
+        let mut nodes = Nodes::new(&[]);
+        let moved = nodes.inode(Path::new("a"));
+        let child = nodes.inode(Path::new("d/x"));
+        nodes.rename(Path::new("a"), Path::new("b"));
+        check_eq(
+            names(&nodes, moved),
+            vec![std::ffi::OsString::from("b")],
+            "a file keeps no trailing separator",
+        )?;
+        nodes.rename(Path::new("d"), Path::new("e"));
+        check_eq(
+            names(&nodes, child),
+            vec![std::ffi::OsString::from("e/x")],
+            "a path under a moved folder follows it",
+        )
+    }
+
+    #[test]
+    fn a_removed_name_is_not_handed_to_the_next_file_created_there() -> TestResult {
+        let mut nodes = Nodes::new(&[]);
+        let first = nodes.inode(Path::new("f.tmp"));
+        nodes.alias(Path::new("f"), first);
+        nodes.forget(Path::new("f.tmp"));
+        check_eq(nodes.link_count(first), 1, "only the other name counts")?;
+        let second = nodes.inode(Path::new("f.tmp"));
+        check_eq(
+            second != first,
+            true,
+            "the new file at the reused name has its own number",
+        )?;
+        check_eq(
+            names(&nodes, first),
+            vec![std::ffi::OsString::from("f")],
+            "the surviving name stays with the first inode",
+        )
+        .ctx("names")
+    }
 }

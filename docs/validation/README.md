@@ -1,6 +1,6 @@
 # Real-game release acceptance
 
-Version 0.0.2 stays pending until these checks have evidence. A manual Release
+A version stays pending until these checks have evidence; 0.0.2 is pending now. A manual Release
 workflow builds downloadable candidates without publishing a tag. Automated
 fixtures must never operate on an existing game library.
 
@@ -39,12 +39,16 @@ For each native Linux, Proton, Windows, and Mac run:
    copy and launch again. Exercise interruption and recovery on another
    disposable copy. Keep all retained copies until verification completes.
 7. Save the local compatibility report through the app. Copy its path-free JSON
-   into this directory. Add a run to `0.0.2.json` containing `kind`, `game`,
-   `tester`, `date`, `report`, `restart_verified`, and
-   `launcher_verification_passed`. Kinds are `native-linux`, `proton`, `windows`,
-   and `macos`. Set `status` to `passed` only when all four have passed.
+   into this directory under its own file name. Add a run to the version's
+   record, `VERSION.json`, containing `kind`, `game` (the title), `game_key` and
+   `game_build` (copied from the report's `game.key` and `game.build`), `tester`,
+   `date`, `report`, `restart_verified`, and `launcher_verification_passed`.
+   Kinds are `native-linux`, `proton`, `windows`, and `macos`. Set `status` to
+   `passed` only when all four have passed.
 
-A tag build checks these records before publication. Build/install CI and native
+Every stable tag needs a record at `docs/validation/VERSION.json`; the tag
+build checks it before publication and fails when it is missing. Prerelease
+tags skip the check. Build/install CI and native
 APFS fixtures establish those particular behaviors; they do not establish
 real-game compatibility. Windows and Mac interactive acceptance is performed
 on the user's machines. Linux native and Proton evidence also remains required.
@@ -54,6 +58,21 @@ corpus hash, matching logical-byte counts, and positive allocated-byte and
 load-time measurements. Linux native and Proton runs must exercise Maximum
 Space; Windows and Mac runs must exercise native compression. Measurements must
 be integers, and restart and launcher verification must be JSON `true`.
+The compressed allocation may not exceed the original. Each run names its own
+report file and its own corpus hash, so one report cannot stand for two kinds,
+and a run's `game_key` and `game_build` must equal its report's. A report's
+`flummox_version` is the release version or one of its release candidates,
+such as `0.0.2-rc.3` for `0.0.2`.
+
+A report made by a CI build also carries `flummox_commit`, the 40-digit
+lowercase id of the commit the build came from. It names source, not a host.
+Builds made locally have none. The check takes the commit being released from
+`--commit` or `GITHUB_SHA` and requires each report's commit to be that commit
+or an ancestor of it, using `git merge-base --is-ancestor`, so it runs in a
+checkout with full history. A stable version needs the field in every run's
+report, which means each real-game run must use a build from the release
+workflow. A prerelease may leave it out. The field is a claim made by the
+tester's build and is not signed.
 
 ## Desktop checks before game qualification
 

@@ -23,7 +23,7 @@ pub struct Footprint {
 pub fn inventory(root: &Path) -> Result<Footprint> {
     ensure!(
         root.is_dir(),
-        "Storage location is unavailable: {}",
+        "{} is not available. Check that its drive is connected.",
         root.display()
     );
     let mut result = Footprint::default();
@@ -54,7 +54,7 @@ pub fn inventory(root: &Path) -> Result<Footprint> {
             result.bytes = result
                 .bytes
                 .checked_add(length)
-                .context("Folder is too large")?;
+                .context("The folder is too large to measure")?;
             result.largest = result.largest.max(length);
         }
     }
@@ -80,7 +80,7 @@ pub fn volume(path: &Path) -> Result<Volume> {
     let existing = path
         .ancestors()
         .find(|path| path.exists())
-        .context("Storage drive is unavailable")?
+        .context("The drive is not available. Check that it is connected.")?
         .canonicalize()?;
     volume_existing(&existing)
 }
@@ -90,7 +90,7 @@ pub fn volume(path: &Path) -> Result<Volume> {
 #[cfg(target_os = "linux")]
 fn volume_existing(path: &Path) -> Result<Volume> {
     let fs = crate::fsprobe::probe(path)?;
-    if fs.magic == crate::fsprobe::magic::FUSE && fs.source == "flummox-pack" {
+    if fs.is_pack_mount() {
         // Managed mounts receive a new filesystem ID after each remount.
         // Library identity and capacity belong to the underlying drive.
         let parent = fs
@@ -99,26 +99,46 @@ fn volume_existing(path: &Path) -> Result<Volume> {
             .context("Managed game mount has no parent folder")?;
         return volume_existing(parent);
     }
-    ensure!(!fs.read_only, "Storage volume is read-only");
-    let source = Path::new(&fs.source).canonicalize().ok();
-    let uuid = std::fs::read_dir("/dev/disk/by-uuid")
-        .ok()
-        .and_then(|entries| {
-            entries.flatten().find_map(|entry| {
-                (source.is_some() && entry.path().canonicalize().ok() == source)
-                    .then(|| entry.file_name().to_string_lossy().into_owned())
-            })
-        });
-    let fallback = format!(
-        "{}:{:?}",
-        fs.source,
-        nix::sys::statfs::statfs(path)?.filesystem_id()
+    ensure!(
+        !fs.read_only,
+        "The drive is read-only, so Flummox cannot change it."
     );
     Ok(Volume {
-        identity: format!("{}:{}", fs.fstype, uuid.unwrap_or(fallback)),
+        identity: linux_identity(&fs, path, Path::new("/dev/disk/by-uuid"))?,
         path: fs.mountpoint,
         available: crate::backend::free_bytes(path)?,
     })
+}
+
+/// A btrfs asks the filesystem for its UUID, because `statfs` ids differ
+/// between subvolumes of one filesystem. Others look their device up in
+/// `by_uuid`, and fall back to the source and `statfs` id.
+#[cfg(target_os = "linux")]
+fn linux_identity(fs: &crate::fsprobe::FsInfo, path: &Path, by_uuid: &Path) -> Result<String> {
+    let own = (fs.fstype == "btrfs")
+        .then(|| crate::backend::btrfs::filesystem_uuid(path).ok())
+        .flatten();
+    let uuid = match own {
+        Some(uuid) => Some(uuid),
+        None => {
+            let source = Path::new(&fs.source).canonicalize().ok();
+            std::fs::read_dir(by_uuid).ok().and_then(|entries| {
+                entries.flatten().find_map(|entry| {
+                    (source.is_some() && entry.path().canonicalize().ok() == source)
+                        .then(|| entry.file_name().to_string_lossy().into_owned())
+                })
+            })
+        }
+    };
+    let uuid = match uuid {
+        Some(uuid) => uuid,
+        None => format!(
+            "{}:{:?}",
+            fs.source,
+            nix::sys::statfs::statfs(path)?.filesystem_id()
+        ),
+    };
+    Ok(format!("{}:{uuid}", fs.fstype))
 }
 
 #[cfg(target_os = "macos")]
@@ -130,14 +150,14 @@ fn volume_existing(path: &Path) -> Result<Volume> {
     let result = unsafe { libc::statfs(path_c.as_ptr(), stat.as_mut_ptr()) };
     ensure!(
         result == 0,
-        "Cannot inspect storage volume: {}",
+        "Could not read the drive: {}",
         std::io::Error::last_os_error()
     );
     // SAFETY: a successful statfs initialized the whole structure.
     let stat = unsafe { stat.assume_init() };
     ensure!(
         stat.f_flags & libc::MNT_RDONLY as u32 == 0,
-        "Storage volume is read-only"
+        "The drive is read-only, so Flummox cannot change it."
     );
     let mount: Vec<u8> = stat
         .f_mntonname
@@ -185,7 +205,7 @@ fn volume_existing(path: &Path) -> Result<Volume> {
     };
     ensure!(
         result == 0 && uuid.length as usize == std::mem::size_of::<VolumeUuid>(),
-        "Cannot identify the storage volume: {}",
+        "Could not identify the drive: {}",
         std::io::Error::last_os_error()
     );
     let uuid: String = uuid
@@ -216,7 +236,7 @@ fn volume_existing(path: &Path) -> Result<Volume> {
             u32::try_from(mount.len())?,
         )
     };
-    ensure!(result != 0, "Cannot locate storage volume");
+    ensure!(result != 0, "Could not find the drive");
     let mut name = vec![0u16; 128];
     // SAFETY: mount is terminated by GetVolumePathNameW and name has the supplied capacity.
     let result = unsafe {
@@ -226,7 +246,7 @@ fn volume_existing(path: &Path) -> Result<Volume> {
             u32::try_from(name.len())?,
         )
     };
-    ensure!(result != 0, "Cannot identify storage volume");
+    ensure!(result != 0, "Could not identify the drive");
     let mut available = 0u64;
     // SAFETY: mount is terminated, available is writable, and unused outputs are null.
     let result = unsafe {
@@ -257,7 +277,7 @@ fn volume_existing(path: &Path) -> Result<Volume> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn volume_existing(_path: &Path) -> Result<Volume> {
-    anyhow::bail!("Storage planning is unavailable on this platform")
+    anyhow::bail!("Checking free space is not available on this platform.")
 }
 
 /// Free space one volume must have before a job starts.
@@ -317,10 +337,10 @@ impl SpacePlan {
                 .context("Space requirement overflow")?;
             ensure!(
                 requirement.volume.available >= needed,
-                "Not enough space on {}: need {} additional bytes including safety headroom; {} available",
+                "Not enough space on {}: {} needed including a safety margin, {} available. Free up space or choose another drive.",
                 requirement.volume.path.display(),
-                needed,
-                requirement.volume.available
+                humansize::format_size(needed, humansize::DECIMAL),
+                humansize::format_size(requirement.volume.available, humansize::DECIMAL)
             );
         }
         Ok(())
@@ -334,7 +354,7 @@ impl SpacePlan {
             let volume = volume(&row.volume.path)?;
             ensure!(
                 volume.identity == row.volume.identity,
-                "Storage volume changed; review the space plan again"
+                "The drive changed since the storage plan was made. Review the storage plan again."
             );
             row.volume = volume;
         }
@@ -356,12 +376,41 @@ pub fn native_plan(root: &Path, restore: bool) -> Result<SpacePlan> {
         volume(root)?,
         additional,
         if restore {
-            "Ordinary expansion and temporary file; old blocks may remain pinned"
+            "The decompressed files and one temporary file, in case snapshots keep the old version"
         } else {
-            "Worst-case native rewrite with snapshots or shared extents retaining old blocks"
+            "The whole game and its largest file, in case snapshots keep the old version"
         },
     )?;
     Ok(plan)
+}
+
+/// Plan for a backend that rewrites one file at a time and keeps no copy of the
+/// rest: Windows compression and macOS compressed files.
+///
+/// Compressing needs room for the largest file while it is rewritten. A
+/// restore needs room for the whole install, since every file grows back. Use
+/// [`native_plan`] for btrfs, where snapshots can pin the old blocks.
+pub fn per_file_plan(root: &Path, restore: bool) -> Result<SpacePlan> {
+    let footprint = inventory(root)?;
+    let mut plan = SpacePlan::default();
+    let (additional, reason) = per_file_requirement(&footprint, restore);
+    plan.add(volume(root)?, additional, reason)?;
+    Ok(plan)
+}
+
+/// The bytes and the reason behind [`per_file_plan`].
+fn per_file_requirement(footprint: &Footprint, restore: bool) -> (u64, &'static str) {
+    if restore {
+        (
+            footprint.bytes,
+            "Every file returns to its full size when decompressed",
+        )
+    } else {
+        (
+            footprint.largest,
+            "Room for the largest file while it is rewritten",
+        )
+    }
 }
 
 /// Upper bound on a new store's size: the content, plus 1/32 of it, plus the
@@ -397,6 +446,85 @@ mod tests {
             "shared volume must include both allocations and headroom",
         )
     }
+    #[test]
+    fn per_file_plans_need_the_largest_file_or_the_whole_install() -> TestResult {
+        let footprint = Footprint {
+            files: 3,
+            bytes: 100,
+            largest: 60,
+            metadata_bytes: 0,
+        };
+        check_eq(per_file_requirement(&footprint, false).0, 60, "compress")?;
+        check_eq(per_file_requirement(&footprint, true).0, 100, "restore")?;
+        let root = tempfile::tempdir().ctx("fixture")?;
+        std::fs::write(root.path().join("big"), vec![0u8; 4096]).ctx("big")?;
+        std::fs::write(root.path().join("small"), vec![0u8; 16]).ctx("small")?;
+        let plan = per_file_plan(root.path(), false).ctx("per-file plan")?;
+        let native = native_plan(root.path(), false).ctx("native plan")?;
+        let wanted = |plan: &SpacePlan| plan.requirements.first().map(|row| row.additional);
+        check_eq(wanted(&plan), Some(4096), "the largest file only")?;
+        check_eq(
+            wanted(&native),
+            Some(4096 + 16 + 4096),
+            "control: the native plan still wants the whole install and more",
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn subvolumes_of_one_btrfs_are_one_volume_without_by_uuid() -> TestResult {
+        let here = std::env::current_dir().ctx("working directory")?;
+        let tmp = tempfile::TempDir::new_in(here).ctx("temp directory")?;
+        let fs = crate::fsprobe::probe(tmp.path()).ctx("probe")?;
+        if fs.fstype != "btrfs" {
+            check(
+                std::env::var_os("FLUMMOX_REQUIRE_BTRFS").is_none(),
+                "the test directory is not btrfs, and FLUMMOX_REQUIRE_BTRFS is set",
+            )?;
+            eprintln!("skipped: subvolume identity requires btrfs");
+            return Ok(());
+        }
+        let mut paths = Vec::new();
+        for name in ["a", "b"] {
+            let path = tmp.path().join(name);
+            let made = std::process::Command::new("btrfs")
+                .args(["subvolume", "create"])
+                .arg(&path)
+                .output()
+                .ctx("run btrfs subvolume create")?;
+            check(
+                made.status.success(),
+                format!(
+                    "btrfs subvolume create: {}",
+                    String::from_utf8_lossy(&made.stderr)
+                ),
+            )?;
+            paths.push(path);
+        }
+        let ids: Vec<_> = paths
+            .iter()
+            .map(|path| nix::sys::statfs::statfs(path).map(|s| format!("{:?}", s.filesystem_id())))
+            .collect::<Result<_, _>>()
+            .ctx("statfs")?;
+        check(
+            ids.first() != ids.get(1),
+            "control: statfs gives the two subvolumes different ids",
+        )?;
+        let missing = tmp.path().join("no-by-uuid");
+        let identity = |path: &Path| -> Result<String, String> {
+            let fs = crate::fsprobe::probe(path).ctx("probe a subvolume")?;
+            linux_identity(&fs, path, &missing).ctx("identity")
+        };
+        let first = identity(paths.first().ctx("first subvolume")?)?;
+        let second = identity(paths.get(1).ctx("second subvolume")?)?;
+        check_eq(first.clone(), second, "one filesystem, one identity")?;
+        let uuid = first.strip_prefix("btrfs:").ctx("a btrfs identity")?;
+        check(
+            Path::new("/sys/fs/btrfs").join(uuid).is_dir(),
+            format!("{uuid} is the UUID sysfs knows"),
+        )
+    }
+
     #[test]
     fn inventory_does_not_follow_external_symlinks() -> TestResult {
         let root = tempfile::tempdir().ctx("fixture")?;

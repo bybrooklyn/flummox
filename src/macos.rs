@@ -17,6 +17,11 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+// Every staging directory starts with this prefix.
+const WORK_PREFIX: &str = ".flummox-work-";
+// How often a pass looks again for programs that opened files in the game folder.
+const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
+
 // A Steam game as the `scan` command lists it.
 #[derive(Debug, Clone)]
 pub struct InstalledGame {
@@ -76,7 +81,9 @@ pub struct Recovery {
     // The game file being replaced.
     #[serde(with = "crate::path_serde")]
     pub source: PathBuf,
-    // The new copy, at `<source's directory>/.flummox-work-*/candidate`.
+    // The new copy, at `<work parent>/.flummox-work-*/candidate`. The work parent is
+    // the source's directory, or the folder holding its outermost `.app`. Journals
+    // from earlier versions always used the source's directory.
     #[serde(with = "crate::path_serde")]
     pub staged: PathBuf,
     pub volume: crate::storage::Volume,
@@ -226,20 +233,21 @@ pub fn recover_folder(folder: &Path) -> Result<()> {
 }
 
 // Canonicalises a game folder and refuses one that is too broad (a filesystem
-// root, the home directory, /Applications, /Users), one inside a system or
-// Flummox-owned directory, and one that is not on APFS.
+// root, a volume's mount point, the home directory, /Applications, /Users, any
+// folder holding Flummox's state), one inside a system or Flummox-owned
+// directory, and one that is not on APFS.
 fn validate(root: &Path) -> Result<PathBuf> {
     let root = root.canonicalize()?;
     ensure!(
         root.is_dir() && root.parent().is_some(),
-        "Choose a game folder, not a drive"
+        "Choose a game folder, not a drive."
     );
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .context("HOME is not set")?;
     ensure!(
         root != home && root != Path::new("/Applications") && root != Path::new("/Users"),
-        "Choose an installed game folder"
+        "Choose an installed game folder."
     );
     for protected in [
         PathBuf::from("/System"),
@@ -253,14 +261,31 @@ fn validate(root: &Path) -> Result<PathBuf> {
         home.join(".ssh"),
         home.join("Library/Application Support/flummox"),
     ] {
-        ensure!(!root.starts_with(protected), "This location is protected");
+        ensure!(!root.starts_with(protected), "This location is protected.");
     }
     let volume = crate::storage::volume(&root)?;
+    let state = crate::libraries::data_dir()?;
+    let state = state.canonicalize().unwrap_or_else(|_| state.clone());
+    if let Some(reason) = too_broad(&root, &volume.path, &state) {
+        anyhow::bail!(reason);
+    }
     ensure!(
         volume.identity.starts_with("apfs:"),
-        "Native Mac compression requires APFS"
+        "Compressing on a Mac needs a drive formatted as APFS."
     );
     Ok(root)
+}
+
+// Why `root` cannot be a game folder: it is its volume's mount point, or it
+// contains Flummox's state directory.
+fn too_broad(root: &Path, mount: &Path, state: &Path) -> Option<&'static str> {
+    if root == mount {
+        Some("Choose a game folder, not a drive.")
+    } else if state.starts_with(root) {
+        Some("This folder contains Flummox's own data")
+    } else {
+        None
+    }
 }
 
 // Fails if any process has a file open under `root`. The check passes only when
@@ -273,7 +298,7 @@ fn idle(root: &Path) -> Result<()> {
         .output()?;
     ensure!(
         output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty(),
-        "Close the game and launcher activity before changing storage"
+        "Close the game and its launcher, then try again."
     );
     Ok(())
 }
@@ -295,12 +320,24 @@ fn hash(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-// The file's extended attributes, leaving out the two that a compressed file gains
-// or loses: `com.apple.decmpfs` and the resource fork.
+// Attributes the kernel or the compressor sets and that may differ between two
+// copies of one file: compression state, the resource fork and the provenance
+// tag that macOS 13 and later attaches to files written by tracked apps.
+fn kernel_managed(name: &std::ffi::OsStr) -> bool {
+    [
+        "com.apple.decmpfs",
+        "com.apple.ResourceFork",
+        "com.apple.provenance",
+    ]
+    .iter()
+    .any(|managed| name == *managed)
+}
+
+// The file's extended attributes, leaving out the kernel-managed ones.
 fn attributes(path: &Path) -> Result<std::collections::BTreeMap<std::ffi::OsString, Vec<u8>>> {
     let mut attributes = std::collections::BTreeMap::new();
     for name in xattr::list(path)? {
-        if name == "com.apple.decmpfs" || name == "com.apple.ResourceFork" {
+        if kernel_managed(&name) {
             continue;
         }
         attributes.insert(
@@ -351,32 +388,104 @@ fn metadata_equal(first: &Path, second: &Path) -> Result<()> {
     Ok(())
 }
 
+fn is_app(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "app")
+}
 // The nearest of the path and its ancestors that has an `.app` extension.
 fn bundle(path: &Path) -> Option<PathBuf> {
     path.ancestors()
-        .find(|parent| {
-            parent
-                .extension()
-                .is_some_and(|extension| extension == "app")
-        })
+        .find(|parent| is_app(parent))
         .map(Path::to_path_buf)
 }
-// The enclosing application bundle if it carries a code signature. `codesign
-// --display` failing is read as unsigned and returns None. A signed bundle must
-// verify now, before any file in it is replaced.
-fn signed_bundle(path: &Path) -> Result<Option<PathBuf>> {
-    let Some(bundle) = bundle(path) else {
-        return Ok(None);
+// The outermost of the path and its ancestors that has an `.app` extension.
+fn outer_bundle(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .filter(|parent| is_app(parent))
+        .last()
+        .map(Path::to_path_buf)
+}
+// The directory that holds the work directory for `source`. For a file inside an
+// application bundle it is the folder containing the outermost bundle, because a
+// work directory inside a signed bundle breaks its seal. Otherwise it is the
+// file's own folder. Both are on the file's volume, so the swap stays atomic.
+fn work_parent(source: &Path) -> Option<PathBuf> {
+    outer_bundle(source)
+        .as_deref()
+        .unwrap_or(source)
+        .parent()
+        .map(Path::to_path_buf)
+}
+// Whether a journal's staged path is somewhere `stage` could have put it for
+// `source`: the current layout, or the older one beside the file inside `root`.
+fn staging_expected(root: &Path, source: &Path, staged: &Path) -> bool {
+    let Some(parent) = staged.parent().and_then(Path::parent) else {
+        return false;
     };
+    work_parent(source).is_some_and(|expected| expected == parent)
+        || (source.parent() == Some(parent) && staged.starts_with(root))
+}
+// True when `codesign --display` succeeds, which is how this module reads "signed".
+fn is_signed(bundle: &Path) -> Result<bool> {
     let output = std::process::Command::new("/usr/bin/codesign")
         .args(["--display"])
-        .arg(&bundle)
+        .arg(bundle)
         .output()?;
-    if !output.status.success() {
-        return Ok(None);
+    Ok(output.status.success())
+}
+// Signature state of each application bundle met in one pass.
+#[derive(Default)]
+struct Seals {
+    bundles: std::collections::BTreeMap<PathBuf, Seal>,
+}
+struct Seal {
+    // The bundle was signed and verified before its first file was replaced.
+    valid: bool,
+    // At least one file in it has been replaced.
+    changed: bool,
+}
+impl Seals {
+    // Called before a file is replaced. The first call for a bundle verifies it. A
+    // bundle that is unsigned, or whose signature is already invalid, is not
+    // verified again afterwards.
+    fn before(&mut self, path: &Path) -> Result<()> {
+        let Some(bundle) = bundle(path) else {
+            return Ok(());
+        };
+        if self.bundles.contains_key(&bundle) {
+            return Ok(());
+        }
+        let valid = is_signed(&bundle)? && verify_bundle(&bundle).is_ok();
+        self.bundles.insert(
+            bundle,
+            Seal {
+                valid,
+                changed: false,
+            },
+        );
+        Ok(())
     }
-    verify_bundle(&bundle)?;
-    Ok(Some(bundle))
+    // Notes that a file under `path`'s bundle was replaced.
+    fn changed(&mut self, path: &Path) {
+        if let Some(bundle) = bundle(path)
+            && let Some(seal) = self.bundles.get_mut(&bundle)
+        {
+            seal.changed = true;
+        }
+    }
+    // Verifies each bundle that was valid before the pass and had a file replaced.
+    fn verify_after(&self) -> Result<()> {
+        for (bundle, seal) in &self.bundles {
+            if seal.valid && seal.changed {
+                verify_bundle(bundle).with_context(|| {
+                    format!(
+                        "{} no longer verifies; decompress the game to undo the pass",
+                        bundle.display()
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
 }
 fn verify_bundle(path: &Path) -> Result<()> {
     let output = std::process::Command::new("/usr/bin/codesign")
@@ -391,6 +500,29 @@ fn verify_bundle(path: &Path) -> Result<()> {
     Ok(())
 }
 
+// Treats a missing path as already removed.
+fn ignore_missing(result: std::io::Result<()>) -> std::io::Result<()> {
+    match result {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+// True when nothing exists at `path`. Any other failure to look is an error.
+fn is_missing(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
+// Deletes the journal and syncs its directory.
+fn remove_journal(record: &Recovery) -> Result<()> {
+    let path = journal_path(record)?;
+    std::fs::remove_file(&path)?;
+    File::open(path.parent().context("Journal has no parent")?)?.sync_all()?;
+    Ok(())
+}
+
 // Deletes the staging directory with whichever copy it holds, then the journal.
 // Refuses a directory whose name lacks the `.flummox-work-` prefix.
 fn clear_record(record: &Recovery) -> Result<()> {
@@ -401,19 +533,21 @@ fn clear_record(record: &Recovery) -> Result<()> {
     ensure!(
         parent
             .file_name()
-            .is_some_and(|name| name.to_string_lossy().starts_with(".flummox-work-")),
+            .is_some_and(|name| name.to_string_lossy().starts_with(WORK_PREFIX)),
         "Unexpected staging directory"
     );
-    std::fs::remove_dir_all(parent)?;
-    std::fs::remove_file(journal_path(record)?)?;
-    Ok(())
+    ignore_missing(std::fs::remove_dir_all(parent))?;
+    if let Some(outer) = parent.parent() {
+        File::open(outer)?.sync_all()?;
+    }
+    remove_journal(record)
 }
 
 /// Restores a journaled original only when both identities still match.
 pub fn recover_original(record: &Recovery) -> Result<()> {
     let root = validate(&record.root)?;
     ensure!(
-        record.source.starts_with(&root) && record.staged.starts_with(&root),
+        record.source.starts_with(&root) && staging_expected(&root, &record.source, &record.staged),
         "Recovery paths escaped the game folder"
     );
     ensure!(
@@ -421,25 +555,37 @@ pub fn recover_original(record: &Recovery) -> Result<()> {
         "Reconnect the original drive"
     );
     idle(&root)?;
+    // The work directory is gone and the journal remains: a crash between the two
+    // deletions in `clear_record`, or a journal whose work directory was never
+    // kept. The source must hold the verified new copy or the untouched original.
+    if is_missing(&record.staged)? {
+        let current = identity(&record.source)?;
+        ensure!(
+            (current == record.candidate && hash(&record.source)? == record.hash)
+                || current == record.original,
+            "Files changed after interruption; retain both copies for review"
+        );
+        return remove_journal(record);
+    }
     // The journal was written but the swap never ran. The original is in place, so
     // only the candidate and the journal need removing.
     if identity(&record.source)? == record.original && identity(&record.staged)? == record.candidate
     {
         return clear_record(record);
     }
-    // Otherwise the files must be exactly swapped. Swap them back and check the
-    // original's bytes before deleting anything.
+    // Otherwise the files must be exactly swapped. Check the original's bytes
+    // where it sits, so a bad original is never put back over the new copy.
     ensure!(
         identity(&record.source)? == record.candidate
             && identity(&record.staged)? == record.original,
         "Files changed after interruption; retain both copies for review"
     );
-    swap(&record.source, &record.staged)?;
-    File::open(record.source.parent().context("File has no parent")?)?.sync_all()?;
     ensure!(
-        hash(&record.source)? == record.hash,
+        hash(&record.staged)? == record.hash,
         "Original verification failed; recovery copies retained"
     );
+    swap(&record.source, &record.staged)?;
+    File::open(record.source.parent().context("File has no parent")?)?.sync_all()?;
     clear_record(record)
 }
 
@@ -447,7 +593,7 @@ pub fn recover_original(record: &Recovery) -> Result<()> {
 // is set. Returns false when the file is left alone. The copy is built beside the
 // file, verified, journaled and swapped in. The original is deleted only after the
 // swapped result has been verified too.
-fn stage(root: &Path, source: &Path, restore: bool) -> Result<bool> {
+fn stage(root: &Path, source: &Path, restore: bool, seals: &mut Seals) -> Result<bool> {
     let original = identity(source)?;
     let stat = std::fs::symlink_metadata(source)?;
     let compressed = stat.st_flags() & libc::UF_COMPRESSED != 0;
@@ -466,12 +612,14 @@ fn stage(root: &Path, source: &Path, restore: bool) -> Result<bool> {
         "Temporary file and replacement",
     )?;
     space.recheck()?;
-    let signature = signed_bundle(source)?;
-    // The work directory sits beside the file, so the swap stays on one volume.
+    seals.before(source)?;
+    // The work directory sits beside the file, or beside the enclosing `.app`, so
+    // the swap stays on one volume and the bundle's seal is not disturbed.
     let parent = source.parent().context("File has no parent")?;
+    let work = work_parent(source).context("File has no parent")?;
     let temporary = tempfile::Builder::new()
-        .prefix(".flummox-work-")
-        .tempdir_in(parent)?;
+        .prefix(WORK_PREFIX)
+        .tempdir_in(&work)?;
     let staged = temporary.path().join("candidate");
     let before_hash = hash(source)?;
     // Restore: reading a compressed file yields its plain bytes, so a byte copy is
@@ -505,7 +653,7 @@ fn stage(root: &Path, source: &Path, restore: bool) -> Result<bool> {
                 xattr::remove(&staged, attribute)?;
             }
         }
-        // SAFETY: stage_c names our private staging file; compression metadata was removed.
+        // SAFETY: stage_c is a terminated path string that outlives the call.
         let result =
             unsafe { libc::chflags(stage_c.as_ptr(), stat.st_flags() & !libc::UF_COMPRESSED) };
         ensure!(result == 0, "Cannot restore ordinary file flags");
@@ -554,12 +702,13 @@ fn stage(root: &Path, source: &Path, restore: bool) -> Result<bool> {
         candidate: identity(&staged)?,
         hash: before_hash,
     };
-    // From here the work directory must outlive this function on any error, and
-    // the journal must be on disk before the swap. An early return below leaves
-    // both files and the journal for `recover_original`.
-    let _retained = temporary.keep();
+    // The journal must be on disk before the swap. If saving fails, `temporary`
+    // drops and removes the work directory. Once it is saved the directory is kept
+    // on any error below, with both files, for `recover_original`.
     save(&record)?;
+    let _retained = temporary.keep();
     swap(source, &staged)?;
+    seals.changed(source);
     File::open(parent)?.sync_all()?;
     // After the swap `staged` holds the original and `source` holds the new copy.
     ensure!(
@@ -571,17 +720,15 @@ fn stage(root: &Path, source: &Path, restore: bool) -> Result<bool> {
         "Published bytes failed verification; recovery copies retained"
     );
     metadata_equal(source, &staged)?;
-    if let Some(bundle) = signature {
-        verify_bundle(&bundle)?;
-    }
     clear_record(&record)?;
     Ok(true)
 }
 
-// Runs one pass over a game folder and returns a summary line. Holds native.lock
-// for the whole pass. Refuses to start while the folder has a journal, while any
-// file under it is open, or when the space plan does not fit. `cancel` is checked
-// before each file, and a raised flag ends the pass with an error.
+// Runs one pass over a game folder and returns a summary. Holds native.lock for
+// the whole pass. Refuses to start while the folder has a journal, while any file
+// under it is open, or when the space plan does not fit. A file that fails is
+// counted as skipped and listed in the summary. `cancel` is checked before each
+// file and ends the pass with an error. A program opening files ends it early.
 fn visit(
     root: &Path,
     restore: bool,
@@ -603,56 +750,179 @@ fn visit(
     );
     ensure!(
         !recovery()?.iter().any(|record| record.root == root),
-        "Review Recovery before processing this game"
+        "Review this game under Recovery before running another job."
     );
     idle(&root)?;
-    crate::storage::native_plan(&root, restore)?.recheck()?;
-    let mut summary = Progress::default();
-    for entry in walkdir::WalkDir::new(&root)
-        .follow_links(false)
-        .into_iter()
-        // Do not descend into staging directories.
-        .filter_entry(|entry| {
-            !entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".flummox-work-")
-        })
-    {
-        ensure!(!cancel.load(Ordering::Relaxed), "Operation stopped");
-        let entry = entry?;
-        if !entry.file_type().is_file() {
-            continue;
+    let found = survey(&root);
+    remove_orphans(&found.work_dirs, &recovery()?)?;
+    crate::storage::per_file_plan(&root, restore)?.recheck()?;
+    let mut summary = Progress {
+        skipped: found.unreadable,
+        ..Progress::default()
+    };
+    let mut seals = Seals::default();
+    let mut failures = Vec::new();
+    if found.unreadable > 0 {
+        failures.push(format!("{} entries could not be read", found.unreadable));
+    }
+    let mut stopped = None;
+    let mut busy = false;
+    let mut last_idle = std::time::Instant::now();
+    for path in &found.files {
+        if cancel.load(Ordering::Relaxed) {
+            stopped = Some(anyhow::anyhow!("The job was stopped."));
+            break;
         }
-        let stat = entry.metadata()?;
-        summary.files += 1;
+        if last_idle.elapsed() >= IDLE_RECHECK {
+            if idle(&root).is_err() {
+                busy = true;
+                break;
+            }
+            last_idle = std::time::Instant::now();
+        }
+        let outcome = visit_file(&root, path, restore, &mut seals, &mut summary);
+        report(summary.clone());
+        if let Err(error) = outcome {
+            failures.push(format!("{}: {error:#}", path.display()));
+            // A journal left behind marks a swap that needs review. Stop there.
+            let review = match recovery() {
+                Ok(records) => records.iter().any(|record| record.root == root),
+                Err(_) => true,
+            };
+            if review {
+                stopped = Some(error);
+                break;
+            }
+        }
+    }
+    let sealed = seals.verify_after();
+    if let Some(error) = stopped {
+        return Err(match sealed {
+            Ok(()) => error,
+            Err(seal) => anyhow::anyhow!("{error:#}; {seal:#}"),
+        });
+    }
+    sealed?;
+    let mut lines = vec![format!(
+        "{} processed · {} changed · {} skipped · space used: {} before, {} after",
+        crate::text::count(summary.files, "file", "files"),
+        summary.changed,
+        summary.skipped,
+        humansize::format_size(summary.allocation_before, humansize::DECIMAL),
+        humansize::format_size(summary.allocation_after, humansize::DECIMAL)
+    )];
+    if !failures.is_empty() {
+        lines.push(format!("Skipped after an error ({}):", failures.len()));
+        lines.extend(failures.into_iter().take(5));
+    }
+    if busy {
+        lines.push(
+            "Stopped early: a program opened files in this game folder. Close it and run the job again."
+                .to_owned(),
+        );
+    }
+    Ok(lines.join("\n"))
+}
+
+// What one walk of a game folder finds.
+struct Survey {
+    // Regular files, in walk order.
+    files: Vec<PathBuf>,
+    // Staging directories from earlier passes, here and beside an enclosing `.app`.
+    work_dirs: Vec<PathBuf>,
+    // Entries the walk could not read.
+    unreadable: u64,
+}
+fn is_work_name(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy().starts_with(WORK_PREFIX)
+}
+// Lists the folder's files up front, so no directory handle of ours is open while
+// the pass re-checks for other programs. Does not descend into staging directories.
+fn survey(root: &Path) -> Survey {
+    let mut found = Survey {
+        files: Vec::new(),
+        work_dirs: Vec::new(),
+        unreadable: 0,
+    };
+    let mut walker = walkdir::WalkDir::new(root).follow_links(false).into_iter();
+    while let Some(entry) = walker.next() {
+        let Ok(entry) = entry else {
+            found.unreadable += 1;
+            continue;
+        };
+        if is_work_name(entry.file_name()) {
+            if entry.file_type().is_dir() {
+                found.work_dirs.push(entry.path().to_path_buf());
+                walker.skip_current_dir();
+            }
+        } else if entry.file_type().is_file() {
+            found.files.push(entry.into_path());
+        }
+    }
+    // Files inside an enclosing bundle stage in the folder that holds it.
+    if let Some(outer) = outer_bundle(root)
+        && let Some(parent) = outer.parent()
+        && let Ok(entries) = std::fs::read_dir(parent)
+    {
+        for entry in entries.flatten() {
+            if is_work_name(&entry.file_name()) && entry.file_type().is_ok_and(|kind| kind.is_dir())
+            {
+                found.work_dirs.push(entry.path());
+            }
+        }
+    }
+    found
+}
+// Removes the staging directories that no journal names, which are left by a pass
+// that was killed or whose journal could not be saved. Returns how many it removed.
+fn remove_orphans(directories: &[PathBuf], journals: &[Recovery]) -> Result<u64> {
+    let mut removed = 0;
+    for directory in directories {
+        let named = directory.file_name().is_some_and(is_work_name);
+        let kept = journals
+            .iter()
+            .any(|record| record.staged.parent() == Some(directory.as_path()));
+        if named && !kept {
+            ignore_missing(std::fs::remove_dir_all(directory))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+// Processes one file and adds it to the running totals. A file that cannot be
+// processed counts as skipped and its error is returned.
+fn visit_file(
+    root: &Path,
+    path: &Path,
+    restore: bool,
+    seals: &mut Seals,
+    summary: &mut Progress,
+) -> Result<()> {
+    let before = std::fs::symlink_metadata(path);
+    summary.files += 1;
+    if let Ok(stat) = &before {
         summary.bytes = summary.bytes.saturating_add(stat.len());
         // `blocks()` counts 512-byte units whatever the filesystem's block size.
         summary.allocation_before = summary
             .allocation_before
             .saturating_add(stat.blocks().saturating_mul(512));
-        if stat.nlink() == 1 && stage(&root, entry.path(), restore)? {
-            summary.changed += 1;
-        } else {
-            summary.skipped += 1;
-        }
-        summary.allocation_after = summary.allocation_after.saturating_add(
-            entry
-                .path()
-                .symlink_metadata()?
-                .blocks()
-                .saturating_mul(512),
-        );
-        report(summary.clone());
     }
-    Ok(format!(
-        "{} files processed; {} changed, {} skipped. Allocated storage: {} before, {} after.",
-        summary.files,
-        summary.changed,
-        summary.skipped,
-        summary.allocation_before,
-        summary.allocation_after
-    ))
+    let outcome = match &before {
+        Ok(stat) if stat.nlink() == 1 => stage(root, path, restore, seals),
+        Ok(_) => Ok(false),
+        Err(error) => Err(anyhow::anyhow!("{error}")),
+    };
+    if matches!(outcome, Ok(true)) {
+        summary.changed += 1;
+    } else {
+        summary.skipped += 1;
+    }
+    if let Ok(stat) = std::fs::symlink_metadata(path) {
+        summary.allocation_after = summary
+            .allocation_after
+            .saturating_add(stat.blocks().saturating_mul(512));
+    }
+    outcome.map(|_| ())
 }
 
 // Compresses the files under `root`. `report` receives running totals after each file.
@@ -763,6 +1033,29 @@ enum Command {
     Recovery,
     Recover { folder: PathBuf },
 }
+// A flag that SIGINT and SIGTERM raise, so a pass stops between files and its
+// current work directory is removed.
+fn interrupt_flag() -> Result<std::sync::Arc<AtomicBool>> {
+    let flag = std::sync::Arc::new(AtomicBool::new(false));
+    for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+        let _id = signal_hook::flag::register(signal, std::sync::Arc::clone(&flag))
+            .with_context(|| format!("installing the handler for signal {signal}"))?;
+    }
+    Ok(flag)
+}
+// A progress reporter that writes running totals to stderr, at most once a second.
+fn stderr_progress() -> impl FnMut(Progress) {
+    let mut last = std::time::Instant::now();
+    move |progress| {
+        if last.elapsed() >= std::time::Duration::from_secs(1) {
+            last = std::time::Instant::now();
+            eprintln!(
+                "{} files, {} changed, {} skipped",
+                progress.files, progress.changed, progress.skipped
+            );
+        }
+    }
+}
 // Runs the macOS command line tool.
 pub fn run() -> Result<()> {
     match Args::parse().command {
@@ -773,27 +1066,21 @@ pub fn run() -> Result<()> {
         }
         Command::Analyze { folder } => println!(
             "{}",
-            serde_json::to_string_pretty(&crate::storage::native_plan(
+            serde_json::to_string_pretty(&crate::storage::per_file_plan(
                 &validate(&folder)?,
                 false
             )?)?
         ),
         Command::Compress { folder } => println!(
             "{}",
-            optimize_folder_with(&folder, &AtomicBool::new(false), |_| {})?
+            optimize_folder_with(&folder, &*interrupt_flag()?, stderr_progress())?
         ),
         Command::Decompress { folder } => println!(
             "{}",
-            restore_folder_with(&folder, &AtomicBool::new(false), |_| {})?
+            restore_folder_with(&folder, &*interrupt_flag()?, stderr_progress())?
         ),
         Command::Recovery => println!("{}", serde_json::to_string_pretty(&recovery()?)?),
-        // Same loop as `recover_folder`, without taking native.lock.
-        Command::Recover { folder } => {
-            let folder = validate(&folder)?;
-            for record in recovery()?.iter().filter(|record| record.root == folder) {
-                recover_original(record)?;
-            }
-        }
+        Command::Recover { folder } => recover_folder(&folder)?,
     }
     Ok(())
 }
@@ -815,7 +1102,7 @@ mod tests {
         xattr::set(&path, "user.flummox-fixture", b"metadata").ctx("attribute")?;
         let before = std::fs::symlink_metadata(&path).ctx("original metadata")?;
         check(
-            stage(&root, &path, false).ctx("compress")?,
+            stage(&root, &path, false, &mut Seals::default()).ctx("compress")?,
             "APFS must actually compress the positive control",
         )?;
         let compressed = std::fs::symlink_metadata(&path).ctx("compressed metadata")?;
@@ -829,7 +1116,7 @@ mod tests {
             "ordinary reads preserve bytes",
         )?;
         check(
-            stage(&root, &path, true).ctx("restore")?,
+            stage(&root, &path, true, &mut Seals::default()).ctx("restore")?,
             "compressed file must restore",
         )?;
         check_eq(
@@ -862,7 +1149,7 @@ mod tests {
         let source = root.join("original");
         std::fs::write(&source, b"original bytes").ctx("source")?;
         let temporary = tempfile::Builder::new()
-            .prefix(".flummox-work-")
+            .prefix(WORK_PREFIX)
             .tempdir_in(&root)
             .ctx("staging")?;
         let staged = temporary.path().join("candidate");
@@ -890,5 +1177,122 @@ mod tests {
             !journal_path(&record).ctx("journal")?.exists(),
             "successful recovery clears its journal",
         )
+    }
+    #[test]
+    fn kernel_managed_attributes_are_left_out_of_the_comparison() -> TestResult {
+        for name in [
+            "com.apple.provenance",
+            "com.apple.decmpfs",
+            "com.apple.ResourceFork",
+        ] {
+            check(
+                kernel_managed(std::ffi::OsStr::new(name)),
+                format!("{name} is kernel-managed"),
+            )?;
+        }
+        check(
+            !kernel_managed(std::ffi::OsStr::new("com.apple.quarantine")),
+            "quarantine is compared",
+        )?;
+        check(
+            !kernel_managed(std::ffi::OsStr::new("user.flummox-fixture")),
+            "user attributes are compared",
+        )
+    }
+    #[test]
+    fn too_broad_refuses_mount_points_and_state_ancestors() -> TestResult {
+        let mount = Path::new("/Volumes/Games");
+        let state = Path::new("/Users/a/Library/Application Support/flummox");
+        check(
+            too_broad(mount, mount, state).is_some(),
+            "a mount point is refused",
+        )?;
+        check(
+            too_broad(Path::new("/Users/a/Library"), mount, state).is_some(),
+            "an ancestor of the state directory is refused",
+        )?;
+        check(
+            too_broad(Path::new("/Volumes/Games/Portal"), mount, state).is_none(),
+            "a game folder on the volume is accepted",
+        )
+    }
+    #[test]
+    fn work_directories_stay_outside_application_bundles() -> TestResult {
+        check_eq(
+            work_parent(Path::new("/g/Game/data/file.bin")),
+            Some(PathBuf::from("/g/Game/data")),
+            "an ordinary file stages beside itself",
+        )?;
+        check_eq(
+            work_parent(Path::new("/g/Game/Foo.app/Contents/MacOS/foo")),
+            Some(PathBuf::from("/g/Game")),
+            "a bundle file stages beside the bundle",
+        )?;
+        check_eq(
+            work_parent(Path::new(
+                "/g/Foo.app/Contents/Frameworks/Bar.app/Contents/x",
+            )),
+            Some(PathBuf::from("/g")),
+            "a nested bundle stages beside the outermost one",
+        )
+    }
+    #[test]
+    fn staging_locations_accept_both_layouts_and_nothing_else() -> TestResult {
+        let root = Path::new("/g/Game");
+        let bundle_file = Path::new("/g/Game/Foo.app/Contents/MacOS/foo");
+        check(
+            staging_expected(
+                root,
+                bundle_file,
+                Path::new("/g/Game/.flummox-work-a/candidate"),
+            ),
+            "current layout beside the bundle",
+        )?;
+        check(
+            staging_expected(
+                root,
+                bundle_file,
+                Path::new("/g/Game/Foo.app/Contents/MacOS/.flummox-work-a/candidate"),
+            ),
+            "older layout beside the file",
+        )?;
+        check(
+            !staging_expected(
+                root,
+                bundle_file,
+                Path::new("/elsewhere/.flummox-work-a/candidate"),
+            ),
+            "a location outside the root is refused",
+        )
+    }
+    #[test]
+    fn orphaned_work_directories_are_removed_and_other_folders_kept() -> TestResult {
+        let fixture = tempfile::tempdir().ctx("fixture")?;
+        let orphan = fixture.path().join(".flummox-work-orphan");
+        let other = fixture.path().join("saves");
+        std::fs::create_dir(&orphan).ctx("orphan")?;
+        std::fs::write(orphan.join("candidate"), b"partial").ctx("partial copy")?;
+        std::fs::create_dir(&other).ctx("other")?;
+        let removed =
+            remove_orphans(&[orphan.clone(), other.clone()], &[]).ctx("remove orphans")?;
+        check_eq(removed, 1, "one directory removed")?;
+        check(!orphan.exists(), "the orphan is gone")?;
+        check(other.exists(), "a folder without the prefix is kept")
+    }
+    #[test]
+    fn survey_lists_files_and_work_directories_separately() -> TestResult {
+        let fixture = tempfile::tempdir().ctx("fixture")?;
+        let work = fixture.path().join(".flummox-work-a");
+        std::fs::create_dir(&work).ctx("work")?;
+        std::fs::write(work.join("candidate"), b"partial").ctx("partial copy")?;
+        std::fs::write(fixture.path().join("game.bin"), b"data").ctx("game file")?;
+        let found = survey(fixture.path());
+        check_eq(
+            found.files,
+            vec![fixture.path().join("game.bin")],
+            "only the game file is listed",
+        )?;
+        check_eq(found.work_dirs, vec![work], "the work directory is listed")?;
+        check_eq(found.unreadable, 0, "nothing was unreadable")
     }
 }

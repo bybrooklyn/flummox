@@ -217,6 +217,10 @@ mod tests {
         let here = std::env::current_dir().ctx("working directory")?;
         let tmp = tempfile::TempDir::new_in(here).ctx("temp directory")?;
         if crate::fsprobe::probe(tmp.path()).ctx("probe")?.fstype != "btrfs" {
+            check(
+                std::env::var_os("FLUMMOX_REQUIRE_BTRFS").is_none(),
+                "the extent refusal requires btrfs, and FLUMMOX_REQUIRE_BTRFS is set",
+            )?;
             eprintln!("skipped: the extent refusal requires btrfs");
             return Ok(());
         }

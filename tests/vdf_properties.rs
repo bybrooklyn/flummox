@@ -9,7 +9,7 @@
 //! scan.
 //!
 //! That turns "the parser handles malformed input" into a claim that cannot be
-//! checked with examples: the interesting inputs are the ones nobody thought
+//! checked with examples: the interesting inputs are the ones no author thought
 //! to write down. The properties here therefore quantify over arbitrary input
 //! and assert the things that must hold for *all* of it:
 //!
@@ -135,6 +135,56 @@ fn write_document(pairs: &[(String, String)]) -> String {
     text
 }
 
+/// A value in a generated, structurally valid document.
+#[derive(Debug, Clone)]
+enum Val {
+    /// A string, written quoted or as a bare token.
+    Leaf(String, bool),
+    /// An object of plain quoted pairs.
+    Obj(Vec<(String, String)>),
+}
+
+/// A bare token the lexer must read back unchanged. It may start with a lone
+/// slash and may hold `/`, but never begins a `//` comment.
+fn bare_word() -> impl Strategy<Value = String> {
+    prop_oneof![
+        1 => Just("/".to_owned()),
+        6 => "/?[A-Za-z0-9_.:-][A-Za-z0-9_./:-]{0,10}",
+    ]
+}
+
+/// Entries of a valid document: a key, a value, and whether a comment follows.
+fn valid_entries() -> impl Strategy<Value = Vec<(String, Val, bool)>> {
+    let leaf = prop_oneof![
+        (vdf_text(), Just(false)).prop_map(|(t, q)| Val::Leaf(t, q)),
+        (bare_word(), Just(true)).prop_map(|(t, u)| Val::Leaf(t, u)),
+    ];
+    let obj = prop::collection::vec((vdf_text(), vdf_text()), 0..4).prop_map(Val::Obj);
+    prop::collection::vec((vdf_text(), prop_oneof![leaf, obj], any::<bool>()), 0..8)
+}
+
+/// Renders [`valid_entries`]. `unquoted` in a leaf means the bare form.
+fn write_valid(entries: &[(String, Val, bool)]) -> String {
+    let mut text = String::from("\"root\"\n{\n");
+    for (key, value, comment) in entries {
+        text.push_str(&format!("\"{}\" ", vdf_escape(key)));
+        match value {
+            Val::Leaf(token, true) => text.push_str(token),
+            Val::Leaf(token, false) => text.push_str(&format!("\"{}\"", vdf_escape(token))),
+            Val::Obj(pairs) => {
+                text.push_str("{\n");
+                for (k, v) in pairs {
+                    text.push_str(&format!("\"{}\" \"{}\"\n", vdf_escape(k), vdf_escape(v)));
+                }
+                text.push('}');
+            }
+        }
+        text.push_str(if *comment { " // note\n" } else { "\n" });
+    }
+    text.push_str("}\n");
+    text
+}
+
 proptest! {
     // Each case builds and parses a document up to a few hundred characters
     // long, so a few hundred cases stay well inside a second.
@@ -194,6 +244,55 @@ proptest! {
         }
     }
 
+    /// Valid documents, bare tokens and comments included, read back exactly.
+    ///
+    /// The other generators rarely produce a well-formed document, so this one
+    /// is where the entry count and every value are compared with what was
+    /// written.
+    #[test]
+    fn valid_documents_with_bare_tokens_and_comments_read_back(entries in valid_entries()) {
+        let text = write_valid(&entries);
+        let obj = match vdf::parse(&text) {
+            Ok(obj) => obj,
+            Err(e) => return Err(TestCaseError::fail(format!("{e} while parsing {text:?}"))),
+        };
+        prop_assert_eq!(obj.entries().len(), entries.len(), "top-level count in {:?}", text);
+        for (i, (key, value, _)) in entries.iter().enumerate() {
+            let Some((got_key, got)) = obj.entries().get(i) else {
+                return Err(TestCaseError::fail(format!("no entry {i} in {text:?}")));
+            };
+            prop_assert_eq!(got_key, key, "key {}", i);
+            match value {
+                Val::Leaf(token, _) => {
+                    prop_assert_eq!(got.as_str(), Some(token.as_str()), "value {} in {:?}", i, text);
+                }
+                Val::Obj(pairs) => {
+                    let inner = got.as_obj().map(|o| o.entries().len());
+                    prop_assert_eq!(inner, Some(pairs.len()), "object {} in {:?}", i, text);
+                }
+            }
+        }
+        prop_assert_eq!(count_entries(&obj) <= text.chars().count(), true, "entry bound");
+    }
+
+    /// Cutting a valid document anywhere before its final brace is an error.
+    ///
+    /// The root object is then unclosed whatever the cut lands in, so a parser
+    /// that accepted a truncated manifest as a shorter complete one fails here.
+    #[test]
+    fn truncated_valid_documents_are_rejected(entries in valid_entries(), cut in any::<prop::sample::Index>()) {
+        let text = write_valid(&entries);
+        let chars: Vec<char> = text.chars().collect();
+        let limit = chars.len().saturating_sub(2);
+        let keep = cut.index(limit.max(1)).min(limit);
+        let truncated: String = chars.iter().take(keep).collect();
+        prop_assert!(
+            vdf::parse(&truncated).is_err(),
+            "accepted a truncated document: {:?}",
+            truncated
+        );
+    }
+
     /// Whatever a manifest says, the tool must read back what was written.
     ///
     /// Steam stores Windows paths (`C:\\games\\x`), display names with quotes
@@ -238,37 +337,57 @@ proptest! {
 /// the attacker's length rather than ours.
 #[test]
 fn pathological_documents_terminate_with_a_result() -> TestResult {
-    let cases: Vec<String> = vec![
+    use vdf::ErrorKind::{
+        ExpectedRoot, UnexpectedEof, UnterminatedConditional, UnterminatedString,
+    };
+    // Each document with the answer it must give: `Ok(entries)` or the error.
+    let cases: Vec<(String, Result<usize, vdf::ErrorKind>)> = vec![
         // Truncated mid-object: the shape of a manifest Steam was killed while
         // writing.
-        "\"AppState\" {".to_owned(),
+        ("\"AppState\" {".to_owned(), Err(UnexpectedEof)),
         // A quote that never closes, at end of input.
-        "\"".to_owned(),
-        "\"AppState\" { \"name\" \"unterminated".to_owned(),
+        ("\"".to_owned(), Err(UnterminatedString)),
+        (
+            "\"AppState\" { \"name\" \"unterminated".to_owned(),
+            Err(UnterminatedString),
+        ),
         // A trailing backslash: the escape reader must not read past the end.
-        "\"AppState\" { \"name\" \"path\\".to_owned(),
+        (
+            "\"AppState\" { \"name\" \"path\\".to_owned(),
+            Err(UnterminatedString),
+        ),
         // A conditional with no closing bracket.
-        "\"AppState\" { [$UNTERMINATED".to_owned(),
+        (
+            "\"AppState\" { [$UNTERMINATED".to_owned(),
+            Err(UnterminatedConditional),
+        ),
         // A key and a token far larger than any real manifest holds.
-        format!("\"AppState\" {{ \"{}\" \"v\" }}", "k".repeat(200_000)),
-        format!("\"{}\"", "x".repeat(200_000)),
-        "x".repeat(200_000),
+        (
+            format!("\"AppState\" {{ \"{}\" \"v\" }}", "k".repeat(200_000)),
+            Ok(1),
+        ),
+        (format!("\"{}\"", "x".repeat(200_000)), Err(ExpectedRoot)),
+        ("x".repeat(200_000), Err(ExpectedRoot)),
         // Braces with nothing to bind them to, in both directions.
-        "{".repeat(10_000),
-        "}".repeat(10_000),
-        // A great many entries from a small file.
-        format!("\"AppState\" {{ {} }}", "\"a\" ".repeat(50_000)),
+        ("{".repeat(10_000), Err(ExpectedRoot)),
+        ("}".repeat(10_000), Err(ExpectedRoot)),
+        // A great many entries from a small file: 25,000 key/value pairs.
+        (
+            format!("\"AppState\" {{ {} }}", "\"a\" ".repeat(50_000)),
+            Ok(25_000),
+        ),
         // A comment that never ends, and control characters in a value.
-        "// no newline ever".to_owned(),
-        "\"AppState\" { \"a\" \"\u{0}\u{1}\u{feff}\" }".to_owned(),
+        ("// no newline ever".to_owned(), Err(ExpectedRoot)),
+        (
+            "\"AppState\" { \"a\" \"\u{0}\u{1}\u{feff}\" }".to_owned(),
+            Ok(1),
+        ),
     ];
-    for (i, case) in cases.iter().enumerate() {
-        // Reaching this assignment at all is the property under test.
-        let outcome = match vdf::parse(case) {
-            Ok(obj) => format!("case {i}: parsed {} entries", count_entries(&obj)),
-            Err(e) => format!("case {i}: rejected at line {}: {}", e.line, e.kind),
-        };
-        check(!outcome.is_empty(), outcome)?;
+    for (i, (case, expected)) in cases.iter().enumerate() {
+        let outcome = vdf::parse(case)
+            .map(|obj| count_entries(&obj))
+            .map_err(|e| e.kind);
+        check_eq(outcome, expected.clone(), format!("case {i}"))?;
     }
     Ok(())
 }

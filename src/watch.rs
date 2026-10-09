@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::inotify;
@@ -50,18 +51,62 @@ pub fn appid_from_manifest(name: &str) -> Option<u32> {
         .ok()
 }
 
+/// Waits before each retry of an `on_ready` that failed: three retries after
+/// the first attempt.
+pub const RETRY_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(10),
+    Duration::from_secs(60),
+    Duration::from_secs(300),
+];
+
+/// An app whose `on_ready` failed and is waiting for its next attempt.
+struct Retry {
+    app: App,
+    /// Attempts made so far.
+    attempts: usize,
+    due: Instant,
+}
+
+/// What the watcher last saw of an app.
+struct Seen {
+    settled: bool,
+    build: Option<String>,
+}
+
+/// Whether an app is newly ready: settled now, and either it was not settled
+/// before or it settled on a different build.
+///
+/// An update that starts and finishes while a caller is busy with another
+/// game leaves the app settled at both readings, and only the build changes.
+fn newly_ready(before: Option<&Seen>, app: &App) -> bool {
+    is_settled(app) && before.is_none_or(|seen| !seen.settled || seen.build != app.build)
+}
+
 /// Watches each library's `steamapps` directory, reporting apps as they settle.
 ///
-/// Runs until `cancel` is set. `on_ready` is called once per app each time it
-/// becomes settled, not once per manifest write.
+/// Runs until `cancel` is set, or fails once every watched folder is gone.
+/// `on_ready` is called once per app each time it becomes settled or settles
+/// on a new build, not once per manifest write. An app counts as handled only
+/// when `on_ready` returns `Ok`. After an error it is retried on the
+/// [`RETRY_BACKOFF`] schedule, and once that is spent, at the next manifest change.
 pub fn run(
     libraries: &[PathBuf],
     cancel: &AtomicBool,
-    mut on_ready: impl FnMut(&App),
+    on_ready: impl FnMut(&App) -> anyhow::Result<()>,
+) -> io::Result<()> {
+    run_with_backoff(libraries, cancel, &RETRY_BACKOFF, on_ready)
+}
+
+/// [`run`] with the waits between retries of a failing `on_ready`.
+pub fn run_with_backoff(
+    libraries: &[PathBuf],
+    cancel: &AtomicBool,
+    backoff: &[Duration],
+    mut on_ready: impl FnMut(&App) -> anyhow::Result<()>,
 ) -> io::Result<()> {
     let fd = inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK)?;
 
-    let mut settled: HashMap<u32, bool> = HashMap::new();
+    let mut seen: HashMap<u32, Seen> = HashMap::new();
     let mut watched: Vec<PathBuf> = Vec::new();
     for library in libraries {
         let steamapps = library.join("steamapps");
@@ -78,7 +123,13 @@ pub fn run(
         // Seeded from what is installed now. Without this, starting the
         // watcher on a full library would report every finished game at once.
         for app in steam::apps_in_library(library).unwrap_or_default() {
-            settled.insert(app.appid, is_settled(&app));
+            seen.insert(
+                app.appid,
+                Seen {
+                    settled: is_settled(&app),
+                    build: app.build.clone(),
+                },
+            );
         }
         watched.push(library.clone());
     }
@@ -89,16 +140,31 @@ pub fn run(
         ));
     }
 
+    let mut alive = watched.len();
+    let mut retries: HashMap<u32, Retry> = HashMap::new();
     let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); BUF_BYTES];
     while !cancel.load(Ordering::Relaxed) {
         let mut fds = [PollFd::new(&fd, PollFlags::IN)];
-        match poll(&mut fds, Some(&WAIT)) {
-            Ok(0) => continue,
+        let timeout = wait_for(&retries);
+        match poll(&mut fds, Some(&timeout)) {
+            Ok(0) => {
+                retry_due(&mut retries, &mut seen, backoff, &mut on_ready);
+                continue;
+            }
             Ok(_) => {}
             Err(rustix::io::Errno::INTR) => continue,
             Err(e) => return Err(e.into()),
         }
-        if !drain(&fd, &mut buf)? {
+        let drained = drain(&fd, &mut buf)?;
+        alive = alive.saturating_sub(drained.lost);
+        if alive == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "every watched Steam folder has gone away",
+            ));
+        }
+        retry_due(&mut retries, &mut seen, backoff, &mut on_ready);
+        if !drained.rescan {
             continue;
         }
         // One manifest changed, so every library is re-read. A library holds
@@ -106,10 +172,30 @@ pub fn run(
         // watch descriptor belongs to which directory.
         for library in &watched {
             for app in steam::apps_in_library(library).unwrap_or_default() {
-                let now = is_settled(&app);
-                let before = settled.insert(app.appid, now).unwrap_or(false);
-                if now && !before {
-                    on_ready(&app);
+                let settled = is_settled(&app);
+                let ready = newly_ready(seen.get(&app.appid), &app);
+                // An app waiting on a backoff keeps waiting while its build is
+                // unchanged, so another game's manifest cannot cut the wait short.
+                let waiting = retries.get(&app.appid).is_some_and(|retry| {
+                    retry.app.build == app.build && retry.due > Instant::now()
+                });
+                if ready && waiting {
+                    continue;
+                }
+                // An app that is ready is recorded as handled only once
+                // `on_ready` succeeds.
+                seen.insert(
+                    app.appid,
+                    Seen {
+                        settled: settled && !ready,
+                        build: app.build.clone(),
+                    },
+                );
+                if !settled {
+                    retries.remove(&app.appid);
+                }
+                if ready {
+                    attempt(&app, 1, &mut retries, &mut seen, backoff, &mut on_ready);
                 }
             }
         }
@@ -117,9 +203,112 @@ pub fn run(
     Ok(())
 }
 
-/// Reads the pending events, reporting whether any named a manifest.
-fn drain(fd: &impl rustix::fd::AsFd, buf: &mut [std::mem::MaybeUninit<u8>]) -> io::Result<bool> {
-    let mut saw_manifest = false;
+/// Runs `on_ready` for `app`, which has made `attempts - 1` earlier tries.
+/// Success marks it settled. A failure schedules the next try, or once the
+/// backoff is spent logs the error and leaves the app for the next manifest change.
+fn attempt(
+    app: &App,
+    attempts: usize,
+    retries: &mut HashMap<u32, Retry>,
+    seen: &mut HashMap<u32, Seen>,
+    backoff: &[Duration],
+    on_ready: &mut impl FnMut(&App) -> anyhow::Result<()>,
+) {
+    match on_ready(app) {
+        Ok(()) => {
+            retries.remove(&app.appid);
+            seen.insert(
+                app.appid,
+                Seen {
+                    settled: true,
+                    build: app.build.clone(),
+                },
+            );
+        }
+        Err(error) => match backoff.get(attempts.saturating_sub(1)) {
+            Some(wait) => {
+                tracing::debug!(appid = app.appid, attempts, %error, "retrying a finished download");
+                retries.insert(
+                    app.appid,
+                    Retry {
+                        app: app.clone(),
+                        attempts,
+                        due: Instant::now() + *wait,
+                    },
+                );
+            }
+            None => {
+                retries.remove(&app.appid);
+                tracing::warn!(
+                    appid = app.appid,
+                    name = %app.name,
+                    attempts,
+                    "gave up on a finished download until its manifest changes: {error:#}"
+                );
+            }
+        },
+    }
+}
+
+/// Retries every app whose wait is over.
+fn retry_due(
+    retries: &mut HashMap<u32, Retry>,
+    seen: &mut HashMap<u32, Seen>,
+    backoff: &[Duration],
+    on_ready: &mut impl FnMut(&App) -> anyhow::Result<()>,
+) {
+    let now = Instant::now();
+    let due: Vec<u32> = retries
+        .iter()
+        .filter(|(_, retry)| retry.due <= now)
+        .map(|(appid, _)| *appid)
+        .collect();
+    for appid in due {
+        if let Some(retry) = retries.remove(&appid) {
+            attempt(
+                &retry.app,
+                retry.attempts + 1,
+                retries,
+                seen,
+                backoff,
+                on_ready,
+            );
+        }
+    }
+}
+
+/// How long to wait for events: the regular interval, or less when a retry is
+/// due sooner.
+fn wait_for(retries: &HashMap<u32, Retry>) -> Timespec {
+    let now = Instant::now();
+    let soonest = retries
+        .values()
+        .map(|retry| retry.due.saturating_duration_since(now))
+        .min();
+    match soonest {
+        Some(left) if left < Duration::from_secs(1) => Timespec {
+            tv_sec: 0,
+            tv_nsec: i64::from(left.subsec_nanos()).max(1_000_000),
+        },
+        _ => WAIT,
+    }
+}
+
+/// What the pending events asked for.
+struct Drained {
+    /// A manifest changed, or the kernel dropped events and any might have.
+    rescan: bool,
+    /// Watches the kernel removed, because their folder went away.
+    lost: usize,
+}
+
+/// Reads the pending events.
+fn drain(fd: &impl rustix::fd::AsFd, buf: &mut [std::mem::MaybeUninit<u8>]) -> io::Result<Drained> {
+    use inotify::ReadFlags;
+    let mut drained = Drained {
+        rescan: false,
+        lost: 0,
+    };
     let mut reader = inotify::Reader::new(fd, buf);
     loop {
         match reader.next() {
@@ -129,11 +318,15 @@ fn drain(fd: &impl rustix::fd::AsFd, buf: &mut [std::mem::MaybeUninit<u8>]) -> i
                     .and_then(|name| name.to_str().ok())
                     .and_then(appid_from_manifest)
                     .is_some()
+                    || event.events().contains(ReadFlags::QUEUE_OVERFLOW)
                 {
-                    saw_manifest = true;
+                    drained.rescan = true;
+                }
+                if event.events().contains(ReadFlags::IGNORED) {
+                    drained.lost += 1;
                 }
             }
-            Err(rustix::io::Errno::WOULDBLOCK) => return Ok(saw_manifest),
+            Err(rustix::io::Errno::WOULDBLOCK) => return Ok(drained),
             Err(rustix::io::Errno::INTR) => {}
             Err(e) => return Err(e.into()),
         }

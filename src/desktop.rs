@@ -44,7 +44,7 @@ macro_rules! display_choices {
 }
 display_choices!(ThemeChoice, System => "System", Dark => "Dark", Light => "Light");
 display_choices!(MotionChoice, Normal => "Smooth", Subtle => "Subtle", Reduced => "Reduced");
-display_choices!(LocationKind, Game => "One game", Collection => "Games library");
+display_choices!(LocationKind, Game => "Single game", Collection => "Games library");
 impl MotionChoice {
     /// Length of the page transition.
     pub fn duration(self) -> std::time::Duration {
@@ -88,6 +88,22 @@ pub struct Preferences {
     /// Holds every job while true. On Windows the worker owns this value, and a
     /// Settings command from the window does not change it.
     pub maintenance_paused: bool,
+    /// The drive each location was last seen on, as the identity jobs use, keyed by
+    /// `location_key`. A location missing here has not been seen yet.
+    pub location_volumes: std::collections::BTreeMap<String, String>,
+}
+/// A fixed-length key for a location path.
+pub fn location_key(path: &Path) -> String {
+    blake3::hash(path.as_os_str().as_encoded_bytes())
+        .to_hex()
+        .to_string()
+}
+/// The identity of the drive holding `path`, or `None` when it cannot be read, for
+/// example while the drive is disconnected.
+pub fn volume_identity(path: &Path) -> Option<String> {
+    crate::storage::volume(path)
+        .ok()
+        .map(|volume| volume.identity)
 }
 /// Reads a whole file, failing if it holds more than `limit` bytes. It reads one byte
 /// past the limit, so the check does not depend on the size the filesystem reports.
@@ -109,6 +125,88 @@ fn missing(error: &anyhow::Error) -> bool {
         .downcast_ref::<std::io::Error>()
         .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
+/// Renames an unreadable state file to `<name>.corrupt` (then `.corrupt.1`, and so on)
+/// so a fresh one can be written. Returns the new path. The contents are kept.
+pub fn quarantine(path: &Path) -> Result<PathBuf> {
+    let name = path
+        .file_name()
+        .context("State file has no name")?
+        .to_string_lossy()
+        .into_owned();
+    for attempt in 0..100u32 {
+        let suffix = if attempt == 0 {
+            ".corrupt".to_owned()
+        } else {
+            format!(".corrupt.{attempt}")
+        };
+        let target = path.with_file_name(format!("{name}{suffix}"));
+        if !target.exists() {
+            std::fs::rename(path, &target)?;
+            return Ok(target);
+        }
+    }
+    anyhow::bail!("Too many quarantined copies of {}", path.display())
+}
+
+/// Folders that must never be compressed whole, and the folders that contain them.
+#[derive(Debug, Default, Clone)]
+pub struct ProtectedFolders {
+    /// A game folder may not be one of these or hold one: the system root,
+    /// the user profile and the Program Files and ProgramData roots.
+    pub roots: Vec<PathBuf>,
+    /// A game folder may not be inside one of these: the system root.
+    pub trees: Vec<PathBuf>,
+}
+
+impl ProtectedFolders {
+    /// Reads the Windows locations from the environment, canonical where they
+    /// exist. Empty on a system that sets none of these variables.
+    pub fn from_environment() -> Self {
+        let find = |name: &str| {
+            std::env::var_os(name)
+                .map(PathBuf::from)
+                .and_then(|path| path.canonicalize().ok())
+        };
+        let trees: Vec<PathBuf> = ["SystemRoot", "windir"]
+            .iter()
+            .filter_map(|name| find(name))
+            .collect();
+        let mut roots = trees.clone();
+        roots.extend(
+            [
+                "USERPROFILE",
+                "ProgramFiles",
+                "ProgramFiles(x86)",
+                "ProgramW6432",
+                "ProgramData",
+            ]
+            .iter()
+            .filter_map(|name| find(name)),
+        );
+        Self { roots, trees }
+    }
+
+    /// Fails for a filesystem root, for a protected folder or one of its
+    /// ancestors, and for anything inside a protected tree. Expects canonical paths.
+    pub fn check(&self, path: &Path) -> Result<()> {
+        ensure!(
+            path.parent().is_some(),
+            "Choose a game folder, not a drive."
+        );
+        ensure!(
+            !self.roots.iter().any(|root| root.starts_with(path)),
+            "{} is a system or profile folder.",
+            path.display()
+        );
+        ensure!(
+            !self.trees.iter().any(|tree| path.starts_with(tree)),
+            "{} is inside the Windows folder.",
+            path.display()
+        );
+        Ok(())
+    }
+}
+
 impl Preferences {
     /// Loads `desktop.json` from `root`. Without one it migrates the older
     /// `folders.json` list of game folders, and with neither it returns the defaults.
@@ -151,7 +249,7 @@ impl Preferences {
         let bytes = serde_json::to_vec(self)?;
         ensure!(
             bytes.len() <= 1024 * 1024,
-            "Desktop preferences exceed 1 MiB"
+            "Settings are too large to save."
         );
         let mut staged = tempfile::NamedTempFile::new_in(root)?;
         staged.write_all(&bytes)?;
@@ -165,10 +263,8 @@ impl Preferences {
     /// exist and is stored canonical. A filesystem root is refused.
     pub fn add(&mut self, path: &Path, kind: LocationKind) -> Result<()> {
         let path = path.canonicalize()?;
-        ensure!(
-            path.is_dir() && path.parent().is_some(),
-            "Choose an existing game or games library"
-        );
+        ensure!(path.is_dir(), "Choose an existing game or games library.");
+        ProtectedFolders::from_environment().check(&path)?;
         if let Some(old) = self
             .locations
             .iter_mut()
@@ -176,6 +272,9 @@ impl Preferences {
         {
             old.kind = kind;
         } else {
+            if let Some(identity) = volume_identity(&path) {
+                self.location_volumes.insert(location_key(&path), identity);
+            }
             self.locations.push(Location {
                 path,
                 kind,
@@ -190,6 +289,29 @@ impl Preferences {
         let resolved = resolved_path(path);
         self.locations
             .retain(|location| resolved_path(&location.path) != resolved);
+        self.prune_volumes();
+    }
+    fn prune_volumes(&mut self) {
+        let keep: std::collections::HashSet<String> = self
+            .locations
+            .iter()
+            .map(|location| location_key(&location.path))
+            .collect();
+        self.location_volumes.retain(|key, _| keep.contains(key));
+    }
+    /// Stores the drive each location is on now, as read by `current`, and drops
+    /// entries for locations that are gone. A location whose drive cannot be read
+    /// keeps its old entry. Returns true when anything changed.
+    pub fn record_volumes(&mut self, current: &dyn Fn(&Path) -> Option<String>) -> bool {
+        let before = self.location_volumes.clone();
+        for location in &self.locations {
+            if let Some(identity) = current(&location.path) {
+                self.location_volumes
+                    .insert(location_key(&location.path), identity);
+            }
+        }
+        self.prune_volumes();
+        self.location_volumes != before
     }
     /// The games under the user's locations, plus one warning per path that could
     /// not be read. Each game's build is a metadata stamp of its files, so a change
@@ -197,6 +319,7 @@ impl Preferences {
     pub fn custom_games(&self) -> (Vec<crate::model::Game>, Vec<String>) {
         let mut games = vec![];
         let mut warnings = vec![];
+        let protected = ProtectedFolders::from_environment();
         for location in &self.locations {
             let paths = if location.kind == LocationKind::Game {
                 vec![location.path.clone()]
@@ -225,7 +348,10 @@ impl Preferences {
             };
             for path in paths {
                 if !path.is_dir() {
-                    warnings.push(format!("{} is unavailable", path.display()));
+                    warnings.push(format!(
+                        "{} is not available. Check that its drive is connected.",
+                        path.display()
+                    ));
                     continue;
                 }
                 let title = path
@@ -233,14 +359,25 @@ impl Preferences {
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "Custom game".into());
                 let mut game = manual_game(title, path);
+                // Listed but not startable, so a library placed over a drive root
+                // cannot offer the Windows folder as a game.
+                if let Ok(resolved) = game.install_dir.canonicalize()
+                    && protected.check(&resolved).is_err()
+                {
+                    game.state = crate::model::InstallState::Broken {
+                        detail: "System folders cannot be compressed.".into(),
+                    };
+                    games.push(game);
+                    continue;
+                }
                 match content_stamp(&game.install_dir) {
                     Ok(stamp) => game.build = Some(format!("local:{stamp}")),
-                    // Includes a tree too large to stamp within its limits. The game
-                    // stays listed, and a broken game cannot start a job.
+                    // A file or folder that cannot be read. The game stays listed and
+                    // cannot start a job. No warning is added, since a warning would
+                    // hold maintenance for every other game too.
                     Err(error) => {
-                        warnings.push(format!("{}: {error}", game.install_dir.display()));
                         game.state = crate::model::InstallState::Broken {
-                            detail: "Game files could not be inspected".into(),
+                            detail: format!("Game files could not be inspected: {error}"),
                         };
                     }
                 }
@@ -306,7 +443,7 @@ pub fn merge(games: Vec<crate::model::Game>) -> Vec<crate::model::Game> {
         }
         if let Some(previous) = merged
             .iter_mut()
-            .find(|old| old.install_dir == game.install_dir)
+            .find(|old| crate::model::same_install_dir(&old.install_dir, &game.install_dir))
         {
             for id in game.ids() {
                 if !previous.ids().any(|old| old == id) {
@@ -322,21 +459,49 @@ pub fn merge(games: Vec<crate::model::Game>) -> Vec<crate::model::Game> {
     }
     merged
 }
+/// Most entries `content_stamp` reads before it stops.
+const STAMP_ENTRY_LIMIT: usize = 250_000;
+/// Longest `content_stamp` walks before it stops.
+const STAMP_TIME_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Tracks custom-game file changes without reading file contents or following links.
+///
+/// A tree past 250,000 entries or 5 seconds is not an error: the stamp covers what was
+/// read and starts with `partial:` and the entry count reached, so the game stays
+/// usable and a change in that part still shows. After a time stop the count is
+/// rounded down to a multiple of 1000, so a slower walk does not look like a change.
 pub fn content_stamp(root: &Path) -> Result<String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    content_stamp_within(
+        root,
+        STAMP_ENTRY_LIMIT,
+        std::time::Instant::now() + STAMP_TIME_LIMIT,
+    )
+}
+fn content_stamp_within(
+    root: &Path,
+    entry_limit: usize,
+    deadline: std::time::Instant,
+) -> Result<String> {
     let mut fingerprint = blake3::Hasher::new();
+    // The hasher and entry count at the last multiple of 1000 entries.
+    let mut checkpoint = (fingerprint.clone(), 0usize);
+    let mut stopped = None;
     for (count, entry) in walkdir::WalkDir::new(root)
         .follow_links(false)
         .sort_by_file_name()
         .into_iter()
         .enumerate()
     {
-        // Bounded at 250000 entries and 5 seconds. Past either the stamp is an error.
-        ensure!(
-            count < 250000 && std::time::Instant::now() < deadline,
-            "Game metadata scan exceeds its limit"
-        );
+        if count >= entry_limit {
+            stopped = Some((count, false));
+            break;
+        }
+        if count % 1000 == 0 {
+            checkpoint = (fingerprint.clone(), count);
+            if std::time::Instant::now() >= deadline {
+                stopped = Some((count, true));
+                break;
+            }
+        }
         let entry = entry?;
         if !entry.file_type().is_file() {
             continue;
@@ -352,15 +517,26 @@ pub fn content_stamp(root: &Path) -> Result<String> {
         fingerprint.update(&(name.len() as u64).to_le_bytes());
         fingerprint.update(name);
         fingerprint.update(&metadata.len().to_le_bytes());
-        fingerprint.update(
-            &metadata
-                .modified()?
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos()
-                .to_le_bytes(),
-        );
+        // A missing or pre-1970 timestamp hashes as zero, so one odd file does not
+        // make the whole game unstampable.
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        fingerprint.update(&modified.to_le_bytes());
     }
-    Ok(fingerprint.finalize().to_hex().to_string())
+    Ok(match stopped {
+        None => fingerprint.finalize().to_hex().to_string(),
+        Some((count, timed)) => {
+            let (hasher, count) = if timed {
+                checkpoint
+            } else {
+                (fingerprint, count)
+            };
+            format!("partial:{count}:{}", hasher.finalize().to_hex())
+        }
+    })
 }
 #[cfg(test)]
 mod tests {
@@ -447,5 +623,155 @@ mod tests {
             second != content_stamp(temp.path()).ctx("new file stamp")?,
             "new files change the stamp",
         )
+    }
+    fn tree_of(files: usize) -> Result<tempfile::TempDir, String> {
+        let temp = tempfile::tempdir().ctx("fixture folder")?;
+        for index in 0..files {
+            std::fs::write(temp.path().join(format!("f{index:03}.dat")), b"x")
+                .ctx("fixture file")?;
+        }
+        Ok(temp)
+    }
+    fn far() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(600)
+    }
+    #[test]
+    fn a_tree_past_the_entry_limit_gets_a_partial_stamp_instead_of_an_error() -> TestResult {
+        let temp = tree_of(10)?;
+        let whole = content_stamp_within(temp.path(), 100, far()).ctx("within the limit")?;
+        check(
+            !whole.starts_with("partial:"),
+            "control: a small tree is whole",
+        )?;
+        let first = content_stamp_within(temp.path(), 5, far()).ctx("past the limit")?;
+        check(
+            first.starts_with("partial:5:"),
+            "the stamp says it is partial",
+        )?;
+        check_eq(
+            content_stamp_within(temp.path(), 5, far()).ctx("again")?,
+            first.clone(),
+            "an unchanged partial tree is stable",
+        )?;
+        // Entry 0 is the folder; entries 1 to 4 are f000 to f003.
+        std::fs::write(temp.path().join("f001.dat"), b"changed and longer")
+            .ctx("change a file in the part read")?;
+        let second = content_stamp_within(temp.path(), 5, far()).ctx("after change")?;
+        check(
+            first != second,
+            "a change in the read part is still a change",
+        )?;
+        std::fs::write(temp.path().join("f009.dat"), b"changed and longer")
+            .ctx("change a file past the limit")?;
+        check_eq(
+            content_stamp_within(temp.path(), 5, far()).ctx("after change past the limit")?,
+            second,
+            "the part not read cannot show a change",
+        )
+    }
+    #[test]
+    fn a_walk_that_runs_out_of_time_is_partial() -> TestResult {
+        let temp = tree_of(3)?;
+        let stamp = content_stamp_within(temp.path(), 1000, std::time::Instant::now())
+            .ctx("expired deadline")?;
+        check(
+            stamp.starts_with("partial:0:"),
+            "stopped at the first checkpoint",
+        )
+    }
+    #[test]
+    fn an_ordinary_game_has_a_whole_stamp() -> TestResult {
+        let temp = tree_of(3)?;
+        let stamp = content_stamp(temp.path()).ctx("stamp")?;
+        check(!stamp.starts_with("partial:"), "no limit was reached")
+    }
+    fn protected() -> ProtectedFolders {
+        ProtectedFolders {
+            roots: vec![
+                "/c/Windows".into(),
+                "/c/Users/me".into(),
+                "/c/Program Files".into(),
+            ],
+            trees: vec!["/c/Windows".into()],
+        }
+    }
+    #[test]
+    fn system_profile_and_program_roots_and_their_ancestors_are_refused() -> TestResult {
+        for refused in [
+            "/",
+            "/c",
+            "/c/Users",
+            "/c/Users/me",
+            "/c/Windows",
+            "/c/Windows/System32",
+            "/c/Program Files",
+        ] {
+            check(
+                protected().check(Path::new(refused)).is_err(),
+                format!("{refused} must be refused"),
+            )?;
+        }
+        // Control: ordinary game folders pass the same check.
+        for allowed in [
+            "/c/Program Files/Some Game",
+            "/c/Users/me/Games",
+            "/d/Games/One",
+        ] {
+            protected()
+                .check(Path::new(allowed))
+                .ctx(format!("{allowed} must be accepted"))?;
+        }
+        Ok(())
+    }
+    #[test]
+    fn unreadable_state_is_renamed_aside_and_never_overwritten() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let file = temp.path().join("native-queue.json");
+        std::fs::write(&file, b"first").ctx("write")?;
+        let first = quarantine(&file).ctx("first quarantine")?;
+        std::fs::write(&file, b"second").ctx("rewrite")?;
+        let second = quarantine(&file).ctx("second quarantine")?;
+        check(!file.exists(), "the original name is free again")?;
+        check_eq(
+            std::fs::read(&first).ctx("first copy")?,
+            b"first".to_vec(),
+            "first copy kept",
+        )?;
+        check_eq(
+            std::fs::read(&second).ctx("second copy")?,
+            b"second".to_vec(),
+            "second copy kept",
+        )
+    }
+    #[test]
+    fn a_file_with_a_timestamp_before_1970_does_not_stop_stamping() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let path = temp.path().join("old.dat");
+        std::fs::write(&path, b"data").ctx("write")?;
+        let before_epoch = std::time::UNIX_EPOCH - std::time::Duration::from_secs(86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .ctx("open")?
+            .set_modified(before_epoch)
+            .ctx("set mtime before 1970")?;
+        content_stamp(temp.path()).ctx("stamp with an old file")?;
+        Ok(())
+    }
+    #[test]
+    fn a_location_cannot_be_a_filesystem_root() -> TestResult {
+        let mut settings = Preferences::default();
+        check(
+            settings
+                .add(Path::new("/"), LocationKind::Collection)
+                .is_err(),
+            "the drive root is refused",
+        )?;
+        check(settings.locations.is_empty(), "and nothing is stored")?;
+        let fixture = tempfile::tempdir().ctx("fixture")?;
+        settings
+            .add(fixture.path(), LocationKind::Collection)
+            .ctx("control: an ordinary folder")?;
+        check_eq(settings.locations.len(), 1, "is stored")
     }
 }

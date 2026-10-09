@@ -51,29 +51,30 @@ Launcher scans and process detection are periodic, so pause is not instantaneous
   a baseline; subsequent new installs and settled updates enqueue work.
   A managed desktop startup entry exists while any library opts in.
 
-## Maximum Space jobs
+## Maximum jobs
 
-The GUI queues store creation, activation, compaction, restoration, and reclaim
+The GUI queues store creation, switching to Maximum, folding in updates,
+decompressing, and deleting the original or the previous version
 with durable paths and task parameters. A coordinator-owned storage thread keeps
 client sockets responsive and owns all mount sessions during a transaction.
-Native workers and storage threads run one at a time under the operation lock.
+Compression workers and storage threads run one at a time under the operation lock.
 Closing the GUI leaves queued and running work with the coordinator.
 
-Creation, chunk verification, source comparison, and compaction preparation have
-pause/cancel checkpoints. Compression of one chunk finishes before a checkpoint.
-The final switch, restore, and deletion transactions finish uninterrupted;
+Creation, chunk verification, source comparison, and preparing to fold in updates
+have pause and stop checkpoints. Compression of one chunk finishes before a checkpoint.
+The final switch, decompress, and deletion transactions finish uninterrupted;
 controls disappear while these phases run. Interrupted preparation retries from
 the beginning and can reuse already published pool objects. Existing activation
 records retain their recovery path across coordinator restart.
 
-A qualification must match the game build, platform, full corpus, and policy.
-Analysis records the identity of the matching report. Automatic activation
+A compatibility report must match the game build, platform, full corpus, and policy.
+Analysis records the identity of the matching report. Automatic switching
 rehashes the installed corpus before creation and again before the final switch.
 Choosing Maximum for one game in the window proceeds without a report: the
 original is kept until the user confirms the game runs. Library-wide and
 automatic work never choose Maximum.
-Creating or activating a store keeps the original allocation until explicit
-reclaim. Rebuilding ordinary files after reclaim requires additional free space.
+Creating a store and switching to it keeps the original until you delete it.
+Decompressing after the original is deleted needs additional free space.
 
 ## Decisions and evidence
 
@@ -85,10 +86,10 @@ or encoded payloads, so they keep the full distributed sample. Unknown data,
 encrypted ZIP entries, and familiar extensions still reach compression trials.
 Parsers never unpack archives or alter their internal format.
 
-Distributed samples include the first and last blocks. Native Maximum compares
-levels 9 and 15 per file. Maximum Space compares levels 9, 15, 19, and 22 per
-unique chunk and keeps the smallest representation. Update compaction uses the
-same level search, so maintaining a store does not silently lower its compression
+Distributed samples include the first and last blocks. Max (the Standard
+strength) compares levels 9 and 15 per file. Maximum compares levels 9, 15, 19,
+and 22 per unique chunk and keeps the smallest representation. Folding in updates uses the
+same level search, so maintaining a store keeps its compression
 policy. Workers verify file identity before and after processing. Native btrfs
 rewrites flush dirty pages first so new writes have extents to process.
 
@@ -102,12 +103,12 @@ Three different quantities must stay separate:
 
 Desktop analysis samples the largest files first, up to 32 MiB total and
 1 MiB per file. Unsampled eligible files still reach the native pass. A
-sampled file with a pack-only gain does not trigger a native rewrite. The
+sampled file that only Maximum would shrink does not trigger a Standard rewrite. The
 one-click choice requires at least 16 MiB and 5% projected saving; Maximum
-Space also needs a game-specific compatibility result. Completed compression
+also needs a compatibility report for the game. Completed compression
 consumes the earlier potential estimate.
 
-The Maximum Space preview scores large-file samples separately. Up to 4 MiB of
+The Maximum preview scores large-file samples separately. Up to 4 MiB of
 small files are also compared with the store's grouping policy at level 19,
 within the 32 MiB distinct-payload sample budget. The GUI reports the extra
 grouped-payload saving separately; it is not added to the overall prediction,
@@ -123,13 +124,13 @@ WOF/LZX measurement.
 ## Current boundaries
 
 Native writes support Linux btrfs, Windows WOF/LZX and macOS APFS in the
-unreleased 0.0.2 source. The [pack store](pack-store.md) adds verified larger
-chunks, within-store and cross-game sharing, restoration, and Linux FUSE
+unreleased 0.0.2 source. The [Maximum store](pack-store.md) adds verified larger
+chunks, within-store and cross-game sharing, decompressing, and Linux FUSE
 mounts with persistent copy-on-write data. Windows background maintenance is
-implemented; Windows and Mac pack mounting, Bottles discovery, and opt-in
+implemented; Maximum on Windows and Mac, Bottles discovery, and opt-in
 community data remain separate work. Heroic and Lutris adapters depend on
 their installed metadata; missing or malformed sources produce warnings.
-The Linux GUI's custom-folder control accepts a path; native selection uses
+The Linux GUI's location control accepts a path; native selection uses
 an installed KDialog or Zenity helper.
 
 `just ci` checks code, tests, dependency policy, and prose. The IPC tests use
@@ -139,12 +140,14 @@ btrfs announce a skip on other filesystems.
 
 ## Updating the coordinator
 
-Settings exposes Restart worker; the CLI equivalent is `flummox jobs restart`.
-The coordinator refuses to exit while jobs are active or Maximum Space installs
-are mounted. It removes its socket on a successful idle restart; the requesting
-client waits for ownership to be released and starts the installed executable.
-Settings and completed queue history remain in SQLite. The restart request is
-accepted across protocol versions so future updates can replace an idle worker.
-Workers predating restart support require a logout/login after jobs finish and
-mounted installs are restored. A mismatched client checks the response version
+Settings exposes **Restart background worker** under Background worker; the CLI equivalent is `flummox jobs restart`.
+The coordinator refuses to exit while jobs are active or a process is using the
+folder of a game that runs from its store; the refusal names the game. With
+those clear it unmounts each store, removes its socket and exits, and the next
+coordinator mounts the stores again. The requesting client waits for ownership
+to be released and starts the installed executable. Settings and completed
+queue history remain in SQLite. Restart, Cancel, Pause and Snapshot are
+accepted across protocol versions so an upgrade never leaves a job that cannot
+be stopped. Workers predating protocol version 9 refuse a restart while games
+use Maximum, so decompress those games first. A mismatched client checks the response version
 before decoding the snapshot and cannot submit work under the wrong protocol.

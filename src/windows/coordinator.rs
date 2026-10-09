@@ -45,6 +45,9 @@ pub enum Command {
     /// Cancel waiting jobs, stop the running one after its current file, then exit.
     Shutdown,
 }
+/// A request in the main loop's channel, with its reply slot and a flag the
+/// listener raises when it stopped waiting for the reply.
+type Pending = (Request, mpsc::Sender<Response>, Arc<AtomicBool>);
 /// The worker's whole visible state at one moment.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -65,6 +68,10 @@ pub struct Snapshot {
     /// A discovery pass is running. No job starts until it ends.
     pub discovering: bool,
     pub maintenance_paused: bool,
+    /// Why maintenance set a new starting point for a location, such as a different
+    /// drive at the same path. The newest five are kept until the worker exits.
+    #[serde(default)]
+    pub notices: Vec<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct Request {
@@ -92,7 +99,7 @@ fn call_file(command: Command, mut file: std::fs::File) -> Result<Snapshot> {
     crate::windows::ipc::send(&mut file, &true)?;
     ensure!(
         response.version == VERSION,
-        "Worker protocol changed. Restart Flummox."
+        "The background worker is from another version. Restart Flummox."
     );
     if let Some(error) = response.error {
         anyhow::bail!(error);
@@ -109,8 +116,12 @@ fn call(command: Command) -> Result<Snapshot> {
 /// Sends a command, first starting a worker if none answers and waiting up to 5
 /// seconds for its pipe. `Shutdown` never starts one.
 pub fn request(command: Command) -> Result<Snapshot> {
-    if let Ok(file) = crate::windows::ipc::connect() {
-        return call_file(command, file);
+    match crate::windows::ipc::connect() {
+        Ok(file) => return call_file(command, file),
+        // Only a missing pipe means no worker runs. Any other failure, such as a
+        // refused connection, must not start a second one.
+        Err(error) if !crate::windows::ipc::is_missing(&error) => return Err(error),
+        Err(_) => {}
     }
     if matches!(command, Command::Shutdown) {
         return call(command);
@@ -154,32 +165,87 @@ pub fn entrypoint() -> Result<bool> {
             .write(true)
             .open(root.join("coordinator.lock"))?;
         // A worker holds this lock for its whole life. Getting it means none is running.
-        if lock.try_lock().is_ok() {
-            cleanup_startup(&args, &root)?;
-            return Ok(true);
-        }
-        call(Command::Shutdown)?;
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while lock.try_lock().is_err() {
-            ensure!(
-                Instant::now() < deadline,
-                "The worker is finishing a file. Wait before upgrading or uninstalling."
+        let stopped = wait_for_worker(
+            || lock.try_lock().is_ok(),
+            || call(Command::Shutdown).map(|_| ()),
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+        )?;
+        if stopped == Stopped::StillWorking {
+            eprintln!(
+                "The background worker is finishing a file. Wait before upgrading or uninstalling."
             );
-            std::thread::sleep(Duration::from_millis(100));
+            // The installer reads 3 as "still working" and any other failure as an
+            // error. Returning an error from `main` can only give 1.
+            #[allow(clippy::exit)]
+            std::process::exit(EXIT_STILL_WORKING);
         }
         cleanup_startup(&args, &root)?;
         return Ok(true);
     }
     Ok(false)
 }
+/// Exit code of `--native-worker-exit` when the worker is still finishing a file.
+const EXIT_STILL_WORKING: i32 = 3;
+#[derive(Debug, PartialEq, Eq)]
+enum Stopped {
+    /// No worker holds the lock any more.
+    Gone,
+    /// A worker still holds it after the patience ran out.
+    StillWorking,
+}
+/// Asks the worker to shut down until `released` says it has let go of its lock, or
+/// `patience` runs out. `shutdown` is repeated every `resend`, because a worker
+/// that is starting or exiting may not hear the first request. A failed request is
+/// not an error while the lock is still held: the worker may be on its way out. At
+/// the deadline the last failure is returned unless it only says the pipe is
+/// missing. A worker that is gone, whether before the first request or during the
+/// wait, is `Gone`.
+fn wait_for_worker(
+    mut released: impl FnMut() -> bool,
+    mut shutdown: impl FnMut() -> Result<()>,
+    patience: Duration,
+    resend: Duration,
+) -> Result<Stopped> {
+    let deadline = Instant::now() + patience;
+    let mut last_sent: Option<Instant> = None;
+    let mut last_error: Option<anyhow::Error> = None;
+    loop {
+        if released() {
+            return Ok(Stopped::Gone);
+        }
+        if Instant::now() >= deadline {
+            return match last_error {
+                Some(error) if !crate::windows::ipc::is_missing(&error) => Err(error),
+                _ => Ok(Stopped::StillWorking),
+            };
+        }
+        if due(last_sent, resend) {
+            last_sent = Some(Instant::now());
+            last_error = shutdown().err();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
 /// With `--remove-owned-startup`, deletes this installation's login entry and
 /// clears the matching preference.
 fn cleanup_startup(args: &[std::ffi::OsString], root: &std::path::Path) -> Result<()> {
+    // Neither step may fail the call: this runs before an uninstall, which a
+    // startup entry from another installation or a damaged preferences file
+    // would otherwise block for good.
     if args.iter().any(|arg| arg == "--remove-owned-startup") {
-        crate::windows::launchers::startup(false)?;
-        let mut preferences = Preferences::load(root)?;
-        preferences.start_at_login = false;
-        preferences.save(root)?;
+        if let Err(error) = crate::windows::launchers::startup(false) {
+            tracing::warn!(%error, "Startup entry left in place");
+        }
+        match Preferences::load(root) {
+            Ok(mut preferences) => {
+                preferences.start_at_login = false;
+                if let Err(error) = preferences.save(root) {
+                    tracing::warn!(%error, "Preferences could not be updated");
+                }
+            }
+            Err(error) => tracing::warn!(%error, "Preferences could not be read"),
+        }
     }
     Ok(())
 }
@@ -253,6 +319,7 @@ fn start(job: &Job) -> Active {
                     bytes: progress.bytes,
                     allocation_before: progress.allocation_before,
                     allocation_after: progress.allocation_after,
+                    failed: progress.failed,
                 }));
             },
         )
@@ -269,16 +336,19 @@ fn start(job: &Job) -> Active {
         drive_online: true,
     }
 }
-/// A moment far enough back that anything timed from it is due.
-///
-/// Windows counts `Instant` from boot and cannot represent a time before
-/// it, so plain subtraction panics in a worker started within a minute of
-/// boot, which a login start is. Falling back to now only delays the first
-/// scan by one interval.
-fn overdue() -> Instant {
-    Instant::now()
-        .checked_sub(Duration::from_secs(60))
-        .unwrap_or_else(Instant::now)
+/// Whether a periodic step is due. A step that has never run is due at once,
+/// which an `Instant` cannot express near boot, where it has no earlier value.
+fn due(last: Option<Instant>, every: Duration) -> bool {
+    last.is_none_or(|last| last.elapsed() >= every)
+}
+
+/// Writes the queue. A failure is logged and flagged so the periodic save tries
+/// again, and the worker keeps serving.
+fn save_queue(queue: &Queue, root: &std::path::Path, dirty: &mut bool) {
+    if let Err(error) = queue.save(root) {
+        tracing::warn!(%error, "Job queue could not be saved");
+        *dirty = true;
+    }
 }
 
 /// The worker: one loop, about every 20 ms, that owns the queue, runs at most one
@@ -297,10 +367,15 @@ fn run() -> Result<()> {
         return Ok(());
     }
     // `load` marks jobs the last worker left mid-run as interrupted. Save that now.
-    let mut queue = Queue::load(&root)?;
-    queue.save(&root)?;
+    let (mut queue, damaged) = Queue::load_or_quarantine(&root)?;
+    if let Some(note) = damaged {
+        tracing::warn!("{note}");
+    }
+    if let Err(error) = queue.save(&root) {
+        tracing::warn!(%error, "Job queue could not be saved at start");
+    }
     let mut pipe = crate::windows::ipc::listener()?;
-    let (requests, receive) = mpsc::channel::<(Request, mpsc::Sender<Response>)>();
+    let (requests, receive) = mpsc::channel::<Pending>();
     let stopped = Arc::new(AtomicBool::new(false));
     let listener_stop = stopped.clone();
     let listener_failed = Arc::new(AtomicBool::new(false));
@@ -314,11 +389,17 @@ fn run() -> Result<()> {
                 Ok(true) => {
                     if let Ok(request) = crate::windows::ipc::receive::<Request>(&mut pipe) {
                         let (send, reply) = mpsc::channel();
-                        if requests.send((request, send)).is_ok()
-                            && let Ok(response) = reply.recv_timeout(Duration::from_secs(3))
-                            && crate::windows::ipc::send(&mut pipe, &response).is_ok()
-                        {
-                            let _acknowledged = crate::windows::ipc::receive::<bool>(&mut pipe);
+                        let abandoned = Arc::new(AtomicBool::new(false));
+                        if requests.send((request, send, abandoned.clone())).is_ok() {
+                            if let Ok(response) = reply.recv_timeout(Duration::from_secs(3))
+                                && crate::windows::ipc::send(&mut pipe, &response).is_ok()
+                            {
+                                let _acknowledged = crate::windows::ipc::receive::<bool>(&mut pipe);
+                            } else {
+                                // The client was told it failed, so the loop must
+                                // not carry the command out afterwards.
+                                abandoned.store(true, Ordering::Relaxed);
+                            }
                         }
                     }
                     crate::windows::ipc::disconnect(&pipe);
@@ -344,10 +425,21 @@ fn run() -> Result<()> {
         )?,
         ..Default::default()
     };
-    let mut preferences = Preferences::load(&root)?;
+    let mut preferences = match Preferences::load(&root) {
+        Ok(preferences) => preferences,
+        Err(error) => {
+            // Set the damaged file aside so the worker can start and the window
+            // can save new settings.
+            let aside = crate::desktop::quarantine(&root.join("desktop.json"))?;
+            tracing::warn!(%error, kept = %aside.display(), "Preferences were unreadable");
+            Preferences::default()
+        }
+    };
     let mut preferences_healthy = true;
-    if preferences.start_at_login {
-        crate::windows::launchers::startup(true)?;
+    if preferences.start_at_login
+        && let Err(error) = crate::windows::launchers::startup(true)
+    {
+        tracing::warn!(%error, "Startup entry could not be refreshed");
     }
     let tray = tray()
         .map_err(|error| {
@@ -355,27 +447,34 @@ fn run() -> Result<()> {
             error
         })
         .ok();
-    // The timers below start 60 seconds in the past so the first loop pass runs
-    // each periodic step.
+    // A timer that is `None` has never run, so the first loop pass runs its step.
     let mut active: Option<Active> = None;
     let mut shutdown = false;
     let mut queue_dirty = false;
-    let mut last_scan = overdue();
-    let mut last_activity = overdue();
+    let mut last_scan: Option<Instant> = None;
+    let mut last_activity: Option<Instant> = None;
     let mut last_save = Instant::now();
-    let mut last_preferences = overdue();
+    let mut last_preferences: Option<Instant> = None;
+    // No job starts before one discovery has finished and one activity check has
+    // run for the jobs waiting.
+    let mut discovered_once = false;
+    let mut activity_checked = false;
+    // The preferences the running discovery started with. Its catalog may hold
+    // games from locations added later, but never from locations missing here.
+    let mut scan_preferences = preferences.clone();
+    let mut last_start_failure: Option<Instant> = None;
     let mut discovery: Option<
         mpsc::Receiver<std::result::Result<crate::desktop_discovery::Catalog, String>>,
     > = None;
     loop {
         ensure!(
             !listener_failed.load(Ordering::Relaxed),
-            "The coordinator pipe failed; work stopped safely"
+            "The background worker lost its connection and stopped safely. Restart Flummox."
         );
         // Reread preferences every second. While they cannot be read the old copy
         // stays in use and every job is held.
-        if last_preferences.elapsed() >= Duration::from_secs(1) {
-            last_preferences = Instant::now();
+        if due(last_preferences, Duration::from_secs(1)) {
+            last_preferences = Some(Instant::now());
             match Preferences::load(&root) {
                 Ok(settings) => {
                     preferences = settings;
@@ -383,7 +482,7 @@ fn run() -> Result<()> {
                 }
                 Err(error) => {
                     preferences_healthy = false;
-                    snapshot.busy = Some(format!("Preferences unavailable: {error}"));
+                    snapshot.busy = Some(format!("Your settings could not be read: {error}"));
                 }
             }
         }
@@ -391,9 +490,13 @@ fn run() -> Result<()> {
         // is running. Only one pass runs at a time.
         if !shutdown
             && discovery.is_none()
-            && last_scan.elapsed() >= Duration::from_secs(if active.is_some() { 3 } else { 30 })
+            && due(
+                last_scan,
+                Duration::from_secs(if active.is_some() { 3 } else { 30 }),
+            )
         {
-            last_scan = Instant::now();
+            last_scan = Some(Instant::now());
+            scan_preferences = preferences.clone();
             let (send, receive) = mpsc::channel();
             discovery = Some(receive);
             snapshot.discovering = true;
@@ -406,13 +509,14 @@ fn run() -> Result<()> {
             .and_then(|receiver| match receiver.try_recv() {
                 Ok(result) => Some(result),
                 Err(mpsc::TryRecvError::Empty) => None,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    Some(Err("Discovery worker stopped unexpectedly".into()))
-                }
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(
+                    "Finding games stopped unexpectedly. Refresh to try again.".into(),
+                )),
             });
         if let Some(result) = discovered {
             discovery = None;
             snapshot.discovering = false;
+            discovered_once = true;
             match result {
                 Ok(catalog) => {
                     snapshot.games = catalog.games;
@@ -420,26 +524,34 @@ fn run() -> Result<()> {
                     snapshot.warnings = catalog.warnings;
                     // Maintenance: queue what `observe` reports as due. A scan with
                     // warnings counts as unhealthy and queues nothing. The baseline
-                    // moves only once the job for this folder is for this build.
-                    for game in
-                        queue.observe(&snapshot.games, &preferences, snapshot.warnings.is_empty())
-                    {
-                        let observed = game.clone();
-                        match queue.enqueue_automatic(game) {
-                            Ok(id) => {
-                                if queue
-                                    .jobs
-                                    .iter()
-                                    .find(|job| job.id == id)
-                                    .is_some_and(|job| job.game.build == observed.build)
-                                {
-                                    queue.acknowledge(&observed);
-                                }
-                            }
-                            Err(error) => snapshot.warnings.push(error.to_string()),
+                    // moves when the job ends, in `Queue::settle`. The scan's own
+                    // preferences are used, since its catalog was built from them.
+                    for game in queue.observe(
+                        &snapshot.games,
+                        &scan_preferences,
+                        snapshot.warnings.is_empty(),
+                    ) {
+                        if let Err(error) = queue.enqueue_automatic(game) {
+                            snapshot.warnings.push(error.to_string());
                         }
                     }
-                    queue.save(&root)?;
+                    for notice in std::mem::take(&mut queue.notices) {
+                        if !snapshot.notices.contains(&notice) {
+                            snapshot.notices.push(notice);
+                        }
+                    }
+                    let extra = snapshot.notices.len().saturating_sub(5);
+                    snapshot.notices.drain(..extra);
+                    // Remember which drive each location is on, now that `observe`
+                    // has compared against what was saved.
+                    if preferences_healthy
+                        && snapshot.warnings.is_empty()
+                        && preferences.record_volumes(&crate::desktop::volume_identity)
+                        && let Err(error) = preferences.save(&root)
+                    {
+                        snapshot.warnings.push(error.to_string());
+                    }
+                    save_queue(&queue, &root, &mut queue_dirty);
                 }
                 Err(error) => snapshot.warnings = vec![error],
             }
@@ -447,8 +559,18 @@ fn run() -> Result<()> {
         // Every second, look for a running game or launcher tool. Folders of active
         // jobs are included even if discovery no longer lists them. A failed check
         // holds work, with the error as the reason.
-        if last_activity.elapsed() >= Duration::from_secs(1) {
-            last_activity = Instant::now();
+        let jobs_wait = queue.jobs.iter().any(|job| job.phase.active());
+        if !jobs_wait {
+            // Nothing to hold, so the check is skipped. A job queued later waits
+            // for a fresh check before it can start.
+            last_activity = None;
+            activity_checked = false;
+            if preferences_healthy {
+                snapshot.busy = None;
+            }
+        } else if due(last_activity, Duration::from_secs(1)) {
+            last_activity = Some(Instant::now());
+            activity_checked = true;
             let mut games = snapshot.games.clone();
             games.extend(
                 queue
@@ -457,68 +579,74 @@ fn run() -> Result<()> {
                     .filter(|job| job.phase.active())
                     .map(|job| job.game.clone()),
             );
-            snapshot.busy = Some("Checking running games".into());
+            snapshot.busy = Some("Checking running games…".into());
             snapshot.busy = activity(&games).unwrap_or_else(|error| Some(error.to_string()));
             if !preferences_healthy {
-                snapshot.busy = Some("Desktop preferences need attention".into());
+                snapshot.busy = Some(
+                    "Your settings could not be read. Check that the settings file is not damaged."
+                        .into(),
+                );
             }
         }
         if let Some((_, actions)) = &tray {
             for action in actions.try_iter() {
                 match action {
                     crate::windows::tray::Action::Open => {
-                        let executable = std::env::current_exe()?.with_file_name("flummox-gui.exe");
-                        if let Err(error) = std::process::Command::new(executable).spawn() {
+                        let opened = std::env::current_exe()
+                            .map_err(anyhow::Error::from)
+                            .and_then(|path| {
+                                std::process::Command::new(path.with_file_name("flummox-gui.exe"))
+                                    .spawn()
+                                    .map_err(anyhow::Error::from)
+                            });
+                        if let Err(error) = opened {
                             tracing::warn!(%error, "Flummox window could not open");
                         }
                     }
-                    crate::windows::tray::Action::Pause => {
-                        preferences.maintenance_paused = true;
-                        preferences.save(&root)?;
-                    }
-                    crate::windows::tray::Action::Resume => {
-                        preferences.maintenance_paused = false;
-                        preferences.save(&root)?;
+                    crate::windows::tray::Action::Pause | crate::windows::tray::Action::Resume => {
+                        preferences.maintenance_paused =
+                            matches!(action, crate::windows::tray::Action::Pause);
+                        if let Err(error) = preferences.save(&root) {
+                            tracing::warn!(%error, "Pause setting could not be saved");
+                        }
                     }
                     crate::windows::tray::Action::Exit => {
+                        // Waiting jobs stay waiting, and the next worker picks them up.
                         shutdown = true;
                         if let Some(running) = &active {
                             running.cancel.store(true, Ordering::Relaxed);
                         }
-                        for job in &mut queue.jobs {
-                            if job.phase == Phase::Waiting {
-                                job.phase = Phase::Cancelled;
-                            }
-                        }
-                        queue.save(&root)?;
+                        save_queue(&queue, &root, &mut queue_dirty);
                     }
                 }
             }
         }
         // Answer clients. Each command runs in a closure so its error goes back to
         // that client and does not end the loop.
-        for (request, reply) in receive.try_iter().take(64) {
+        for (request, reply, abandoned) in receive.try_iter().take(64) {
+            if abandoned.load(Ordering::Relaxed) {
+                continue;
+            }
             let result = (|| -> Result<()> {
                 ensure!(
                     request.version == VERSION,
-                    "Worker protocol changed. Restart Flummox."
+                    "The background worker is from another version. Restart Flummox."
                 );
                 match request.command {
                     Command::Snapshot => {}
                     // Backdating the timer makes the discovery step above fire next pass.
-                    Command::Refresh => last_scan = overdue(),
+                    Command::Refresh => last_scan = None,
                     Command::Enqueue { mut game, restore } => {
                         game.install_dir = game.install_dir.canonicalize()?;
-                        ensure!(
-                            game.install_dir.is_dir() && game.install_dir.parent().is_some(),
-                            "Choose an installed game folder"
-                        );
+                        ensure!(game.install_dir.is_dir(), "Choose an installed game folder");
+                        crate::desktop::ProtectedFolders::from_environment()
+                            .check(&game.install_dir)?;
                         ensure!(
                             restore
                                 || !game
                                     .ids()
                                     .any(|id| preferences.excluded.contains(&id.to_string())),
-                            "This game is excluded from jobs"
+                            "This game is excluded. Include it before running a job."
                         );
                         queue.enqueue(game, restore)?;
                         queue.save(&root)?;
@@ -542,9 +670,11 @@ fn run() -> Result<()> {
                             && running.id == id
                         {
                             running.cancel.store(true, Ordering::Relaxed);
-                            job.message = "Stopping after the current file".into();
+                            job.message = "Stopping after the current file…".into();
                         } else if job.phase.active() {
                             job.phase = Phase::Cancelled;
+                            // The user chose this, so maintenance leaves the build alone.
+                            queue.settle(id, false);
                         }
                         queue.save(&root)?;
                     }
@@ -565,17 +695,13 @@ fn run() -> Result<()> {
                         }
                         settings.save(&root)?;
                         preferences = settings;
-                        last_scan = overdue();
+                        last_scan = None;
                     }
                     Command::Shutdown => {
+                        // Waiting jobs stay waiting, and the next worker picks them up.
                         shutdown = true;
                         if let Some(running) = &active {
                             running.cancel.store(true, Ordering::Relaxed);
-                        }
-                        for job in &mut queue.jobs {
-                            if job.phase == Phase::Waiting {
-                                job.phase = Phase::Cancelled;
-                            }
                         }
                         queue.save(&root)?;
                     }
@@ -611,7 +737,7 @@ fn run() -> Result<()> {
                     running.cancel.store(true, Ordering::Relaxed);
                 } else if job.phase.active() {
                     job.phase = Phase::Cancelled;
-                    job.message = "Excluded from background work".into();
+                    job.message = "This game is excluded, so the job was stopped.".into();
                     queue_dirty = true;
                 }
             }
@@ -619,6 +745,7 @@ fn run() -> Result<()> {
         // The running job: decide whether it should be paused right now, set its
         // message, then take the events its thread has sent.
         let mut finished = false;
+        let mut finished_id = None;
         if let Some(running) = &mut active
             && let Some(job) = queue.jobs.iter_mut().find(|job| job.id == running.id)
         {
@@ -649,19 +776,19 @@ fn run() -> Result<()> {
             job.message = if job.user_paused {
                 "Paused by you".into()
             } else if preferences.maintenance_paused {
-                "Background work paused".into()
+                "Background jobs are paused".into()
             } else if !running.drive_online {
                 "Reconnect the original drive".into()
             } else if let Some(reason) = &snapshot.busy {
                 reason.clone()
             } else if unavailable {
-                "Waiting for the launcher".into()
+                "Waiting for the launcher…".into()
             } else if job.automatic && !snapshot.warnings.is_empty() {
-                "Discovery needs attention".into()
+                "Finding games needs attention. Refresh to try again.".into()
             } else if running.cancel.load(Ordering::Relaxed) {
-                "Stopping after the current file".into()
+                "Stopping after the current file…".into()
             } else {
-                "Processing files".into()
+                "Processing files…".into()
             };
             queue_dirty |= before != (job.phase, job.message.clone());
             // At most 256 events per pass, so a fast job cannot starve the loop.
@@ -675,7 +802,7 @@ fn run() -> Result<()> {
                             finished = true;
                             job.phase = Phase::Failed;
                             job.message =
-                                "Storage worker stopped unexpectedly. Review recovery.".into();
+                                "The job stopped unexpectedly. Review it under Recovery before trying again.".into();
                         }
                         break;
                     }
@@ -687,6 +814,7 @@ fn run() -> Result<()> {
                     }
                     Event::Finished(result) => {
                         finished = true;
+                        finished_id = Some(job.id);
                         job.phase = if running.cancel.load(Ordering::Relaxed) {
                             Phase::Cancelled
                         } else if result.is_ok() {
@@ -705,7 +833,10 @@ fn run() -> Result<()> {
         // Dropping `Active` joins the thread, which has already sent its last event.
         if finished {
             active = None;
-            queue.save(&root)?;
+            if let Some(id) = finished_id {
+                queue.settle(id, shutdown);
+            }
+            save_queue(&queue, &root, &mut queue_dirty);
         }
         if active.is_none() && shutdown {
             stopped.store(true, Ordering::Relaxed);
@@ -715,7 +846,14 @@ fn run() -> Result<()> {
         // deal with it. The journal is read only when a job could start.
         let recovery_pending =
             if active.is_none() && queue.jobs.iter().any(|job| job.phase == Phase::Waiting) {
-                !crate::windows::recovery()?.is_empty()
+                // An unreadable journal holds work back like a present one.
+                crate::windows::recovery().map_or_else(
+                    |error| {
+                        tracing::warn!(%error, "Job journal could not be read");
+                        true
+                    },
+                    |records| !records.is_empty(),
+                )
             } else {
                 false
             };
@@ -728,7 +866,7 @@ fn run() -> Result<()> {
             let message = if job.user_paused {
                 "Paused by you".into()
             } else if preferences.maintenance_paused {
-                "Background work paused".into()
+                "Background jobs are paused".into()
             } else if let Some(reason) = &snapshot.busy {
                 reason.clone()
             } else if !job.game.install_dir.is_dir() {
@@ -740,15 +878,15 @@ fn run() -> Result<()> {
             {
                 format!("Waiting: {}", game.state)
             } else if job.automatic && recovery_pending {
-                "Review interrupted storage before maintenance".into()
+                "Review the interrupted job before background jobs run".into()
             } else if job.automatic && !snapshot.warnings.is_empty() {
-                "Discovery needs attention".into()
+                "Finding games needs attention. Refresh to try again.".into()
             } else if snapshot.discovering {
-                "Checking installed games".into()
+                "Checking installed games…".into()
             } else if active.is_some() {
-                "Waiting for the current job".into()
+                "Waiting for the current job…".into()
             } else {
-                "Waiting to start".into()
+                "Waiting to start…".into()
             };
             if job.message != message {
                 job.message = message;
@@ -760,8 +898,11 @@ fn run() -> Result<()> {
         if !shutdown
             && active.is_none()
             && snapshot.busy.is_none()
+            && discovered_once
+            && activity_checked
             && !preferences.maintenance_paused
             && !snapshot.discovering
+            && last_start_failure.is_none_or(|at| at.elapsed() >= Duration::from_secs(5))
             && let Some(job) = queue.jobs.iter_mut().find(|job| {
                 job.phase == Phase::Waiting
                     && (!job.automatic || (snapshot.warnings.is_empty() && !recovery_pending))
@@ -780,15 +921,28 @@ fn run() -> Result<()> {
         {
             // Saved as running before the thread starts, so a crash from here on is
             // loaded as an interrupted job.
+            let id = job.id;
             job.phase = Phase::Running;
-            job.message = "Preparing files".into();
-            queue.save(&root)?;
-            let job = queue
-                .jobs
-                .iter()
-                .find(|job| job.phase == Phase::Running)
-                .context("Starting job disappeared")?;
-            active = Some(start(job));
+            job.message = "Preparing files…".into();
+            if let Err(error) = queue.save(&root) {
+                // Without the record a crash would lose track of the job, so it
+                // does not start until the queue can be written.
+                tracing::warn!(%error, "Job not started: the queue could not be saved");
+                for job in &mut queue.jobs {
+                    if job.id == id {
+                        job.phase = Phase::Waiting;
+                        job.message = "Waiting. The job list could not be saved.".into();
+                    }
+                }
+                last_start_failure = Some(Instant::now());
+            } else {
+                let job = queue
+                    .jobs
+                    .iter()
+                    .find(|job| job.id == id)
+                    .context("Starting job disappeared")?;
+                active = Some(start(job));
+            }
         }
         if let Some((tray, _)) = &tray {
             tray.set_paused(preferences.maintenance_paused);
@@ -796,8 +950,8 @@ fn run() -> Result<()> {
         // Changes flagged through `queue_dirty` are written at most once a second.
         if queue_dirty && last_save.elapsed() >= Duration::from_secs(1) {
             last_save = Instant::now();
-            queue.save(&root)?;
             queue_dirty = false;
+            save_queue(&queue, &root, &mut queue_dirty);
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -839,6 +993,78 @@ fn activity(games: &[Game]) -> Result<Option<String>> {
 mod tests {
     use super::*;
     use crate::testutil::{Ctx, TestResult, check, check_eq};
+    fn missing_pipe() -> anyhow::Error {
+        std::io::Error::from(std::io::ErrorKind::NotFound).into()
+    }
+    #[test]
+    fn a_worker_that_is_gone_or_leaves_during_the_wait_is_not_an_error() -> TestResult {
+        let patience = Duration::from_secs(5);
+        let resend = Duration::from_millis(10);
+        let mut asked = 0;
+        check_eq(
+            wait_for_worker(|| true, || Err(missing_pipe()), patience, resend)
+                .ctx("lock already free")?,
+            Stopped::Gone,
+            "no worker needs no request",
+        )?;
+        let mut polls = 0;
+        check_eq(
+            wait_for_worker(
+                || {
+                    polls += 1;
+                    polls > 3
+                },
+                || {
+                    asked += 1;
+                    Err(missing_pipe())
+                },
+                patience,
+                resend,
+            )
+            .ctx("worker exits before hearing the request")?,
+            Stopped::Gone,
+            "a missing pipe while the lock frees is a worker that left",
+        )?;
+        check(asked >= 1, "the request was tried")
+    }
+    #[test]
+    fn a_worker_that_keeps_its_lock_is_still_working_or_an_error() -> TestResult {
+        let patience = Duration::from_millis(100);
+        let resend = Duration::from_millis(10);
+        check_eq(
+            wait_for_worker(|| false, || Ok(()), patience, resend).ctx("busy worker")?,
+            Stopped::StillWorking,
+            "control: a worker that does not let go blocks the upgrade",
+        )?;
+        check_eq(
+            wait_for_worker(|| false, || Err(missing_pipe()), patience, resend)
+                .ctx("lock held with no pipe")?,
+            Stopped::StillWorking,
+            "a held lock is never reported as gone",
+        )?;
+        check(
+            wait_for_worker(
+                || false,
+                || Err(anyhow::anyhow!("Another account is using the pipe")),
+                patience,
+                resend,
+            )
+            .is_err(),
+            "a real failure to reach the worker is reported",
+        )
+    }
+    #[test]
+    fn a_step_that_never_ran_is_due_and_a_recent_one_is_not() -> TestResult {
+        check(due(None, Duration::from_secs(30)), "never run is due")?;
+        check(
+            !due(Some(Instant::now()), Duration::from_secs(30)),
+            "a step that just ran waits its interval",
+        )?;
+        check(
+            due(Some(Instant::now()), Duration::ZERO),
+            "a zero interval is always due",
+        )
+    }
     struct Child(std::process::Child);
     impl Drop for Child {
         fn drop(&mut self) {

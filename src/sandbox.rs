@@ -41,6 +41,16 @@ use landlock::{
 /// what it cannot honour and downgrades the reported status.
 const TARGET_ABI: ABI = ABI::V5;
 
+/// Rights a job never uses on the folders it writes: running programs from
+/// them, and creating devices, sockets or FIFOs in them.
+fn never_needed() -> landlock::BitFlags<AccessFs> {
+    AccessFs::Execute
+        | AccessFs::MakeChar
+        | AccessFs::MakeBlock
+        | AccessFs::MakeSock
+        | AccessFs::MakeFifo
+}
+
 /// How much of the sandbox the kernel actually applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxStatus {
@@ -153,22 +163,34 @@ impl SandboxPlan {
     }
 }
 
-/// Makes creating a socket fail for this thread and every thread it starts.
+/// Makes `socket`, `socketpair` and `io_uring_setup` fail for this thread and
+/// every thread it starts, under the x32 numbers as well on x86_64.
 ///
-/// Landlock governs files and does not cover connecting to a socket by path,
-/// so a sandboxed worker could still reach the coordinator's control socket
-/// and send it commands. A worker talks only over the pipes it was started
-/// with, so it loses `socket` altogether. Call it where [`restrict`] is
-/// called: before any other thread exists.
+/// Landlock does not cover connecting to a socket by path, so a worker could
+/// otherwise reach the coordinator's control socket. Workers use their pipes.
+/// Call it where [`restrict`] is called, before any other thread exists.
 pub fn deny_sockets() -> Result<(), String> {
     use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, apply_filter};
 
     let arch = std::env::consts::ARCH
         .try_into()
         .map_err(|error| format!("seccomp does not know this processor: {error}"))?;
-    // An empty rule list matches the call whatever its arguments.
-    let rules = [(libc::SYS_socket, vec![]), (libc::SYS_socketpair, vec![])]
+    let numbers = [
+        libc::SYS_socket,
+        libc::SYS_socketpair,
+        libc::SYS_io_uring_setup,
+    ];
+    // On x86_64 a call with bit 30 set reaches the x32 table under the same
+    // audit architecture, so the filter lists those numbers as well.
+    #[cfg(target_arch = "x86_64")]
+    let numbers = numbers
         .into_iter()
+        .chain(numbers.into_iter().map(|number| number | 0x4000_0000))
+        .collect::<Vec<_>>();
+    // An empty rule list matches the call whatever its arguments.
+    let rules = numbers
+        .into_iter()
+        .map(|number| (number, vec![]))
         .collect();
     let filter = SeccompFilter::new(
         rules,
@@ -207,7 +229,7 @@ pub fn restrict(plan: &SandboxPlan) -> SandboxStatus {
         .and_then(|r| {
             r.add_rules(path_beneath_rules(
                 &plan.writable,
-                AccessFs::from_all(TARGET_ABI),
+                AccessFs::from_all(TARGET_ABI) & !never_needed(),
             ))
         })
         .and_then(|r| r.restrict_self());
