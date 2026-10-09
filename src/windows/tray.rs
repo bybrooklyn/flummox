@@ -309,8 +309,12 @@ fn run(
         )
     };
     ensure!(!window.is_null(), "Cannot create tray window");
-    // SAFETY: IDI_APPLICATION is a system-owned resource identifier and null selects system resources.
-    let icon = unsafe { LoadIconW(std::ptr::null_mut(), IDI_APPLICATION) };
+    // The drawn mark, or the generic system icon when Windows refuses to build it.
+    let drawn = crate::windows::icon::create();
+    let icon = drawn.unwrap_or_else(|| {
+        // SAFETY: IDI_APPLICATION is a system-owned resource identifier and null selects system resources.
+        unsafe { LoadIconW(std::ptr::null_mut(), IDI_APPLICATION) }
+    });
     let mut data = NOTIFYICONDATAW {
         cbSize: u32::try_from(std::mem::size_of::<NOTIFYICONDATAW>())?,
         hWnd: window,
@@ -352,6 +356,13 @@ fn run(
     // SAFETY: this removes only the tray icon identified by this worker's window and ID.
     unsafe {
         Shell_NotifyIconW(NIM_DELETE, &data);
+    }
+    if let Some(icon) = drawn {
+        // SAFETY: the icon was created by `icon::create` for this thread and the shell
+        // entry that used it was deleted above.
+        unsafe {
+            DestroyIcon(icon);
+        }
     }
     Ok(())
 }

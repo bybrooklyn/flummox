@@ -60,31 +60,50 @@ begin
     Result := MsgBox('Close Flummox and finish all compression jobs before installing or upgrading.', mbInformation, MB_OKCANCEL) = IDOK;
 end;
 
+var
+  WorkerProblem: String;
+
+{ Stops this install's background worker. Returns True when none is running any
+  more, whether it was never running, left before the request or finished its file.
+  --native-worker-exit exits 0 when the worker is gone and 3 while it is still
+  finishing a file. Anything else leaves WorkerProblem set. }
 function StopOwnedWorker(RemoveStartup: Boolean): Boolean;
 var
   ExitCode: Integer;
   Arguments: String;
 begin
   Result := True;
+  WorkerProblem := '';
   if not FileExists(ExpandConstant('{app}\flummox.exe')) then Exit;
   Arguments := '--native-worker-exit';
   if RemoveStartup then Arguments := Arguments + ' --remove-owned-startup';
-  Result := Exec(ExpandConstant('{app}\flummox.exe'), Arguments, '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
-  if Result then
-    { Legacy CLI versions return 2 for an unsupported worker command. }
-    Result := (ExitCode = 0) or (ExitCode = 2);
+  if not Exec(ExpandConstant('{app}\flummox.exe'), Arguments, '', SW_HIDE, ewWaitUntilTerminated, ExitCode) then
+  begin
+    { Exec failed, so ExitCode is a Windows error. 2 and 3 mean the file or its
+      folder vanished after the check above, so there is no worker to wait for. }
+    Result := (ExitCode = 2) or (ExitCode = 3);
+    if not Result then
+      WorkerProblem := Format('Flummox could not ask its background worker to stop (Windows error %d).', [ExitCode]);
+    Exit;
+  end;
+  { Legacy CLI versions return 2 for an unsupported worker command. }
+  Result := (ExitCode = 0) or (ExitCode = 2);
+  if ExitCode = 3 then
+    WorkerProblem := 'Flummox is finishing a storage operation.'
+  else if not Result then
+    WorkerProblem := Format('Flummox could not stop its background worker (code %d). Quit it from the tray icon.', [ExitCode]);
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
   if not StopOwnedWorker(False) then
-    Result := 'Flummox is finishing a storage operation. Wait, then retry the upgrade.';
+    Result := WorkerProblem + ' Wait, then retry the upgrade.';
 end;
 
 function InitializeUninstall(): Boolean;
 begin
   Result := StopOwnedWorker(True);
   if not Result and not UninstallSilent then
-    MsgBox('Flummox is finishing a storage operation. Wait, then retry uninstalling.', mbError, MB_OK);
+    MsgBox(WorkerProblem + ' Wait, then retry uninstalling.', mbError, MB_OK);
 end;
