@@ -372,9 +372,9 @@ impl Preferences {
                 }
                 match content_stamp(&game.install_dir) {
                     Ok(stamp) => game.build = Some(format!("local:{stamp}")),
-                    // Includes a tree too large to stamp within its limits. The game
-                    // stays listed and cannot start a job. No warning is added, since
-                    // a warning would hold maintenance for every other game too.
+                    // A file or folder that cannot be read. The game stays listed and
+                    // cannot start a job. No warning is added, since a warning would
+                    // hold maintenance for every other game too.
                     Err(error) => {
                         game.state = crate::model::InstallState::Broken {
                             detail: format!("Game files could not be inspected: {error}"),
@@ -459,21 +459,49 @@ pub fn merge(games: Vec<crate::model::Game>) -> Vec<crate::model::Game> {
     }
     merged
 }
+/// Most entries `content_stamp` reads before it stops.
+const STAMP_ENTRY_LIMIT: usize = 250_000;
+/// Longest `content_stamp` walks before it stops.
+const STAMP_TIME_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Tracks custom-game file changes without reading file contents or following links.
+///
+/// A tree past 250,000 entries or 5 seconds is not an error: the stamp covers what was
+/// read and starts with `partial:` and the entry count reached, so the game stays
+/// usable and a change in that part still shows. After a time stop the count is
+/// rounded down to a multiple of 1000, so a slower walk does not look like a change.
 pub fn content_stamp(root: &Path) -> Result<String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    content_stamp_within(
+        root,
+        STAMP_ENTRY_LIMIT,
+        std::time::Instant::now() + STAMP_TIME_LIMIT,
+    )
+}
+fn content_stamp_within(
+    root: &Path,
+    entry_limit: usize,
+    deadline: std::time::Instant,
+) -> Result<String> {
     let mut fingerprint = blake3::Hasher::new();
+    // The hasher and entry count at the last multiple of 1000 entries.
+    let mut checkpoint = (fingerprint.clone(), 0usize);
+    let mut stopped = None;
     for (count, entry) in walkdir::WalkDir::new(root)
         .follow_links(false)
         .sort_by_file_name()
         .into_iter()
         .enumerate()
     {
-        // Bounded at 250000 entries and 5 seconds. Past either the stamp is an error.
-        ensure!(
-            count < 250000 && std::time::Instant::now() < deadline,
-            "This folder has too many files to check. Choose the game's own folder."
-        );
+        if count >= entry_limit {
+            stopped = Some((count, false));
+            break;
+        }
+        if count % 1000 == 0 {
+            checkpoint = (fingerprint.clone(), count);
+            if std::time::Instant::now() >= deadline {
+                stopped = Some((count, true));
+                break;
+            }
+        }
         let entry = entry?;
         if !entry.file_type().is_file() {
             continue;
@@ -498,7 +526,17 @@ pub fn content_stamp(root: &Path) -> Result<String> {
             .map_or(0, |elapsed| elapsed.as_nanos());
         fingerprint.update(&modified.to_le_bytes());
     }
-    Ok(fingerprint.finalize().to_hex().to_string())
+    Ok(match stopped {
+        None => fingerprint.finalize().to_hex().to_string(),
+        Some((count, timed)) => {
+            let (hasher, count) = if timed {
+                checkpoint
+            } else {
+                (fingerprint, count)
+            };
+            format!("partial:{count}:{}", hasher.finalize().to_hex())
+        }
+    })
 }
 #[cfg(test)]
 mod tests {
@@ -585,6 +623,67 @@ mod tests {
             second != content_stamp(temp.path()).ctx("new file stamp")?,
             "new files change the stamp",
         )
+    }
+    fn tree_of(files: usize) -> Result<tempfile::TempDir, String> {
+        let temp = tempfile::tempdir().ctx("fixture folder")?;
+        for index in 0..files {
+            std::fs::write(temp.path().join(format!("f{index:03}.dat")), b"x")
+                .ctx("fixture file")?;
+        }
+        Ok(temp)
+    }
+    fn far() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(600)
+    }
+    #[test]
+    fn a_tree_past_the_entry_limit_gets_a_partial_stamp_instead_of_an_error() -> TestResult {
+        let temp = tree_of(10)?;
+        let whole = content_stamp_within(temp.path(), 100, far()).ctx("within the limit")?;
+        check(
+            !whole.starts_with("partial:"),
+            "control: a small tree is whole",
+        )?;
+        let first = content_stamp_within(temp.path(), 5, far()).ctx("past the limit")?;
+        check(
+            first.starts_with("partial:5:"),
+            "the stamp says it is partial",
+        )?;
+        check_eq(
+            content_stamp_within(temp.path(), 5, far()).ctx("again")?,
+            first.clone(),
+            "an unchanged partial tree is stable",
+        )?;
+        // Entry 0 is the folder; entries 1 to 4 are f000 to f003.
+        std::fs::write(temp.path().join("f001.dat"), b"changed and longer")
+            .ctx("change a file in the part read")?;
+        let second = content_stamp_within(temp.path(), 5, far()).ctx("after change")?;
+        check(
+            first != second,
+            "a change in the read part is still a change",
+        )?;
+        std::fs::write(temp.path().join("f009.dat"), b"changed and longer")
+            .ctx("change a file past the limit")?;
+        check_eq(
+            content_stamp_within(temp.path(), 5, far()).ctx("after change past the limit")?,
+            second,
+            "the part not read cannot show a change",
+        )
+    }
+    #[test]
+    fn a_walk_that_runs_out_of_time_is_partial() -> TestResult {
+        let temp = tree_of(3)?;
+        let stamp = content_stamp_within(temp.path(), 1000, std::time::Instant::now())
+            .ctx("expired deadline")?;
+        check(
+            stamp.starts_with("partial:0:"),
+            "stopped at the first checkpoint",
+        )
+    }
+    #[test]
+    fn an_ordinary_game_has_a_whole_stamp() -> TestResult {
+        let temp = tree_of(3)?;
+        let stamp = content_stamp(temp.path()).ctx("stamp")?;
+        check(!stamp.starts_with("partial:"), "no limit was reached")
     }
     fn protected() -> ProtectedFolders {
         ProtectedFolders {
