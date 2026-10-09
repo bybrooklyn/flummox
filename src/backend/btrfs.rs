@@ -242,6 +242,60 @@ fn ensure_decompressed(file: &File) -> io::Result<()> {
     ))
 }
 
+/// Text of the error when a kernel leaves a test file compressed.
+pub const PROBE_FAILED: &str = "This kernel did not decompress a test file, so it cannot undo btrfs compression in place. Update the kernel to one that supports the defrag no-compress flag. Nothing was changed.";
+
+/// Checks that the kernel honours the decompress flag before a job changes any
+/// state. Writes a small compressible file in a scratch folder on the game's
+/// filesystem, beside the install or in `state_dir`, and removes it again.
+/// Returns `Ok` when no scratch folder is available, since nothing was learned.
+pub fn probe_decompress(install_dir: &Path, state_dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(install_dir) else {
+        return Ok(());
+    };
+    let device = meta.dev();
+    for base in install_dir.parent().into_iter().chain([state_dir]) {
+        let Ok(scratch) = tempfile::Builder::new()
+            .prefix(".flummox-probe-")
+            .tempdir_in(base)
+        else {
+            continue;
+        };
+        if scratch.path().metadata().map(|meta| meta.dev()).ok() == Some(device) {
+            return probe_decompress_in(scratch.path(), decompress_fd);
+        }
+    }
+    Ok(())
+}
+
+/// [`probe_decompress`] in `dir`, with `decompress` standing in for the
+/// kernel call so a test can supply a kernel that ignores the flag.
+fn probe_decompress_in(
+    dir: &Path,
+    decompress: impl Fn(&File) -> io::Result<()>,
+) -> io::Result<()> {
+    use std::io::Write;
+    // Anonymous, so nothing is left behind whatever happens next.
+    let file = tempfile::tempfile_in(dir)?;
+    let line = b"flummox decompress probe, compressible text.\n";
+    let mut writer = io::BufWriter::new(&file);
+    for _ in 0..(4 * 1024 * 1024 / line.len()) {
+        writer.write_all(line)?;
+    }
+    writer.flush()?;
+    drop(writer);
+    file.sync_all()?;
+    // If the file will not compress, the probe cannot tell anything about
+    // decompressing, and the pass itself still checks every file.
+    if compress_fd(&file, 3).is_err() || compressed_bytes_fd(&file)?.0 == 0 {
+        return Ok(());
+    }
+    let unsupported = |_: io::Error| io::Error::new(io::ErrorKind::Unsupported, PROBE_FAILED);
+    decompress(&file).map_err(unsupported)?;
+    ensure_decompressed(&file).map_err(unsupported)
+}
+
 /// Limits each in-flight ioctl to 16 MiB. An interrupted file gets no success
 /// receipt, so retrying safely revisits it even if some ranges were rewritten.
 ///
@@ -505,16 +559,25 @@ nix::ioctl_read!(fs_ioc_getflags, b'f', 1, libc::c_long);
 /// compression.
 const FS_NOCOW_FL: libc::c_long = 0x0080_0000;
 
+/// Whether the file carries the no-copy-on-write attribute. btrfs never
+/// compresses such a file, so a pass skips it and an estimate should not
+/// count it. Fails on a filesystem without the ioctl.
+pub fn is_nocow(file: &File) -> io::Result<bool> {
+    let mut flags: libc::c_long = 0;
+    // SAFETY: `file` is open and `flags` is writable for the whole call. A
+    // filesystem without the ioctl makes the kernel return ENOTTY.
+    unsafe { fs_ioc_getflags(file.as_raw_fd(), &mut flags) }.map_err(errno_to_io)?;
+    Ok(flags & FS_NOCOW_FL != 0)
+}
+
 /// Why a job should not rewrite this file, if there is a reason.
 ///
 /// btrfs never compresses a no-copy-on-write file, yet the defrag ioctl
 /// still returns success for it, so a pass would record it as done.
 fn leave_alone_reason(file: &File) -> Option<&'static str> {
-    let mut flags: libc::c_long = 0;
-    // SAFETY: `file` is open and `flags` is writable for the whole call. A
-    // filesystem without the ioctl makes the kernel return ENOTTY.
-    unsafe { fs_ioc_getflags(file.as_raw_fd(), &mut flags) }.ok()?;
-    (flags & FS_NOCOW_FL != 0).then_some("btrfs does not compress files marked no-copy-on-write")
+    is_nocow(file)
+        .ok()?
+        .then_some("btrfs does not compress files marked no-copy-on-write")
 }
 
 /// Compresses games in place on btrfs.
@@ -1094,5 +1157,66 @@ mod tests {
         )?;
         // Clearing twice must not fail.
         set_dir_property(tmp.path(), false).ctx("clear btrfs.compression a second time")
+    }
+
+    #[test]
+    fn a_kernel_that_leaves_the_probe_compressed_fails_the_job() -> TestResult {
+        let Some(tmp) = btrfs_tempdir()? else {
+            return Ok(());
+        };
+        // Control: the real call decompresses the probe file on this kernel.
+        probe_decompress_in(tmp.path(), decompress_fd)
+            .ctx("control: a kernel that honours the flag passes")?;
+        // A kernel that ignores the flag returns success and changes nothing.
+        let ignored = probe_decompress_in(tmp.path(), |_| Ok(()));
+        check(
+            ignored
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.to_string() == PROBE_FAILED),
+            format!("a probe that stays compressed fails with the kernel message: {ignored:?}"),
+        )?;
+        // A kernel that rejects the flag fails the same way.
+        let rejected = probe_decompress_in(tmp.path(), |_| {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "no"))
+        });
+        check(
+            rejected
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.to_string() == PROBE_FAILED),
+            format!("a rejected flag fails with the kernel message: {rejected:?}"),
+        )
+    }
+
+    #[test]
+    fn the_decompress_probe_passes_here_and_leaves_nothing_behind() -> TestResult {
+        let Some(tmp) = btrfs_tempdir()? else {
+            return Ok(());
+        };
+        let library = tmp.path().join("Library");
+        let game = library.join("game");
+        let state = tmp.path().join("state");
+        std::fs::create_dir_all(&game).ctx("game folder")?;
+        std::fs::create_dir(&state).ctx("state folder")?;
+        probe_decompress(&game, &state).ctx("the probe passes on this machine")?;
+        for dir in [library, state, game] {
+            let leftovers: Vec<_> = std::fs::read_dir(&dir)
+                .ctx("list")?
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name())
+                .filter(|name| name.to_string_lossy().starts_with(".flummox-probe"))
+                .collect();
+            check(
+                leftovers.is_empty(),
+                format!("{} holds {leftovers:?}", dir.display()),
+            )?;
+        }
+        // Control: with no usable scratch folder nothing is learned and the job goes on.
+        probe_decompress(
+            &tmp.path().join("missing/game"),
+            &tmp.path().join("missing"),
+        )
+        .ctx("no scratch folder is not a failure")
     }
 }
