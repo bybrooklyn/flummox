@@ -100,7 +100,6 @@ pub fn save_override(game: String, path: PathBuf) -> Result<()> {
 }
 /// Removes the saved image for a game, so it goes back to its default
 /// artwork. Blocks on file I/O.
-#[cfg(target_os = "linux")]
 pub fn clear_override(game: &str) -> Result<()> {
     let mut items = overrides()?;
     items.retain(|item| item.game != game);

@@ -7,10 +7,13 @@
 // callers there.
 #![cfg_attr(target_os = "linux", allow(dead_code))]
 
+#[cfg(any(windows, test))]
 use super::theme::Tone;
+#[cfg(any(windows, test))]
+use crate::desktop_jobs::Job;
 use crate::{
     desktop::{Location, LocationKind},
-    desktop_jobs::{Job, Phase},
+    desktop_jobs::Phase,
     model::Game,
 };
 use std::path::{Path, PathBuf};
@@ -58,6 +61,7 @@ pub fn needs_attention(game: &Game, latest: Option<Phase>) -> bool {
 }
 
 /// The phase of the newest job for `game`, if any.
+#[cfg(windows)]
 pub fn latest_phase(jobs: &[Job], game: &Game) -> Option<Phase> {
     jobs.iter()
         .rev()
@@ -67,6 +71,7 @@ pub fn latest_phase(jobs: &[Job], game: &Game) -> Option<Phase> {
 
 /// The active job on `folder`. A running or paused job wins over one that is
 /// still waiting.
+#[cfg(any(windows, test))]
 pub fn job_for_folder<'a>(jobs: &'a [Job], folder: &Path) -> Option<&'a Job> {
     let on_folder = || {
         jobs.iter()
@@ -80,6 +85,7 @@ pub fn job_for_folder<'a>(jobs: &'a [Job], folder: &Path) -> Option<&'a Job> {
 
 /// Whether a retained record for `root` belongs to a job that is still active.
 /// Either path may be the parent of the other.
+#[cfg(any(windows, test))]
 pub fn recovery_in_use(jobs: &[Job], root: &Path) -> bool {
     jobs.iter().any(|job| {
         job.phase.active()
@@ -88,11 +94,13 @@ pub fn recovery_in_use(jobs: &[Job], root: &Path) -> bool {
 }
 
 /// How many jobs are waiting, running or paused.
+#[cfg(windows)]
 pub fn active_jobs(jobs: &[Job]) -> usize {
     jobs.iter().filter(|job| job.phase.active()).count()
 }
 
 /// The colour a job's phase label draws in.
+#[cfg(any(windows, test))]
 pub fn job_tone(phase: Phase) -> Tone {
     match phase {
         Phase::Paused => Tone::Warning,
@@ -164,6 +172,7 @@ pub fn apply_location(
 
 /// Excludes or includes a game. Every id the game answers to is removed first,
 /// so none stays listed, and `primary` is added back when excluding.
+#[cfg(any(windows, test))]
 pub fn set_excluded(excluded: &mut Vec<String>, ids: &[String], primary: &str, exclude: bool) {
     excluded.retain(|old| !ids.contains(old));
     if exclude {
@@ -172,6 +181,7 @@ pub fn set_excluded(excluded: &mut Vec<String>, ids: &[String], primary: &str, e
 }
 
 /// Whether any of `ids` is excluded.
+#[cfg(any(windows, test))]
 pub fn is_excluded(excluded: &[String], ids: &[String]) -> bool {
     ids.iter().any(|id| excluded.contains(id))
 }

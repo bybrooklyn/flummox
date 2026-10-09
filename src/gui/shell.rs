@@ -26,6 +26,7 @@ pub const MIN_WINDOW: (f32, f32) = (640.0, 480.0);
 /// How long an informational toast stays.
 pub const INFO_SECONDS: u64 = 4;
 /// How long a toast showing the worker's refusal stays.
+#[cfg(any(target_os = "linux", windows))]
 pub const REFUSAL_SECONDS: u64 = 8;
 
 /// The symbols the sidebar draws for each destination.
@@ -116,6 +117,7 @@ impl Toast {
 
     /// Shows the worker's refusal of something the user asked for. It leaves
     /// after a few seconds and is not a lost connection.
+    #[cfg(any(target_os = "linux", windows))]
     pub fn show_refusal(&mut self, text: String, fade: Duration) {
         self.show(Status::error(text), fade);
         self.deadline = Some(Instant::now() + Duration::from_secs(REFUSAL_SECONDS));
@@ -598,6 +600,7 @@ pub fn empty_panel<'a, M: Clone + 'a>(
 }
 
 /// The Jobs page groups with the line shown when a group is empty.
+#[cfg(any(target_os = "linux", windows))]
 pub const JOB_GROUPS: [(&str, &str); 4] = [
     ("Running", "No jobs running"),
     ("Waiting", "No games waiting"),
@@ -606,6 +609,7 @@ pub const JOB_GROUPS: [(&str, &str); 4] = [
 ];
 
 /// How many finished jobs the history lists.
+#[cfg(any(target_os = "linux", windows))]
 pub const HISTORY_LIMIT: usize = 20;
 
 /// One row of Settings > Appearance: a label with its description, and the
@@ -659,6 +663,7 @@ mod tests {
         check(toast.deadline.is_none(), "an error has no deadline")
     }
 
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn a_refusal_leaves_after_eight_seconds() -> TestResult {
         let mut toast = Toast::default();
