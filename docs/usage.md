@@ -7,14 +7,14 @@ Capabilities by platform are in [status](status.md).
 
 Open `flummox-gui` on Linux and choose Games. Analysis starts in the
 background, and the list sorts itself into four groups: worth compressing,
-not analyzed yet, compressed, and little to gain. Press **Compress** on a game,
+not analyzed yet, compressed, and little to save. Press **Compress** on a game,
 or tick several and press **Compress selected**. The job starts at once when
 the drive has room, and the window stays where you were. A compressed game
 shows what it saved; on btrfs that figure is an estimate and says so.
 
 Open a game to choose how it is compressed:
 
-- **Standard** is quick, and the game's files stay exactly where they are.
+- **Standard** is quick, and the game's files stay where they are.
   It is the default wherever the drive can compress in place.
 - **Maximum** saves more and takes minutes. The game runs from a compressed
   store mounted at its usual path, and the original is kept until you confirm
@@ -30,7 +30,7 @@ deleted after you next play. **Decompress to ordinary files** undoes it at any
 point.
 
 **Decompress** puts a game back and **Analyze** estimates it again. Advanced
-holds the Standard strength (Fast, Balanced, Max), the store location, and the
+holds the Standard strength (Fast, Balanced or Max), the store location, and the
 compatibility report form. Maximum compares levels 9, 15, 19 and 22 for each
 unique chunk and keeps the smallest; ties use the cheaper level.
 
@@ -40,7 +40,7 @@ field usable.
 
 On Windows, choose a locally detected Steam, Epic, GOG or Heroic game, or add
 another installed-game folder, then press **Compress**. Flummox reports files
-processed and allocated bytes freed while Windows works. **Stop** finishes the
+processed and space freed while Windows works. **Stop** finishes the
 current file and keeps completed work valid. **Decompress** removes WOF backing
 and leaves the same files at the same paths.
 
@@ -49,30 +49,31 @@ storage controls appear only when their backend and FUSE support are available.
 Mac uses built-in APFS compression with staged verification and durable replacement
 journals. Unsupported desktop targets retain the informational shell.
 
-The Jobs page groups running, waiting, attention and completed work. A job
-you pause keeps its place, and the jobs behind it say they are waiting for it.
-Linux
-jobs support pause, resume, cancel and retry for native work and Maximum Space
-preparation. Store creation and compaction report measured progress; verification
-reports checked items. File switches, restoration and reclaim finish without
-interruption, with controls hidden during those phases. Linux and Windows jobs
-survive closing the window because their coordinators keep running. Mac jobs
+On Linux the Jobs page lists Running, Waiting, Needs attention and History.
+On Windows and Mac, Jobs is a section of Settings. A job you pause keeps its
+place, and the jobs behind it say they are waiting for it. Linux jobs support
+pause, resume, stop and retry for Standard compression and for switching a game
+to Maximum. Creating a store and folding in updates report measured progress, and
+checking a store reports its own progress. Switching files, decompressing and
+deleting the original finish without interruption, with controls hidden during
+those steps. Linux and Windows jobs
+survive closing the window because the background worker keeps running. Mac jobs
 currently run inside the app. Analysis and compression pause when a detected
 game is running. A stop request, from the window or the command line, lets the
 current Linux filesystem operation finish: workers stop between files and at
 16 MiB range boundaries inside large files.
 
-Settings > Locations lets you add game folders. On Linux and Windows,
-Settings > Maintenance opts libraries into background work. Opting in
-establishes a baseline, so existing installs are not all compressed
-immediately. Subsequent installations and
-completed updates can queue work. Linux maintains a login entry while an opted-in
-library or mounted install needs its coordinator. Windows login startup is a
-separate opt-in.
+Settings > Locations lets you add a game or a games library. On Linux and
+Windows, the **Maintain new installs and updates** checkbox on a location opts
+it into background jobs. Opting in establishes a baseline, so existing installs
+are not all compressed immediately. Later installations and completed updates
+can queue jobs. Linux keeps a login entry while an opted-in location or a game
+using Maximum needs the background worker. Windows login startup is a separate
+opt-in.
 
 `Ctrl+F` focuses game search, `Ctrl+R` refreshes, and `Escape` clears selection
-and closes details. Tab and Shift+Tab move focus. Reduce motion is saved in
-Settings > Appearance. Artwork comes from local launcher caches; no artwork or
+and closes details. Tab and Shift+Tab move focus. The Motion setting (Smooth,
+Subtle or Reduced) is saved in Settings > Appearance. Artwork comes from local launcher caches; no artwork or
 telemetry is sent to a server.
 
 On Linux, the command line shares ordinary compression and decompression jobs
@@ -90,7 +91,7 @@ flummox jobs retry 12
 
 The advanced `compress --force`, `compress --no-pause` and
 `decompress --force` paths run in the command's own process instead of the
-queue. They share an operation lock with coordinator workers and check free
+queue. They share an operation lock with the background worker and check free
 space before they start, as a queued job does.
 
 ## Use the command line
@@ -103,31 +104,32 @@ flummox decompress 105600           # put it back
 flummox status 105600               # how much is stored compressed
 flummox log                         # what Flummox has done
 flummox doctor                      # check this machine
-flummox compatibility list --json  # export path-free qualification records
-flummox compatibility measure DIR  # allocated bytes for a qualification
+flummox compatibility list --json  # export path-free compatibility reports
+flummox compatibility measure DIR  # allocated bytes for a compatibility report
 ```
 
-Import a locally produced compatibility qualification from Settings or an
+Import a locally produced compatibility report from Settings or an
 expanded game, or with `flummox compatibility import report.json`. Analysis
 hashes installed files when a candidate report matches the game build. Automatic
-activation checks the corpus again before creation and before switching storage. Reports identify a launcher key, build and
-corpus hash. They contain no game title, install path, user name or machine
-identifier. Maximum Space automation accepts only a matching verified build
+switching checks the game files again before the store is created and before the
+game switches to it. Reports identify a launcher key, build and
+corpus hash (a fingerprint of the game files). They contain no game title, install path, user name or machine
+identifier. Automatic Maximum accepts only a matching verified build
 whose measured load-time change stays within policy.
 
 Steam reports some folders that are not games, like shared redistributables
 and runtimes. Flummox filters the obvious ones, and you can correct the rest:
 
 ```sh
-flummox exclude add "Steamworks Shared"   # stop seeing it
+flummox exclude add "Steamworks Shared"   # leave it out
 flummox exclude list
 flummox exclude remove 105600
 ```
 
-A hidden entry stays out of scans and will not be compressed even if you name
-it directly. `exclude remove` takes an ID, a whole title or part of a title,
-tried in that order. It refuses a partial title that matches several hidden
-games, and an empty one, and lists the matches so you can choose.
+An excluded game stays out of the games list and will not be compressed even
+if you name it directly. `exclude remove` takes an ID, a whole title or part of
+a title, tried in that order. It refuses a partial title that matches several
+excluded games, and an empty one, and lists the matches so you can choose.
 
 Name a game by its Steam app ID, by `steam:105600`, or by part of its title.
 Presets are `fast`, `balanced` and `max`. `--level` overrides the preset with
