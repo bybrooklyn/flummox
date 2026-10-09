@@ -275,6 +275,7 @@ fn start(job: &Job) -> Active {
                     bytes: progress.bytes,
                     allocation_before: progress.allocation_before,
                     allocation_after: progress.allocation_after,
+                    failed: progress.failed,
                 }));
             },
         )

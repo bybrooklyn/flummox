@@ -54,6 +54,9 @@ pub struct Progress {
     /// Allocated size of the visited files before each was processed, and after.
     pub allocation_before: u64,
     pub allocation_after: u64,
+    /// Files the pass could not process and went on without.
+    #[serde(default)]
+    pub failed: u64,
 }
 /// One queued or finished storage operation on one game folder.
 #[derive(Debug, Clone, Serialize, Deserialize)]

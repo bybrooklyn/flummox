@@ -93,6 +93,8 @@ pub(crate) struct Progress {
     pub bytes: u64,
     pub allocation_before: u64,
     pub allocation_after: u64,
+    /// Files that could not be processed. The pass went on without them.
+    pub failed: u64,
 }
 
 /// Files a pass could not process. The pass went on without them.
@@ -505,6 +507,7 @@ fn visit_in(
                 Ok(before) => before,
                 Err(error) => {
                     note_failure(&mut failures, &error);
+                    summary.failed = failures.count;
                     report(summary.clone());
                     continue;
                 }
@@ -546,6 +549,7 @@ fn visit_in(
                 }
             };
             summary.allocation_after = summary.allocation_after.saturating_add(after);
+            summary.failed = failures.count;
             report(summary.clone());
         }
         ensure!(
@@ -555,6 +559,7 @@ fn visit_in(
         );
         Ok(())
     })();
+    summary.failed = failures.count;
     if disagreed > 0 {
         tracing::debug!(disagreed, files = summary.files, "Size readings disagreed");
     }
@@ -730,7 +735,7 @@ mod tests {
         let (_temp, game, state) = fixture(3)?;
         let stop = AtomicBool::new(false);
         // Control: with nothing held open, nothing fails.
-        let (_, clean) = visit_in(
+        let (clean_summary, clean) = visit_in(
             &state,
             &game,
             &stop,
@@ -740,6 +745,7 @@ mod tests {
         )
         .ctx("clean pass")?;
         check_eq(clean.count, 0, "an unlocked folder has no failures")?;
+        check_eq(clean_summary.failed, 0, "and the progress counts none")?;
         // An exclusive handle makes the next open of that file fail.
         let held = OpenOptions::new()
             .read(true)
@@ -751,6 +757,7 @@ mod tests {
             .ctx("pass with a held file")?;
         drop(held);
         check_eq(failures.count, 1, "only the held file failed")?;
+        check_eq(summary.failed, 1, "the progress counts it for the window")?;
         check_eq(summary.files, 3, "every file was visited")?;
         check(
             recovery_in(&state).ctx("journal")?.is_empty(),
