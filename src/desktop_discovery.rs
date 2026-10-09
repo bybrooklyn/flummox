@@ -520,7 +520,8 @@ mod tests {
             Launcher::Epic,
             "root".into(),
             "Root".into(),
-            PathBuf::from("/"),
+            // `/` is not an absolute path on Windows.
+            PathBuf::from(if cfg!(windows) { "C:\\" } else { "/" }),
             None,
         )
         .ctx("a root is listed, not dropped")?;
