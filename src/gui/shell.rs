@@ -9,7 +9,8 @@ use super::{
 use humansize::{DECIMAL, format_size};
 use iced::keyboard::{Key, Modifiers, key::Named};
 use iced::widget::{
-    Space, button, column, container, image, row, scrollable, stack, text, tooltip,
+    Space, button, column, container, image, pick_list, row, scrollable, stack, text, text_input,
+    tooltip,
 };
 use iced::{Alignment, Animation, Element, Length, Task, animation::Easing};
 use std::time::{Duration, Instant};

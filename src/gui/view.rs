@@ -12,8 +12,7 @@ use crate::{
     },
 };
 use iced::widget::{
-    Space, button, checkbox, column, container, pick_list, progress_bar, responsive, row, text,
-    text_input,
+    Space, button, checkbox, column, container, progress_bar, responsive, row, text,
 };
 use iced::{Alignment, Element, Length};
 
