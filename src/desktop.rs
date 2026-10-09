@@ -401,7 +401,7 @@ pub fn merge(games: Vec<crate::model::Game>) -> Vec<crate::model::Game> {
         }
         if let Some(previous) = merged
             .iter_mut()
-            .find(|old| old.install_dir == game.install_dir)
+            .find(|old| crate::model::same_install_dir(&old.install_dir, &game.install_dir))
         {
             for id in game.ids() {
                 if !previous.ids().any(|old| old == id) {

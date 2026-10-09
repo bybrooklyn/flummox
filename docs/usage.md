@@ -136,9 +136,10 @@ Name a game by its Steam app ID, by `steam:105600`, or by part of its title.
 Presets are `fast`, `balanced` and `max`. `--level` overrides the preset with
 a zstd level from -15 to 15, and 0 is refused. `--threads` takes 1 to 32.
 
-Every read-only command takes `--json`, with one exception: `flummox doctor`
-has no JSON output and returns an error when asked for it. `drives --json`,
-`watch status --json` and `compress --dry-run --json` work.
+Every read-only command takes `--json`. `doctor --json` prints one object
+with a `checks` list, and each entry has a `name`, a `status` (`ok`, `warn` or
+`off`) and a `detail`. `drives --json`, `watch status --json` and
+`compress --dry-run --json` work too.
 
 Flummox will not start on a game that is running, updating or being verified.
 If you launch the game while a job is working, the job pauses and waits for
