@@ -755,6 +755,32 @@ fn enqueue_job(
     Ok(())
 }
 
+/// Applies each item as an `Enqueue` and returns the ones that were refused.
+/// A refusal for one item never stops the rest.
+fn enqueue_many(
+    items: Vec<(Game, Operation, CompressOpts)>,
+    snapshot: &mut Snapshot,
+    db: &Connection,
+    active: &mut Option<Active>,
+) -> Vec<Refusal> {
+    let mut refused = Vec::new();
+    for (game, operation, options) in items {
+        let title = game.title.clone();
+        let command = Command::Enqueue {
+            game,
+            operation,
+            options,
+        };
+        if let Err(error) = apply(command, snapshot, db, active, &mut Vec::new(), None) {
+            refused.push(Refusal {
+                title,
+                reason: error.to_string(),
+            });
+        }
+    }
+    refused
+}
+
 /// Cancels the running worker when its job is an analysis, so that work the
 /// user requested does not wait behind it.
 fn preempt_analysis(
@@ -868,6 +894,7 @@ fn apply(
         | Command::Restart
         | Command::RefreshDiscovery
         | Command::CancelDiscovery => {}
+        Command::EnqueueMany { .. } => bail!("Use a batch request to queue several jobs."),
         // The motion arms write rows 3 and 6 together, so the older boolean
         // and the newer preference always agree.
         Command::ReducedMotion(value) => {
@@ -2101,6 +2128,7 @@ pub(super) fn run() -> Result<()> {
             Ok((mut stream, _)) => {
                 last_client = Instant::now();
                 let mut restart = false;
+                let mut refused = Vec::new();
                 let result = (|| -> Result<()> {
                     stream.set_read_timeout(Some(Duration::from_millis(500)))?;
                     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
@@ -2178,14 +2206,19 @@ pub(super) fn run() -> Result<()> {
                     {
                         running.control.request_control(&message.command)?;
                     }
-                    apply(
-                        message.command,
-                        &mut snapshot,
-                        &db,
-                        &mut active,
-                        &mut mounts,
-                        pack_active.as_ref().map(|running| running.id),
-                    )?;
+                    match message.command {
+                        Command::EnqueueMany { items } => {
+                            refused = enqueue_many(items, &mut snapshot, &db, &mut active);
+                        }
+                        command => apply(
+                            command,
+                            &mut snapshot,
+                            &db,
+                            &mut active,
+                            &mut mounts,
+                            pack_active.as_ref().map(|running| running.id),
+                        )?,
+                    }
                     // Mirror the change into the history database, which
                     // workers check before they process a game.
                     if let Some((id, excluded)) = exclusion {
@@ -2223,6 +2256,7 @@ pub(super) fn run() -> Result<()> {
                     version: VERSION,
                     snapshot: result.as_ref().ok().map(|_| snapshot.clone()),
                     error: result.err().map(|e| e.to_string()),
+                    refused,
                 };
                 let mut writer = std::io::BufWriter::new(&mut stream);
                 let _sent = serde_json::to_writer(&mut writer, &response)
@@ -2472,6 +2506,86 @@ mod tests {
             state: InstallState::Idle,
             is_tool: false,
         }
+    }
+
+    #[test]
+    fn a_batch_queues_what_passes_and_names_what_was_refused() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let (db, mut snapshot) = open_store(&temp.path().join("jobs.sqlite")).ctx("store")?;
+        let folder = |name: &str| -> Result<PathBuf, String> {
+            let path = temp.path().join(name);
+            std::fs::create_dir(&path).ctx("game folder")?;
+            Ok(path)
+        };
+        let first = folder("first")?;
+        let blocked = folder("blocked")?;
+        let last = folder("last")?;
+        snapshot
+            .excluded
+            .push(game(&blocked, "blocked").id.to_string());
+        let mut relative = game(&first, "relative");
+        relative.install_dir = PathBuf::from("relative/path");
+        let item = |game: Game| (game, Operation::Compress, CompressOpts::default());
+        let refused = enqueue_many(
+            vec![
+                item(game(&first, "first")),
+                item(game(&blocked, "blocked")),
+                item(relative),
+                item(game(&last, "last")),
+            ],
+            &mut snapshot,
+            &db,
+            &mut None,
+        );
+        let queued: Vec<_> = snapshot
+            .jobs
+            .iter()
+            .map(|job| job.game.title.as_str())
+            .collect();
+        check_eq(queued, vec!["first", "last"], "items after a refusal are queued")?;
+        let titles: Vec<_> = refused.iter().map(|item| item.title.as_str()).collect();
+        check_eq(titles, vec!["blocked", "relative"], "each refusal names its game")?;
+        check(
+            refused
+                .first()
+                .is_some_and(|item| item.reason.contains("excluded")),
+            "the reason is the one Enqueue gives",
+        )?;
+        let again = enqueue_many(
+            vec![item(game(&first, "first"))],
+            &mut snapshot,
+            &db,
+            &mut None,
+        );
+        check(
+            again.is_empty() && snapshot.jobs.len() == 2,
+            "control: a repeat of an active job is not an error and queues nothing",
+        )
+    }
+
+    #[test]
+    fn a_batch_reply_carries_the_refusals_and_old_replies_still_parse() -> TestResult {
+        let response = Response {
+            version: VERSION,
+            snapshot: None,
+            error: None,
+            refused: vec![Refusal {
+                title: "Portal".into(),
+                reason: "This game is excluded.".into(),
+            }],
+        };
+        let text = serde_json::to_string(&response).ctx("encode")?;
+        let back: Response = serde_json::from_str(&text).ctx("decode")?;
+        check_eq(back.refused, response.refused, "the refusals round-trip")?;
+        let plain = serde_json::to_string(&Response {
+            refused: Vec::new(),
+            ..response
+        })
+        .ctx("encode plain")?;
+        check(!plain.contains("refused"), "an empty list is not sent")?;
+        let old: Response =
+            serde_json::from_str(&plain).ctx("a reply without the field still decodes")?;
+        check(old.refused.is_empty(), "the field defaults to empty")
     }
 
     #[test]

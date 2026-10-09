@@ -1267,6 +1267,78 @@ fn an_older_idle_coordinator_is_replaced_and_a_newer_one_is_left_alone() -> Test
 }
 
 #[test]
+fn a_batch_request_queues_the_valid_items_and_lists_the_refused_ones() -> TestResult {
+    let temp = tempfile::tempdir().ctx("fixture")?;
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).ctx("home")?;
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    std::fs::create_dir(&first).ctx("first game")?;
+    std::fs::create_dir(&second).ctx("second game")?;
+    let _service = start(&home)?;
+    let options = serde_json::to_value(flummox::backend::CompressOpts::default()).ctx("options")?;
+    let item = |game: Game| serde_json::json!([game, "Analyze", options]);
+    let mut relative = fixture_game(&first, "relative");
+    relative.install_dir = "not/absolute".into();
+    let reply = {
+        let socket = home.join("state/flummox/desktop/control.sock");
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            if let Ok(stream) = UnixStream::connect(&socket) {
+                break stream;
+            }
+            check(Instant::now() < until, "coordinator did not listen")?;
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .ctx("timeout")?;
+        serde_json::to_writer(
+            &mut stream,
+            &serde_json::json!({
+                "version": flummox::jobs::VERSION,
+                "command": {"EnqueueMany": {"items": [
+                    item(fixture_game(&first, "first")),
+                    item(relative),
+                    item(fixture_game(&second, "second")),
+                ]}}
+            }),
+        )
+        .ctx("request")?;
+        stream.write_all(b"\n").ctx("delimiter")?;
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).ctx("reply")?;
+        serde_json::from_str::<serde_json::Value>(&line).ctx("reply JSON")?
+    };
+    check(
+        reply.get("error").is_some_and(serde_json::Value::is_null),
+        format!("the batch itself succeeds: {reply}"),
+    )?;
+    let refused = reply.get("refused").and_then(serde_json::Value::as_array);
+    check_eq(refused.map(Vec::len), Some(1), "one item is refused")?;
+    check_eq(
+        refused
+            .and_then(|list| list.first())
+            .and_then(|item| item.get("title"))
+            .and_then(serde_json::Value::as_str),
+        Some("relative"),
+        "the refusal names the game",
+    )?;
+    let snapshot = request(&home, Request::Snapshot)?;
+    let mut titles: Vec<_> = snapshot
+        .jobs
+        .iter()
+        .map(|job| job.game.title.clone())
+        .collect();
+    titles.sort();
+    check_eq(
+        titles,
+        vec!["first".to_string(), "second".to_string()],
+        "both valid items are queued around the refused one",
+    )
+}
+
+#[test]
 fn custom_locations_persist_discover_games_and_remove_without_deletion() -> TestResult {
     use flummox::jobs::{FolderKind, Library};
     let temp = tempfile::tempdir().ctx("custom locations")?;

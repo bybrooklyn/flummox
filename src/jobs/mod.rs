@@ -17,10 +17,10 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub use client::{configured_libraries, request, state_dir};
+pub use client::{configured_libraries, request, request_many, state_dir};
 
 /// Protocol version. A mismatched installed worker is rejected before work.
-pub const VERSION: u32 = 8;
+pub const VERSION: u32 = 9;
 
 /// Which application palette the desktop shell follows.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,6 +329,12 @@ pub enum Command {
         operation: Operation,
         options: CompressOpts,
     },
+    /// Queue several jobs in one request. Each item gets the checks of
+    /// `Enqueue`; a refused item does not stop the rest. The reply lists the
+    /// refusals beside the snapshot.
+    EnqueueMany {
+        items: Vec<(Game, Operation, CompressOpts)>,
+    },
     /// Queue a Maximum Space task. Needs a build with pack mounting.
     EnqueuePack {
         game: Game,
@@ -397,12 +403,24 @@ pub(crate) struct Request {
     pub version: u32,
     pub command: Command,
 }
+/// One item of an `EnqueueMany` request that was not queued.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Refusal {
+    /// Title of the game as sent in the request.
+    pub title: String,
+    /// Why the coordinator refused it, as it would reply to `Enqueue`.
+    pub reason: String,
+}
+
 /// The coordinator's reply. Exactly one of `snapshot` and `error` is set.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Response {
     pub version: u32,
     pub snapshot: Option<Snapshot>,
     pub error: Option<String>,
+    /// Items of an `EnqueueMany` that were refused. Empty for other commands.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<Refusal>,
 }
 
 /// Lines a worker writes to stdout for the coordinator.
