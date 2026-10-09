@@ -95,7 +95,7 @@ fn call_file(command: Command, mut file: std::fs::File) -> Result<Snapshot> {
     crate::windows::ipc::send(&mut file, &true)?;
     ensure!(
         response.version == VERSION,
-        "Worker protocol changed. Restart Flummox."
+        "The background worker is from another version. Restart Flummox."
     );
     if let Some(error) = response.error {
         anyhow::bail!(error);
@@ -170,7 +170,7 @@ pub fn entrypoint() -> Result<bool> {
         while lock.try_lock().is_err() {
             ensure!(
                 Instant::now() < deadline,
-                "The worker is finishing a file. Wait before upgrading or uninstalling."
+                "The background worker is finishing a file. Wait before upgrading or uninstalling."
             );
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -420,7 +420,7 @@ fn run() -> Result<()> {
     loop {
         ensure!(
             !listener_failed.load(Ordering::Relaxed),
-            "The coordinator pipe failed; work stopped safely"
+            "The background worker lost its connection and stopped safely. Restart Flummox."
         );
         // Reread preferences every second. While they cannot be read the old copy
         // stays in use and every job is held.
@@ -433,7 +433,7 @@ fn run() -> Result<()> {
                 }
                 Err(error) => {
                     preferences_healthy = false;
-                    snapshot.busy = Some(format!("Preferences unavailable: {error}"));
+                    snapshot.busy = Some(format!("Your settings could not be read: {error}"));
                 }
             }
         }
@@ -460,9 +460,9 @@ fn run() -> Result<()> {
             .and_then(|receiver| match receiver.try_recv() {
                 Ok(result) => Some(result),
                 Err(mpsc::TryRecvError::Empty) => None,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    Some(Err("Discovery worker stopped unexpectedly".into()))
-                }
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(
+                    "Finding games stopped unexpectedly. Refresh to try again.".into(),
+                )),
             });
         if let Some(result) = discovered {
             discovery = None;
@@ -514,10 +514,13 @@ fn run() -> Result<()> {
                     .filter(|job| job.phase.active())
                     .map(|job| job.game.clone()),
             );
-            snapshot.busy = Some("Checking running games".into());
+            snapshot.busy = Some("Checking running games…".into());
             snapshot.busy = activity(&games).unwrap_or_else(|error| Some(error.to_string()));
             if !preferences_healthy {
-                snapshot.busy = Some("Desktop preferences need attention".into());
+                snapshot.busy = Some(
+                    "Your settings could not be read. Check that the settings file is not damaged."
+                        .into(),
+                );
             }
         }
         if let Some((_, actions)) = &tray {
@@ -562,7 +565,7 @@ fn run() -> Result<()> {
             let result = (|| -> Result<()> {
                 ensure!(
                     request.version == VERSION,
-                    "Worker protocol changed. Restart Flummox."
+                    "The background worker is from another version. Restart Flummox."
                 );
                 match request.command {
                     Command::Snapshot => {}
@@ -578,7 +581,7 @@ fn run() -> Result<()> {
                                 || !game
                                     .ids()
                                     .any(|id| preferences.excluded.contains(&id.to_string())),
-                            "This game is excluded from jobs"
+                            "This game is excluded. Include it before running a job."
                         );
                         queue.enqueue(game, restore)?;
                         queue.save(&root)?;
@@ -602,7 +605,7 @@ fn run() -> Result<()> {
                             && running.id == id
                         {
                             running.cancel.store(true, Ordering::Relaxed);
-                            job.message = "Stopping after the current file".into();
+                            job.message = "Stopping after the current file…".into();
                         } else if job.phase.active() {
                             job.phase = Phase::Cancelled;
                             // The user chose this, so maintenance leaves the build alone.
@@ -669,7 +672,7 @@ fn run() -> Result<()> {
                     running.cancel.store(true, Ordering::Relaxed);
                 } else if job.phase.active() {
                     job.phase = Phase::Cancelled;
-                    job.message = "Excluded from background work".into();
+                    job.message = "This game is excluded, so the job was stopped.".into();
                     queue_dirty = true;
                 }
             }
@@ -708,19 +711,19 @@ fn run() -> Result<()> {
             job.message = if job.user_paused {
                 "Paused by you".into()
             } else if preferences.maintenance_paused {
-                "Background work paused".into()
+                "Background jobs are paused".into()
             } else if !running.drive_online {
                 "Reconnect the original drive".into()
             } else if let Some(reason) = &snapshot.busy {
                 reason.clone()
             } else if unavailable {
-                "Waiting for the launcher".into()
+                "Waiting for the launcher…".into()
             } else if job.automatic && !snapshot.warnings.is_empty() {
-                "Discovery needs attention".into()
+                "Finding games needs attention. Refresh to try again.".into()
             } else if running.cancel.load(Ordering::Relaxed) {
-                "Stopping after the current file".into()
+                "Stopping after the current file…".into()
             } else {
-                "Processing files".into()
+                "Processing files…".into()
             };
             queue_dirty |= before != (job.phase, job.message.clone());
             // At most 256 events per pass, so a fast job cannot starve the loop.
@@ -734,7 +737,7 @@ fn run() -> Result<()> {
                             finished = true;
                             job.phase = Phase::Failed;
                             job.message =
-                                "Storage worker stopped unexpectedly. Review recovery.".into();
+                                "The job stopped unexpectedly. Review it under Recovery before trying again.".into();
                         }
                         break;
                     }
@@ -798,7 +801,7 @@ fn run() -> Result<()> {
             let message = if job.user_paused {
                 "Paused by you".into()
             } else if preferences.maintenance_paused {
-                "Background work paused".into()
+                "Background jobs are paused".into()
             } else if let Some(reason) = &snapshot.busy {
                 reason.clone()
             } else if !job.game.install_dir.is_dir() {
@@ -810,15 +813,15 @@ fn run() -> Result<()> {
             {
                 format!("Waiting: {}", game.state)
             } else if job.automatic && recovery_pending {
-                "Review interrupted storage before maintenance".into()
+                "Review the interrupted job before background jobs run".into()
             } else if job.automatic && !snapshot.warnings.is_empty() {
-                "Discovery needs attention".into()
+                "Finding games needs attention. Refresh to try again.".into()
             } else if snapshot.discovering {
-                "Checking installed games".into()
+                "Checking installed games…".into()
             } else if active.is_some() {
-                "Waiting for the current job".into()
+                "Waiting for the current job…".into()
             } else {
-                "Waiting to start".into()
+                "Waiting to start…".into()
             };
             if job.message != message {
                 job.message = message;
@@ -855,7 +858,7 @@ fn run() -> Result<()> {
             // loaded as an interrupted job.
             let id = job.id;
             job.phase = Phase::Running;
-            job.message = "Preparing files".into();
+            job.message = "Preparing files…".into();
             if let Err(error) = queue.save(&root) {
                 // Without the record a crash would lose track of the job, so it
                 // does not start until the queue can be written.
@@ -863,7 +866,7 @@ fn run() -> Result<()> {
                 for job in &mut queue.jobs {
                     if job.id == id {
                         job.phase = Phase::Waiting;
-                        job.message = "Waiting: the job list could not be saved".into();
+                        job.message = "Waiting. The job list could not be saved.".into();
                     }
                 }
                 last_start_failure = Some(Instant::now());

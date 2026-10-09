@@ -244,7 +244,12 @@ pub fn refuse_install_path_with(path: &Path, home: Option<&Path>) -> Result<(), 
         return Err("Install path resolves to a filesystem root".into());
     }
     #[cfg(windows)]
-    for name in ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData"] {
+    for name in [
+        "SystemRoot",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramData",
+    ] {
         if let Some(system) = std::env::var_os(name)
             && Path::new(&system).starts_with(path)
         {
@@ -256,8 +261,8 @@ pub fn refuse_install_path_with(path: &Path, home: Option<&Path>) -> Result<(), 
 
 /// [`refuse_install_path_with`] using the current user's home directory.
 pub fn refuse_install_path(path: &Path) -> Result<(), String> {
-    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-        .map(PathBuf::from);
+    let home =
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
     refuse_install_path_with(path, home.as_deref())
 }
 

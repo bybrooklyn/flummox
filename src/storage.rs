@@ -23,7 +23,7 @@ pub struct Footprint {
 pub fn inventory(root: &Path) -> Result<Footprint> {
     ensure!(
         root.is_dir(),
-        "Storage location is unavailable: {}",
+        "{} is not available. Check that its drive is connected.",
         root.display()
     );
     let mut result = Footprint::default();
@@ -54,7 +54,7 @@ pub fn inventory(root: &Path) -> Result<Footprint> {
             result.bytes = result
                 .bytes
                 .checked_add(length)
-                .context("Folder is too large")?;
+                .context("The folder is too large to measure")?;
             result.largest = result.largest.max(length);
         }
     }
@@ -80,7 +80,7 @@ pub fn volume(path: &Path) -> Result<Volume> {
     let existing = path
         .ancestors()
         .find(|path| path.exists())
-        .context("Storage drive is unavailable")?
+        .context("The drive is not available. Check that it is connected.")?
         .canonicalize()?;
     volume_existing(&existing)
 }
@@ -99,7 +99,10 @@ fn volume_existing(path: &Path) -> Result<Volume> {
             .context("Managed game mount has no parent folder")?;
         return volume_existing(parent);
     }
-    ensure!(!fs.read_only, "Storage volume is read-only");
+    ensure!(
+        !fs.read_only,
+        "The drive is read-only, so Flummox cannot change it."
+    );
     Ok(Volume {
         identity: linux_identity(&fs, path, Path::new("/dev/disk/by-uuid"))?,
         path: fs.mountpoint,
@@ -147,14 +150,14 @@ fn volume_existing(path: &Path) -> Result<Volume> {
     let result = unsafe { libc::statfs(path_c.as_ptr(), stat.as_mut_ptr()) };
     ensure!(
         result == 0,
-        "Cannot inspect storage volume: {}",
+        "Could not read the drive: {}",
         std::io::Error::last_os_error()
     );
     // SAFETY: a successful statfs initialized the whole structure.
     let stat = unsafe { stat.assume_init() };
     ensure!(
         stat.f_flags & libc::MNT_RDONLY as u32 == 0,
-        "Storage volume is read-only"
+        "The drive is read-only, so Flummox cannot change it."
     );
     let mount: Vec<u8> = stat
         .f_mntonname
@@ -202,7 +205,7 @@ fn volume_existing(path: &Path) -> Result<Volume> {
     };
     ensure!(
         result == 0 && uuid.length as usize == std::mem::size_of::<VolumeUuid>(),
-        "Cannot identify the storage volume: {}",
+        "Could not identify the drive: {}",
         std::io::Error::last_os_error()
     );
     let uuid: String = uuid
@@ -233,7 +236,7 @@ fn volume_existing(path: &Path) -> Result<Volume> {
             u32::try_from(mount.len())?,
         )
     };
-    ensure!(result != 0, "Cannot locate storage volume");
+    ensure!(result != 0, "Could not find the drive");
     let mut name = vec![0u16; 128];
     // SAFETY: mount is terminated by GetVolumePathNameW and name has the supplied capacity.
     let result = unsafe {
@@ -243,7 +246,7 @@ fn volume_existing(path: &Path) -> Result<Volume> {
             u32::try_from(name.len())?,
         )
     };
-    ensure!(result != 0, "Cannot identify storage volume");
+    ensure!(result != 0, "Could not identify the drive");
     let mut available = 0u64;
     // SAFETY: mount is terminated, available is writable, and unused outputs are null.
     let result = unsafe {
@@ -274,7 +277,7 @@ fn volume_existing(path: &Path) -> Result<Volume> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn volume_existing(_path: &Path) -> Result<Volume> {
-    anyhow::bail!("Storage planning is unavailable on this platform")
+    anyhow::bail!("Checking free space is not available on this platform.")
 }
 
 /// Free space one volume must have before a job starts.
@@ -334,10 +337,10 @@ impl SpacePlan {
                 .context("Space requirement overflow")?;
             ensure!(
                 requirement.volume.available >= needed,
-                "Not enough space on {}: need {} additional bytes including safety headroom; {} available",
+                "Not enough space on {}: {} needed including a safety margin, {} available. Free up space or choose another drive.",
                 requirement.volume.path.display(),
-                needed,
-                requirement.volume.available
+                humansize::format_size(needed, humansize::DECIMAL),
+                humansize::format_size(requirement.volume.available, humansize::DECIMAL)
             );
         }
         Ok(())
@@ -351,7 +354,7 @@ impl SpacePlan {
             let volume = volume(&row.volume.path)?;
             ensure!(
                 volume.identity == row.volume.identity,
-                "Storage volume changed; review the space plan again"
+                "The drive changed since the storage plan was made. Review the storage plan again."
             );
             row.volume = volume;
         }
@@ -373,9 +376,9 @@ pub fn native_plan(root: &Path, restore: bool) -> Result<SpacePlan> {
         volume(root)?,
         additional,
         if restore {
-            "Ordinary expansion and temporary file; old blocks may remain pinned"
+            "The decompressed files and one temporary file, in case snapshots keep the old version"
         } else {
-            "Worst-case native rewrite with snapshots or shared extents retaining old blocks"
+            "The whole game and its largest file, in case snapshots keep the old version"
         },
     )?;
     Ok(plan)
@@ -400,7 +403,7 @@ fn per_file_requirement(footprint: &Footprint, restore: bool) -> (u64, &'static 
     if restore {
         (
             footprint.bytes,
-            "Every file returns to its full size when the compression is removed",
+            "Every file returns to its full size when decompressed",
         )
     } else {
         (

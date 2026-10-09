@@ -240,14 +240,14 @@ fn validate(root: &Path) -> Result<PathBuf> {
     let root = root.canonicalize()?;
     ensure!(
         root.is_dir() && root.parent().is_some(),
-        "Choose a game folder, not a drive"
+        "Choose a game folder, not a drive."
     );
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .context("HOME is not set")?;
     ensure!(
         root != home && root != Path::new("/Applications") && root != Path::new("/Users"),
-        "Choose an installed game folder"
+        "Choose an installed game folder."
     );
     for protected in [
         PathBuf::from("/System"),
@@ -261,7 +261,7 @@ fn validate(root: &Path) -> Result<PathBuf> {
         home.join(".ssh"),
         home.join("Library/Application Support/flummox"),
     ] {
-        ensure!(!root.starts_with(protected), "This location is protected");
+        ensure!(!root.starts_with(protected), "This location is protected.");
     }
     let volume = crate::storage::volume(&root)?;
     let state = crate::libraries::data_dir()?;
@@ -271,7 +271,7 @@ fn validate(root: &Path) -> Result<PathBuf> {
     }
     ensure!(
         volume.identity.starts_with("apfs:"),
-        "Native Mac compression requires APFS"
+        "Compressing on a Mac needs a drive formatted as APFS."
     );
     Ok(root)
 }
@@ -280,7 +280,7 @@ fn validate(root: &Path) -> Result<PathBuf> {
 // contains Flummox's state directory.
 fn too_broad(root: &Path, mount: &Path, state: &Path) -> Option<&'static str> {
     if root == mount {
-        Some("Choose a game folder, not a drive")
+        Some("Choose a game folder, not a drive.")
     } else if state.starts_with(root) {
         Some("This folder contains Flummox's own data")
     } else {
@@ -298,7 +298,7 @@ fn idle(root: &Path) -> Result<()> {
         .output()?;
     ensure!(
         output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty(),
-        "Close the game and launcher activity before changing storage"
+        "Close the game and its launcher, then try again."
     );
     Ok(())
 }
@@ -750,7 +750,7 @@ fn visit(
     );
     ensure!(
         !recovery()?.iter().any(|record| record.root == root),
-        "Review Recovery before processing this game"
+        "Review this game under Recovery before running another job."
     );
     idle(&root)?;
     let found = survey(&root);
@@ -770,7 +770,7 @@ fn visit(
     let mut last_idle = std::time::Instant::now();
     for path in &found.files {
         if cancel.load(Ordering::Relaxed) {
-            stopped = Some(anyhow::anyhow!("Operation stopped"));
+            stopped = Some(anyhow::anyhow!("The job was stopped."));
             break;
         }
         if last_idle.elapsed() >= IDLE_RECHECK {
@@ -804,12 +804,12 @@ fn visit(
     }
     sealed?;
     let mut lines = vec![format!(
-        "{} files processed; {} changed, {} skipped. Allocated storage: {} before, {} after.",
-        summary.files,
+        "{} processed · {} changed · {} skipped · space used: {} before, {} after",
+        crate::text::count(summary.files, "file", "files"),
         summary.changed,
         summary.skipped,
-        summary.allocation_before,
-        summary.allocation_after
+        humansize::format_size(summary.allocation_before, humansize::DECIMAL),
+        humansize::format_size(summary.allocation_after, humansize::DECIMAL)
     )];
     if !failures.is_empty() {
         lines.push(format!("Skipped after an error ({}):", failures.len()));
@@ -817,7 +817,7 @@ fn visit(
     }
     if busy {
         lines.push(
-            "Stopped early: a program opened files in this game folder. Close it and run the pass again."
+            "Stopped early: a program opened files in this game folder. Close it and run the job again."
                 .to_owned(),
         );
     }

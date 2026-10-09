@@ -175,9 +175,9 @@ fn cancel_unrunnable(
         .filter(|job| job.phase.active() && !running.contains(&job.id))
     {
         let reason = if is_excluded(&job.game, &excluded) {
-            "Excluded from future work"
+            "This game is excluded, so the job was stopped."
         } else if games.is_some_and(|games| current_game(&job.game, games).is_none()) {
-            "This game is no longer installed"
+            "This game is no longer installed, so the job was stopped."
         } else {
             continue;
         };
@@ -216,12 +216,12 @@ fn abandon_slow_scan(
     abandoned.push(worker);
     snapshot.scan_source = None;
     snapshot.scan_warnings.push(format!(
-        "Discovery has not finished in {} seconds. Game states are unknown until it does, so no job will start.",
-        deadline.as_secs()
+        "Finding games has not finished in {}. Game states are unknown until it does, so no job will start. Refresh to try again.",
+        crate::text::duration(deadline.as_secs())
     ));
     for game in games {
         game.state = crate::model::InstallState::Broken {
-            detail: "Discovery is not responding".into(),
+            detail: "Finding games is not responding. Refresh to try again.".into(),
         };
     }
     true
@@ -549,7 +549,8 @@ fn open_store(path: &Path) -> Result<(Connection, Snapshot)> {
             && job.elapsed == 0;
         if job.phase.active() && job.phase != Phase::Queued && !never_started {
             job.phase = Phase::Interrupted;
-            job.message = "Work was interrupted. Resume to finish the remaining files.".into();
+            job.message =
+                "The job was interrupted. Resume it to finish the remaining files.".into();
             save(&db, &job)?;
         }
         snapshot.jobs.push(job);
@@ -611,7 +612,7 @@ fn enqueue(
 ) -> Result<()> {
     ensure!(
         operation != Operation::Pack,
-        "Pack jobs require a storage task"
+        "Use the Maximum controls to start this job."
     );
     enqueue_job(snapshot, game, operation, options, None, db)
 }
@@ -631,20 +632,20 @@ fn enqueue_job(
     let path = validate_folder(&game.install_dir)?;
     ensure!(
         (1..=32).contains(&options.threads),
-        "Choose between 1 and 32 worker threads."
+        "Choose between 1 and 32 threads."
     );
     ensure!(
         options
             .level
             .is_none_or(|level| (-15..=15).contains(&level)),
-        "btrfs levels range from -15 to 15."
+        "Compression levels range from -15 to 15."
     );
     ensure!(
         !snapshot
             .excluded
             .iter()
             .any(|id| game.ids().any(|g| g.to_string() == *id)),
-        "This game is excluded. Restore it in Drives first."
+        "This game is excluded. Include it in Settings, under Locations, first."
     );
     if let Some(existing) = snapshot
         .jobs
@@ -659,7 +660,7 @@ fn enqueue_job(
             existing
                 .pack
                 .as_ref()
-                .map_or("A storage task", PackTask::label)
+                .map_or("A Maximum job", PackTask::label)
         );
         return Ok(());
     }
@@ -677,7 +678,7 @@ fn enqueue_job(
     }
     ensure!(
         snapshot.jobs.iter().filter(|j| j.phase.active()).count() < 200,
-        "The queue is full. Let some jobs finish first."
+        "Too many jobs are waiting. Let some finish first."
     );
     let mut game = game;
     game.install_dir = path;
@@ -693,7 +694,7 @@ fn enqueue_job(
         files_total: 0,
         bytes_total: 0,
         estimate: None,
-        message: "Queued".into(),
+        message: "Waiting".into(),
         errors: vec![],
         created: now(),
         elapsed: 0,
@@ -737,7 +738,7 @@ fn preempt_analysis(
     {
         send_control(&mut worker.input, Control::Cancel)?;
         job.phase = Phase::Cancelling;
-        job.message = "Making room for your requested job".into();
+        job.message = "Stopping the analysis to run your job…".into();
         save(db, job)?;
     }
     Ok(())
@@ -776,7 +777,7 @@ fn require_absolute(command: &Command) -> Result<()> {
     for path in paths {
         ensure!(
             path.is_absolute(),
-            "The background worker needs a full path, not {}",
+            "Use a full path, not {}.",
             path.display()
         );
     }
@@ -808,7 +809,7 @@ fn apply(
                         ..
                     } | Command::EnqueuePack { .. }
                 ),
-                "Space plans apply only to storage jobs"
+                "Only jobs that change files need a storage plan."
             );
             plan.recheck()?;
             let (path, operation) = match &*command {
@@ -816,7 +817,7 @@ fn apply(
                     game, operation, ..
                 } => (game.install_dir.clone(), *operation),
                 Command::EnqueuePack { game, .. } => (game.install_dir.clone(), Operation::Pack),
-                _ => bail!("Storage command is missing"),
+                _ => bail!("Use the Maximum controls to start this job."),
             };
             apply(*command, snapshot, db, active, mounts, running_pack)?;
             // The enqueue may have joined an existing job. The plan belongs
@@ -887,7 +888,7 @@ fn apply(
         Command::EnqueuePack { game, task } => {
             ensure!(
                 cfg!(feature = "pack-mount"),
-                "Maximum Space requires a build with pack mounting"
+                "This build of Flummox cannot use Maximum."
             );
             enqueue_job(
                 snapshot,
@@ -952,7 +953,7 @@ fn apply(
                 .iter_mut()
                 .find(|j| j.id == id)
                 .context("Job no longer exists")?;
-            ensure!(!job.phase.active(), "This job is already queued");
+            ensure!(!job.phase.active(), "This job is already waiting.");
             let game = job.game.clone();
             let operation = job.operation;
             let options = job.options;
@@ -976,21 +977,21 @@ fn apply(
                 .libraries
                 .iter()
                 .find(|l| l.path == path && l.custom)
-                .context("This custom location is no longer registered")?
+                .context("This location is no longer in the list.")?
                 .clone();
             ensure!(
                 !snapshot
                     .jobs
                     .iter()
                     .any(|job| job.phase.active() && job.game.install_dir.starts_with(&path)),
-                "Finish or cancel jobs in this location before removing it."
+                "Finish or stop the jobs in this location before removing it."
             );
             ensure!(
                 !snapshot
                     .packs
                     .iter()
                     .any(|install| install.game_path.starts_with(&path)),
-                "Restore Maximum Space games in this location before removing it."
+                "Decompress the games in this location that use Maximum before removing it."
             );
             if path.is_dir() {
                 update_live_compression(&Library {
@@ -1021,7 +1022,7 @@ fn apply(
                     } else {
                         job.phase = Phase::Cancelled;
                     }
-                    job.message = "Excluded from future work".into();
+                    job.message = "This game is excluded, so the job was stopped.".into();
                     save(db, job)?;
                 }
             }
@@ -1108,7 +1109,7 @@ fn note_waiting(snapshot: &mut Snapshot, running: Option<i64>) {
     {
         match &holder {
             Some(reason) => job.message.clone_from(reason),
-            None if job.message.starts_with("Waiting for ") => job.message = "Queued".into(),
+            None if job.message.starts_with("Waiting for ") => job.message = "Waiting".into(),
             None => {}
         }
     }
@@ -1121,7 +1122,7 @@ fn pause_reason(by_user: bool, playing: Option<&str>) -> String {
     } else if let Some(game) = playing {
         format!("Paused while you play {game}")
     } else {
-        "Waiting for the original drive or launcher activity to finish".into()
+        "Waiting for the game or its launcher to finish…".into()
     }
 }
 
@@ -1262,11 +1263,11 @@ fn event(job: &mut Job, event: WorkerEvent, db: &Connection) -> Result<bool> {
             job.errors = errors.into_iter().take(20).collect();
             job.drive_change = drive_change;
             job.message = if cancelled {
-                "Stopped. Resume to finish the remaining files."
+                "Stopped. Resume the job to finish the remaining files."
             } else if job.errors.is_empty() {
                 "Finished"
             } else {
-                "Some files need another attempt."
+                "Some files need another attempt. See the errors below."
             }
             .into();
             save(db, job)?;
@@ -1276,7 +1277,7 @@ fn event(job: &mut Job, event: WorkerEvent, db: &Connection) -> Result<bool> {
         // since the process holding it will finish.
         WorkerEvent::Failed(message) if message.contains(super::LOCK_BUSY) => {
             job.phase = Phase::Queued;
-            job.message = "Waiting for another Flummox process to finish".into();
+            job.message = "Waiting for another Flummox process to finish…".into();
             save(db, job)?;
             return Ok(true);
         }
@@ -1315,14 +1316,13 @@ impl PackControl {
         use std::sync::atomic::Ordering;
         self.checkpoint()?;
         {
-            let _transition = self
-                .transition
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Storage control lock stopped"))?;
+            let _transition = self.transition.lock().map_err(|_| {
+                anyhow::anyhow!("The job controls stopped working. Restart the background worker.")
+            })?;
             self.interruptible.store(false, Ordering::SeqCst);
             ensure!(
                 !self.cancel.load(Ordering::SeqCst),
-                "Storage job stopped before switching files"
+                "The job was stopped before the files were switched."
             );
         }
         // Sent after the lock is released: a full channel blocks this call,
@@ -1347,13 +1347,12 @@ impl PackControl {
     /// the task is past the point where it can stop.
     fn request_control(&self, command: &Command) -> Result<()> {
         use std::sync::atomic::Ordering;
-        let _transition = self
-            .transition
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Storage control lock stopped"))?;
+        let _transition = self.transition.lock().map_err(|_| {
+            anyhow::anyhow!("The job controls stopped working. Restart the background worker.")
+        })?;
         ensure!(
             self.interruptible.load(Ordering::SeqCst),
-            "The storage switch is finishing; controls return when it is safe"
+            "The job is finishing a step that cannot be interrupted. Try again in a moment."
         );
         match command {
             Command::Cancel(_) => self.cancel.store(true, Ordering::SeqCst),
@@ -1375,13 +1374,13 @@ impl crate::pack::Observer for PackControl {
     // every 50 ms, and a cancel ends the wait.
     fn checkpoint(&self) -> Result<()> {
         use std::sync::atomic::Ordering;
-        ensure!(!self.cancel.load(Ordering::Relaxed), "Storage job stopped");
+        ensure!(!self.cancel.load(Ordering::Relaxed), "The job was stopped.");
         if self.paused.load(Ordering::Relaxed) {
             self.emit(crate::backend::Event::Paused {
                 by: "Paused until resumed or launcher activity finishes".into(),
             });
             while self.paused.load(Ordering::Relaxed) {
-                ensure!(!self.cancel.load(Ordering::Relaxed), "Storage job stopped");
+                ensure!(!self.cancel.load(Ordering::Relaxed), "The job was stopped.");
                 std::thread::sleep(Duration::from_millis(50));
             }
             self.emit(crate::backend::Event::Resumed);
@@ -1428,7 +1427,7 @@ fn start_pack(
     mounts: &mut Vec<PackMount>,
     database: &Path,
 ) -> Result<PackActive> {
-    let task = job.pack.clone().context("Storage task is missing")?;
+    let task = job.pack.clone().context("The job has no task to run.")?;
     // Taken only now, so a job that fails validation leaves the mounts in place.
     let mounts = std::mem::take(mounts);
     let expected_plan = job.space_plan.clone();
@@ -1488,31 +1487,33 @@ fn start_pack(
 fn storage_parent(root: &Path, store: &Path) -> Result<PathBuf> {
     ensure!(
         store.is_absolute() && store.file_name().is_some(),
-        "Choose an absolute store path with a name"
+        "Choose a store location with a full path and a name."
     );
     ensure!(
         !store
             .components()
             .any(|part| matches!(part, std::path::Component::ParentDir)),
-        "The store path cannot contain parent-directory steps"
+        "The store location cannot contain \"..\"."
     );
-    let parent = store.parent().context("The store needs a parent folder")?;
+    let parent = store
+        .parent()
+        .context("The store needs to be inside a folder.")?;
     // The nearest existing ancestor is checked before anything is created,
     // and the created parent is checked again after symlinks resolve.
     let ancestor = parent
         .ancestors()
         .find(|path| path.exists())
-        .context("The storage drive is unavailable")?
+        .context("The drive for the store is not available.")?
         .canonicalize()?;
     ensure!(
         !ancestor.starts_with(root),
-        "Keep the store outside the game folder"
+        "Keep the store outside the game folder."
     );
     std::fs::create_dir_all(parent)?;
     let parent = parent.canonicalize()?;
     ensure!(
         !parent.starts_with(root),
-        "Keep the store outside the game folder"
+        "Keep the store outside the game folder."
     );
     Ok(parent)
 }
@@ -1561,13 +1562,13 @@ fn run_pack_task(
             let root = validate_folder(&game.install_dir)?;
             ensure!(
                 crate::busy::process_using(&root, &crate::busy::ProcFs::new()).is_none(),
-                "Close the game and launcher activity before activating storage"
+                "Close the game and its launcher, then switch this game to Maximum again."
             );
             // With a qualification report, the installed files are hashed
             // here and again just before the switch. Both hashes must equal
             // the report's corpus.
             if let Some(report) = qualification {
-                control.started(0, 0, "Checking game compatibility");
+                control.started(0, 0, "Checking the compatibility report…");
                 let corpus = crate::compatibility::corpus(&root, &control.cancel, control)?;
                 ensure!(
                     report.corpus == corpus
@@ -1576,7 +1577,7 @@ fn run_pack_task(
                             &corpus.sha256,
                             crate::compatibility::Policy::default()
                         ),
-                    "Compatibility no longer matches this game; analyze it again"
+                    "The compatibility report no longer matches this game. Analyze the game again."
                 );
             }
             let parent = storage_parent(&root, store)?;
@@ -1606,18 +1607,17 @@ fn run_pack_task(
                             &corpus.sha256,
                             crate::compatibility::Policy::default()
                         ),
-                    "Game files changed; automatic activation was stopped"
+                    "The game files changed, so the switch to Maximum was stopped. Try again."
                 );
             }
-            control
-                .transaction("Activating storage; the original remains available for rollback")?;
+            control.transaction("Switching to Maximum. The original is kept.")?;
             activate_prepared(snapshot, db, mounts, install)
         }
         PackTask::Compact => {
             pack_compact_observed(snapshot, db, mounts, &game.install_dir, control)
         }
         PackTask::Restore => {
-            control.transaction("Restoring files; this step must finish before stopping")?;
+            control.transaction("Decompressing. This step must finish before the job can stop.")?;
             pack_rollback(snapshot, db, mounts, &game.install_dir)
         }
         PackTask::VerifyRestored => {
@@ -1625,22 +1625,26 @@ fn run_pack_task(
                 .packs
                 .iter()
                 .position(|install| install.game_path == game.install_dir)
-                .context("Install record is missing")?;
+                .context("Flummox has no record of this game using Maximum.")?;
             let install = snapshot
                 .packs
                 .get(position)
-                .context("Install record is missing")?;
+                .context("Flummox has no record of this game using Maximum.")?;
             crate::pack::verify_restored(install, &control.cancel, control)?;
             // Verification closes only the record. Store, update layer, and backups remain.
             snapshot.packs.remove(position);
             save_packs(db, snapshot)
         }
         PackTask::Reclaim => {
-            control.transaction("Reclaiming the retained original; this step must finish")?;
+            control.transaction(
+                "Deleting the original. This step must finish before the job can stop.",
+            )?;
             pack_reclaim(snapshot, db, &game.install_dir)
         }
         PackTask::Prune => {
-            control.transaction("Reclaiming the previous version; this step must finish")?;
+            control.transaction(
+                "Deleting the previous version. This step must finish before the job can stop.",
+            )?;
             pack_prune(snapshot, db, &game.install_dir)
         }
     }
@@ -1655,7 +1659,7 @@ fn run_pack_task(
     _mounts: &mut Vec<PackMount>,
     _control: &PackControl,
 ) -> Result<()> {
-    bail!("Build Flummox with pack mounting to run storage jobs")
+    bail!("This build of Flummox cannot use Maximum.")
 }
 
 /// Drives the storage thread for one loop pass: passes on cancel and pause,
@@ -1673,7 +1677,7 @@ fn poll_pack(
             .jobs
             .iter_mut()
             .find(|job| job.id == running.id)
-            .context("Storage job is missing")?;
+            .context("The job is missing.")?;
         // An exclusion marks the job without asking the task, so the request
         // is made here. A step that must finish refuses it, and the job then
         // ends as Failed or Completed rather than Cancelled.
@@ -1707,7 +1711,7 @@ fn poll_pack(
             .jobs
             .iter_mut()
             .find(|job| job.id == running.id)
-            .context("Storage job is missing")?;
+            .context("The job is missing.")?;
         // `Ok` means the thread returned. Its records and mounts replace the
         // coordinator's, whatever the task's own result. `Err` means it
         // panicked: the mounts it held were dropped with it and the
@@ -1731,13 +1735,15 @@ fn poll_pack(
                     Phase::Failed
                 };
                 job.message = match result.result {
-                    Ok(()) => "Storage job finished".into(),
+                    Ok(()) => "Finished".into(),
                     Err(error) => error.to_string(),
                 };
             }
             Err(_) => {
                 job.phase = Phase::Interrupted;
-                job.message = "Storage worker stopped; review recovery before retrying".into();
+                job.message =
+                    "The job stopped unexpectedly. Review it under Recovery before trying again."
+                        .into();
             }
         }
         job.pack_interruptible = false;
@@ -1934,7 +1940,7 @@ pub(super) fn run() -> Result<()> {
                 crate::launchers::scan_job::Event::Finished(result) => {
                     if !cancelled && result.is_none() {
                         snapshot.scan_warnings.push(
-                            "Discovery stopped unexpectedly; showing the previous library".into(),
+                            "Finding games stopped unexpectedly. The list shows the previous result. Refresh to try again.".into(),
                         );
                     }
                     if !cancelled && let Some(scan) = result {
@@ -2074,18 +2080,18 @@ pub(super) fn run() -> Result<()> {
                     // client from another release can replace this process.
                     ensure!(
                         message.version == VERSION || matches!(&message.command, Command::Restart),
-                        "Worker protocol changed. Restart Flummox."
+                        "The background worker is from another version. Restart Flummox."
                     );
                     if matches!(&message.command, Command::Restart) {
                         ensure!(
                             active.is_none()
                                 && pack_active.is_none()
                                 && !snapshot.jobs.iter().any(|job| job.phase.active()),
-                            "Finish or cancel queued jobs before restarting the background worker."
+                            "Finish or stop the jobs before restarting the background worker."
                         );
                         ensure!(
                             snapshot.packs.is_empty(),
-                            "Restore mounted Maximum Space games before restarting the background worker."
+                            "Decompress the games that use Maximum before restarting the background worker."
                         );
                         restart = true;
                     }
@@ -2130,7 +2136,7 @@ pub(super) fn run() -> Result<()> {
                     ) {
                         ensure!(
                             active.is_none() && pack_active.is_none(),
-                            "A job is running. Wait for it to finish before changing storage."
+                            "A job is running. Wait for it to finish first."
                         );
                     }
                     // Pause and cancel for the running storage job go to its
@@ -2174,7 +2180,7 @@ pub(super) fn run() -> Result<()> {
                             snapshot.libraries.iter().any(|l|l.automatic)
                                 || !snapshot.packs.is_empty(),
                         )
-                            .context("Library settings were saved, but login startup could not be configured")?;
+                            .context("Location settings were saved, but starting at login could not be set up")?;
                     }
                     Ok(())
                 })();
@@ -2332,7 +2338,7 @@ pub(super) fn run() -> Result<()> {
                 } else {
                     Phase::Running
                 };
-                job.message = "Preparing files".into();
+                job.message = "Preparing files…".into();
                 survive("saving a job", save(&db, job));
                 // A pack job runs on a storage thread in this process and
                 // takes every mount with it. Other jobs get a worker process.
@@ -2382,7 +2388,8 @@ pub(super) fn run() -> Result<()> {
                     .find(|install| install.game_path == path)
                 {
                     install.phase = crate::pack::InstallPhase::Attention;
-                    install.message = "The mount stopped; Flummox will retry it".into();
+                    install.message =
+                        "The game folder stopped working. Flummox will try again.".into();
                 }
             }
         }
@@ -3541,7 +3548,7 @@ mod tests {
         note_waiting(&mut snapshot, Some(first));
         check_eq(
             message(&snapshot)?.as_str(),
-            "Queued",
+            "Waiting",
             "control: the note goes when the pause does",
         )?;
         // A Pause that arrives after the job finished changes nothing and is

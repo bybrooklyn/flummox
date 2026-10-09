@@ -44,7 +44,7 @@ impl BusyCheck for Pause {
     fn in_use_by(&self) -> Option<String> {
         self.0
             .load(Ordering::Relaxed)
-            .then(|| "Paused. Work continues when resumed or gaming ends.".into())
+            .then(|| "Paused. The job continues when you resume it or stop playing.".into())
     }
 }
 
@@ -104,7 +104,10 @@ fn carried_saving(earlier: u64, install_bytes: u64, rewritten: u64, this_pass: u
 }
 
 fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Result<()> {
-    ensure!(work.version == VERSION, "Worker version mismatch");
+    ensure!(
+        work.version == VERSION,
+        "The background worker is from another version. Restart Flummox."
+    );
     let job = work.job;
     // Checks that need the whole filesystem come first. The sandbox below
     // narrows this process to the game folder.
@@ -134,7 +137,7 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
     for id in job.game.ids() {
         ensure!(
             !db.is_excluded(id)?,
-            "This game is excluded. Restore it before processing."
+            "This game is excluded. Include it before running a job."
         );
     }
     // Receipts stored under this job's policy name files an earlier attempt
@@ -249,7 +252,7 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
     let anchor = Anchor::open(&path)?;
     ensure!(
         anchor.fully_resolved(),
-        "This kernel cannot safely resolve game paths. Update Linux before using GUI jobs."
+        "This kernel cannot safely resolve game paths. Update Linux before running jobs."
     );
     let mut summary = Estimate {
         install_bytes: full.total_bytes(),
@@ -282,7 +285,7 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
             observer.output.event(Event::Progress {
                 files_done: 0,
                 bytes_done: 0,
-                current: "Checking Maximum Space compatibility".into(),
+                current: "Checking the compatibility report…".into(),
             });
             let corpus = crate::compatibility::corpus(&path, &cancel, &observer)?;
             if let Some(report) = candidates.iter().find(|report| report.corpus == corpus) {
@@ -318,7 +321,7 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
         output.event(Event::Progress {
             files_done: 0,
             bytes_done: 0,
-            current: "Sampling small-file grouping".into(),
+            current: "Sampling small files…".into(),
         });
         summary.small_files =
             crate::pack::sample_small_files(&path, &full, 4 * 1024 * 1024, &cancel, &observer)?;
@@ -422,7 +425,7 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
                 Event::Progress {
                     files_done: 0,
                     bytes_done: 0,
-                    current: format!("Analyzing {}", entry.rel.display()),
+                    current: format!("Analyzing {}…", entry.rel.display()),
                 }
             });
         }

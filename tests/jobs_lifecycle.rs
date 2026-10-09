@@ -1143,7 +1143,7 @@ fn other_version_coordinator(
             let error = if restart {
                 serde_json::Value::Null
             } else {
-                "Worker protocol changed. Restart Flummox.".into()
+                "The background worker is from another version. Restart Flummox.".into()
             };
             if restart {
                 std::fs::remove_file(&socket).ctx("remove socket")?;

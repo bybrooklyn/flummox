@@ -131,14 +131,14 @@ impl Queue {
         };
         ensure!(
             queue.jobs.len() <= 1000,
-            "Native job history exceeds its limit"
+            "The job history is too large to read."
         );
         for job in &mut queue.jobs {
             if matches!(job.phase, Phase::Running | Phase::Paused)
                 || (job.phase == Phase::Waiting && job.volume.is_none())
             {
                 job.phase = Phase::Interrupted;
-                job.message = "Worker stopped. Review recovery before retrying.".into();
+                job.message = "The background worker stopped. Review the job under Recovery before trying again.".into();
             }
         }
         // Guards against a file whose `next_id` is behind its own jobs.
@@ -158,7 +158,7 @@ impl Queue {
         let bytes = serde_json::to_vec(self)?;
         ensure!(
             bytes.len() <= 16 * 1024 * 1024,
-            "Native job history exceeds 16 MiB"
+            "The job history is too large to save."
         );
         let mut file = tempfile::NamedTempFile::new_in(root)?;
         file.write_all(&bytes)?;
@@ -174,7 +174,7 @@ impl Queue {
     pub fn enqueue(&mut self, game: Game, restore: bool) -> Result<u64> {
         ensure!(
             game.state.is_idle(),
-            "Wait for the launcher or game to finish"
+            "Wait for the launcher or game to finish."
         );
         if let Some(job) = self
             .jobs
@@ -183,13 +183,13 @@ impl Queue {
         {
             ensure!(
                 job.restore == restore,
-                "Cancel the existing job before switching between compression and restoration"
+                "Stop the existing job before switching between compressing and decompressing."
             );
             return Ok(job.id);
         }
         ensure!(
             self.jobs.iter().filter(|job| job.phase.active()).count() < 200,
-            "The queue is full"
+            "Too many jobs are waiting. Let some finish first."
         );
         // History is capped at 1000 jobs. Room is made by dropping the oldest completed
         // or cancelled job. Failed and interrupted jobs are never dropped this way.
@@ -201,7 +201,9 @@ impl Queue {
             {
                 self.jobs.remove(index);
             } else {
-                anyhow::bail!("Review the retained job history before adding more jobs");
+                anyhow::bail!(
+                    "Too many jobs need attention. Retry or finish some before adding more."
+                );
             }
         }
         self.next_id = self
@@ -219,7 +221,7 @@ impl Queue {
             phase: Phase::Waiting,
             user_paused: false,
             progress: Progress::default(),
-            message: "Waiting to start".into(),
+            message: "Waiting to start…".into(),
         });
         Ok(id)
     }
@@ -230,31 +232,34 @@ impl Queue {
             .jobs
             .iter()
             .find(|job| job.id == id)
-            .ok_or_else(|| anyhow::anyhow!("Job no longer exists"))?;
-        ensure!(!old.phase.active(), "The job is already active");
+            .ok_or_else(|| anyhow::anyhow!("That job no longer exists."))?;
+        ensure!(
+            !old.phase.active(),
+            "That job is already running or waiting."
+        );
         ensure!(
             self.jobs.iter().filter(|job| job.phase.active()).count() < 200,
-            "The queue is full"
+            "Too many jobs are waiting. Let some finish first."
         );
         ensure!(
             !self
                 .jobs
                 .iter()
                 .any(|job| job.phase.active() && job.game.install_dir == old.game.install_dir),
-            "This game already has an active job"
+            "This game already has a job."
         );
         let job = self
             .jobs
             .iter_mut()
             .find(|job| job.id == id)
-            .ok_or_else(|| anyhow::anyhow!("Job no longer exists"))?;
+            .ok_or_else(|| anyhow::anyhow!("That job no longer exists."))?;
         if job.volume.is_none() {
             job.volume = Some(crate::storage::volume(&job.game.install_dir)?);
         }
         job.phase = Phase::Waiting;
         job.user_paused = false;
         job.progress = Progress::default();
-        job.message = "Waiting to retry".into();
+        job.message = "Waiting to retry…".into();
         Ok(())
     }
     /// `enqueue` for a compression that maintenance asked for. Only a job this call

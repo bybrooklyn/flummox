@@ -44,7 +44,7 @@ macro_rules! display_choices {
 }
 display_choices!(ThemeChoice, System => "System", Dark => "Dark", Light => "Light");
 display_choices!(MotionChoice, Normal => "Smooth", Subtle => "Subtle", Reduced => "Reduced");
-display_choices!(LocationKind, Game => "One game", Collection => "Games library");
+display_choices!(LocationKind, Game => "Single game", Collection => "Games library");
 impl MotionChoice {
     /// Length of the page transition.
     pub fn duration(self) -> std::time::Duration {
@@ -173,15 +173,18 @@ impl ProtectedFolders {
     /// Fails for a filesystem root, for a protected folder or one of its
     /// ancestors, and for anything inside a protected tree. Expects canonical paths.
     pub fn check(&self, path: &Path) -> Result<()> {
-        ensure!(path.parent().is_some(), "Choose a game folder, not a drive");
+        ensure!(
+            path.parent().is_some(),
+            "Choose a game folder, not a drive."
+        );
         ensure!(
             !self.roots.iter().any(|root| root.starts_with(path)),
-            "{} is a system or profile folder",
+            "{} is a system or profile folder.",
             path.display()
         );
         ensure!(
             !self.trees.iter().any(|tree| path.starts_with(tree)),
-            "{} is inside the Windows folder",
+            "{} is inside the Windows folder.",
             path.display()
         );
         Ok(())
@@ -230,7 +233,7 @@ impl Preferences {
         let bytes = serde_json::to_vec(self)?;
         ensure!(
             bytes.len() <= 1024 * 1024,
-            "Desktop preferences exceed 1 MiB"
+            "Settings are too large to save."
         );
         let mut staged = tempfile::NamedTempFile::new_in(root)?;
         staged.write_all(&bytes)?;
@@ -244,7 +247,7 @@ impl Preferences {
     /// exist and is stored canonical. A filesystem root is refused.
     pub fn add(&mut self, path: &Path, kind: LocationKind) -> Result<()> {
         let path = path.canonicalize()?;
-        ensure!(path.is_dir(), "Choose an existing game or games library");
+        ensure!(path.is_dir(), "Choose an existing game or games library.");
         ProtectedFolders::from_environment().check(&path)?;
         if let Some(old) = self
             .locations
@@ -303,7 +306,10 @@ impl Preferences {
             };
             for path in paths {
                 if !path.is_dir() {
-                    warnings.push(format!("{} is unavailable", path.display()));
+                    warnings.push(format!(
+                        "{} is not available. Check that its drive is connected.",
+                        path.display()
+                    ));
                     continue;
                 }
                 let title = path
@@ -317,7 +323,7 @@ impl Preferences {
                     && protected.check(&resolved).is_err()
                 {
                     game.state = crate::model::InstallState::Broken {
-                        detail: "System folders cannot be compressed".into(),
+                        detail: "System folders cannot be compressed.".into(),
                     };
                     games.push(game);
                     continue;
@@ -424,7 +430,7 @@ pub fn content_stamp(root: &Path) -> Result<String> {
         // Bounded at 250000 entries and 5 seconds. Past either the stamp is an error.
         ensure!(
             count < 250000 && std::time::Instant::now() < deadline,
-            "Game metadata scan exceeds its limit"
+            "This folder has too many files to check. Choose the game's own folder."
         );
         let entry = entry?;
         if !entry.file_type().is_file() {
@@ -615,7 +621,9 @@ mod tests {
     fn a_location_cannot_be_a_filesystem_root() -> TestResult {
         let mut settings = Preferences::default();
         check(
-            settings.add(Path::new("/"), LocationKind::Collection).is_err(),
+            settings
+                .add(Path::new("/"), LocationKind::Collection)
+                .is_err(),
             "the drive root is refused",
         )?;
         check(settings.locations.is_empty(), "and nothing is stored")?;
