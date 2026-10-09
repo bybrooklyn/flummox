@@ -127,7 +127,41 @@ phrases from rules 5 and 8.
 - `src/observer.rs`: the progress trait moved out of the Linux-only store
   module so every platform builds it.
 
-## In progress when this was written
+### 05, Windows and Mac window
 
-- 05, the Windows and Mac window.
-- 04, wording and the glossary.
+All 25 findings, and the parity rows marked as drift. The two windows now
+share `src/gui/shell.rs`: the sidebar, toast and its timing, the storage plan
+panel, artwork tiles, keyboard shortcuts and the theme lookup. The decisions
+the native window makes (which controls are enabled and why, which job a
+folder owns, what a location change does) are pure functions in
+`src/gui/native_rules.rs` with tests that run on Linux. Nothing was run or
+drawn on Windows or a Mac.
+
+Not added to the Windows and Mac window, because those backends report no
+data for them: savings figures, progress bars with totals, bulk compression,
+the drive and launcher filters, report import and diagnostics export. The
+sidebar highlight there does not animate. `src/gui/unsupported.rs` still has
+its own plain page, since no fourth target can be built here.
+
+### 04, wording
+
+The glossary is applied to the window, the command line output and the
+current docs. `src/text.rs` holds the count and duration helpers. A paused
+job is listed under Waiting. The toast sits above the job bar.
+
+Left as they were: release notes, validation records and the changelog for
+past versions, which describe the program as it was named then. The Linux
+"Restart worker" button keeps its label because the install guide names it.
+On a Mac the recovery action reads "Decompress to ordinary files" though it
+replays a journal and puts a kept original back.
+
+## State at the end
+
+On the final commit of `audit-fixes`:
+
+- `just lint`, `just win-lint` and `just mac-lint` pass.
+- `cargo test --all-features` passes 401 tests with the three
+  `FLUMMOX_REQUIRE_` variables set. Before the audit it passed 200.
+- `python3 packaging/test_release.py` passes 17 tests and skips the one that
+  needs minisign.
+- `just prose` is clean.
