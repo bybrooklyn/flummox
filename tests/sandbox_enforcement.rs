@@ -23,6 +23,21 @@ fn io_uring_setup_errno() -> i32 {
     }
 }
 
+/// The errno of `socket(0, 0, 0)` through the x32 syscall number, which is the
+/// native number with bit 30 set. EPERM comes from the filter. A kernel
+/// without x32 answers ENOSYS, and one with it rejects the domain.
+#[cfg(target_arch = "x86_64")]
+fn x32_socket_errno() -> i32 {
+    // SAFETY: domain 0 is not a valid address family, so the kernel rejects
+    // the call before creating anything, and no pointer is passed.
+    let result = unsafe { libc::syscall(libc::SYS_socket | 0x4000_0000, 0, 0, 0) };
+    if result == -1 {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    } else {
+        0
+    }
+}
+
 /// A skip, or a failure on a machine that is supposed to have Landlock.
 fn skipped(why: &str) -> TestResult {
     check(
@@ -194,11 +209,23 @@ fn a_worker_cannot_reach_a_socket_by_path() -> TestResult {
             libc::EPERM,
             "control: io_uring_setup is not refused before the filter",
         )?;
+        #[cfg(target_arch = "x86_64")]
+        check_ne(
+            x32_socket_errno(),
+            libc::EPERM,
+            "control: the x32 socket number is not refused before the filter",
+        )?;
         deny_sockets().ctx("socket filter")?;
         check_eq(
             io_uring_setup_errno(),
             libc::EPERM,
             "io_uring_setup is refused after the filter",
+        )?;
+        #[cfg(target_arch = "x86_64")]
+        check_eq(
+            x32_socket_errno(),
+            libc::EPERM,
+            "the x32 socket number is refused after the filter",
         )?;
         let refused = UnixStream::connect(&socket);
         check(
