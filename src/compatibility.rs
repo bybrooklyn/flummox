@@ -46,6 +46,19 @@ impl GameBuild {
         }
     }
 
+    /// Rewrites the key of a custom-folder report to its hashed form and says
+    /// whether it changed. A key already shaped `hash-` and 32 hex digits stays.
+    fn hash_manual_key(&mut self) -> bool {
+        let hashed = self.key.strip_prefix("hash-").is_some_and(|rest| {
+            rest.len() == 32 && rest.bytes().all(|b| b.is_ascii_hexdigit())
+        });
+        if self.launcher != Launcher::Manual || hashed {
+            return false;
+        }
+        self.key = Self::key_for(&GameId::new(Launcher::Manual, self.key.as_str()));
+        true
+    }
+
     /// Whether `game` is this launcher entry at this build. A game whose
     /// build is unknown never matches.
     pub fn matches(&self, game: &Game) -> bool {
@@ -318,7 +331,12 @@ impl Store {
                 continue;
             }
             match Self::read(&path) {
-                Ok(report) => reports.push(report),
+                Ok((report, migrated)) => {
+                    if migrated && let Err(error) = self.rewrite(&path, &report) {
+                        tracing::warn!(path = %path.display(), %error, "could not rewrite a migrated compatibility report");
+                    }
+                    reports.push(report);
+                }
                 Err(error) => {
                     tracing::warn!(path = %path.display(), %error, "skipped a compatibility report");
                 }
@@ -327,16 +345,38 @@ impl Store {
         Ok(reports)
     }
 
-    /// Reads and validates one report file of at most 1 MiB.
-    fn read(path: &Path) -> Result<Report> {
+    /// Replaces an old report with its migrated form. The new file is staged
+    /// beside the store, synced and renamed to its content name, and only then
+    /// is the old file removed, so a crash leaves a complete report either way.
+    fn rewrite(&self, old: &Path, report: &Report) -> Result<()> {
+        use std::io::Write;
+        let target = self.root.join(report.filename()?);
+        let mut staged = tempfile::NamedTempFile::new_in(&self.root)?;
+        staged.write_all(&serde_json::to_vec_pretty(report)?)?;
+        staged.as_file().sync_all()?;
+        staged.persist(&target)?;
+        #[cfg(unix)]
+        std::fs::File::open(&self.root)?.sync_all()?;
+        if target != old {
+            std::fs::remove_file(old)?;
+        }
+        Ok(())
+    }
+
+    /// Reads and validates one report file of at most 1 MiB. The flag says the
+    /// key of a custom-folder report was rewritten to its hashed form, which
+    /// reports saved before the key was hashed need. An imported report is
+    /// never migrated.
+    fn read(path: &Path) -> Result<(Report, bool)> {
         ensure!(
             std::fs::metadata(path)?.len() <= 1024 * 1024,
             "Compatibility report exceeds 1 MiB"
         );
         let bytes = std::fs::read(path).context("Reading the report")?;
-        let report: Report = serde_json::from_slice(&bytes).context("Parsing the report")?;
+        let mut report: Report = serde_json::from_slice(&bytes).context("Parsing the report")?;
+        let migrated = report.game.hash_manual_key();
         report.validate()?;
-        Ok(report)
+        Ok((report, migrated))
     }
 }
 
@@ -649,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn a_report_that_carries_a_path_is_rejected_and_never_loads() -> TestResult {
+    fn a_report_that_carries_a_path_is_rejected_on_import_and_migrated_on_load() -> TestResult {
         let mut old = report();
         old.game.launcher = Launcher::Manual;
         old.game.key = "/home/person/Games/private".into();
@@ -662,14 +702,32 @@ mod tests {
             serde_json::to_vec(&old).ctx("serialise an old report")?,
         )
         .ctx("plant an old report")?;
+        let loaded = store.load().ctx("load an old report")?;
+        let migrated = loaded.first().ctx("the migrated report")?;
         check(
-            store.load().ctx("load beside an old report")?.is_empty(),
-            "an old path-keyed report is skipped on load",
+            migrated.qualifies(&manual_game(), &"a".repeat(64), Policy::default()),
+            "the migrated report matches the game it was made for",
         )?;
-        check(
-            !old.qualifies(&manual_game(), &"a".repeat(64), Policy::default()),
-            "and would never match",
-        )?;
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(&root).ctx("list the store")? {
+            let path = entry.ctx("entry")?.path();
+            let text = std::fs::read_to_string(&path).ctx("read a stored file")?;
+            check(
+                !text.contains("/home/person"),
+                "no stored file keeps the path",
+            )?;
+            files.push((path, text));
+        }
+        check_eq(files.len(), 1, "one file remains and no temp file is left")?;
+        let again = store.load().ctx("load again")?;
+        check_eq(again, loaded, "a second load returns the same report")?;
+        let mut after = Vec::new();
+        for entry in std::fs::read_dir(&root).ctx("list again")? {
+            let path = entry.ctx("entry")?.path();
+            let text = std::fs::read_to_string(&path).ctx("read again")?;
+            after.push((path, text));
+        }
+        check_eq(after, files, "a second load writes nothing")?;
         let mut long = report();
         long.game.build = "7".repeat(MAX_TEXT_LEN + 1);
         check(long.validate().is_err(), "an over-long build is rejected")?;
