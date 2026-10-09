@@ -7,6 +7,7 @@
 
 mod activity;
 pub mod coordinator;
+mod icon;
 mod ipc;
 pub(crate) mod launchers;
 mod tray;
