@@ -732,10 +732,10 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
     let saving = if let Some(job) = working {
         if job.files_total > 0 {
             format!(
-                "{} · {} of {} files",
+                "{} · {} of {}",
                 kind_words(job),
                 job.files_done,
-                job.files_total
+                shell::files_count(job.files_total)
             )
         } else {
             kind_words(job).to_owned()
@@ -1770,7 +1770,7 @@ fn preferences(state: &State) -> Element<'_, Message> {
         worker = worker.push(theme::muted(reason));
     }
     worker = worker.push(secondary_maybe(
-        "Restart background worker",
+        "Restart worker",
         restart_blocked
             .is_none()
             .then_some(Message::Send(Command::Restart)),

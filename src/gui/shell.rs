@@ -584,7 +584,7 @@ pub fn attention_notes<'a, M: Clone + 'a>(
         )));
     }
     if attention > 0 {
-        notes = notes.push(theme::muted("Review lists the games"));
+        notes = notes.push(theme::muted("Review lists the games."));
     }
     let mut card = row![notes].spacing(12).align_y(Alignment::Center);
     if attention > 0
