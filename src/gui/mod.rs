@@ -22,9 +22,6 @@ mod preview_renderer;
 mod shell;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod surface;
-// The windows and macOS front end adopts these helpers in a later change, so
-// until then the ones only the Linux window calls would warn there.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) mod theme;
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod unsupported;

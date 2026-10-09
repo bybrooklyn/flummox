@@ -1,4 +1,9 @@
-//! Shared desktop shell for targets without a storage backend yet.
+//! The window for targets without a storage backend yet.
+//!
+//! It draws one page with the version and a statement that compression is not
+//! available. The shared shell (`shell`, the sidebar, the toast and the card
+//! helpers) is compiled only for Linux, Windows and macOS, because no other
+//! target can be built or linted here, so this window uses `theme` alone.
 
 use anyhow::Result;
 use iced::widget::{column, container, text};
