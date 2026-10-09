@@ -12,15 +12,16 @@ mod artwork;
 mod dialog;
 #[cfg(any(windows, target_os = "macos"))]
 mod native;
+#[cfg(any(windows, target_os = "macos", all(test, target_os = "linux")))]
+mod native_rules;
 #[cfg(all(test, target_os = "linux"))]
 mod preview;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 mod preview_renderer;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+mod shell;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod surface;
-// The windows and macOS front end adopts these helpers in a later change, so
-// until then the ones only the Linux window calls would warn there.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) mod theme;
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod unsupported;
@@ -67,12 +68,14 @@ use anyhow::Context;
 /// an inline closure gets inferred for one specific lifetime instead.
 #[cfg(target_os = "linux")]
 fn theme_of(state: &app::State) -> iced::Theme {
-    let dark = match state.theme {
-        crate::jobs::ThemePreference::System => state.system_theme != iced::theme::Mode::Light,
-        crate::jobs::ThemePreference::Dark => true,
-        crate::jobs::ThemePreference::Light => false,
-    };
-    theme::theme(dark)
+    shell::window_theme(
+        state.system_theme,
+        match state.theme {
+            crate::jobs::ThemePreference::System => None,
+            crate::jobs::ThemePreference::Dark => Some(true),
+            crate::jobs::ThemePreference::Light => Some(false),
+        },
+    )
 }
 
 /// Whether any animation held in the state is still running. Always false
@@ -86,7 +89,7 @@ fn animation_pending(state: &app::State) -> bool {
             .iter()
             .any(|(_, animation)| animation.is_animating(now))
             || state.page_reveal.is_animating(now)
-            || state.status_reveal.is_animating(now)
+            || state.toast.animating()
             || state.detail.is_animating(now)
             || state
                 .progress
@@ -130,10 +133,6 @@ fn animation_frames(state: &app::State) -> iced::Subscription<app::Message> {
 #[cfg(target_os = "linux")]
 const DEFAULT_LOG_FILTER: &str = "warn,wgpu_hal=error,wgpu_core=error";
 
-/// The smallest window size, below which the compact layout cannot fit a row.
-#[cfg(target_os = "linux")]
-const MIN_WINDOW: (f32, f32) = (640.0, 480.0);
-
 /// Opens the window and runs until it closes. Logs go to stderr at `warn`
 /// unless `RUST_LOG` says otherwise.
 #[cfg(target_os = "linux")]
@@ -166,8 +165,8 @@ pub fn run() -> Result<()> {
     .theme(theme_of)
     .default_font(theme::BODY_FONT)
     .window(iced::window::Settings {
-        size: iced::Size::new(1100.0, 720.0),
-        min_size: Some(iced::Size::new(MIN_WINDOW.0, MIN_WINDOW.1)),
+        size: iced::Size::new(shell::WINDOW_SIZE.0, shell::WINDOW_SIZE.1),
+        min_size: Some(iced::Size::new(shell::MIN_WINDOW.0, shell::MIN_WINDOW.1)),
         ..iced::window::Settings::default()
     })
     .run();

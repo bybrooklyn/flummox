@@ -7,10 +7,10 @@
 use iced::widget::{Space, button, column, pick_list as pick_list_widget, row};
 use iced::widget::{container, text};
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-use iced::widget::{
-    progress_bar as progress_widget, scrollable as scrollable_widget,
-    text_input as text_input_widget,
-};
+#[cfg(any(target_os = "linux", test))]
+use iced::widget::progress_bar as progress_widget;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+use iced::widget::{scrollable as scrollable_widget, text_input as text_input_widget};
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use iced::{Alignment, Border, Element, Length, Padding};
 use iced::{Background, Color, Font, Theme, color};
@@ -116,10 +116,10 @@ pub const BUTTON_PADDING: [f32; 2] = [9.0, 14.0];
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub const INPUT_PADDING: [f32; 2] = [9.0, 12.0];
 /// Width of the figures column of a list row, so sizes line up.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[cfg(target_os = "linux")]
 pub const TRAILING_WIDTH: f32 = 220.0;
 /// Width of the slot that holds a list row's one button, empty or not.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[cfg(target_os = "linux")]
 pub const ACTION_SLOT_WIDTH: f32 = 140.0;
 /// Height of the page header row, so titles sit at one baseline.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -225,32 +225,6 @@ pub fn attention_panel(is_error: bool) -> impl Fn(&Theme) -> container::Style {
             background: Some(Background::Color(mix(colors.panel, edge, 0.06))),
             border: Border {
                 radius: 12.0.into(),
-                width: 1.0,
-                color: edge,
-            },
-            text_color: Some(colors.text),
-            ..container::Style::default()
-        }
-    }
-}
-
-/// A banner across the top of the content area.
-///
-/// `is_error` picks the colour, rather than the wording being sniffed for
-/// words like "failed". The wording of a message does not reliably say what kind it is.
-#[cfg(any(windows, target_os = "macos"))]
-pub fn banner(is_error: bool) -> impl Fn(&Theme) -> container::Style {
-    move |theme| {
-        let colors = colors(theme);
-        let edge = if is_error {
-            colors.danger
-        } else {
-            colors.accent
-        };
-        container::Style {
-            background: Some(Background::Color(mix(colors.panel, edge, 0.14))),
-            border: Border {
-                radius: 8.0.into(),
                 width: 1.0,
                 color: edge,
             },
@@ -585,7 +559,7 @@ pub fn scrollable(theme: &Theme, status: scrollable_widget::Status) -> scrollabl
 }
 
 /// How a job's bar and phase label are coloured.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[cfg(any(target_os = "linux", windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tone {
     /// Work is moving, or finished.
@@ -597,7 +571,7 @@ pub enum Tone {
 }
 
 /// The colour a `tone` draws in.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[cfg(any(target_os = "linux", windows, test))]
 fn tone_color(colors: Colors, tone: Tone) -> Color {
     match tone {
         Tone::Normal => colors.accent,
@@ -607,7 +581,7 @@ fn tone_color(colors: Colors, tone: Tone) -> Color {
 }
 
 /// A thin progress bar in the colour of `tone`.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[cfg(any(target_os = "linux", test))]
 pub fn progress_bar(tone: Tone) -> impl Fn(&Theme) -> progress_widget::Style {
     move |theme| {
         let colors = colors(theme);
@@ -623,7 +597,7 @@ pub fn progress_bar(tone: Tone) -> impl Fn(&Theme) -> progress_widget::Style {
 }
 
 /// Text in the colour of `tone`, for a phase label.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[cfg(any(target_os = "linux", windows))]
 pub fn tone_text(tone: Tone) -> impl Fn(&Theme) -> text::Style {
     move |theme| text::Style {
         color: Some(match tone {
@@ -675,7 +649,7 @@ pub fn warning_text<'a>(label: impl text::IntoFragment<'a>) -> text::Text<'a> {
 }
 
 /// A success marker, such as the tick on a finished job.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[cfg(any(target_os = "linux", windows))]
 pub fn accent_text<'a>(label: impl text::IntoFragment<'a>) -> text::Text<'a> {
     text(label).style(|theme: &Theme| text::Style {
         color: Some(colors(theme).accent),
@@ -756,7 +730,7 @@ pub fn secondary_maybe<'a, Message: Clone + 'a>(
 }
 
 /// A toggle button, drawn in its chosen state when `chosen`.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[cfg(target_os = "linux")]
 pub fn choice<'a, Message: Clone + 'a>(
     label: impl Into<String>,
     chosen: bool,
@@ -862,7 +836,7 @@ pub fn field<'a, Message: 'a>(
 }
 
 /// A line of label and value, with the label in a fixed-width column.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[cfg(target_os = "linux")]
 pub fn fact<'a, Message: 'a>(label: &'a str, value: String) -> Element<'a, Message> {
     row![
         container(muted(label)).width(Length::Fixed(110.0)),

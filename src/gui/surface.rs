@@ -21,6 +21,32 @@ pub fn recorded(positions: &Positions, key: &str) -> f32 {
         .unwrap_or_default()
 }
 
+/// Scrolls the scrollable with id `id` to `offset`, then sends `tick` so the
+/// window redraws. Frames keep coming for 150 ms through `redraw_until`, since
+/// a programmatic scroll sends no input event of its own.
+pub fn scroll_to_offset<M: Send + 'static>(
+    redraw_until: &mut Option<Instant>,
+    id: &'static str,
+    offset: f32,
+    tick: M,
+) -> iced::Task<M> {
+    *redraw_until = Some(Instant::now() + Duration::from_millis(150));
+    restore_offset(id, offset, tick)
+}
+
+/// [`scroll_to_offset`] without the redraw window, for a page change whose
+/// reveal animation already asks for frames.
+pub fn restore_offset<M: Send + 'static>(id: &'static str, offset: f32, tick: M) -> iced::Task<M> {
+    iced::widget::operation::scroll_to(
+        id,
+        iced::widget::operation::AbsoluteOffset {
+            x: None,
+            y: Some(offset),
+        },
+    )
+    .chain(iced::Task::done(tick))
+}
+
 /// Wraps `content`, drawing it `offset` pixels lower and clipped to its own
 /// bounds.
 ///
