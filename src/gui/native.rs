@@ -49,7 +49,12 @@ const FOLDER_HINT: &str = "~/My Games/Your game";
 const LIBRARY_HINT: &str = "C:\\Games or D:\\Games";
 #[cfg(target_os = "macos")]
 const LIBRARY_HINT: &str = "~/My Games";
+/// The recovery button. Windows decompresses the files, and macOS puts a kept
+/// original back, so the label names what each does.
+#[cfg(windows)]
 const RECOVERY_ACTION: &str = "Decompress to ordinary files";
+#[cfg(target_os = "macos")]
+const RECOVERY_ACTION: &str = "Put the original back";
 
 /// What a finished background settings save hands back: the worker's new
 /// snapshot on Windows, nothing on macOS.
@@ -74,7 +79,7 @@ impl Page {
             Self::Settings => "Settings",
         }
     }
-    fn icon(self) -> &'static str {
+    fn icon(self) -> super::icon::Icon {
         match self {
             Self::Overview => shell::icons::OVERVIEW,
             Self::Games => shell::icons::GAMES,
@@ -231,6 +236,8 @@ struct State {
     page: Page,
     /// Progress of the page transition.
     reveal: Animation<bool>,
+    /// The highlight of each sidebar entry.
+    nav: shell::NavHighlight<Page>,
     /// Frames are requested until this instant so a programmatic scroll gets drawn.
     scroll_redraw_until: Option<Instant>,
     /// Sign of the transition offset: -1.0 towards an earlier page, 1.0 otherwise.
@@ -267,6 +274,10 @@ struct State {
     /// The wizard's hash is running.
     qualifying: bool,
     qualify_cancel: Arc<AtomicBool>,
+    /// Id of the newest compatibility run. A result with another id is dropped.
+    qualify_run: u64,
+    /// Something was typed or ticked in the compatibility form since it opened.
+    qualify_dirty: bool,
 }
 
 impl Default for State {
@@ -304,6 +315,11 @@ impl Default for State {
             reveal: Animation::new(true)
                 .duration(Duration::from_millis(180))
                 .easing(Easing::EaseOutCubic),
+            nav: shell::NavHighlight::new(
+                [Page::Overview, Page::Games, Page::Jobs, Page::Settings],
+                Page::Overview,
+                Duration::from_millis(shell::NAV_TIMING.0),
+            ),
             direction: 1.0,
             scroll_positions: Default::default(),
             games: Vec::new(),
@@ -326,6 +342,8 @@ impl Default for State {
             qualification: None,
             qualifying: false,
             qualify_cancel: Default::default(),
+            qualify_run: 0,
+            qualify_dirty: false,
         }
     }
 }
@@ -333,6 +351,14 @@ impl Default for State {
 impl State {
     fn reduced_motion(&self) -> bool {
         self.preferences.motion == MotionChoice::Reduced
+    }
+    /// How long the sidebar highlight takes to move, by the motion setting.
+    fn nav_duration(&self) -> Duration {
+        Duration::from_millis(match self.preferences.motion {
+            MotionChoice::Normal => shell::NAV_TIMING.0,
+            MotionChoice::Subtle => shell::NAV_TIMING.1,
+            MotionChoice::Reduced => 0,
+        })
     }
     /// How long the toast takes to appear, by the motion setting.
     fn fade(&self) -> Duration {
@@ -408,6 +434,7 @@ impl State {
         self.qualify_cancel.store(true, Ordering::Relaxed);
         self.qualifying = false;
         self.qualification = None;
+        self.qualify_dirty = false;
     }
 }
 
@@ -497,7 +524,7 @@ enum Message {
     /// Add the selected folder to the locations as one game.
     Remember,
     Qualify,
-    QualificationReady(std::result::Result<Box<crate::qualification::Wizard>, String>),
+    QualificationReady(u64, std::result::Result<Box<crate::qualification::Wizard>, String>),
     QualificationField(crate::qualification::Field, String),
     QualificationCheck(crate::qualification::Check, bool),
     QualificationMode(crate::compatibility::StorageMode),
@@ -955,6 +982,9 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                     1.0
                 };
                 state.page = page;
+                let duration = state.nav_duration();
+                state.nav.retime(duration);
+                state.nav.select(page, Instant::now());
                 state.reveal = Animation::new(false)
                     .duration(state.preferences.motion.duration())
                     .easing(Easing::EaseOutCubic)
@@ -991,6 +1021,8 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
             }
             if let Some(game) = game {
                 state.qualifying = true;
+                state.qualify_run += 1;
+                let run = state.qualify_run;
                 state.qualify_cancel = Default::default();
                 let cancel = state.qualify_cancel.clone();
                 return Task::perform(
@@ -1003,15 +1035,20 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                         .map(Box::new)
                         .map_err(|error| error.to_string())
                     }),
-                    Message::QualificationReady,
+                    move |result| Message::QualificationReady(run, result),
                 );
             }
         }
-        Message::QualificationReady(result) => {
-            // A result that arrives after the user cancelled is dropped.
-            if std::mem::take(&mut state.qualifying) {
+        Message::QualificationReady(run, result) => {
+            // A result that arrives after the user cancelled, or that belongs
+            // to an earlier run, is dropped.
+            if shell::run_is_current(state.qualifying, state.qualify_run, run) {
+                state.qualifying = false;
                 match result {
-                    Ok(wizard) => state.qualification = Some(*wizard),
+                    Ok(wizard) => {
+                        state.qualification = Some(*wizard);
+                        state.qualify_dirty = false;
+                    }
                     Err(error) => state.error(format!(
                         "Could not start the compatibility test: {error}"
                     )),
@@ -1020,16 +1057,19 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::QualificationField(field, text) => {
             if let Some(wizard) = &mut state.qualification {
+                state.qualify_dirty = true;
                 wizard.field(field, text);
             }
         }
         Message::QualificationCheck(check, value) => {
             if let Some(wizard) = &mut state.qualification {
+                state.qualify_dirty = true;
                 wizard.check(check, value);
             }
         }
         Message::QualificationMode(mode) => {
             if let Some(wizard) = &mut state.qualification {
+                state.qualify_dirty = true;
                 wizard.mode = mode;
             }
         }
@@ -1055,6 +1095,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::QualificationMeasured(result) => {
             if let Some(wizard) = &mut state.qualification {
+                state.qualify_dirty = true;
                 wizard.measured(result);
             }
         }
@@ -1117,7 +1158,16 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                 None => {}
             }
             if key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) {
-                state.planned = None;
+                match shell::escape_step(
+                    state.planned.is_some(),
+                    state.qualification.is_some(),
+                    state.qualify_dirty,
+                ) {
+                    shell::Escape::ClosePlan => state.planned = None,
+                    shell::Escape::CloseForm => state.stop_qualifying(),
+                    shell::Escape::KeepForm => state.info(shell::DISCARD_NOTICE),
+                    shell::Escape::Other => {}
+                }
             }
         }
         Message::Key(_) => {}
@@ -1232,11 +1282,11 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
         Message::Recover(folder) => {
             state.working = true;
             state.job_folder = None;
-            state.info("Recovering the kept original…");
+            state.info("Putting the original back…");
             return Task::perform(
                 background(move || {
                     backend::recover_folder(&folder)
-                        .map(|()| "Recovery finished.".into())
+                        .map(|()| "The original is back.".into())
                         .map_err(|error| error.to_string())
                 }),
                 Message::Finished,
@@ -1385,7 +1435,9 @@ fn filtered_games(state: &State) -> Vec<&crate::model::Game> {
 /// Whether a page transition, the toast or a programmatic scroll still needs frames.
 fn animating(state: &State) -> bool {
     (!state.reduced_motion()
-        && (state.reveal.is_animating(Instant::now()) || state.toast.animating()))
+        && (state.reveal.is_animating(Instant::now())
+            || state.nav.animating(Instant::now())
+            || state.toast.animating()))
         || state
             .scroll_redraw_until
             .is_some_and(|until| Instant::now() < until)
@@ -1463,6 +1515,11 @@ fn overview(state: &State) -> Element<'_, Message> {
             &state.warnings,
             Some(Message::ReviewAttention),
         ));
+    }
+    // The worker's notes, such as a location that moved to another drive.
+    #[cfg(windows)]
+    if !state.worker.notices.is_empty() {
+        content = content.push(shell::attention_notes(0, &state.worker.notices, None));
     }
     content = content.push(theme::section_title("Running jobs"));
     content = content.push(theme::panel_card(text(current_work(state))));
@@ -1606,6 +1663,9 @@ fn progress_box<'a>(title: String, totals: Totals, note: &'a str) -> Element<'a,
         )),
     ]
     .spacing(4);
+    if let Some(failed) = rules::failed_text(totals.failed) {
+        content = content.push(theme::danger_text(failed));
+    }
     if !note.is_empty() {
         content = content.push(theme::muted(note));
     }
@@ -1624,6 +1684,7 @@ fn selected_progress(state: &State) -> Option<Element<'_, Message>> {
             bytes: job.progress.bytes,
             allocation_before: job.progress.allocation_before,
             allocation_after: job.progress.allocation_after,
+            failed: job.progress.failed,
         };
         Some(progress_box(
             format!(
@@ -1649,6 +1710,8 @@ fn selected_progress(state: &State) -> Option<Element<'_, Message>> {
             bytes: progress.bytes,
             allocation_before: progress.allocation_before,
             allocation_after: progress.allocation_after,
+            // The macOS pass reports no per-file failures.
+            failed: 0,
         };
         Some(progress_box(
             format!("Working on {}", folder_title(state, &state.selected_path())),
@@ -1877,7 +1940,12 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         shell::nav_entry(
             destination.label(),
             destination.icon(),
-            if destination == page { 1.0 } else { 0.0 },
+            state.nav.value(
+                destination,
+                page,
+                state.reduced_motion(),
+                Instant::now(),
+            ),
             compact,
             Message::GoTo(destination),
         )
@@ -2493,6 +2561,10 @@ fn job_card<'a>(state: &State, job: &'a crate::desktop_jobs::Job) -> Element<'a,
         .align_y(Alignment::Center),
     ]
     .spacing(10);
+    let content = match rules::failed_text(job.progress.failed) {
+        Some(text) => content.push(theme::danger_text(text)),
+        None => content,
+    };
     if failed {
         theme::attention_card(content, true)
     } else {
@@ -2507,9 +2579,9 @@ fn completed_row(job: &crate::desktop_jobs::Job) -> Element<'_, Message> {
     theme::panel_card(
         row![
             if job.phase == Phase::Completed {
-                Element::from(theme::accent_text("✓").size(18))
+                super::icon::icon(super::icon::Icon::Check, 18.0, super::icon::Tint::Accent)
             } else {
-                Element::from(text("○").size(18))
+                super::icon::icon(super::icon::Icon::Dot, 18.0, super::icon::Tint::Muted)
             },
             column![
                 text(&job.game.title).size(15),
@@ -2519,7 +2591,11 @@ fn completed_row(job: &crate::desktop_jobs::Job) -> Element<'_, Message> {
                     shell::files_count(job.progress.files),
                     job.progress.changed,
                     job.progress.skipped
-                ))
+                )),
+                match rules::failed_text(job.progress.failed) {
+                    Some(text) => Element::from(theme::danger_text(text)),
+                    None => Element::from(iced::widget::Space::new()),
+                }
             ]
             .spacing(3)
             .width(Length::Fill),

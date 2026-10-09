@@ -1,12 +1,12 @@
 //! The window for targets without a storage backend yet.
 //!
-//! It draws one page with the version and a statement that compression is not
-//! available. The shared shell (`shell`, the sidebar, the toast and the card
-//! helpers) is compiled only for Linux, Windows and macOS, because no other
-//! target can be built or linted here, so this window uses `theme` alone.
+//! It draws a titled page with a card saying compression is not available and
+//! the version. `shell` (sidebar, toast, About card) is compiled only for
+//! Linux, Windows and macOS, so this window uses the cards, headings and
+//! colours of `theme`, which every target has.
 
 use anyhow::Result;
-use iced::widget::{column, container, text};
+use iced::widget::{column, container};
 use iced::{Element, Length, Task, Theme};
 
 use super::theme;
@@ -37,14 +37,22 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
 }
 
 fn view(_state: &State) -> Element<'_, Message> {
+    let card = theme::panel_card(
+        column![
+            theme::section_title("Compression is not available on this system"),
+            theme::muted(
+                "Flummox has no storage backend for this operating system, so it changes no game files. It compresses games on Linux, Windows and macOS."
+            ),
+            theme::muted(format!("Version {}", env!("CARGO_PKG_VERSION"))),
+        ]
+        .spacing(8),
+    );
     container(
         column![
-            text("Flummox").size(26),
-            theme::muted(format!("Version {}", env!("CARGO_PKG_VERSION"))),
-            text("Compression is not available on this platform yet.").size(16),
-            theme::muted("Game files are unchanged."),
+            theme::page_header::<Message>("Flummox", Some("Game compression"), None),
+            card
         ]
-        .spacing(12),
+        .spacing(theme::PAGE_GAP),
     )
     .padding(28)
     .width(Length::Fill)

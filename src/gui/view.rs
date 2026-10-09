@@ -67,16 +67,12 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
     // the bottom and switches without animation.
     // Every entry, Settings included, eases its highlight the same way.
     let highlight_of = |page: Page| {
-        if state.reduced_motion {
-            if state.page == page { 1. } else { 0. }
-        } else {
-            state
-                .nav
-                .iter()
-                .find(|(target, _)| *target == page)
-                .map(|(_, a)| a.interpolate(0., 1., std::time::Instant::now()))
-                .unwrap_or(0.)
-        }
+        state.nav.value(
+            page,
+            state.page,
+            state.reduced_motion,
+            std::time::Instant::now(),
+        )
     };
     let nav_entry = |page: Page| -> Element<'_, Message> {
         shell::nav_entry(
@@ -285,13 +281,13 @@ fn empty_games(state: &State) -> (&'static str, &'static str, Option<(&'static s
 }
 
 /// The symbol drawn for a page in the sidebar.
-fn page_icon(page: Page) -> &'static str {
+fn page_icon(page: Page) -> super::icon::Icon {
     match page {
         Page::Overview => shell::icons::OVERVIEW,
         Page::Games => shell::icons::GAMES,
         Page::Queue => shell::icons::JOBS,
-        Page::Drives => "▰",
-        Page::Recovery => "⟲",
+        Page::Drives => super::icon::Icon::Drives,
+        Page::Recovery => super::icon::Icon::Recovery,
         Page::Settings => shell::icons::SETTINGS,
     }
 }
@@ -927,6 +923,26 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                     .align_y(Alignment::Center),
                 );
         }
+        // A game that cannot be compressed has no other Advanced controls, but
+        // its artwork can still be changed.
+        if !item.supported {
+            details = details.push(advanced_toggle(&id, advanced_open));
+            if advanced_open {
+                details = details.push(
+                    row![
+                        secondary_maybe(
+                            "Choose artwork…",
+                            (!state.picker_busy).then(|| Message::Browse(
+                                super::dialog::Target::Artwork(id.clone())
+                            )),
+                        ),
+                        secondary("Use default artwork", Message::ClearArtwork(id.clone())),
+                    ]
+                    .spacing(8)
+                    .wrap(),
+                );
+            }
+        }
         // Advanced: the native preset, then the store controls.
         let preset_id = id.clone();
         if item.native_supported && !stored && advanced_open {
@@ -1120,7 +1136,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
             details = details.push(theme::muted(confidence.clone()));
         }
         // Advanced, continued: reports, exclusion, and what the analysis saw.
-        if advanced_open {
+        if advanced_open && item.supported {
             let mut tools = row![
                 secondary_maybe(
                     if state.qualifying {
@@ -1744,6 +1760,16 @@ fn settings_page(state: &State) -> Element<'_, Message> {
     .spacing(theme::PAGE_GAP * 2.0)
     .into()
 }
+/// Why Restart background worker is disabled. The worker also refuses while a
+/// game runs from its store, and its message names the game.
+pub(super) fn restart_blocked(snapshot: &crate::jobs::Snapshot) -> Option<&'static str> {
+    snapshot
+        .jobs
+        .iter()
+        .any(|job| job.phase.active())
+        .then_some("Jobs are waiting or running.")
+}
+
 /// The last Settings sections: background worker restart, automatic
 /// maintenance, appearance, compatibility reports and About.
 fn preferences(state: &State) -> Element<'_, Message> {
@@ -1753,24 +1779,17 @@ fn preferences(state: &State) -> Element<'_, Message> {
         .iter()
         .filter(|library| library.automatic)
         .count();
-    // The worker refuses a restart while any job is active or a store exists.
-    let restart_blocked = if state.snapshot.jobs.iter().any(|job| job.phase.active()) {
-        Some("Jobs are waiting or running.")
-    } else if !state.snapshot.packs.is_empty() {
-        Some("Games are running from Maximum stores. Decompress them first.")
-    } else {
-        None
-    };
+    let restart_blocked = restart_blocked(&state.snapshot);
     let mut worker = column![
         theme::section_title("Background worker"),
-        theme::muted("After an upgrade, restart when no jobs are waiting or running and Maximum games have been decompressed."),
+        theme::muted("After an upgrade, restart when no jobs are waiting or running. The worker says which game to close if one is running from a Maximum store."),
     ]
     .spacing(10);
     if let Some(reason) = restart_blocked {
         worker = worker.push(theme::muted(reason));
     }
     worker = worker.push(secondary_maybe(
-        "Restart worker",
+        "Restart background worker",
         restart_blocked
             .is_none()
             .then_some(Message::Send(Command::Restart)),
@@ -1868,9 +1887,9 @@ fn completed_job_row(job: &Job) -> Element<'_, Message> {
     panel(
         row![
             if job.phase == Phase::Completed {
-                Element::from(theme::accent_text("✓").size(18))
+                super::icon::icon(super::icon::Icon::Check, 18.0, super::icon::Tint::Accent)
             } else {
-                Element::from(text("○").size(18))
+                super::icon::icon(super::icon::Icon::Dot, 18.0, super::icon::Tint::Muted)
             },
             column![
                 text(&job.game.title).size(15),

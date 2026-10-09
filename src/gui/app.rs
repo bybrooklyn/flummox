@@ -19,7 +19,6 @@ use std::time::{Duration, Instant};
 /// Animation lengths in milliseconds as (expressive, subtle). Reduced motion
 /// gives zero. Every transition in the window takes its length from here.
 mod timing {
-    pub const NAV: (u64, u64) = (220, 140);
     pub const PAGE: (u64, u64) = (180, 120);
     pub const DETAIL: (u64, u64) = (260, 150);
     pub const TOAST: (u64, u64) = (240, 150);
@@ -319,9 +318,13 @@ pub struct State {
     pub qualifying: bool,
     /// Set to stop that hash, which reads the whole install.
     pub qualify_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Id of the newest compatibility run. A result with another id is dropped.
+    pub qualify_run: u64,
+    /// Something was typed or ticked in the compatibility form since it opened.
+    pub qualify_dirty: bool,
     // Navigation and scrolling.
     /// The highlight animation of each sidebar entry.
-    pub nav: Vec<(Page, Animation<bool>)>,
+    pub nav: super::shell::NavHighlight<Page>,
     pub page_reveal: Animation<bool>,
     /// Frames keep coming until this instant, after a scroll set from code.
     pub scroll_redraw_until: Option<Instant>,
@@ -441,18 +444,13 @@ impl State {
             qualification: None,
             qualifying: false,
             qualify_cancel: Default::default(),
-            nav: PAGES
-                .into_iter()
-                .chain(std::iter::once(Page::Settings))
-                .map(|page| {
-                    (
-                        page,
-                        Animation::new(page == Page::Overview)
-                            .duration(Duration::from_millis(timing::NAV.0))
-                            .easing(EASING),
-                    )
-                })
-                .collect(),
+            qualify_run: 0,
+            qualify_dirty: false,
+            nav: super::shell::NavHighlight::new(
+                PAGES.into_iter().chain(std::iter::once(Page::Settings)),
+                Page::Overview,
+                Duration::from_millis(super::shell::NAV_TIMING.0),
+            ),
             scroll_redraw_until: None,
             page_reveal: Animation::new(true)
                 .duration(Duration::from_millis(timing::PAGE.0))
@@ -824,6 +822,7 @@ impl State {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.qualifying = false;
         self.qualification = None;
+        self.qualify_dirty = false;
     }
     /// What `choice` is predicted to save for this game. `None` until it has
     /// been analyzed, and zero when the saving is too small to bother with
@@ -1202,9 +1201,17 @@ impl State {
 pub struct Batch {
     /// The worker's state after the last command it accepted.
     pub snapshot: Snapshot,
-    /// The game id (empty for a command without one) and the reason, for each
-    /// command the worker refused.
-    pub refused: Vec<(String, String)>,
+    /// Each item the worker refused.
+    pub refused: Vec<Refused>,
+}
+
+/// One item of a batch that the worker refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    /// The game's `GameId::to_string()`.
+    pub id: String,
+    pub title: String,
+    pub reason: String,
 }
 
 /// Why adding a folder failed.
@@ -1245,7 +1252,8 @@ pub enum Message {
     CancelPlanned,
     ExportDiagnostics,
     Qualify(String),
-    QualificationReady(Result<crate::qualification::Wizard, String>),
+    /// The run id it was started with, then the form or the reason it failed.
+    QualificationReady(u64, Result<crate::qualification::Wizard, String>),
     QualificationField(crate::qualification::Field, String),
     QualificationCheck(crate::qualification::Check, bool),
     QualificationMode(crate::compatibility::StorageMode),
@@ -1362,49 +1370,82 @@ fn send_unchecked(command: Command) -> Task<Message> {
     )
 }
 
-/// Sends commands in order on one thread, with no space plan review, and
-/// delivers the last reply with the commands the worker refused. A refusal
-/// does not stop the commands after it.
-fn send_many(commands: Vec<Command>) -> Task<Message> {
-    Task::perform(background(move || send_batch(commands)), |result| {
+/// One job to queue: the game, the operation and its options.
+type Item = (Game, Operation, crate::backend::CompressOpts);
+
+/// Queues the items in one request, with no space plan review, and delivers
+/// the worker's state with the items it refused. A refusal does not stop the
+/// items after it.
+fn send_many(items: Vec<Item>) -> Task<Message> {
+    Task::perform(background(move || send_batch(items)), |result| {
         Message::Batched(result.and_then(|result| result))
     })
 }
 
-/// Sends the commands one after another. Blocks. Fails only when the first
-/// snapshot request does.
-fn send_batch(commands: Vec<Command>) -> Result<Batch, String> {
-    let mut snapshot = jobs::request(Command::Snapshot).map_err(|e| e.to_string())?;
-    let mut refused = vec![];
-    for command in commands {
-        let game = match &command {
-            Command::Enqueue { game, .. } | Command::EnqueuePack { game, .. } => {
-                game.id.to_string()
-            }
-            _ => String::new(),
-        };
-        match jobs::request(command) {
-            Ok(next) => snapshot = next,
-            Err(error) => refused.push((game, error.to_string())),
-        }
-    }
-    Ok(Batch { snapshot, refused })
+/// Sends the items as one `request_many`. Blocks. Fails only when the worker
+/// cannot be reached.
+fn send_batch(items: Vec<Item>) -> Result<Batch, String> {
+    let sent: Vec<(String, String)> = items
+        .iter()
+        .map(|(game, _, _)| (game.id.to_string(), game.title.clone()))
+        .collect();
+    let (snapshot, refusals) = jobs::request_many(items).map_err(|e| e.to_string())?;
+    Ok(Batch {
+        snapshot,
+        refused: pair_refusals(&sent, refusals),
+    })
 }
 
-/// One sentence for the commands of a batch that the worker refused: how many
-/// and the first reason. `noun` and `outcome` are each the singular and plural
-/// form.
-fn refusal_text(
-    refused: &[(String, String)],
-    noun: (&str, &str),
-    outcome: (&str, &str),
-) -> Option<String> {
-    let (_, reason) = refused.first()?;
+/// Attaches game ids to the worker's refusals, which name titles only. Two
+/// games with one title take their refusals in the order sent.
+fn pair_refusals(sent: &[(String, String)], refusals: Vec<jobs::Refusal>) -> Vec<Refused> {
+    let mut used = vec![false; sent.len()];
+    refusals
+        .into_iter()
+        .map(|refusal| {
+            let slot = sent
+                .iter()
+                .zip(used.iter_mut())
+                .find(|((_, title), used)| !**used && *title == refusal.title);
+            let id = slot
+                .map(|((id, _), used)| {
+                    *used = true;
+                    id.clone()
+                })
+                .unwrap_or_default();
+            Refused {
+                id,
+                title: refusal.title,
+                reason: refusal.reason,
+            }
+        })
+        .collect()
+}
+
+/// One notice for the items of a batch that the worker refused: how many, then
+/// at most three titles with their reasons. `noun` and `outcome` are each the
+/// singular and plural form.
+fn refusal_text(refused: &[Refused], noun: (&str, &str), outcome: (&str, &str)) -> Option<String> {
+    if refused.is_empty() {
+        return None;
+    }
     let count = u64::try_from(refused.len()).unwrap_or(u64::MAX);
+    let listed: Vec<String> = refused
+        .iter()
+        .take(3)
+        .map(|item| format!("{}: {}.", item.title, item.reason.trim_end_matches('.')))
+        .collect();
+    let more = refused.len().saturating_sub(3);
     Some(format!(
-        "{} {}. {reason}",
+        "{} {}: {}{}",
         crate::text::count(count, noun.0, noun.1),
-        if count == 1 { outcome.0 } else { outcome.1 }
+        if count == 1 { outcome.0 } else { outcome.1 },
+        listed.join(" "),
+        if more > 0 {
+            format!(" And {more} more.")
+        } else {
+            String::new()
+        }
     ))
 }
 
@@ -1415,33 +1456,37 @@ fn refusal_text(
 fn queue_standard(state: &mut State, games: Vec<Game>, operation: Operation) -> Task<Message> {
     let wanted = games.len();
     let mut queued = vec![];
-    let commands: Vec<Command> = games
+    let items: Vec<Item> = games
         .into_iter()
         .filter_map(|game| {
             let id = game.id.to_string();
-            let command = if operation == Operation::Compress {
-                state.optimize_command(game, StorageChoice::Standard).ok()
+            let item = if operation == Operation::Compress {
+                match state.optimize_command(game, StorageChoice::Standard) {
+                    Ok(Command::Enqueue {
+                        game,
+                        operation,
+                        options,
+                    }) => Some((game, operation, options)),
+                    _ => None,
+                }
             } else {
-                Some(Command::Enqueue {
-                    options: crate::backend::CompressOpts {
-                        preset: state.preset_for(&id),
-                        ..Default::default()
-                    },
-                    game,
-                    operation,
-                })
+                let options = crate::backend::CompressOpts {
+                    preset: state.preset_for(&id),
+                    ..Default::default()
+                };
+                Some((game, operation, options))
             };
-            if command.is_some() {
+            if item.is_some() {
                 queued.push(id);
             }
-            command
+            item
         })
         .collect();
     // The ticks have done their job once the commands are on their way.
     for id in &queued {
         state.selected.remove(id);
     }
-    let skipped = wanted - commands.len();
+    let skipped = wanted - items.len();
     if skipped > 0 {
         state.show_status(Status::info(format!(
             "{} left out: their drive needs Maximum, which is chosen per game.",
@@ -1452,11 +1497,11 @@ fn queue_standard(state: &mut State, games: Vec<Game>, operation: Operation) -> 
             )
         )));
     }
-    if commands.is_empty() {
+    if items.is_empty() {
         return Task::none();
     }
     let navigation = update(state, Message::GoTo(Page::Queue));
-    Task::batch([navigation, send_many(commands)])
+    Task::batch([navigation, send_many(items)])
 }
 
 /// Plans a job that mounts a store over the game, creating the store first
@@ -1601,15 +1646,11 @@ fn analyze_pending(state: &mut State) -> Task<Message> {
         return Task::none();
     }
     state.analysis_queuing = true;
-    let commands = games
+    let items: Vec<Item> = games
         .into_iter()
-        .map(|game| Command::Enqueue {
-            game,
-            operation: Operation::Analyze,
-            options: Default::default(),
-        })
+        .map(|game| (game, Operation::Analyze, Default::default()))
         .collect();
-    Task::perform(background(move || send_batch(commands)), |result| {
+    Task::perform(background(move || send_batch(items)), |result| {
         Message::AnalysisQueued(result.and_then(|result| result))
     })
 }
@@ -1641,6 +1682,8 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                 .map(|row| row.game.clone())
             {
                 state.qualifying = true;
+                state.qualify_run += 1;
+                let run = state.qualify_run;
                 state.qualify_cancel = Default::default();
                 let cancel = state.qualify_cancel.clone();
                 return Task::perform(
@@ -1652,15 +1695,22 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                         )
                         .map_err(|error| error.to_string())
                     }),
-                    |result| Message::QualificationReady(result.and_then(|result| result)),
+                    move |result| {
+                        Message::QualificationReady(run, result.and_then(|result| result))
+                    },
                 );
             }
         }
-        Message::QualificationReady(result) => {
-            // A result that arrives after the user cancelled is dropped.
-            if std::mem::take(&mut state.qualifying) {
+        Message::QualificationReady(run, result) => {
+            // A result that arrives after the user cancelled, or that belongs
+            // to an earlier run, is dropped.
+            if super::shell::run_is_current(state.qualifying, state.qualify_run, run) {
+                state.qualifying = false;
                 match result {
-                    Ok(wizard) => state.qualification = Some(wizard),
+                    Ok(wizard) => {
+                        state.qualification = Some(wizard);
+                        state.qualify_dirty = false;
+                    }
                     Err(error) => state.show_status(Status::error(format!(
                         "Could not start the compatibility test: {error}"
                     ))),
@@ -1669,16 +1719,19 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::QualificationField(field, text) => {
             if let Some(wizard) = &mut state.qualification {
+                state.qualify_dirty = true;
                 wizard.field(field, text);
             }
         }
         Message::QualificationCheck(check, value) => {
             if let Some(wizard) = &mut state.qualification {
+                state.qualify_dirty = true;
                 wizard.check(check, value);
             }
         }
         Message::QualificationMode(mode) => {
             if let Some(wizard) = &mut state.qualification {
+                state.qualify_dirty = true;
                 wizard.mode = mode;
             }
         }
@@ -1706,6 +1759,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::QualificationMeasured(result) => {
             if let Some(wizard) = &mut state.qualification {
+                state.qualify_dirty = true;
                 wizard.measured(result);
             }
         }
@@ -1890,9 +1944,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                     .go(true, Instant::now());
             }
             state.confirm_reclaim.clear();
-            for (target, animation) in &mut state.nav {
-                animation.go_mut(*target == page, Instant::now());
-            }
+            state.nav.select(page, Instant::now());
             // A section destination scrolls to its section. Any other page
             // change returns to where that page was last scrolled.
             if let Some(section) = destination.section() {
@@ -1989,11 +2041,11 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                 Ok(batch) => {
                     state
                         .analysis_refused
-                        .extend(batch.refused.iter().map(|(id, _)| id.clone()));
+                        .extend(batch.refused.iter().map(|item| item.id.clone()));
                     let notice = refusal_text(
                         &batch.refused,
-                        ("analysis", "analyses"),
-                        ("was skipped", "were skipped"),
+                        ("game", "games"),
+                        ("could not be analyzed", "could not be analyzed"),
                     );
                     let task = update(state, Message::Snapshot(Ok(batch.snapshot)));
                     if let Some(text) = notice {
@@ -2009,7 +2061,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                 let task = update(state, Message::Snapshot(Ok(batch.snapshot)));
                 if let Some(text) = refusal_text(
                     &batch.refused,
-                    ("job", "jobs"),
+                    ("game", "games"),
                     ("could not be queued", "could not be queued"),
                 ) {
                     state.show_refusal(text);
@@ -2428,12 +2480,8 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
             state.reduced_motion = motion == MotionPreference::Reduced;
             // The sidebar animations are rebuilt at their current value with
             // the new timing. The setting is also sent to the worker.
-            let duration = state.motion_duration(timing::NAV);
-            for (_, animation) in &mut state.nav {
-                *animation = Animation::new(animation.value())
-                    .duration(duration)
-                    .easing(EASING);
-            }
+            let duration = state.motion_duration(super::shell::NAV_TIMING);
+            state.nav.retime(duration);
             return send(Command::Motion(motion));
         }
         Message::Theme(theme) => {
@@ -2515,12 +2563,22 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                 }
                 (_, Some(Shortcut::Rescan)) => return update(state, Message::Rescan),
                 (Key::Named(Named::Escape), None) => {
-                    // An open storage plan is closed first and nothing else.
-                    if state.planned.take().is_some() {
-                        return Task::none();
+                    use super::shell::Escape;
+                    match super::shell::escape_step(
+                        state.planned.is_some(),
+                        state.qualification.is_some(),
+                        state.qualify_dirty,
+                    ) {
+                        Escape::ClosePlan => state.planned = None,
+                        Escape::CloseForm => state.stop_qualifying(),
+                        Escape::KeepForm => {
+                            state.show_status(Status::info(super::shell::DISCARD_NOTICE));
+                        }
+                        Escape::Other => {
+                            state.close_detail();
+                            state.selected.clear();
+                        }
                     }
-                    state.close_detail();
-                    state.selected.clear();
                 }
                 _ => {}
             }
@@ -3493,6 +3551,62 @@ mod tests {
         check(state.planned.is_none(), "Escape dismisses the plan")
     }
 
+    fn open_form(state: &mut State) {
+        state.qualification = Some(crate::qualification::Wizard::new(
+            named("a", true).game,
+            crate::compatibility::Corpus {
+                sha256: "a".repeat(64),
+                files: 1,
+                bytes: 1,
+            },
+        ));
+    }
+
+    #[test]
+    fn escape_closes_an_untouched_compatibility_form_and_keeps_a_filled_one() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        open_form(&mut state);
+        let _task = update(&mut state, Message::Keyboard(escape()));
+        check(state.qualification.is_none(), "an untouched form closes")?;
+        open_form(&mut state);
+        let _task = update(
+            &mut state,
+            Message::QualificationField(crate::qualification::Field::Build, "1.2".into()),
+        );
+        let _task = update(&mut state, Message::Keyboard(escape()));
+        check(state.qualification.is_some(), "a form with an entry stays")?;
+        check_eq(
+            state.toast.status.as_ref().map(|status| status.text.clone()),
+            Some("Press Close to discard the compatibility test.".to_owned()),
+            "and says how to leave",
+        )?;
+        let _task = update(&mut state, Message::CloseQualification);
+        open_form(&mut state);
+        let _task = update(&mut state, Message::Keyboard(escape()));
+        check(
+            state.qualification.is_none(),
+            "closing cleared the flag for the next form",
+        )
+    }
+
+    #[test]
+    fn a_cancelled_compatibility_run_cannot_clear_the_next_ones_busy_flag() -> TestResult {
+        let mut state = State::new(Env::from_home("/fixture"));
+        state.qualifying = true;
+        state.qualify_run = 2;
+        let _task = update(
+            &mut state,
+            Message::QualificationReady(1, Err("old run".into())),
+        );
+        check(state.qualifying, "the older run's result is ignored")?;
+        check(state.toast.status.is_none(), "and says nothing")?;
+        let _task = update(
+            &mut state,
+            Message::QualificationReady(2, Err("this run".into())),
+        );
+        check(!state.qualifying, "control: the current run's result ends it")
+    }
+
     #[test]
     fn adding_a_folder_does_not_touch_the_disk_on_the_window_thread() -> TestResult {
         let mut state = State::new(Env::from_home("/fixture"));
@@ -3591,8 +3705,8 @@ mod tests {
         let batch = Batch {
             snapshot: snapshot_of(1, vec![]),
             refused: vec![
-                ("manual:a".into(), "This game is excluded.".into()),
-                ("manual:b".into(), "The queue is full.".into()),
+                refused("manual:a", "Alpha", "This game is excluded."),
+                refused("manual:b", "Beta", "The queue is full."),
             ],
         };
         let _task = update(&mut state, Message::Batched(Ok(batch)));
@@ -3608,7 +3722,7 @@ mod tests {
             .map(|status| status.text.clone());
         check(
             text.as_deref()
-                .is_some_and(|text| text.starts_with("2 jobs could not be queued")),
+                .is_some_and(|text| text.starts_with("2 games could not be queued: Alpha: This game is excluded.")),
             format!("the refusals are counted: {text:?}"),
         )?;
         check(
@@ -3628,7 +3742,7 @@ mod tests {
         state.analysis_queuing = true;
         let batch = Batch {
             snapshot: snapshot_of(1, vec![]),
-            refused: vec![("manual:a".into(), "The queue is full.".into())],
+            refused: vec![refused("manual:a", "A", "The queue is full.")],
         };
         let _task = update(&mut state, Message::AnalysisQueued(Ok(batch)));
         check(!state.analysis_queuing(), "the batch is over")?;
@@ -3700,8 +3814,8 @@ mod tests {
     fn every_transition_takes_its_length_from_one_table() -> TestResult {
         let mut state = State::new(Env::from_home("/fixture"));
         check_eq(
-            state.motion_duration(timing::NAV),
-            Duration::from_millis(timing::NAV.0),
+            state.motion_duration(crate::gui::shell::NAV_TIMING),
+            Duration::from_millis(crate::gui::shell::NAV_TIMING.0),
             "expressive",
         )?;
         state.motion = MotionPreference::Subtle;
@@ -3730,26 +3844,102 @@ mod tests {
         check_eq(state.filtered().len(), 1, "cleared")
     }
 
+    fn refused(id: &str, title: &str, reason: &str) -> Refused {
+        Refused {
+            id: id.into(),
+            title: title.into(),
+            reason: reason.into(),
+        }
+    }
+
     #[test]
-    fn refusals_are_summarised_by_count_and_first_reason() -> TestResult {
-        let jobs = ("job", "jobs");
+    fn restart_is_blocked_only_by_active_jobs() -> TestResult {
+        let game = named("a", true).game;
+        let idle = snapshot_of(1, vec![]);
+        check(
+            crate::gui::view::restart_blocked(&idle).is_none(),
+            "an idle worker can restart",
+        )?;
+        let mut busy = snapshot_of(
+            1,
+            vec![job(1, &game, Operation::Compress, Phase::Running, 0)],
+        );
+        check(
+            crate::gui::view::restart_blocked(&busy).is_some(),
+            "a running job blocks it",
+        )?;
+        busy.jobs.clear();
+        check(
+            crate::gui::view::restart_blocked(&busy).is_none(),
+            "control: with the job gone it can restart",
+        )
+    }
+
+    #[test]
+    fn refusals_are_summarised_by_count_and_at_most_three_titles() -> TestResult {
+        let games = ("game", "games");
         let outcome = ("could not be queued", "could not be queued");
         check(
-            refusal_text(&[], jobs, outcome).is_none(),
+            refusal_text(&[], games, outcome).is_none(),
             "nothing refused",
         )?;
         check_eq(
-            refusal_text(&[("a".into(), "Why.".into())], jobs, outcome),
-            Some("1 job could not be queued. Why.".to_owned()),
+            refusal_text(&[refused("a", "Alpha", "Why.")], games, outcome),
+            Some("1 game could not be queued: Alpha: Why.".to_owned()),
             "one",
         )?;
-        let two = [("a".into(), "Why.".into()), ("b".into(), "Else.".into())];
+        let five: Vec<Refused> = ["A", "B", "C", "D", "E"]
+            .iter()
+            .map(|title| refused(title, title, "No"))
+            .collect();
         check_eq(
-            refusal_text(&two, ("analysis", "analyses"), ("was skipped", "were skipped")),
-            Some("2 analyses were skipped. Why.".to_owned()),
-            "two, with the plural noun and verb",
+            refusal_text(&five, games, outcome),
+            Some("5 games could not be queued: A: No. B: No. C: No. And 2 more.".to_owned()),
+            "five, three listed",
         )
     }
+
+    #[test]
+    fn a_mixed_batch_pairs_each_refusal_with_its_game() -> TestResult {
+        let sent: Vec<(String, String)> = vec![
+            ("manual:a".into(), "Same".into()),
+            ("manual:b".into(), "Other".into()),
+            ("manual:c".into(), "Same".into()),
+        ];
+        let refusals = vec![
+            jobs::Refusal {
+                title: "Same".into(),
+                reason: "Full.".into(),
+            },
+            jobs::Refusal {
+                title: "Other".into(),
+                reason: "Excluded.".into(),
+            },
+            jobs::Refusal {
+                title: "Same".into(),
+                reason: "Full.".into(),
+            },
+            jobs::Refusal {
+                title: "Unknown".into(),
+                reason: "Odd.".into(),
+            },
+        ];
+        let ids: Vec<String> = pair_refusals(&sent, refusals)
+            .into_iter()
+            .map(|item| item.id)
+            .collect();
+        check_eq(
+            ids,
+            vec![
+                "manual:a".to_owned(),
+                "manual:b".to_owned(),
+                "manual:c".to_owned(),
+                String::new(),
+            ],
+            "titles shared by two games take them in order, an unknown title has no id",
+        )
+    }
+
     #[test]
     fn a_prospect_is_judged_against_the_whole_install() -> TestResult {
         let mut state = State::new(Env::from_home("/fixture"));
@@ -3817,7 +4007,7 @@ mod tests {
         check(!state.qualifying, "the button is available again")?;
         let _late = update(
             &mut state,
-            Message::QualificationReady(Err("Compatibility verification stopped".into())),
+            Message::QualificationReady(0, Err("Compatibility verification stopped".into())),
         );
         check(
             state.toast.status.is_none(),
