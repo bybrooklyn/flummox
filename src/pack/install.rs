@@ -624,7 +624,11 @@ mod enabled {
             .as_ref()
             .filter(|_| install.previous_store_path.is_none());
         if let Some(backup) = current_backup {
-            crate::pack::overlay::Overlay::open(&install.writes_path)?.apply_to(backup)?;
+            // A store that cannot be read must not block putting the original
+            // back, so the layer then opens without it.
+            let store = Reader::open(&install.store_path).ok();
+            crate::pack::overlay::Overlay::open(&install.writes_path, store.as_ref())?
+                .apply_to(backup)?;
             return publish(backup);
         }
         // No current original: rebuild in a sibling staging folder, apply the
@@ -638,7 +642,9 @@ mod enabled {
             .tempdir_in(parent)?;
         let restored = staging.path().join("game");
         crate::pack::restore(&install.store_path, &restored, cancel)?;
-        crate::pack::overlay::Overlay::open(&install.writes_path)?.apply_to(&restored)?;
+        let store = Reader::open(&install.store_path)?;
+        crate::pack::overlay::Overlay::open(&install.writes_path, Some(&store))?
+            .apply_to(&restored)?;
         // The restored folder already carries the mode the store recorded.
         publish(&restored)
     }
