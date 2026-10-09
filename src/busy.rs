@@ -227,6 +227,43 @@ fn exec_maps(maps: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// Whether `dir` is a copy of this process that has not yet become the
+/// program it was started to run.
+///
+/// Between fork and exec a child still holds this process's open files and
+/// working directory, so it would be reported as something using a game.
+/// Such a child has this process as parent and the same program and
+/// arguments.
+fn is_unfinished_spawn(dir: &Path, own_dir: &Path, own: i32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(dir.join("stat")) else {
+        return false;
+    };
+    // The parent id is the second field after the name, which is in
+    // parentheses and may itself contain spaces or parentheses.
+    let parent = stat
+        .rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().nth(1))
+        .and_then(|field| field.parse::<i32>().ok());
+    if parent != Some(own) {
+        return false;
+    }
+    let same = |name: &str| match (
+        std::fs::read(dir.join(name)),
+        std::fs::read(own_dir.join(name)),
+    ) {
+        (Ok(theirs), Ok(ours)) => theirs == ours,
+        _ => false,
+    };
+    let same_program = match (
+        std::fs::read_link(dir.join("exe")),
+        std::fs::read_link(own_dir.join("exe")),
+    ) {
+        (Ok(theirs), Ok(ours)) => theirs == ours,
+        _ => false,
+    };
+    same_program && same("cmdline")
+}
+
 impl ProcSource for ProcFs {
     fn processes(&self) -> Vec<ProcInfo> {
         self.scan().processes
@@ -245,10 +282,14 @@ impl ProcSource for ProcFs {
             }
         };
         let own = std::process::id() as i32;
+        let own_dir = self.root.join(own.to_string());
         let processes: Vec<ProcInfo> = entries
             .flatten()
             .filter_map(|entry| {
                 let pid: i32 = entry.file_name().to_str()?.parse().ok()?;
+                if pid != own && is_unfinished_spawn(&entry.path(), &own_dir, own) {
+                    return None;
+                }
                 self.read_one(&entry.path(), pid)
             })
             .collect();
@@ -496,6 +537,49 @@ mod tests {
                 PathBuf::from("/games/A/with space.so"),
             ],
             "only executable file mappings are kept",
+        )
+    }
+
+    #[test]
+    fn a_child_that_has_not_started_its_program_is_not_a_user_of_the_folder() -> TestResult {
+        let tmp = tempfile::tempdir().ctx("make a temporary directory")?;
+        let proc = tmp.path().join("proc");
+        let own = std::process::id() as i32;
+        let game = tmp.path().join("game");
+        std::fs::create_dir(&game).ctx("game folder")?;
+        // This process, a copy of it between fork and exec, and a child that
+        // has become another program. Both children sit in the game folder.
+        for (pid, program, arguments) in [
+            (own, "/bin/flummox", "flummox\0__coordinator\0"),
+            (own + 1, "/bin/flummox", "flummox\0__coordinator\0"),
+            (own + 2, "/bin/flummox", "flummox\0__worker\0"),
+        ] {
+            let dir = proc.join(pid.to_string());
+            std::fs::create_dir_all(&dir).ctx("fake process directory")?;
+            std::fs::write(
+                dir.join("stat"),
+                format!("{pid} (a name) with) S {own} 1 1"),
+            )
+            .ctx("stat")?;
+            std::fs::write(dir.join("cmdline"), arguments).ctx("cmdline")?;
+            std::os::unix::fs::symlink(program, dir.join("exe")).ctx("exe")?;
+            std::os::unix::fs::symlink(&game, dir.join("cwd")).ctx("cwd")?;
+        }
+        // SAFETY: getuid() takes no arguments and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let seen: Vec<i32> = ProcFs::with_root(proc, uid)
+            .processes()
+            .iter()
+            .filter(|p| p.uses_dir(&game))
+            .map(|p| p.pid)
+            .collect();
+        check(
+            seen.contains(&(own + 2)),
+            "control: a child running another command is still seen",
+        )?;
+        check(
+            !seen.contains(&(own + 1)),
+            "a copy of this process that has not started its program is left out",
         )
     }
 

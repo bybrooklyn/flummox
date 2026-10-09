@@ -47,6 +47,9 @@ pub(super) struct Overlay {
     _owner: File,
 }
 
+/// How long opening a layer waits for its lock before calling it in use.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl Overlay {
     /// Whether `path` is a real folder laid out as an update layer.
     pub fn is_layer(path: &Path) -> bool {
@@ -74,10 +77,17 @@ impl Overlay {
             .truncate(false)
             .mode(0o600)
             .open(root.join("owner.lock"))?;
-        ensure!(
-            owner.try_lock().is_ok(),
-            "This update layer is already mounted or being committed"
-        );
+        // A process forked while the last mount was open keeps a copy of the
+        // lock until it execs, so a lock seen held right after an unmount may
+        // clear within milliseconds.
+        let waited_from = std::time::Instant::now();
+        while owner.try_lock().is_err() {
+            ensure!(
+                waited_from.elapsed() < LOCK_WAIT,
+                "This update layer is already mounted or being committed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         let files = root.join(FILES);
         let trash = root.join(TRASH);
         let state = root.join(STATE);
@@ -1018,7 +1028,11 @@ mod tests {
         again.persist().ctx("journal")?;
         drop(again);
         let reopened = reopen_over(&layer, Some(&reader))?;
-        for stale in ["data/sub/deep.bin", "data/sub/inner", "data/sub/inner/x.bin"] {
+        for stale in [
+            "data/sub/deep.bin",
+            "data/sub/inner",
+            "data/sub/inner/x.bin",
+        ] {
             check(
                 !reopened.visible(&reader, Path::new(stale)),
                 format!("{stale} stays hidden after the crash"),
@@ -1037,6 +1051,31 @@ mod tests {
             !third.visible(&reader, Path::new("data/sub/deep.bin")),
             "the repaired journal keeps them hidden on the next open",
         )
+    }
+
+    #[test]
+    fn a_lock_released_a_moment_later_does_not_refuse_the_layer() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let layer = temp.path().join("layer");
+        drop(Overlay::open(&layer, None).ctx("new layer")?);
+        // A process forked while the last mount was open holds a copy of the
+        // lock until it execs. This stands in for it.
+        let holder = std::fs::File::open(layer.join("owner.lock")).ctx("lock file")?;
+        holder.try_lock().ctx("take the lock")?;
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(holder);
+        });
+        let opened = Overlay::open(&layer, None).map(drop);
+        release.join().ok().ctx("release thread")?;
+        opened.ctx("a lock that clears within the wait")?;
+        let held = Overlay::open(&layer, None).ctx("the layer's own lock")?;
+        check(
+            Overlay::open(&layer, None).is_err(),
+            "control: a lock that stays held still refuses the layer",
+        )?;
+        drop(held);
+        Ok(())
     }
 
     #[test]
