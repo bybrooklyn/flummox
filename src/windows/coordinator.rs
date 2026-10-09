@@ -68,6 +68,10 @@ pub struct Snapshot {
     /// A discovery pass is running. No job starts until it ends.
     pub discovering: bool,
     pub maintenance_paused: bool,
+    /// Why maintenance set a new starting point for a location, such as a different
+    /// drive at the same path. The newest five are kept until the worker exits.
+    #[serde(default)]
+    pub notices: Vec<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct Request {
@@ -161,23 +165,67 @@ pub fn entrypoint() -> Result<bool> {
             .write(true)
             .open(root.join("coordinator.lock"))?;
         // A worker holds this lock for its whole life. Getting it means none is running.
-        if lock.try_lock().is_ok() {
-            cleanup_startup(&args, &root)?;
-            return Ok(true);
-        }
-        call(Command::Shutdown)?;
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while lock.try_lock().is_err() {
-            ensure!(
-                Instant::now() < deadline,
+        let stopped = wait_for_worker(
+            || lock.try_lock().is_ok(),
+            || call(Command::Shutdown).map(|_| ()),
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+        )?;
+        if stopped == Stopped::StillWorking {
+            eprintln!(
                 "The background worker is finishing a file. Wait before upgrading or uninstalling."
             );
-            std::thread::sleep(Duration::from_millis(100));
+            // The installer reads 3 as "still working" and any other failure as an
+            // error. Returning an error from `main` can only give 1.
+            #[allow(clippy::exit)]
+            std::process::exit(EXIT_STILL_WORKING);
         }
         cleanup_startup(&args, &root)?;
         return Ok(true);
     }
     Ok(false)
+}
+/// Exit code of `--native-worker-exit` when the worker is still finishing a file.
+const EXIT_STILL_WORKING: i32 = 3;
+#[derive(Debug, PartialEq, Eq)]
+enum Stopped {
+    /// No worker holds the lock any more.
+    Gone,
+    /// A worker still holds it after the patience ran out.
+    StillWorking,
+}
+/// Asks the worker to shut down until `released` says it has let go of its lock, or
+/// `patience` runs out. `shutdown` is repeated every `resend`, because a worker
+/// that is starting or exiting may not hear the first request. A failed request is
+/// not an error while the lock is still held: the worker may be on its way out. At
+/// the deadline the last failure is returned unless it only says the pipe is
+/// missing. A worker that is gone, whether before the first request or during the
+/// wait, is `Gone`.
+fn wait_for_worker(
+    mut released: impl FnMut() -> bool,
+    mut shutdown: impl FnMut() -> Result<()>,
+    patience: Duration,
+    resend: Duration,
+) -> Result<Stopped> {
+    let deadline = Instant::now() + patience;
+    let mut last_sent: Option<Instant> = None;
+    let mut last_error: Option<anyhow::Error> = None;
+    loop {
+        if released() {
+            return Ok(Stopped::Gone);
+        }
+        if Instant::now() >= deadline {
+            return match last_error {
+                Some(error) if !crate::windows::ipc::is_missing(&error) => Err(error),
+                _ => Ok(Stopped::StillWorking),
+            };
+        }
+        if due(last_sent, resend) {
+            last_sent = Some(Instant::now());
+            last_error = shutdown().err();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 /// With `--remove-owned-startup`, deletes this installation's login entry and
 /// clears the matching preference.
@@ -271,6 +319,7 @@ fn start(job: &Job) -> Active {
                     bytes: progress.bytes,
                     allocation_before: progress.allocation_before,
                     allocation_after: progress.allocation_after,
+                    failed: progress.failed,
                 }));
             },
         )
@@ -485,6 +534,22 @@ fn run() -> Result<()> {
                         if let Err(error) = queue.enqueue_automatic(game) {
                             snapshot.warnings.push(error.to_string());
                         }
+                    }
+                    for notice in std::mem::take(&mut queue.notices) {
+                        if !snapshot.notices.contains(&notice) {
+                            snapshot.notices.push(notice);
+                        }
+                    }
+                    let extra = snapshot.notices.len().saturating_sub(5);
+                    snapshot.notices.drain(..extra);
+                    // Remember which drive each location is on, now that `observe`
+                    // has compared against what was saved.
+                    if preferences_healthy
+                        && snapshot.warnings.is_empty()
+                        && preferences.record_volumes(&crate::desktop::volume_identity)
+                        && let Err(error) = preferences.save(&root)
+                    {
+                        snapshot.warnings.push(error.to_string());
                     }
                     save_queue(&queue, &root, &mut queue_dirty);
                 }
@@ -928,6 +993,66 @@ fn activity(games: &[Game]) -> Result<Option<String>> {
 mod tests {
     use super::*;
     use crate::testutil::{Ctx, TestResult, check, check_eq};
+    fn missing_pipe() -> anyhow::Error {
+        std::io::Error::from(std::io::ErrorKind::NotFound).into()
+    }
+    #[test]
+    fn a_worker_that_is_gone_or_leaves_during_the_wait_is_not_an_error() -> TestResult {
+        let patience = Duration::from_secs(5);
+        let resend = Duration::from_millis(10);
+        let mut asked = 0;
+        check_eq(
+            wait_for_worker(|| true, || Err(missing_pipe()), patience, resend)
+                .ctx("lock already free")?,
+            Stopped::Gone,
+            "no worker needs no request",
+        )?;
+        let mut polls = 0;
+        check_eq(
+            wait_for_worker(
+                || {
+                    polls += 1;
+                    polls > 3
+                },
+                || {
+                    asked += 1;
+                    Err(missing_pipe())
+                },
+                patience,
+                resend,
+            )
+            .ctx("worker exits before hearing the request")?,
+            Stopped::Gone,
+            "a missing pipe while the lock frees is a worker that left",
+        )?;
+        check(asked >= 1, "the request was tried")
+    }
+    #[test]
+    fn a_worker_that_keeps_its_lock_is_still_working_or_an_error() -> TestResult {
+        let patience = Duration::from_millis(100);
+        let resend = Duration::from_millis(10);
+        check_eq(
+            wait_for_worker(|| false, || Ok(()), patience, resend).ctx("busy worker")?,
+            Stopped::StillWorking,
+            "control: a worker that does not let go blocks the upgrade",
+        )?;
+        check_eq(
+            wait_for_worker(|| false, || Err(missing_pipe()), patience, resend)
+                .ctx("lock held with no pipe")?,
+            Stopped::StillWorking,
+            "a held lock is never reported as gone",
+        )?;
+        check(
+            wait_for_worker(
+                || false,
+                || Err(anyhow::anyhow!("Another account is using the pipe")),
+                patience,
+                resend,
+            )
+            .is_err(),
+            "a real failure to reach the worker is reported",
+        )
+    }
     #[test]
     fn a_step_that_never_ran_is_due_and_a_recent_one_is_not() -> TestResult {
         check(due(None, Duration::from_secs(30)), "never run is due")?;
