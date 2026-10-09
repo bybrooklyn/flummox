@@ -1,6 +1,6 @@
 Read-only audit of the Windows coordinator path. Nothing was compiled or run, so every finding is from reading. CONFIRMED means I traced the full path in the source. PLAUSIBLE means the mechanism is in the source but the trigger depends on Windows behaviour or timing I could not observe here.
 
-All paths are under /home/brook/data/gamecompressor.
+All paths are under the repository root.
 
 ## Findings
 

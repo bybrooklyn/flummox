@@ -3,7 +3,7 @@
 
 Scope: read all of `src/gui/native.rs`, `view.rs`, `theme.rs`, `surface.rs`, `native_preview.rs`, `unsupported.rs`, `src/native.rs`, `docs/gui-architecture.md`, and the relevant parts of `app.rs`, `desktop.rs`, `windows/coordinator.rs`, `storage.rs`, `qualification.rs` and `artwork.rs`. Nothing was edited or run. The native module is cfg-gated off Linux, so no finding was rendered; layout claims rest on the code and the iced 0.14 sources in `~/.cargo/registry`.
 
-Paths are relative to `/home/brook/data/gamecompressor`. "native.rs" means `src/gui/native.rs`.
+Paths are relative to `the repository root`. "native.rs" means `src/gui/native.rs`.
 
 ## Findings, most severe first
 

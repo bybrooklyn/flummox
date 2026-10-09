@@ -4,7 +4,7 @@ I opened all 30 previews and 9 of the 14 live screenshots, and read `view.rs`, `
 
 ## Read this first: the previews draw every control as disabled
 
-`/home/brook/data/gamecompressor/src/gui/preview_renderer.rs:23-35` calls `layout` then `draw` and never `update`. In iced 0.14.2, `button.rs:376`, `checkbox.rs:395` and `text_input.rs:471` fall back to `Status::Disabled` until a `RedrawRequested` event has been processed.
+`src/gui/preview_renderer.rs:23-35` calls `layout` then `draw` and never `update`. In iced 0.14.2, `button.rs:376`, `checkbox.rs:395` and `text_input.rs:471` fall back to `Status::Disabled` until a `RedrawRequested` event has been processed.
 
 - Every button, checkbox and text input in the 30 PNGs is in its disabled style. That is why "Compress", "Add folder" and "Compress to save about 900 MB" appear as bare grey text, and game titles are grey.
 - The live screenshots show the real enabled styles (filled green "Compress", bordered search box).
@@ -147,4 +147,4 @@ I opened all 30 previews and 9 of the 14 live screenshots, and read `view.rs`, `
 - Text passes AA everywhere; `danger_text` beside the folder input; "(estimate)" and "About" labels on unmeasured figures.
 - Wrapping jump links on Settings fit at 720 px. No clipped or overlapping text in any of the 30 images apart from the qualification scrollbar.
 
-Files: `/home/brook/data/gamecompressor/src/gui/view.rs`, `/home/brook/data/gamecompressor/src/gui/theme.rs`, `/home/brook/data/gamecompressor/src/gui/preview_renderer.rs`, `/home/brook/data/gamecompressor/src/gui/preview.rs`, `/home/brook/data/gamecompressor/src/qualification.rs`, `/home/brook/data/gamecompressor/src/gui/app.rs`, `/home/brook/data/gamecompressor/src/gui/mod.rs`.
+Files: `src/gui/view.rs`, `src/gui/theme.rs`, `src/gui/preview_renderer.rs`, `src/gui/preview.rs`, `src/qualification.rs`, `src/gui/app.rs`, `src/gui/mod.rs`.

@@ -1,6 +1,6 @@
 # GUI wording audit: Flummox (read-only, no files changed)
 
-All paths are under `/home/brook/data/gamecompressor/`. Every string below was located and is quoted exactly. `docs/usage.md` line numbers are the file's own.
+All paths are under ``. Every string below was located and is quoted exactly. `docs/usage.md` line numbers are the file's own.
 
 Scope notes:
 - I extracted strings by grepping quoted lines and reading the surrounding code; I did not render the window.

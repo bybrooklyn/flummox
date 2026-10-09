@@ -2,7 +2,7 @@
 
 Read-only audit. Nothing was built or run, so every finding rests on code reading. CONFIRMED means I traced the full path through the code (and through fuser 0.18 source where relevant); it does not mean reproduced.
 
-All paths are under `/home/brook/data/gamecompressor/`.
+All paths are under ``.
 
 ## Findings
 

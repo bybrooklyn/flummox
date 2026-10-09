@@ -1,4 +1,4 @@
-Second-pass bug hunt, Linux front end. Read-only: no cargo and no edits, so nothing below was executed. CONFIRMED means I traced the full path in source, including iced 0.14 and the worker where relevant. All paths are under /home/brook/data/gamecompressor.
+Second-pass bug hunt, Linux front end. Read-only: no cargo and no edits, so nothing below was executed. CONFIRMED means I traced the full path in source, including iced 0.14 and the worker where relevant. All paths are under the repository root.
 
 ## Findings, most severe first
 

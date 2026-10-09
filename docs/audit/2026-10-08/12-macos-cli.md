@@ -2,7 +2,7 @@
 
 Nothing was edited, built or run. All findings come from reading the code. macOS findings that depend on how `codesign`, `ditto` or the kernel behave are marked PLAUSIBLE because they cannot be exercised on this machine.
 
-## Part A: macOS (`/home/brook/data/gamecompressor/src/macos.rs`)
+## Part A: macOS (`src/macos.rs`)
 
 1. **`macos.rs:573-577` (with 472-475). Post-swap signature check runs while the staging directory is still inside the bundle.**
    - Defect: `verify_bundle` runs `codesign --verify --deep --strict` before `clear_record` removes `.flummox-work-*/candidate`, which sits beside the file and therefore inside the `.app`.

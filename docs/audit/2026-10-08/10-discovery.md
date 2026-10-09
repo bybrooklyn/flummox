@@ -1,4 +1,4 @@
-Read-only audit of discovery in /home/brook/data/gamecompressor. Nothing was edited, cargo was not run, and the real Steam library was not touched. "CONFIRMED" means traced through the code. Where a finding also depends on an external file format or location I recalled from memory, I say so.
+Read-only audit of discovery in the repository root. Nothing was edited, cargo was not run, and the real Steam library was not touched. "CONFIRMED" means traced through the code. Where a finding also depends on an external file format or location I recalled from memory, I say so.
 
 ## Findings
 

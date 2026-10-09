@@ -1,4 +1,4 @@
-Read-only audit of the Linux job coordinator. Nothing was edited or run; every claim below comes from reading the code. Files are under /home/brook/data/gamecompressor.
+Read-only audit of the Linux job coordinator. Nothing was edited or run; every claim below comes from reading the code. Files are under the repository root.
 
 I found no path that corrupts or loses game bytes. The serious findings are jobs that fail when they should wait, and a coordinator that exits on any single error and takes every mounted game with it.
 
