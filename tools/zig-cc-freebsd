@@ -1,0 +1,11 @@
+#!/bin/sh
+# A C compiler for checking a FreeBSD build: zig, which ships the FreeBSD headers.
+# cc-rs adds a --target flag, and zig takes its target another way.
+for arg in "$@"; do
+    shift
+    case "$arg" in
+        --target=*) ;;
+        *) set -- "$@" "$arg" ;;
+    esac
+done
+exec ${ZIG:-zig} cc -target x86_64-freebsd "$@"
