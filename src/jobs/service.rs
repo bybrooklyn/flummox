@@ -80,6 +80,34 @@ fn restart_allowed(
     Ok(())
 }
 
+/// Runs `apply` and mirrors the exclusion into the history database in the
+/// same step, so the two agree whether either fails. The history write comes
+/// first; an `apply` that then fails puts the history entry back.
+fn mirror_exclusion(
+    history: &crate::db::Db,
+    id: &crate::model::GameId,
+    title: &str,
+    excluded: bool,
+    apply: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let before = history.is_excluded(id)?;
+    if excluded {
+        history.exclude(id, title)?;
+    } else {
+        history.unexclude(id)?;
+    }
+    if let Err(error) = apply() {
+        let restored = if before {
+            history.exclude(id, title)
+        } else {
+            history.unexclude(id).map(|_| ())
+        };
+        survive("restoring the exclusion history", restored.map_err(Into::into));
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Writes one control line to a worker's stdin and flushes it.
 fn send_control(input: &mut impl Write, control: Control) -> Result<()> {
     serde_json::to_writer(&mut *input, &control)?;
@@ -2206,31 +2234,32 @@ pub(super) fn run() -> Result<()> {
                     {
                         running.control.request_control(&message.command)?;
                     }
-                    match message.command {
-                        Command::EnqueueMany { items } => {
-                            refused = enqueue_many(items, &mut snapshot, &db, &mut active);
+                    let run_command = || -> Result<()> {
+                        match message.command {
+                            Command::EnqueueMany { items } => {
+                                refused = enqueue_many(items, &mut snapshot, &db, &mut active);
+                            }
+                            command => apply(
+                                command,
+                                &mut snapshot,
+                                &db,
+                                &mut active,
+                                &mut mounts,
+                                pack_active.as_ref().map(|running| running.id),
+                            )?,
                         }
-                        command => apply(
-                            command,
-                            &mut snapshot,
-                            &db,
-                            &mut active,
-                            &mut mounts,
-                            pack_active.as_ref().map(|running| running.id),
-                        )?,
-                    }
-                    // Mirror the change into the history database, which
-                    // workers check before they process a game.
+                        Ok(())
+                    };
+                    // Workers check the history database before they process
+                    // a game, so it changes in the same step as the queue.
                     if let Some((id, excluded)) = exclusion {
-                        if excluded {
-                            let title = games
-                                .iter()
-                                .find(|game| game.ids().any(|game_id| game_id == &id))
-                                .map(|game| game.title.as_str());
-                            history.exclude(&id, title.unwrap_or(&id.key))?;
-                        } else {
-                            history.unexclude(&id)?;
-                        }
+                        let title = games
+                            .iter()
+                            .find(|game| game.ids().any(|game_id| game_id == &id))
+                            .map_or_else(|| id.key.clone(), |game| game.title.clone());
+                        mirror_exclusion(&history, &id, &title, excluded, run_command)?;
+                    } else {
+                        run_command()?;
                     }
                     if startup_changed {
                         baseline_unseen = true;
@@ -2506,6 +2535,58 @@ mod tests {
             state: InstallState::Idle,
             is_tool: false,
         }
+    }
+
+    #[test]
+    fn an_exclusion_changes_both_stores_or_neither() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let path = temp.path().join("history.sqlite");
+        let history = crate::db::Db::open(&path).ctx("history")?;
+        let id = GameId::new(Launcher::Manual, "portal");
+        let done = std::cell::Cell::new(false);
+        let apply_ok = || {
+            done.set(true);
+            Ok(())
+        };
+        mirror_exclusion(&history, &id, "Portal", true, apply_ok).ctx("control: both succeed")?;
+        check(
+            done.get() && history.is_excluded(&id).ctx("read")?,
+            "control: the exclusion lands in both",
+        )?;
+        // The in-memory change fails, so the history entry must not remain.
+        let other = GameId::new(Launcher::Manual, "half-life");
+        let refused = mirror_exclusion(&history, &other, "Half-Life", true, || {
+            bail!("the queue could not be saved")
+        });
+        check(refused.is_err(), "the failure is reported")?;
+        check(
+            !history.is_excluded(&other).ctx("read")?,
+            "a failed apply leaves no history entry",
+        )?;
+        // Include again, with the in-memory change failing: the entry stays.
+        let refused = mirror_exclusion(&history, &id, "Portal", false, || {
+            bail!("the queue could not be saved")
+        });
+        check(refused.is_err(), "the second failure is reported")?;
+        check(
+            history.is_excluded(&id).ctx("read")?,
+            "a failed include keeps the history entry",
+        )?;
+        // The history write fails, so the in-memory change must not happen.
+        let breaker = Connection::open(&path).ctx("second connection")?;
+        breaker
+            .execute_batch("DROP TABLE hidden")
+            .ctx("break the history")?;
+        let ran = std::cell::Cell::new(false);
+        let refused = mirror_exclusion(&history, &other, "Half-Life", true, || {
+            ran.set(true);
+            Ok(())
+        });
+        check(refused.is_err(), "a history failure is reported")?;
+        check(
+            !ran.get(),
+            "a history failure leaves the in-memory exclusion unapplied",
+        )
     }
 
     #[test]
