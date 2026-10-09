@@ -9,6 +9,8 @@ mod app;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod artwork;
 #[cfg(target_os = "linux")]
+mod desktop_theme;
+#[cfg(target_os = "linux")]
 mod dialog;
 #[cfg(any(windows, target_os = "macos"))]
 mod native;
@@ -145,6 +147,7 @@ pub fn run() -> Result<()> {
         .try_init();
 
     let env = Env::current().context("HOME is not set, so no game library can be found")?;
+    let first_theme = desktop_theme::initial_mode();
 
     // `view::view` is passed as a function item, not wrapped in a closure. A
     // closure's return lifetime is inferred as a fresh one, and `ViewFn`
@@ -153,6 +156,7 @@ pub fn run() -> Result<()> {
         // The first scan and the desktop theme query start with the window.
         move || {
             let mut state = app::State::new(env.clone());
+            state.system_theme = first_theme;
             let refresh = app::update(&mut state, app::Message::Refresh);
             let system_theme = iced::system::theme().map(app::Message::SystemTheme);
             (state, iced::Task::batch([refresh, system_theme]))
