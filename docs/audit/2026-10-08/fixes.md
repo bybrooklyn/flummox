@@ -82,6 +82,17 @@ The first run failed two jobs, and both causes were in this branch: a test
 that assumed the repository as its working directory, and an installer that
 listed a notices file the CI build does not generate.
 
+Later runs found two failures that came and went, and both had one cause.
+Between fork and exec a child process holds copies of its parent's open
+files. A store's update layer lock therefore outlived its mount by a moment,
+and the process scan saw a second process inside a game folder. An agent had
+seen each once under load and could not repeat it. Opening a layer now waits
+up to a second for its lock, and the scan leaves out a child that has this
+process as its parent and the same program and arguments. Each fix has a test
+that fails without it. A third failure was a test that sent its one request
+before the worker had started. The run at `db240d2` passed every job, and so
+did a second run of the same commit.
+
 Both runs uploaded previews of the Windows and Mac window drawn on those
 systems. They show the shared sidebar, the Jobs page, the storage plan panel
 and the toast with text in place. The sidebar highlight sat on Overview on
