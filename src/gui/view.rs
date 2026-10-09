@@ -2,7 +2,7 @@
 
 use super::{
     app::{Filter, GameRow, Message, PAGES, Page, Sort, State, StorageChoice},
-    shell::{self, games_count, size},
+    shell::{self, games_count, input, picker, size},
     theme,
 };
 use crate::{
@@ -44,29 +44,6 @@ fn panel<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
 fn hero<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     theme::hero_card(content)
 }
-/// A drop-down list in the window's style.
-fn picker<'a, T, L, V>(
-    options: L,
-    selected: Option<V>,
-    on_select: impl Fn(T) -> Message + 'a,
-) -> iced::widget::PickList<'a, T, L, V, Message>
-where
-    T: ToString + PartialEq + Clone + 'a,
-    L: std::borrow::Borrow<[T]> + 'a,
-    V: std::borrow::Borrow<T> + 'a,
-{
-    pick_list(options, selected, on_select)
-        .padding(theme::INPUT_PADDING)
-        .style(theme::pick_list)
-        .menu_style(theme::pick_menu)
-}
-/// A text input in the window's style.
-fn input<'a>(placeholder: &str, value: &str) -> iced::widget::TextInput<'a, Message> {
-    text_input(placeholder, value)
-        .padding(theme::INPUT_PADDING)
-        .style(theme::text_input)
-}
-
 /// Builds the whole window from `state`.
 ///
 /// Passed to iced as a function item.

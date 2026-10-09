@@ -399,6 +399,31 @@ pub fn sidebar<'a, M: 'a>(
         .into()
 }
 
+/// A drop-down list in the window's style.
+pub fn picker<'a, T, L, V, M>(
+    options: L,
+    selected: Option<V>,
+    on_select: impl Fn(T) -> M + 'a,
+) -> iced::widget::PickList<'a, T, L, V, M>
+where
+    T: ToString + PartialEq + Clone + 'a,
+    L: std::borrow::Borrow<[T]> + 'a,
+    V: std::borrow::Borrow<T> + 'a,
+    M: Clone + 'a,
+{
+    pick_list(options, selected, on_select)
+        .padding(theme::INPUT_PADDING)
+        .style(theme::pick_list)
+        .menu_style(theme::pick_menu)
+}
+
+/// A text input in the window's style.
+pub fn input<'a, M: Clone + 'a>(placeholder: &str, value: &str) -> iced::widget::TextInput<'a, M> {
+    text_input(placeholder, value)
+        .padding(theme::INPUT_PADDING)
+        .style(theme::text_input)
+}
+
 /// The page inside its scrolling surface and gutter. `id` names the
 /// scrollable that `scroll_to` addresses and under which the offset is
 /// recorded.

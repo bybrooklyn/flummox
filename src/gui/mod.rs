@@ -12,6 +12,8 @@ mod artwork;
 mod dialog;
 #[cfg(any(windows, target_os = "macos"))]
 mod native;
+#[cfg(any(windows, target_os = "macos", all(test, target_os = "linux")))]
+mod native_rules;
 #[cfg(all(test, target_os = "linux"))]
 mod preview;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
