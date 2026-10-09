@@ -1744,6 +1744,16 @@ fn settings_page(state: &State) -> Element<'_, Message> {
     .spacing(theme::PAGE_GAP * 2.0)
     .into()
 }
+/// Why Restart background worker is disabled. The worker also refuses while a
+/// game runs from its store, and its message names the game.
+pub(super) fn restart_blocked(snapshot: &crate::jobs::Snapshot) -> Option<&'static str> {
+    snapshot
+        .jobs
+        .iter()
+        .any(|job| job.phase.active())
+        .then_some("Jobs are waiting or running.")
+}
+
 /// The last Settings sections: background worker restart, automatic
 /// maintenance, appearance, compatibility reports and About.
 fn preferences(state: &State) -> Element<'_, Message> {
@@ -1753,24 +1763,17 @@ fn preferences(state: &State) -> Element<'_, Message> {
         .iter()
         .filter(|library| library.automatic)
         .count();
-    // The worker refuses a restart while any job is active or a store exists.
-    let restart_blocked = if state.snapshot.jobs.iter().any(|job| job.phase.active()) {
-        Some("Jobs are waiting or running.")
-    } else if !state.snapshot.packs.is_empty() {
-        Some("Games are running from Maximum stores. Decompress them first.")
-    } else {
-        None
-    };
+    let restart_blocked = restart_blocked(&state.snapshot);
     let mut worker = column![
         theme::section_title("Background worker"),
-        theme::muted("After an upgrade, restart when no jobs are waiting or running and Maximum games have been decompressed."),
+        theme::muted("After an upgrade, restart when no jobs are waiting or running. The worker says which game to close if one is running from a Maximum store."),
     ]
     .spacing(10);
     if let Some(reason) = restart_blocked {
         worker = worker.push(theme::muted(reason));
     }
     worker = worker.push(secondary_maybe(
-        "Restart worker",
+        "Restart background worker",
         restart_blocked
             .is_none()
             .then_some(Message::Send(Command::Restart)),

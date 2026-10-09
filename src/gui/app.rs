@@ -3780,6 +3780,29 @@ mod tests {
     }
 
     #[test]
+    fn restart_is_blocked_only_by_active_jobs() -> TestResult {
+        let game = named("a", true).game;
+        let idle = snapshot_of(1, vec![]);
+        check(
+            crate::gui::view::restart_blocked(&idle).is_none(),
+            "an idle worker can restart",
+        )?;
+        let mut busy = snapshot_of(
+            1,
+            vec![job(1, &game, Operation::Compress, Phase::Running, 0)],
+        );
+        check(
+            crate::gui::view::restart_blocked(&busy).is_some(),
+            "a running job blocks it",
+        )?;
+        busy.jobs.clear();
+        check(
+            crate::gui::view::restart_blocked(&busy).is_none(),
+            "control: with the job gone it can restart",
+        )
+    }
+
+    #[test]
     fn refusals_are_summarised_by_count_and_at_most_three_titles() -> TestResult {
         let games = ("game", "games");
         let outcome = ("could not be queued", "could not be queued");
