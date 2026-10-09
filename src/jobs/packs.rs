@@ -466,6 +466,42 @@ pub(super) fn pack_prune(
     bail!("This build of Flummox cannot delete the previous version of a game that uses Maximum.")
 }
 
+/// The title of the game at `path`, or its folder name when discovery has
+/// not listed it.
+pub(super) fn game_title(snapshot: &Snapshot, path: &Path) -> String {
+    snapshot
+        .discovered
+        .iter()
+        .find(|game| game.install_dir == path)
+        .map(|game| game.title.clone())
+        .or_else(|| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Unmounts every store this coordinator serves, one at a time. On the first
+/// failure the rest stay mounted and the error names the game.
+#[cfg(feature = "pack-mount")]
+pub(super) fn stop_mounts(mounts: &mut Vec<PackMount>, snapshot: &Snapshot) -> Result<()> {
+    while let Some(mounted) = mounts.pop() {
+        let path = mounted.path.clone();
+        if let Err(error) = mounted.stop() {
+            bail!(
+                "Could not unmount {}: {error}. Close it and try again.",
+                game_title(snapshot, &path)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "pack-mount"))]
+pub(super) fn stop_mounts(_mounts: &mut Vec<PackMount>, _snapshot: &Snapshot) -> Result<()> {
+    Ok(())
+}
+
 /// Mounts every recorded install that has no live mount, finishing any
 /// interrupted transaction first. One that fails is marked `Attention` and
 /// the rest still mount. Runs at start and again while mounts are missing.

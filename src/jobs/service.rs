@@ -48,6 +48,38 @@ fn survive<T>(what: &str, result: Result<T>) -> Option<T> {
     }
 }
 
+/// Whether a request from a client of `version` is served. Commands that
+/// let a user recover after an upgrade are served at any version.
+fn version_accepted(version: u32, command: &Command) -> bool {
+    version == VERSION
+        || matches!(
+            command,
+            Command::Restart | Command::Cancel(_) | Command::Pause { .. } | Command::Snapshot
+        )
+}
+
+/// Whether `Restart` may proceed. Refused while a job is active, and while a
+/// process uses the folder of a game running from its store.
+fn restart_allowed(
+    jobs_active: bool,
+    snapshot: &Snapshot,
+    source: &dyn crate::busy::ProcSource,
+) -> Result<()> {
+    ensure!(
+        !jobs_active,
+        "Finish or stop the jobs before restarting the background worker."
+    );
+    for install in &snapshot.packs {
+        if let Some(user) = crate::busy::process_using(&install.game_path, source) {
+            let title = game_title(snapshot, &install.game_path);
+            bail!(
+                "{title} is running from its store ({user}). Close it before restarting the background worker."
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Writes one control line to a worker's stdin and flushes it.
 fn send_control(input: &mut impl Write, control: Control) -> Result<()> {
     serde_json::to_writer(&mut *input, &control)?;
@@ -2076,23 +2108,22 @@ pub(super) fn run() -> Result<()> {
                         inner: &mut stream,
                         until: Instant::now() + Duration::from_secs(2),
                     }))?;
-                    // `Restart` is accepted from any protocol version, so a
-                    // client from another release can replace this process.
                     ensure!(
-                        message.version == VERSION || matches!(&message.command, Command::Restart),
+                        version_accepted(message.version, &message.command),
                         "The background worker is from another version. Restart Flummox."
                     );
                     if matches!(&message.command, Command::Restart) {
-                        ensure!(
-                            active.is_none()
-                                && pack_active.is_none()
-                                && !snapshot.jobs.iter().any(|job| job.phase.active()),
-                            "Finish or stop the jobs before restarting the background worker."
-                        );
-                        ensure!(
-                            snapshot.packs.is_empty(),
-                            "Decompress the games that use Maximum before restarting the background worker."
-                        );
+                        restart_allowed(
+                            active.is_some()
+                                || pack_active.is_some()
+                                || snapshot.jobs.iter().any(|job| job.phase.active()),
+                            &snapshot,
+                            &crate::busy::ProcFs::new(),
+                        )?;
+                        // The next coordinator remounts these through
+                        // `recover_packs`. A store that stays mounted would
+                        // keep serving from the old executable.
+                        stop_mounts(&mut mounts, &snapshot)?;
                         restart = true;
                     }
                     // After these commands the maintenance baseline and the
@@ -2545,6 +2576,85 @@ mod tests {
         fn processes(&self) -> Vec<crate::busy::ProcInfo> {
             self.0.clone()
         }
+    }
+
+    fn mounted_install(folder: &Path) -> crate::pack::Install {
+        crate::pack::Install {
+            game_path: folder.to_path_buf(),
+            store_path: folder.join("store"),
+            writes_path: folder.join("writes"),
+            backup_path: None,
+            previous_store_path: None,
+            previous_writes_path: None,
+            summary: None,
+            phase: crate::pack::InstallPhase::Mounted,
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn restart_waits_for_jobs_and_for_processes_using_a_mounted_game() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let folder = temp.path().join("Portal");
+        std::fs::create_dir(&folder).ctx("game folder")?;
+        let mut snapshot = Snapshot {
+            packs: vec![mounted_install(&folder)],
+            ..Snapshot::default()
+        };
+        let free = FakeProcs(Vec::new());
+        restart_allowed(false, &snapshot, &free)
+            .ctx("a mounted game that nothing uses does not block a restart")?;
+        let player = crate::busy::ProcInfo {
+            pid: 41,
+            name: "portal.bin".into(),
+            exe: Some(folder.join("portal.bin")),
+            ..crate::busy::ProcInfo::default()
+        };
+        let refused = restart_allowed(false, &snapshot, &FakeProcs(vec![player]))
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        check(
+            refused.contains("Portal") && refused.contains("Close"),
+            format!("the refusal names the game and says to close it: {refused}"),
+        )?;
+        let by_job = restart_allowed(true, &snapshot, &free)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        check(
+            by_job.contains("jobs"),
+            format!("an active job refuses the restart: {by_job}"),
+        )?;
+        snapshot.packs.clear();
+        restart_allowed(false, &snapshot, &free).ctx("control: no stores, no jobs")
+    }
+
+    #[test]
+    fn other_versions_may_restart_cancel_pause_and_read_but_not_enqueue() -> TestResult {
+        let other = VERSION.wrapping_add(1);
+        for command in [
+            Command::Restart,
+            Command::Cancel(1),
+            Command::Pause {
+                id: 1,
+                paused: true,
+            },
+            Command::Snapshot,
+        ] {
+            check(
+                version_accepted(other, &command),
+                format!("{command:?} is served at another version"),
+            )?;
+        }
+        check(
+            !version_accepted(other, &Command::Retry(1)),
+            "control: other commands are refused at another version",
+        )?;
+        check(
+            version_accepted(VERSION, &Command::Retry(1)),
+            "control: the current version is served",
+        )
     }
 
     #[test]

@@ -164,9 +164,57 @@ fn managed_pack_remounts_after_coordinator_restart_and_keeps_updates() -> TestRe
         source_volume.identity.clone(),
         "managed mount keeps the underlying library drive identity",
     )?;
+    // A process working in the mounted folder keeps the coordinator running.
+    let mut player = Command::new("sleep")
+        .arg("30")
+        .current_dir(&game)
+        .spawn()
+        .ctx("process in the game folder")?;
+    let refused = request(&home, Request::Restart);
+    let _killed = player.kill();
+    let _waited = player.wait();
     check(
-        request(&home, Request::Restart).is_err(),
-        "restart refuses to interrupt mounted game reads",
+        refused
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.contains("game") && error.contains("Close")),
+        format!("restart names the running game and says to close it: {refused:?}"),
+    )?;
+    check(
+        service.0.try_wait().ctx("coordinator state")?.is_none(),
+        "a refused restart leaves the coordinator running",
+    )?;
+    check_eq(
+        std::fs::read(game.join("data")).ctx("read after refusal")?,
+        b"base".to_vec(),
+        "the store still serves after a refusal",
+    )?;
+    // With nothing using the folder, restart unmounts and exits, and the
+    // next coordinator mounts the store again.
+    request(&home, Request::Restart).ctx("restart with an idle mounted game")?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = service.0.try_wait().ctx("reap restarted coordinator")? {
+            check(status.success(), "restart exits successfully")?;
+            break;
+        }
+        check(Instant::now() < deadline, "coordinator did not exit")?;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    check(
+        std::fs::read_dir(&game)
+            .ctx("unmounted folder")?
+            .next()
+            .is_none(),
+        "the store is unmounted before the coordinator exits",
+    )?;
+    let mut service = start(&home)?;
+    let snapshot = request(&home, Request::Snapshot)?;
+    check_eq(snapshot.packs.len(), 1, "the install is still recorded")?;
+    check_eq(
+        std::fs::read(game.join("data")).ctx("remounted after restart")?,
+        b"base".to_vec(),
+        "the next coordinator mounts the store again",
     )?;
     std::fs::write(game.join("data"), b"launcher update").ctx("mounted update")?;
     service.stop()?;
