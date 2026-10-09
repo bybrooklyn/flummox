@@ -153,6 +153,16 @@ jobs:
           if [ "$PLATFORM" = windows ]; then suffix=.exe; fi
           actual=$("target/$TARGET/release/flummox$suffix" --version)
           test "$actual" = "flummox $VERSION"
+      # The archives and the installer redistribute statically linked crates
+      # whose licences require their notices to travel with the binary.
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-about
+      - name: Generate third-party licence notices
+        run: |
+          cargo about generate --locked --all-features --config packaging/about.toml --output-file THIRD-PARTY-LICENSES.txt packaging/about.hbs
+          test -s THIRD-PARTY-LICENSES.txt
+          grep -q 'zstd' THIRD-PARTY-LICENSES.txt
       - name: Compile Windows installer
         if: matrix.platform == 'windows'
         shell: pwsh
@@ -166,16 +176,6 @@ jobs:
           if (!$compiler) { throw 'ISCC.exe is missing' }
           & $compiler.FullName "/DAppVersion=$env:VERSION" "/DAppNumericVersion=$($env:VERSION.Split('-')[0])" "/DSourceDir=$env:GITHUB_WORKSPACE\target\$env:TARGET\release" packaging/windows/flummox.iss
           if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed' }
-      # The archives redistribute statically linked crates whose licences
-      # require their notices to travel with the binary.
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
-        with:
-          tool: cargo-about
-      - name: Generate third-party licence notices
-        run: |
-          cargo about generate --locked --all-features --config packaging/about.toml --output-file THIRD-PARTY-LICENSES.txt packaging/about.hbs
-          test -s THIRD-PARTY-LICENSES.txt
-          grep -q 'zstd' THIRD-PARTY-LICENSES.txt
       - name: Bundle release files
         env:
           TARGET: ${{ matrix.target }}
