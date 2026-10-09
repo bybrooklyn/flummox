@@ -1294,6 +1294,9 @@ fn a_batch_request_queues_the_valid_items_and_lists_the_refused_ones() -> TestRe
     let item = |game: Game| serde_json::json!([game, "Analyze", options]);
     let mut relative = fixture_game(&first, "relative");
     relative.install_dir = "not/absolute".into();
+    // The raw request below is sent once. `request` waits out the replies a
+    // worker gives while it starts.
+    request(&home, Request::Snapshot).ctx("the worker has started")?;
     let reply = {
         let socket = home.join("state/flummox/desktop/control.sock");
         let until = Instant::now() + Duration::from_secs(5);
