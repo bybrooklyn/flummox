@@ -923,6 +923,26 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                     .align_y(Alignment::Center),
                 );
         }
+        // A game that cannot be compressed has no other Advanced controls, but
+        // its artwork can still be changed.
+        if !item.supported {
+            details = details.push(advanced_toggle(&id, advanced_open));
+            if advanced_open {
+                details = details.push(
+                    row![
+                        secondary_maybe(
+                            "Choose artwork…",
+                            (!state.picker_busy).then(|| Message::Browse(
+                                super::dialog::Target::Artwork(id.clone())
+                            )),
+                        ),
+                        secondary("Use default artwork", Message::ClearArtwork(id.clone())),
+                    ]
+                    .spacing(8)
+                    .wrap(),
+                );
+            }
+        }
         // Advanced: the native preset, then the store controls.
         let preset_id = id.clone();
         if item.native_supported && !stored && advanced_open {
@@ -1116,7 +1136,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
             details = details.push(theme::muted(confidence.clone()));
         }
         // Advanced, continued: reports, exclusion, and what the analysis saw.
-        if advanced_open {
+        if advanced_open && item.supported {
             let mut tools = row![
                 secondary_maybe(
                     if state.qualifying {
