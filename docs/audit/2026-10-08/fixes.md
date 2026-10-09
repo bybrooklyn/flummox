@@ -65,9 +65,9 @@ default if it is the wrong one.
 | Move the release secrets, add a reviewer and a tag rule | GitHub settings, owner only. |
 | Run the Windows compress and decompress pass | Wine has no WOF and, without a display, no drive lookup. 108 of 122 Windows tests pass under Wine. The 14 that fail are listed in the Windows round's report, and one of them was a test defect that is fixed. |
 | Run the Inno Setup script | Needs Windows. |
-| Link or run anything on a Mac | No Mac toolchain. The Mac code is type-checked and linted only. |
-| Run the new CI and release workflow steps | They run on GitHub. They were checked as text and through unit tests of the scripts. |
-| Confirm any fix in the real window | The previews are software renders of fixture state. |
+| Run anything on a Mac, or link the Mac window | The Mac command line binary links with zig and has no undefined symbols. The window needs Apple's frameworks. Nothing can be run. |
+| Run the new CI and release workflow steps | They run on GitHub. `actionlint` reports nothing for them, and the scripts they call have unit tests. |
+| Confirm the Windows and Mac window on screen | The Linux window was run in a headless session with fixture games: see `docs/validation/2026-10-08-audit-live-window.md`. The other window cannot be drawn here. |
 
 ## Fixed in the first round
 
