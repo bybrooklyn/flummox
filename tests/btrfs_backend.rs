@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use flummox::backend::btrfs::{BtrfsBackend, compress_fd, compressed_bytes};
+use flummox::backend::btrfs::{BtrfsBackend, compress_fd, compressed_bytes, is_nocow};
 use flummox::backend::{Backend, BusyCheck, CompressOpts, JobCtx, NullSink, Outcome};
 use flummox::fsprobe;
 use flummox::inventory::{WalkOpts, walk};
@@ -141,6 +141,15 @@ fn a_no_cow_file_is_skipped_not_recorded() -> TestResult {
     check(status.success(), "chattr +C succeeds")?;
     std::fs::write(&nocow, text(32 * 1024)).ctx("fill the no-cow file")?;
     std::fs::write(tmp.path().join("plain.dat"), text(32 * 1024)).ctx("plain fixture")?;
+    check(
+        is_nocow(&std::fs::File::open(&nocow).ctx("open no-cow")?).ctx("read no-cow flag")?,
+        "is_nocow reports the attribute",
+    )?;
+    check(
+        !is_nocow(&std::fs::File::open(tmp.path().join("plain.dat")).ctx("open plain")?)
+            .ctx("read plain flag")?,
+        "control: is_nocow is false for an ordinary file",
+    )?;
     let outcome = compress_dir(tmp.path(), None)?;
     check_eq(
         completed_names(&outcome),

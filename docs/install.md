@@ -170,7 +170,7 @@ flummox jobs add-folder '/mnt/games/One Game' --single-game
 flummox jobs remove-folder '~/My Games'
 ```
 
-The development background worker protocol is version 8. An older idle worker
+The development background worker protocol is version 9. An older idle worker
 is [replaced automatically](#upgrade-a-running-installation).
 
 ## Verify release signatures

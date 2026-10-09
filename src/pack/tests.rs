@@ -299,7 +299,7 @@ fn shared_small_file_frames_round_trip_and_reject_bad_ranges() -> TestResult {
         #[cfg(feature = "pack-mount")]
         {
             let updates = temp.path().join(format!("updates-{version}"));
-            let mut overlay = overlay::Overlay::open(&updates).ctx("update layer")?;
+            let mut overlay = overlay::Overlay::open(&updates, None).ctx("update layer")?;
             let upper = overlay
                 .copy_up(&reader, Path::new("part-00.dat"))
                 .ctx("copy up shared file")?;
@@ -913,7 +913,7 @@ fn a_recreated_or_replaced_folder_shows_only_its_own_files() -> TestResult {
     let store = temp.path().join("game.flumpack");
     create(&source, &store, Options::default(), &AtomicBool::new(false)).ctx("create")?;
     let reader = Reader::open(&store).ctx("reader")?;
-    let mut overlay = overlay::Overlay::open(&temp.path().join("updates")).ctx("layer")?;
+    let mut overlay = overlay::Overlay::open(&temp.path().join("updates"), None).ctx("layer")?;
     let names = |overlay: &overlay::Overlay, folder: &str| -> Result<Vec<String>, String> {
         Ok(overlay
             .children(&reader, Path::new(folder))
@@ -956,7 +956,7 @@ fn a_recreated_or_replaced_folder_shows_only_its_own_files() -> TestResult {
     // child execs, so the layer can look held for an instant.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let reopened = loop {
-        match overlay::Overlay::open(&temp.path().join("updates")) {
+        match overlay::Overlay::open(&temp.path().join("updates"), None) {
             Ok(layer) => break layer,
             Err(error) => check(
                 std::time::Instant::now() < deadline,

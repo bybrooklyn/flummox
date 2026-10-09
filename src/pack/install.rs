@@ -367,7 +367,7 @@ mod enabled {
                 "The original game folder is missing"
             );
             std::fs::rename(&install.game_path, backup)
-                .context("Moving the original game to its rollback path")?;
+                .context("Moving the original game aside")?;
         }
         if !install.game_path.exists() {
             std::fs::DirBuilder::new()
@@ -478,10 +478,10 @@ mod enabled {
             ensure!(
                 *backup == backup_for(&install.game_path)?
                     && std::fs::symlink_metadata(backup)?.is_dir(),
-                "{} is not this game's retained original, so it was left alone",
+                "{} is not this game's kept original, so it was left alone",
                 backup.display()
             );
-            std::fs::remove_dir_all(backup).context("Removing the rollback copy")?;
+            std::fs::remove_dir_all(backup).context("Removing the kept original")?;
         }
         install.backup_path = None;
         install.phase = InstallPhase::Mounted;
@@ -624,7 +624,11 @@ mod enabled {
             .as_ref()
             .filter(|_| install.previous_store_path.is_none());
         if let Some(backup) = current_backup {
-            crate::pack::overlay::Overlay::open(&install.writes_path)?.apply_to(backup)?;
+            // A store that cannot be read must not block putting the original
+            // back, so the layer then opens without it.
+            let store = Reader::open(&install.store_path).ok();
+            crate::pack::overlay::Overlay::open(&install.writes_path, store.as_ref())?
+                .apply_to(backup)?;
             return publish(backup);
         }
         // No current original: rebuild in a sibling staging folder, apply the
@@ -638,7 +642,9 @@ mod enabled {
             .tempdir_in(parent)?;
         let restored = staging.path().join("game");
         crate::pack::restore(&install.store_path, &restored, cancel)?;
-        crate::pack::overlay::Overlay::open(&install.writes_path)?.apply_to(&restored)?;
+        let store = Reader::open(&install.store_path)?;
+        crate::pack::overlay::Overlay::open(&install.writes_path, Some(&store))?
+            .apply_to(&restored)?;
         // The restored folder already carries the mode the store recorded.
         publish(&restored)
     }

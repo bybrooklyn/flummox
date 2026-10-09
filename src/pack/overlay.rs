@@ -57,7 +57,10 @@ impl Overlay {
 
     /// Opens or creates a layer and takes its lock, failing if another mount
     /// or commit holds it. A new layer is created only in an empty folder.
-    pub fn open(path: &Path) -> Result<Self> {
+    /// `store` is the store the layer was written over. With it, a whiteout
+    /// dropped because its upper folder exists gets whiteouts over the store
+    /// children it hid.
+    pub fn open(path: &Path, store: Option<&Reader>) -> Result<Self> {
         if !path.exists() {
             std::fs::create_dir(path)?;
         }
@@ -120,16 +123,16 @@ impl Overlay {
             ensure!(safe_path(&path), "Unsafe path in update journal");
             deleted.insert(path);
         }
-        // A whiteout whose path exists in the upper tree is dropped. That
-        // pair is what a crash leaves between an upper change and the journal
-        // write that follows it, and the upper entry is taken as current.
-        deleted.retain(|path| std::fs::symlink_metadata(files.join(path)).is_err());
-        let overlay = Self {
+        let mut overlay = Self {
             root,
             files,
             deleted,
             _owner: owner,
         };
+        // A whiteout whose path exists in the upper tree is dropped. That
+        // pair is what a crash leaves between an upper change and the journal
+        // write that follows it, and the upper entry is taken as current.
+        overlay.drop_stale(store);
         overlay.persist()?;
         Ok(overlay)
     }
@@ -706,6 +709,28 @@ impl Overlay {
         Ok(())
     }
 
+    // Drops every whiteout that has an upper entry. The store children of a
+    // dropped folder get whiteouts, which are checked in turn.
+    fn drop_stale(&mut self, store: Option<&Reader>) {
+        loop {
+            let stale: Vec<PathBuf> = self
+                .deleted
+                .iter()
+                .filter(|hidden| std::fs::symlink_metadata(self.files.join(hidden)).is_ok())
+                .cloned()
+                .collect();
+            if stale.is_empty() {
+                return;
+            }
+            for hidden in stale {
+                self.deleted.remove(&hidden);
+                if let Some(store) = store {
+                    self.hide_children(store, &hidden);
+                }
+            }
+        }
+    }
+
     /// Makes `path` visible again after something was created or moved there.
     /// Store children the old whiteout hid get whiteouts of their own. A
     /// whiteout below `path` that now has an upper entry is dropped and
@@ -783,7 +808,8 @@ pub(super) fn commit(
     options: super::Options,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<super::Summary> {
-    let overlay = Overlay::open(writes)?;
+    let reader = Reader::open(store)?;
+    let overlay = Overlay::open(writes, Some(&reader))?;
     let temporary = match scratch {
         Some(path) => tempfile::tempdir_in(path)?,
         None => tempfile::tempdir()?,
@@ -838,7 +864,7 @@ mod tests {
         symlink("../outside", game.join("l")).ctx("destination symlink")?;
         // The layer a game leaves after replacing that link with a folder.
         let layer = temp.path().join("layer");
-        drop(Overlay::open(&layer).ctx("new layer")?);
+        drop(Overlay::open(&layer, None).ctx("new layer")?);
         std::fs::create_dir(layer.join(FILES).join("l")).ctx("layer folder")?;
         std::fs::write(layer.join(FILES).join("l/x"), b"planted").ctx("layer file")?;
 
@@ -846,7 +872,7 @@ mod tests {
         // execs, so the layer can look held for an instant after the drop.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let reopened = loop {
-            match Overlay::open(&layer) {
+            match Overlay::open(&layer, None) {
                 Ok(reopened) => break reopened,
                 Err(error) => check(
                     std::time::Instant::now() < deadline,
@@ -877,9 +903,13 @@ mod tests {
     // A layer is reopened after another handle drops it. Another test forking
     // a child shares the lock until that child execs.
     fn reopen(layer: &Path) -> Result<Overlay, String> {
+        reopen_over(layer, None)
+    }
+
+    fn reopen_over(layer: &Path, store: Option<&Reader>) -> Result<Overlay, String> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            match Overlay::open(layer) {
+            match Overlay::open(layer, store) {
                 Ok(reopened) => return Ok(reopened),
                 Err(error) => check(
                     std::time::Instant::now() < deadline,
@@ -912,7 +942,7 @@ mod tests {
     fn a_folder_moved_onto_a_removed_subfolder_does_not_bring_back_store_files() -> TestResult {
         let temp = tempfile::tempdir().ctx("fixture")?;
         let reader = store_from(temp.path(), &["data/sub/deep.bin"])?;
-        let mut overlay = Overlay::open(&temp.path().join("layer")).ctx("layer")?;
+        let mut overlay = Overlay::open(&temp.path().join("layer"), None).ctx("layer")?;
         overlay
             .rename(
                 &reader,
@@ -959,10 +989,61 @@ mod tests {
     }
 
     #[test]
+    fn a_crash_between_mkdir_and_the_journal_keeps_store_children_hidden() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let reader = store_from(temp.path(), &["data/sub/deep.bin", "data/sub/inner/x.bin"])?;
+        let layer = temp.path().join("layer");
+        let mut overlay = Overlay::open(&layer, None).ctx("layer")?;
+        overlay
+            .rename(
+                &reader,
+                Path::new("data/sub"),
+                Path::new("elsewhere"),
+                false,
+            )
+            .ctx("move the store folder away")?;
+        drop(overlay);
+        // The state a crash leaves: the folder was created in the upper tree
+        // but the journal still holds only the whiteout over the folder.
+        std::fs::create_dir_all(layer.join(FILES).join("data/sub")).ctx("upper folder")?;
+        let without_store = reopen_over(&layer, None)?;
+        check(
+            without_store.visible(&reader, Path::new("data/sub/deep.bin")),
+            "control: opened without the store, the stale file reappears",
+        )?;
+        drop(without_store);
+        // Put the crash state back, since the open above rewrote the journal.
+        let mut again = reopen_over(&layer, Some(&reader))?;
+        again.deleted.insert(PathBuf::from("data/sub"));
+        again.persist().ctx("journal")?;
+        drop(again);
+        let reopened = reopen_over(&layer, Some(&reader))?;
+        for stale in ["data/sub/deep.bin", "data/sub/inner", "data/sub/inner/x.bin"] {
+            check(
+                !reopened.visible(&reader, Path::new(stale)),
+                format!("{stale} stays hidden after the crash"),
+            )?;
+        }
+        check_eq(
+            reopened
+                .children(&reader, Path::new("data/sub"))
+                .ctx("listing")?,
+            Vec::<PathBuf>::new(),
+            "the recreated folder is empty",
+        )?;
+        drop(reopened);
+        let third = reopen_over(&layer, Some(&reader))?;
+        check(
+            !third.visible(&reader, Path::new("data/sub/deep.bin")),
+            "the repaired journal keeps them hidden on the next open",
+        )
+    }
+
+    #[test]
     fn stale_trash_is_emptied_when_a_layer_opens() -> TestResult {
         let temp = tempfile::tempdir().ctx("fixture")?;
         let layer = temp.path().join("layer");
-        drop(Overlay::open(&layer).ctx("new layer")?);
+        drop(Overlay::open(&layer, None).ctx("new layer")?);
         let stale = layer.join(TRASH).join("removed-left-behind");
         std::fs::create_dir(&stale).ctx("stale folder")?;
         std::fs::write(stale.join("entry"), b"half deleted").ctx("stale entry")?;
@@ -981,7 +1062,7 @@ mod tests {
         let temp = tempfile::tempdir().ctx("fixture")?;
         let reader = store_from(temp.path(), &["a", "dir/b"])?;
         let layer = temp.path().join("layer");
-        let mut overlay = Overlay::open(&layer).ctx("layer")?;
+        let mut overlay = Overlay::open(&layer, None).ctx("layer")?;
         // A copy-up that died after staging leaves its temporary file here.
         let stale = layer.join(STAGING).join(".tmpleftover");
         std::fs::write(&stale, b"partial").ctx("stale staging file")?;
@@ -1005,7 +1086,7 @@ mod tests {
     #[test]
     fn applying_whiteouts_skips_a_path_whose_parent_became_a_file() -> TestResult {
         let temp = tempfile::tempdir().ctx("fixture")?;
-        let mut overlay = Overlay::open(&temp.path().join("layer")).ctx("layer")?;
+        let mut overlay = Overlay::open(&temp.path().join("layer"), None).ctx("layer")?;
         overlay.deleted.insert(PathBuf::from("D/a"));
         overlay.persist().ctx("journal")?;
         let destination = temp.path().join("dest");
@@ -1054,7 +1135,7 @@ mod tests {
         let outcome = (|| -> TestResult {
             created.ctx("store")?;
             let reader = Reader::open(&store).ctx("reader")?;
-            let mut overlay = Overlay::open(&layer).ctx("layer")?;
+            let mut overlay = Overlay::open(&layer, None).ctx("layer")?;
             for path in ["ro", "rd"] {
                 let upper = overlay.copy_up(&reader, Path::new(path)).ctx("copy up")?;
                 check_eq(

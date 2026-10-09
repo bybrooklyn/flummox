@@ -45,6 +45,19 @@ fn start(home: &Path) -> Result<Service, String> {
 }
 
 fn request(home: &Path, command: Request) -> Result<Snapshot, String> {
+    // A coordinator still remounting stores answers that it is starting.
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        match request_once(home, &command) {
+            Err(error) if error.contains("is starting") && Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            other => return other,
+        }
+    }
+}
+
+fn request_once(home: &Path, command: &Request) -> Result<Snapshot, String> {
     let socket = home.join("state/flummox/desktop/control.sock");
     let until = Instant::now() + Duration::from_secs(5);
     let mut stream = loop {
@@ -164,9 +177,57 @@ fn managed_pack_remounts_after_coordinator_restart_and_keeps_updates() -> TestRe
         source_volume.identity.clone(),
         "managed mount keeps the underlying library drive identity",
     )?;
+    // A process working in the mounted folder keeps the coordinator running.
+    let mut player = Command::new("sleep")
+        .arg("30")
+        .current_dir(&game)
+        .spawn()
+        .ctx("process in the game folder")?;
+    let refused = request(&home, Request::Restart);
+    let _killed = player.kill();
+    let _waited = player.wait();
     check(
-        request(&home, Request::Restart).is_err(),
-        "restart refuses to interrupt mounted game reads",
+        refused
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.contains("game") && error.contains("Close")),
+        format!("restart names the running game and says to close it: {refused:?}"),
+    )?;
+    check(
+        service.0.try_wait().ctx("coordinator state")?.is_none(),
+        "a refused restart leaves the coordinator running",
+    )?;
+    check_eq(
+        std::fs::read(game.join("data")).ctx("read after refusal")?,
+        b"base".to_vec(),
+        "the store still serves after a refusal",
+    )?;
+    // With nothing using the folder, restart unmounts and exits, and the
+    // next coordinator mounts the store again.
+    request(&home, Request::Restart).ctx("restart with an idle mounted game")?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = service.0.try_wait().ctx("reap restarted coordinator")? {
+            check(status.success(), "restart exits successfully")?;
+            break;
+        }
+        check(Instant::now() < deadline, "coordinator did not exit")?;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    check(
+        std::fs::read_dir(&game)
+            .ctx("unmounted folder")?
+            .next()
+            .is_none(),
+        "the store is unmounted before the coordinator exits",
+    )?;
+    let mut service = start(&home)?;
+    let snapshot = request(&home, Request::Snapshot)?;
+    check_eq(snapshot.packs.len(), 1, "the install is still recorded")?;
+    check_eq(
+        std::fs::read(game.join("data")).ctx("remounted after restart")?,
+        b"base".to_vec(),
+        "the next coordinator mounts the store again",
     )?;
     std::fs::write(game.join("data"), b"launcher update").ctx("mounted update")?;
     service.stop()?;
@@ -1216,6 +1277,131 @@ fn an_older_idle_coordinator_is_replaced_and_a_newer_one_is_left_alone() -> Test
     check(
         String::from_utf8_lossy(&output.stderr).contains("newer Flummox"),
         format!("the error names the cause: {:?}", output),
+    )
+}
+
+#[test]
+fn a_batch_request_queues_the_valid_items_and_lists_the_refused_ones() -> TestResult {
+    let temp = tempfile::tempdir().ctx("fixture")?;
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).ctx("home")?;
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    std::fs::create_dir(&first).ctx("first game")?;
+    std::fs::create_dir(&second).ctx("second game")?;
+    let _service = start(&home)?;
+    let options = serde_json::to_value(flummox::backend::CompressOpts::default()).ctx("options")?;
+    let item = |game: Game| serde_json::json!([game, "Analyze", options]);
+    let mut relative = fixture_game(&first, "relative");
+    relative.install_dir = "not/absolute".into();
+    let reply = {
+        let socket = home.join("state/flummox/desktop/control.sock");
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            if let Ok(stream) = UnixStream::connect(&socket) {
+                break stream;
+            }
+            check(Instant::now() < until, "coordinator did not listen")?;
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .ctx("timeout")?;
+        serde_json::to_writer(
+            &mut stream,
+            &serde_json::json!({
+                "version": flummox::jobs::VERSION,
+                "command": {"EnqueueMany": {"items": [
+                    item(fixture_game(&first, "first")),
+                    item(relative),
+                    item(fixture_game(&second, "second")),
+                ]}}
+            }),
+        )
+        .ctx("request")?;
+        stream.write_all(b"\n").ctx("delimiter")?;
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).ctx("reply")?;
+        serde_json::from_str::<serde_json::Value>(&line).ctx("reply JSON")?
+    };
+    check(
+        reply.get("error").is_some_and(serde_json::Value::is_null),
+        format!("the batch itself succeeds: {reply}"),
+    )?;
+    let refused = reply.get("refused").and_then(serde_json::Value::as_array);
+    check_eq(refused.map(Vec::len), Some(1), "one item is refused")?;
+    check_eq(
+        refused
+            .and_then(|list| list.first())
+            .and_then(|item| item.get("title"))
+            .and_then(serde_json::Value::as_str),
+        Some("relative"),
+        "the refusal names the game",
+    )?;
+    let snapshot = request(&home, Request::Snapshot)?;
+    let mut titles: Vec<_> = snapshot
+        .jobs
+        .iter()
+        .map(|job| job.game.title.clone())
+        .collect();
+    titles.sort();
+    check_eq(
+        titles,
+        vec!["first".to_string(), "second".to_string()],
+        "both valid items are queued around the refused one",
+    )
+}
+
+#[test]
+fn a_client_retries_while_the_coordinator_is_starting() -> TestResult {
+    let temp = tempfile::tempdir().ctx("fixture")?;
+    let home = temp.path().join("home");
+    let dir = home.join("state/flummox/desktop");
+    std::fs::create_dir_all(&dir).ctx("state folder")?;
+    let listener = std::os::unix::net::UnixListener::bind(dir.join("control.sock")).ctx("bind")?;
+    let snapshot = serde_json::to_value(Snapshot::default()).ctx("snapshot")?;
+    let server = std::thread::spawn(move || -> Result<usize, String> {
+        let mut starting = 0;
+        loop {
+            let (mut stream, _) = listener.accept().ctx("accept")?;
+            let mut line = String::new();
+            BufReader::new(&stream)
+                .read_line(&mut line)
+                .ctx("request")?;
+            // Two replies that say the worker is starting, then a real one.
+            let reply = if starting < 2 {
+                starting += 1;
+                serde_json::json!({
+                    "version": flummox::jobs::VERSION,
+                    "snapshot": null,
+                    "error": "The background worker is starting…",
+                })
+            } else {
+                serde_json::json!({
+                    "version": flummox::jobs::VERSION,
+                    "snapshot": snapshot,
+                    "error": null,
+                })
+            };
+            serde_json::to_writer(&mut stream, &reply).ctx("reply")?;
+            stream.write_all(b"\n").ctx("newline")?;
+            if starting >= 2 {
+                return Ok(starting);
+            }
+        }
+    });
+    let output = jobs_command(&home, &["--json", "jobs"])?;
+    check(
+        output.status.success(),
+        format!(
+            "the command waits out the start-up replies: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )?;
+    check_eq(
+        server.join().map_err(|_| "server thread")??,
+        2,
+        "the client asked again after each reply that said the worker was starting",
     )
 }
 

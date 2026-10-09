@@ -62,16 +62,48 @@ pub fn request(command: Command) -> Result<Snapshot> {
     exchange(command, true)
 }
 
+/// Queues many jobs in one request. Returns the coordinator's state and the
+/// items it refused, each with its game's title and the reason. Items that
+/// pass are queued even when others are refused.
+pub fn request_many(
+    items: Vec<(Game, Operation, CompressOpts)>,
+) -> Result<(Snapshot, Vec<Refusal>)> {
+    exchange_full(Command::EnqueueMany { items }, true)
+}
+
 /// Sends one command and returns the coordinator's state after it.
 /// `may_replace` permits one restart of a coordinator from an older version.
 pub(super) fn exchange(command: Command, may_replace: bool) -> Result<Snapshot> {
+    exchange_full(command, may_replace).map(|(snapshot, _)| snapshot)
+}
+
+/// How long a client waits for a coordinator to start answering.
+const STARTUP_WAIT: Duration = Duration::from_secs(5);
+
+/// [`exchange`] that also returns the items of a batch the coordinator refused.
+/// A coordinator that is still remounting stores answers [`STARTING`], and
+/// the request is sent again until [`STARTUP_WAIT`] has passed.
+fn exchange_full(command: Command, may_replace: bool) -> Result<(Snapshot, Vec<Refusal>)> {
+    let began = Instant::now();
+    loop {
+        match exchange_once(command.clone(), may_replace) {
+            Err(error) if error.to_string() == STARTING && began.elapsed() < STARTUP_WAIT => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// One attempt of [`exchange_full`].
+fn exchange_once(command: Command, may_replace: bool) -> Result<(Snapshot, Vec<Refusal>)> {
     let restarting = matches!(&command, Command::Restart);
     let dir = state_dir()?;
     let socket = dir.join("control.sock");
     let mut stream = match UnixStream::connect(&socket) {
         Ok(stream) => stream,
         // Nothing is listening. Start a coordinator in its own process group,
-        // so it outlives this client, and wait up to 5 seconds for its socket.
+        // so it outlives this client, and wait up to `STARTUP_WAIT` for its socket.
         Err(_) => {
             std::process::Command::new(binary()?)
                 .arg("__coordinator")
@@ -91,7 +123,7 @@ pub(super) fn exchange(command: Command, may_replace: bool) -> Result<Snapshot> 
                     break stream;
                 }
                 ensure!(
-                    started.elapsed() < Duration::from_secs(5),
+                    started.elapsed() < STARTUP_WAIT,
                     "The background worker did not start. See service.log in Flummox's state folder."
                 );
                 std::thread::sleep(Duration::from_millis(50));
@@ -139,7 +171,7 @@ pub(super) fn exchange(command: Command, may_replace: bool) -> Result<Snapshot> 
         exchange(Command::Restart, false).context(
             "The background worker belongs to an older Flummox and could not be replaced",
         )?;
-        return exchange(command, false);
+        return exchange_full(command, false);
     }
     if let Some(error) = response.get("error").and_then(serde_json::Value::as_str) {
         bail!("{error}");
@@ -155,7 +187,7 @@ pub(super) fn exchange(command: Command, may_replace: bool) -> Result<Snapshot> 
         loop {
             if owner.try_lock().is_ok() {
                 drop(owner);
-                return request(Command::Snapshot);
+                return request(Command::Snapshot).map(|snapshot| (snapshot, Vec::new()));
             }
             ensure!(
                 started.elapsed() < Duration::from_secs(5),
@@ -164,13 +196,20 @@ pub(super) fn exchange(command: Command, may_replace: bool) -> Result<Snapshot> 
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-    serde_json::from_value(
+    let refused: Vec<Refusal> = response
+        .get("refused")
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()
+        .context("Invalid list of refused jobs")?
+        .unwrap_or_default();
+    let snapshot = serde_json::from_value(
         response
             .get("snapshot")
             .context("The worker returned no state")?
             .clone(),
     )
-    .context("Invalid worker state")
+    .context("Invalid worker state")?;
+    Ok((snapshot, refused))
 }
 
 /// Reads one newline-terminated JSON message of at most [`LIMIT`] bytes.

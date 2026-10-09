@@ -256,7 +256,10 @@ impl StoreFs {
     ) -> Result<Self> {
         let reader = Reader::open(store)?;
         let nodes = Mutex::new(Nodes::new(reader.entries()));
-        let overlay = writes.map(Overlay::open).transpose()?.map(Mutex::new);
+        let overlay = writes
+            .map(|path| Overlay::open(path, Some(&reader)))
+            .transpose()?
+            .map(Mutex::new);
         Ok(Self {
             reader,
             overlay,

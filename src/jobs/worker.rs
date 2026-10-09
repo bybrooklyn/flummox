@@ -133,6 +133,12 @@ fn execute(work: Work, input: BufReader<std::io::Stdin>, output: &Output) -> Res
         output.send(WorkerEvent::SpacePlan(plan.clone()));
         plan.recheck()?;
     }
+    // Before the property, the receipts or the history change, learn whether
+    // this kernel can undo compression at all.
+    if job.operation == Operation::Decompress && matches!(kind, crate::fsprobe::BackendKind::Btrfs)
+    {
+        crate::backend::btrfs::probe_decompress(&path, &super::state_dir()?)?;
+    }
     let mut db = Db::open(&Db::default_path().context("Cannot locate state database")?)?;
     for id in job.game.ids() {
         ensure!(

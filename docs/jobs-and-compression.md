@@ -141,11 +141,13 @@ btrfs announce a skip on other filesystems.
 ## Updating the coordinator
 
 Settings exposes **Restart worker** under Background worker; the CLI equivalent is `flummox jobs restart`.
-The coordinator refuses to exit while jobs are active or games still use
-Maximum. It removes its socket on a successful idle restart; the requesting
-client waits for ownership to be released and starts the installed executable.
-Settings and completed queue history remain in SQLite. The restart request is
-accepted across protocol versions so future updates can replace an idle worker.
-Workers predating restart support require a logout/login after jobs finish and
-games using Maximum are decompressed. A mismatched client checks the response version
+The coordinator refuses to exit while jobs are active or a process is using the
+folder of a game that runs from its store; the refusal names the game. With
+those clear it unmounts each store, removes its socket and exits, and the next
+coordinator mounts the stores again. The requesting client waits for ownership
+to be released and starts the installed executable. Settings and completed
+queue history remain in SQLite. Restart, Cancel, Pause and Snapshot are
+accepted across protocol versions so an upgrade never leaves a job that cannot
+be stopped. Workers predating protocol version 9 refuse a restart while games
+use Maximum, so decompress those games first. A mismatched client checks the response version
 before decoding the snapshot and cannot submit work under the wrong protocol.

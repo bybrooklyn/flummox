@@ -715,7 +715,7 @@ pub fn create_observed(
     space.add(
         crate::storage::volume(&parent)?,
         crate::storage::pack_bound(&crate::storage::inventory(&root)?)?,
-        "Verified store; source retained",
+        "The store; the original is kept",
     )?;
     space.recheck()?;
     ensure!(
@@ -767,9 +767,9 @@ pub fn create_observed(
     // compare a fresh source snapshot, publish without replacement, then
     // sync the parent. An earlier failure drops the staged file.
     let reader = Reader::from_file(staged.reopen()?)?;
-    observer.started(0, 0, "Verifying stored bytes");
+    observer.started(0, 0, "Verifying the store…");
     reader.verify_observed(cancel, observer)?;
-    observer.started(0, 0, "Checking source files before publication");
+    observer.started(0, 0, "Checking the source files…");
     observer.checkpoint()?;
     ensure!(
         snapshot(&root, cancel)? == sources,
@@ -945,7 +945,7 @@ pub fn create_shared_observed(
     space.add(
         crate::storage::volume(&parent)?,
         crate::storage::pack_bound(&crate::storage::inventory(&root)?)?,
-        "Verified store; source retained",
+        "The store; the original is kept",
     )?;
     space.recheck()?;
     ensure!(
@@ -1009,9 +1009,9 @@ pub fn create_shared_observed(
     File::open(&chunks_path)?.sync_all()?;
     File::open(staged.path())?.sync_all()?;
     let reader = Reader::open(staged.path())?;
-    observer.started(0, 0, "Verifying stored bytes");
+    observer.started(0, 0, "Verifying the store…");
     reader.verify_observed(cancel, observer)?;
-    observer.started(0, 0, "Checking source files before publication");
+    observer.started(0, 0, "Checking the source files…");
     observer.checkpoint()?;
     ensure!(
         snapshot(&root, cancel)? == sources,

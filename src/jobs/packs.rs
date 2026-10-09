@@ -253,10 +253,10 @@ pub(super) fn compact_path(path: &Path, identity: &Path, label: &str) -> Result<
         match std::fs::symlink_metadata(&candidate) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
-            Err(error) => return Err(error).context("Checking the compaction destination"),
+            Err(error) => return Err(error).context("Checking the destination for the new store"),
         }
     }
-    bail!("Could not reserve a path for the compacted install")
+    bail!("Could not reserve a path for the new store")
 }
 
 /// Deletes a store, whether it is a directory or a single file.
@@ -348,9 +348,9 @@ pub(super) fn pack_compact_observed(
     } else {
         crate::pack::create_observed(&canonical, &new_store, options, &control.cancel, control)
     }
-    .context("Building the compacted store from the live install")?;
+    .context("Building the new store from the live install")?;
     if let Err(error) = control
-        .transaction("Switching to the new store. This step finishes before the job can stop.")
+        .transaction("Switching to the new store… This step finishes before the job can stop.")
     {
         let _removed = remove_store(&new_store);
         return Err(error);
@@ -407,7 +407,7 @@ pub(super) fn pack_compact_observed(
         .packs
         .get_mut(position)
         .context("Flummox has no record of this game using Maximum.")?;
-    let mounted = crate::pack::recover(install)?.context("The compacted store did not remount")?;
+    let mounted = crate::pack::recover(install)?.context("The new store did not remount")?;
     mounts.push(mounted);
     refresh_pack_summaries(snapshot);
     save_packs(db, snapshot)
@@ -464,6 +464,42 @@ pub(super) fn pack_prune(
     _game_path: &Path,
 ) -> Result<()> {
     bail!("This build of Flummox cannot delete the previous version of a game that uses Maximum.")
+}
+
+/// The title of the game at `path`, or its folder name when discovery has
+/// not listed it.
+pub(super) fn game_title(snapshot: &Snapshot, path: &Path) -> String {
+    snapshot
+        .discovered
+        .iter()
+        .find(|game| game.install_dir == path)
+        .map(|game| game.title.clone())
+        .or_else(|| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Unmounts every store this coordinator serves, one at a time. On the first
+/// failure the rest stay mounted and the error names the game.
+#[cfg(feature = "pack-mount")]
+pub(super) fn stop_mounts(mounts: &mut Vec<PackMount>, snapshot: &Snapshot) -> Result<()> {
+    while let Some(mounted) = mounts.pop() {
+        let path = mounted.path.clone();
+        if let Err(error) = mounted.stop() {
+            bail!(
+                "Could not unmount {}: {error}. Close it and try again.",
+                game_title(snapshot, &path)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "pack-mount"))]
+pub(super) fn stop_mounts(_mounts: &mut Vec<PackMount>, _snapshot: &Snapshot) -> Result<()> {
+    Ok(())
 }
 
 /// Mounts every recorded install that has no live mount, finishing any

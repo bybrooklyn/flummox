@@ -80,7 +80,7 @@ Settings > Locations supports both a collection of immediate game subfolders and
 one individual game. Home shortcuts and escaped spaces are accepted. Tests cover
 legacy registrations, collection discovery, hidden/symlink filtering, overlapping
 locations, persistent registration, and removal without deleting game files.
-The background worker protocol is version 8. A version 8 client asks an older idle
+The background worker protocol is version 9. A version 9 client asks an older idle
 worker to restart and takes over; the restart command exists from
 version 6, which is what 0.0.1 shipped.
 

@@ -107,18 +107,18 @@ pub fn verify_restored(
         .tempdir_in(parent)?;
     let expected = staging.path().join("expected");
     super::restore(&install.store_path, &expected, cancel)?;
-    super::overlay::Overlay::open(&install.writes_path)?.apply_to(&expected)?;
+    super::overlay::Overlay::open(&install.writes_path, Some(&reader))?.apply_to(&expected)?;
     // Two comparisons: a hash over every regular file's path, size and
     // bytes, then the mode, link target, xattrs and hard links of every path.
     let expected_bytes = crate::compatibility::corpus(&expected, cancel, observer)?;
     let actual_bytes = crate::compatibility::corpus(&install.game_path, cancel, observer)?;
     ensure!(
         expected_bytes == actual_bytes,
-        "Ordinary files differ from the retained store and updates; all copies retained"
+        "Ordinary files differ from the store and updates; every copy is kept"
     );
     ensure!(
         metadata(&expected, observer)? == metadata(&install.game_path, observer)?,
-        "Ordinary metadata differs from the retained store and updates; all copies retained"
+        "Ordinary metadata differs from the store and updates; every copy is kept"
     );
     Ok(())
 }
@@ -141,7 +141,7 @@ mod tests {
         let restored = fixture.path().join("restored");
         super::super::restore(&store, &restored, &cancel).ctx("restore")?;
         let writes = fixture.path().join("writes");
-        let overlay = super::super::overlay::Overlay::open(&writes).ctx("updates")?;
+        let overlay = super::super::overlay::Overlay::open(&writes, None).ctx("updates")?;
         drop(overlay);
         let install = Install {
             game_path: restored.clone(),

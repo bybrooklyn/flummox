@@ -48,6 +48,125 @@ fn survive<T>(what: &str, result: Result<T>) -> Option<T> {
     }
 }
 
+/// Whether a request from a client of `version` is served. Commands that
+/// let a user recover after an upgrade are served at any version.
+fn version_accepted(version: u32, command: &Command) -> bool {
+    version == VERSION
+        || matches!(
+            command,
+            Command::Restart | Command::Cancel(_) | Command::Pause { .. } | Command::Snapshot
+        )
+}
+
+/// Whether `Restart` may proceed. Refused while a job is active, and while a
+/// process uses the folder of a game running from its store.
+fn restart_allowed(
+    jobs_active: bool,
+    snapshot: &Snapshot,
+    source: &dyn crate::busy::ProcSource,
+) -> Result<()> {
+    ensure!(
+        !jobs_active,
+        "Finish or stop the jobs before restarting the background worker."
+    );
+    for install in &snapshot.packs {
+        if let Some(user) = crate::busy::process_using(&install.game_path, source) {
+            let title = game_title(snapshot, &install.game_path);
+            bail!(
+                "{title} is running from its store ({user}). Close it before restarting the background worker."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Runs `apply` and mirrors the exclusion into the history database in the
+/// same step, so the two agree whether either fails. The history write comes
+/// first; an `apply` that then fails puts the history entry back.
+fn mirror_exclusion(
+    history: &crate::db::Db,
+    id: &crate::model::GameId,
+    title: &str,
+    excluded: bool,
+    apply: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let before = history.is_excluded(id)?;
+    if excluded {
+        history.exclude(id, title)?;
+    } else {
+        history.unexclude(id)?;
+    }
+    if let Err(error) = apply() {
+        let restored = if before {
+            history.exclude(id, title)
+        } else {
+            history.unexclude(id).map(|_| ())
+        };
+        survive("restoring the exclusion history", restored.map_err(Into::into));
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Answers clients that connect while start-up recovery holds the main
+/// thread, so they get [`STARTING`] at once instead of a timeout.
+struct StartupReplies {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl StartupReplies {
+    /// Starts answering on a clone of `listener`. Stops when dropped.
+    fn start(listener: &UnixListener) -> Result<Self> {
+        let listener = listener.try_clone()?;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = std::thread::spawn(move || {
+            while !stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        // The request is read first, since closing a socket
+                        // with unread data resets the client's connection.
+                        let _answered = (|| -> Result<()> {
+                            stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+                            stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+                            let _request: Request = read_message(&mut BufReader::new(Within {
+                                inner: &mut stream,
+                                until: Instant::now() + Duration::from_secs(2),
+                            }))?;
+                            serde_json::to_writer(
+                                &mut stream,
+                                &Response {
+                                    version: VERSION,
+                                    snapshot: None,
+                                    error: Some(STARTING.into()),
+                                    refused: Vec::new(),
+                                },
+                            )?;
+                            stream.write_all(b"\n")?;
+                            Ok(())
+                        })();
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+        });
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for StartupReplies {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _joined = thread.join();
+        }
+    }
+}
+
 /// Writes one control line to a worker's stdin and flushes it.
 fn send_control(input: &mut impl Write, control: Control) -> Result<()> {
     serde_json::to_writer(&mut *input, &control)?;
@@ -723,6 +842,32 @@ fn enqueue_job(
     Ok(())
 }
 
+/// Applies each item as an `Enqueue` and returns the ones that were refused.
+/// A refusal for one item never stops the rest.
+fn enqueue_many(
+    items: Vec<(Game, Operation, CompressOpts)>,
+    snapshot: &mut Snapshot,
+    db: &Connection,
+    active: &mut Option<Active>,
+) -> Vec<Refusal> {
+    let mut refused = Vec::new();
+    for (game, operation, options) in items {
+        let title = game.title.clone();
+        let command = Command::Enqueue {
+            game,
+            operation,
+            options,
+        };
+        if let Err(error) = apply(command, snapshot, db, active, &mut Vec::new(), None) {
+            refused.push(Refusal {
+                title,
+                reason: error.to_string(),
+            });
+        }
+    }
+    refused
+}
+
 /// Cancels the running worker when its job is an analysis, so that work the
 /// user requested does not wait behind it.
 fn preempt_analysis(
@@ -836,6 +981,7 @@ fn apply(
         | Command::Restart
         | Command::RefreshDiscovery
         | Command::CancelDiscovery => {}
+        Command::EnqueueMany { .. } => bail!("Use a batch request to queue several jobs."),
         // The motion arms write rows 3 and 6 together, so the older boolean
         // and the newer preference always agree.
         Command::ReducedMotion(value) => {
@@ -1610,14 +1756,14 @@ fn run_pack_task(
                     "The game files changed, so the switch to Maximum was stopped. Try again."
                 );
             }
-            control.transaction("Switching to Maximum. The original is kept.")?;
+            control.transaction("Switching to Maximum… The original is kept.")?;
             activate_prepared(snapshot, db, mounts, install)
         }
         PackTask::Compact => {
             pack_compact_observed(snapshot, db, mounts, &game.install_dir, control)
         }
         PackTask::Restore => {
-            control.transaction("Decompressing. This step must finish before the job can stop.")?;
+            control.transaction("Decompressing… This step must finish before the job can stop.")?;
             pack_rollback(snapshot, db, mounts, &game.install_dir)
         }
         PackTask::VerifyRestored => {
@@ -1637,13 +1783,13 @@ fn run_pack_task(
         }
         PackTask::Reclaim => {
             control.transaction(
-                "Deleting the original. This step must finish before the job can stop.",
+                "Deleting the original… This step must finish before the job can stop.",
             )?;
             pack_reclaim(snapshot, db, &game.install_dir)
         }
         PackTask::Prune => {
             control.transaction(
-                "Deleting the previous version. This step must finish before the job can stop.",
+                "Deleting the previous version… This step must finish before the job can stop.",
             )?;
             pack_prune(snapshot, db, &game.install_dir)
         }
@@ -1780,6 +1926,8 @@ pub(super) fn run() -> Result<()> {
     }
     let listener = UnixListener::bind(&socket)?;
     listener.set_nonblocking(true)?;
+    // Clients that connect before the main loop runs are told to retry.
+    let startup_replies = StartupReplies::start(&listener)?;
     let (db, mut snapshot) = open_store(&dir.join("queue.sqlite"))?;
     // Startup: remount activated installs, reapply live compression, and
     // bring the login entry in line with the saved settings.
@@ -1805,6 +1953,7 @@ pub(super) fn run() -> Result<()> {
             )
         }),
     );
+    drop(startup_replies);
     let history =
         crate::db::Db::open(&crate::db::Db::default_path().context("Cannot locate history")?)?;
     // Import exclusions from older CLI-only installations and share future edits.
@@ -2069,6 +2218,7 @@ pub(super) fn run() -> Result<()> {
             Ok((mut stream, _)) => {
                 last_client = Instant::now();
                 let mut restart = false;
+                let mut refused = Vec::new();
                 let result = (|| -> Result<()> {
                     stream.set_read_timeout(Some(Duration::from_millis(500)))?;
                     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
@@ -2076,23 +2226,22 @@ pub(super) fn run() -> Result<()> {
                         inner: &mut stream,
                         until: Instant::now() + Duration::from_secs(2),
                     }))?;
-                    // `Restart` is accepted from any protocol version, so a
-                    // client from another release can replace this process.
                     ensure!(
-                        message.version == VERSION || matches!(&message.command, Command::Restart),
+                        version_accepted(message.version, &message.command),
                         "The background worker is from another version. Restart Flummox."
                     );
                     if matches!(&message.command, Command::Restart) {
-                        ensure!(
-                            active.is_none()
-                                && pack_active.is_none()
-                                && !snapshot.jobs.iter().any(|job| job.phase.active()),
-                            "Finish or stop the jobs before restarting the background worker."
-                        );
-                        ensure!(
-                            snapshot.packs.is_empty(),
-                            "Decompress the games that use Maximum before restarting the background worker."
-                        );
+                        restart_allowed(
+                            active.is_some()
+                                || pack_active.is_some()
+                                || snapshot.jobs.iter().any(|job| job.phase.active()),
+                            &snapshot,
+                            &crate::busy::ProcFs::new(),
+                        )?;
+                        // The next coordinator remounts these through
+                        // `recover_packs`. A store that stays mounted would
+                        // keep serving from the old executable.
+                        stop_mounts(&mut mounts, &snapshot)?;
                         restart = true;
                     }
                     // After these commands the maintenance baseline and the
@@ -2147,26 +2296,32 @@ pub(super) fn run() -> Result<()> {
                     {
                         running.control.request_control(&message.command)?;
                     }
-                    apply(
-                        message.command,
-                        &mut snapshot,
-                        &db,
-                        &mut active,
-                        &mut mounts,
-                        pack_active.as_ref().map(|running| running.id),
-                    )?;
-                    // Mirror the change into the history database, which
-                    // workers check before they process a game.
-                    if let Some((id, excluded)) = exclusion {
-                        if excluded {
-                            let title = games
-                                .iter()
-                                .find(|game| game.ids().any(|game_id| game_id == &id))
-                                .map(|game| game.title.as_str());
-                            history.exclude(&id, title.unwrap_or(&id.key))?;
-                        } else {
-                            history.unexclude(&id)?;
+                    let run_command = || -> Result<()> {
+                        match message.command {
+                            Command::EnqueueMany { items } => {
+                                refused = enqueue_many(items, &mut snapshot, &db, &mut active);
+                            }
+                            command => apply(
+                                command,
+                                &mut snapshot,
+                                &db,
+                                &mut active,
+                                &mut mounts,
+                                pack_active.as_ref().map(|running| running.id),
+                            )?,
                         }
+                        Ok(())
+                    };
+                    // Workers check the history database before they process
+                    // a game, so it changes in the same step as the queue.
+                    if let Some((id, excluded)) = exclusion {
+                        let title = games
+                            .iter()
+                            .find(|game| game.ids().any(|game_id| game_id == &id))
+                            .map_or_else(|| id.key.clone(), |game| game.title.clone());
+                        mirror_exclusion(&history, &id, &title, excluded, run_command)?;
+                    } else {
+                        run_command()?;
                     }
                     if startup_changed {
                         baseline_unseen = true;
@@ -2192,6 +2347,7 @@ pub(super) fn run() -> Result<()> {
                     version: VERSION,
                     snapshot: result.as_ref().ok().map(|_| snapshot.clone()),
                     error: result.err().map(|e| e.to_string()),
+                    refused,
                 };
                 let mut writer = std::io::BufWriter::new(&mut stream);
                 let _sent = serde_json::to_writer(&mut writer, &response)
@@ -2444,6 +2600,183 @@ mod tests {
     }
 
     #[test]
+    fn an_exclusion_changes_both_stores_or_neither() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let path = temp.path().join("history.sqlite");
+        let history = crate::db::Db::open(&path).ctx("history")?;
+        let id = GameId::new(Launcher::Manual, "portal");
+        let done = std::cell::Cell::new(false);
+        let apply_ok = || {
+            done.set(true);
+            Ok(())
+        };
+        mirror_exclusion(&history, &id, "Portal", true, apply_ok).ctx("control: both succeed")?;
+        check(
+            done.get() && history.is_excluded(&id).ctx("read")?,
+            "control: the exclusion lands in both",
+        )?;
+        // The in-memory change fails, so the history entry must not remain.
+        let other = GameId::new(Launcher::Manual, "half-life");
+        let refused = mirror_exclusion(&history, &other, "Half-Life", true, || {
+            bail!("the queue could not be saved")
+        });
+        check(refused.is_err(), "the failure is reported")?;
+        check(
+            !history.is_excluded(&other).ctx("read")?,
+            "a failed apply leaves no history entry",
+        )?;
+        // Include again, with the in-memory change failing: the entry stays.
+        let refused = mirror_exclusion(&history, &id, "Portal", false, || {
+            bail!("the queue could not be saved")
+        });
+        check(refused.is_err(), "the second failure is reported")?;
+        check(
+            history.is_excluded(&id).ctx("read")?,
+            "a failed include keeps the history entry",
+        )?;
+        // The history write fails, so the in-memory change must not happen.
+        let breaker = Connection::open(&path).ctx("second connection")?;
+        breaker
+            .execute_batch("DROP TABLE hidden")
+            .ctx("break the history")?;
+        let ran = std::cell::Cell::new(false);
+        let refused = mirror_exclusion(&history, &other, "Half-Life", true, || {
+            ran.set(true);
+            Ok(())
+        });
+        check(refused.is_err(), "a history failure is reported")?;
+        check(
+            !ran.get(),
+            "a history failure leaves the in-memory exclusion unapplied",
+        )
+    }
+
+    #[test]
+    fn a_client_that_connects_during_recovery_is_told_the_worker_is_starting() -> TestResult {
+        let temp = tempfile::tempdir().ctx("socket folder")?;
+        let socket = temp.path().join("c.sock");
+        let listener = UnixListener::bind(&socket).ctx("bind")?;
+        listener.set_nonblocking(true).ctx("non-blocking")?;
+        let replies = StartupReplies::start(&listener).ctx("start")?;
+        // Nothing else services the listener, as during recovery.
+        let started = Instant::now();
+        let mut stream = std::os::unix::net::UnixStream::connect(&socket).ctx("connect")?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .ctx("timeout")?;
+        serde_json::to_writer(
+            &mut stream,
+            &Request {
+                version: VERSION,
+                command: Command::Snapshot,
+            },
+        )
+        .ctx("request")?;
+        stream.write_all(b"\n").ctx("newline")?;
+        let reply: Response = read_message(&mut BufReader::new(stream)).ctx("reply")?;
+        check_eq(
+            reply.error.as_deref(),
+            Some(STARTING),
+            "the reply says the worker is starting",
+        )?;
+        check(reply.snapshot.is_none(), "no snapshot is sent")?;
+        check(
+            started.elapsed() < Duration::from_secs(2),
+            "the reply is prompt",
+        )?;
+        drop(replies);
+        // Control: once start-up ends the listener is free for the main loop.
+        let accepted = listener.accept();
+        check(
+            accepted
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock),
+            "the helper leaves nothing queued and stops accepting",
+        )
+    }
+
+    #[test]
+    fn a_batch_queues_what_passes_and_names_what_was_refused() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let (db, mut snapshot) = open_store(&temp.path().join("jobs.sqlite")).ctx("store")?;
+        let folder = |name: &str| -> Result<PathBuf, String> {
+            let path = temp.path().join(name);
+            std::fs::create_dir(&path).ctx("game folder")?;
+            Ok(path)
+        };
+        let first = folder("first")?;
+        let blocked = folder("blocked")?;
+        let last = folder("last")?;
+        snapshot
+            .excluded
+            .push(game(&blocked, "blocked").id.to_string());
+        let mut relative = game(&first, "relative");
+        relative.install_dir = PathBuf::from("relative/path");
+        let item = |game: Game| (game, Operation::Compress, CompressOpts::default());
+        let refused = enqueue_many(
+            vec![
+                item(game(&first, "first")),
+                item(game(&blocked, "blocked")),
+                item(relative),
+                item(game(&last, "last")),
+            ],
+            &mut snapshot,
+            &db,
+            &mut None,
+        );
+        let queued: Vec<_> = snapshot
+            .jobs
+            .iter()
+            .map(|job| job.game.title.as_str())
+            .collect();
+        check_eq(queued, vec!["first", "last"], "items after a refusal are queued")?;
+        let titles: Vec<_> = refused.iter().map(|item| item.title.as_str()).collect();
+        check_eq(titles, vec!["blocked", "relative"], "each refusal names its game")?;
+        check(
+            refused
+                .first()
+                .is_some_and(|item| item.reason.contains("excluded")),
+            "the reason is the one Enqueue gives",
+        )?;
+        let again = enqueue_many(
+            vec![item(game(&first, "first"))],
+            &mut snapshot,
+            &db,
+            &mut None,
+        );
+        check(
+            again.is_empty() && snapshot.jobs.len() == 2,
+            "control: a repeat of an active job is not an error and queues nothing",
+        )
+    }
+
+    #[test]
+    fn a_batch_reply_carries_the_refusals_and_old_replies_still_parse() -> TestResult {
+        let response = Response {
+            version: VERSION,
+            snapshot: None,
+            error: None,
+            refused: vec![Refusal {
+                title: "Portal".into(),
+                reason: "This game is excluded.".into(),
+            }],
+        };
+        let text = serde_json::to_string(&response).ctx("encode")?;
+        let back: Response = serde_json::from_str(&text).ctx("decode")?;
+        check_eq(back.refused, response.refused, "the refusals round-trip")?;
+        let plain = serde_json::to_string(&Response {
+            refused: Vec::new(),
+            ..response
+        })
+        .ctx("encode plain")?;
+        check(!plain.contains("refused"), "an empty list is not sent")?;
+        let old: Response =
+            serde_json::from_str(&plain).ctx("a reply without the field still decodes")?;
+        check(old.refused.is_empty(), "the field defaults to empty")
+    }
+
+    #[test]
     fn a_job_that_finds_the_operation_lock_taken_goes_back_in_the_queue() -> TestResult {
         let temp = tempfile::tempdir().ctx("state")?;
         let (db, mut snapshot) = open_store(&temp.path().join("jobs.sqlite")).ctx("store")?;
@@ -2545,6 +2878,85 @@ mod tests {
         fn processes(&self) -> Vec<crate::busy::ProcInfo> {
             self.0.clone()
         }
+    }
+
+    fn mounted_install(folder: &Path) -> crate::pack::Install {
+        crate::pack::Install {
+            game_path: folder.to_path_buf(),
+            store_path: folder.join("store"),
+            writes_path: folder.join("writes"),
+            backup_path: None,
+            previous_store_path: None,
+            previous_writes_path: None,
+            summary: None,
+            phase: crate::pack::InstallPhase::Mounted,
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn restart_waits_for_jobs_and_for_processes_using_a_mounted_game() -> TestResult {
+        let temp = tempfile::tempdir().ctx("state")?;
+        let folder = temp.path().join("Portal");
+        std::fs::create_dir(&folder).ctx("game folder")?;
+        let mut snapshot = Snapshot {
+            packs: vec![mounted_install(&folder)],
+            ..Snapshot::default()
+        };
+        let free = FakeProcs(Vec::new());
+        restart_allowed(false, &snapshot, &free)
+            .ctx("a mounted game that nothing uses does not block a restart")?;
+        let player = crate::busy::ProcInfo {
+            pid: 41,
+            name: "portal.bin".into(),
+            exe: Some(folder.join("portal.bin")),
+            ..crate::busy::ProcInfo::default()
+        };
+        let refused = restart_allowed(false, &snapshot, &FakeProcs(vec![player]))
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        check(
+            refused.contains("Portal") && refused.contains("Close"),
+            format!("the refusal names the game and says to close it: {refused}"),
+        )?;
+        let by_job = restart_allowed(true, &snapshot, &free)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        check(
+            by_job.contains("jobs"),
+            format!("an active job refuses the restart: {by_job}"),
+        )?;
+        snapshot.packs.clear();
+        restart_allowed(false, &snapshot, &free).ctx("control: no stores, no jobs")
+    }
+
+    #[test]
+    fn other_versions_may_restart_cancel_pause_and_read_but_not_enqueue() -> TestResult {
+        let other = VERSION.wrapping_add(1);
+        for command in [
+            Command::Restart,
+            Command::Cancel(1),
+            Command::Pause {
+                id: 1,
+                paused: true,
+            },
+            Command::Snapshot,
+        ] {
+            check(
+                version_accepted(other, &command),
+                format!("{command:?} is served at another version"),
+            )?;
+        }
+        check(
+            !version_accepted(other, &Command::Retry(1)),
+            "control: other commands are refused at another version",
+        )?;
+        check(
+            version_accepted(VERSION, &Command::Retry(1)),
+            "control: the current version is served",
+        )
     }
 
     #[test]
@@ -2867,6 +3279,62 @@ mod tests {
             true,
             "a cancel is refused once the step must finish",
         )
+    }
+
+    #[cfg(feature = "pack-mount")]
+    #[test]
+    fn mounts_survive_a_storage_job_that_fails_validation() -> TestResult {
+        if !Path::new("/dev/fuse").exists() {
+            check(
+                std::env::var_os("FLUMMOX_REQUIRE_FUSE").is_none(),
+                "FUSE is required for this test run",
+            )?;
+            eprintln!("skipped: a live mount requires /dev/fuse");
+            return Ok(());
+        }
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let folder = temp.path().join("game");
+        std::fs::create_dir(&folder).ctx("game folder")?;
+        std::fs::write(folder.join("data"), b"served").ctx("source")?;
+        let store = temp.path().join("game.flumpack");
+        let never = std::sync::atomic::AtomicBool::new(false);
+        crate::pack::create(&folder, &store, crate::pack::Options::default(), &never)
+            .ctx("store")?;
+        let install =
+            crate::pack::prepare(&folder, &store, &temp.path().join("updates"), &never)
+                .ctx("prepare")?;
+        let canonical = install.game_path.clone();
+        let (db, mut snapshot) = open_store(&temp.path().join("jobs.sqlite")).ctx("store")?;
+        let mut mounts = Vec::new();
+        activate_prepared(&mut snapshot, &db, &mut mounts, install).ctx("activate")?;
+        enqueue_job(
+            &mut snapshot,
+            game(&canonical, "game"),
+            Operation::Pack,
+            CompressOpts::default(),
+            Some(PackTask::Restore),
+            &db,
+        )
+        .ctx("job")?;
+        let mut job = snapshot.jobs.first().ctx("job")?.clone();
+        // A storage row with no task is the one input that fails validation.
+        job.pack = None;
+        let refused = start_pack(
+            &job,
+            &snapshot.packs,
+            &[],
+            &mut mounts,
+            &temp.path().join("jobs.sqlite"),
+        );
+        check(refused.is_err(), "a job with no task is refused")?;
+        check_eq(mounts.len(), 1, "the refusal leaves the mount with the caller")?;
+        check_eq(
+            std::fs::read(canonical.join("data")).ctx("read through the mount")?,
+            b"served".to_vec(),
+            "the folder still serves its files",
+        )?;
+        let mounted = take_mount(&mut mounts, &canonical).ctx("mount")?;
+        mounted.stop().ctx("unmount")
     }
 
     #[test]
