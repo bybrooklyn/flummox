@@ -3174,6 +3174,62 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "pack-mount")]
+    #[test]
+    fn mounts_survive_a_storage_job_that_fails_validation() -> TestResult {
+        if !Path::new("/dev/fuse").exists() {
+            check(
+                std::env::var_os("FLUMMOX_REQUIRE_FUSE").is_none(),
+                "FUSE is required for this test run",
+            )?;
+            eprintln!("skipped: a live mount requires /dev/fuse");
+            return Ok(());
+        }
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let folder = temp.path().join("game");
+        std::fs::create_dir(&folder).ctx("game folder")?;
+        std::fs::write(folder.join("data"), b"served").ctx("source")?;
+        let store = temp.path().join("game.flumpack");
+        let never = std::sync::atomic::AtomicBool::new(false);
+        crate::pack::create(&folder, &store, crate::pack::Options::default(), &never)
+            .ctx("store")?;
+        let install =
+            crate::pack::prepare(&folder, &store, &temp.path().join("updates"), &never)
+                .ctx("prepare")?;
+        let canonical = install.game_path.clone();
+        let (db, mut snapshot) = open_store(&temp.path().join("jobs.sqlite")).ctx("store")?;
+        let mut mounts = Vec::new();
+        activate_prepared(&mut snapshot, &db, &mut mounts, install).ctx("activate")?;
+        enqueue_job(
+            &mut snapshot,
+            game(&canonical, "game"),
+            Operation::Pack,
+            CompressOpts::default(),
+            Some(PackTask::Restore),
+            &db,
+        )
+        .ctx("job")?;
+        let mut job = snapshot.jobs.first().ctx("job")?.clone();
+        // A storage row with no task is the one input that fails validation.
+        job.pack = None;
+        let refused = start_pack(
+            &job,
+            &snapshot.packs,
+            &[],
+            &mut mounts,
+            &temp.path().join("jobs.sqlite"),
+        );
+        check(refused.is_err(), "a job with no task is refused")?;
+        check_eq(mounts.len(), 1, "the refusal leaves the mount with the caller")?;
+        check_eq(
+            std::fs::read(canonical.join("data")).ctx("read through the mount")?,
+            b"served".to_vec(),
+            "the folder still serves its files",
+        )?;
+        let mounted = take_mount(&mut mounts, &canonical).ctx("mount")?;
+        mounted.stop().ctx("unmount")
+    }
+
     #[test]
     fn upkeep_measures_the_update_layer_only_when_the_answer_needs_it() -> TestResult {
         let mut install = crate::pack::Install {
