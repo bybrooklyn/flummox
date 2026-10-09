@@ -96,6 +96,9 @@ pub struct Queue {
     /// these once and the worker clears them.
     #[serde(skip)]
     pub notices: Vec<String>,
+    /// For each baseline key, the automatic location that covered the game when the
+    /// key was recorded. A key without one is never removed.
+    pub baseline_homes: HashMap<String, String>,
 }
 impl Queue {
     /// Loads the queue from `root`, or an empty one if the file does not exist. Jobs
@@ -365,6 +368,16 @@ impl Queue {
             }
         }
         for game in games {
+            if let Some(location) = preferences
+                .locations
+                .iter()
+                .find(|l| l.automatic && game.install_dir.starts_with(&l.path))
+            {
+                for key in baseline_keys(game) {
+                    self.baseline_homes
+                        .insert(key, location_key(&location.path));
+                }
+            }
             if moved.iter().any(|path| game.install_dir.starts_with(path)) {
                 let enabled = !game
                     .ids()
@@ -420,6 +433,28 @@ impl Queue {
             .map(|location| location_key(&location.path))
             .collect();
         self.initialized_volumes = volumes;
+        // A healthy scan that no longer lists a game forgets it, so a reinstall is
+        // new. Only while the location it was under is configured, reachable and on
+        // the drive it was on.
+        let listed: HashSet<String> = games.iter().flat_map(baseline_keys).collect();
+        let reachable: HashSet<String> = preferences
+            .locations
+            .iter()
+            .filter(|l| l.automatic && l.path.is_dir() && !moved.contains(&l.path.as_path()))
+            .map(|l| location_key(&l.path))
+            .collect();
+        let forgotten: Vec<String> = self
+            .baseline_homes
+            .iter()
+            .filter(|(key, home)| !listed.contains(*key) && reachable.contains(*home))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in forgotten {
+            self.baseline.remove(&key);
+            self.baseline_homes.remove(&key);
+        }
+        self.baseline_homes
+            .retain(|key, _| self.baseline.contains_key(key));
         due
     }
 }
@@ -820,6 +855,69 @@ mod tests {
         let queue = Queue::load(temp.path()).ctx("load queue")?;
         check_eq(queue.initialized_locations.len(), 1, "locations kept")?;
         check(queue.initialized_volumes.is_empty(), "no drives yet")
+    }
+    #[test]
+    fn a_game_missing_from_a_healthy_scan_is_new_when_it_returns() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let library = temp.path().join("Games");
+        std::fs::create_dir(&library).ctx("library")?;
+        let preferences = Preferences {
+            locations: vec![Location {
+                path: library.clone(),
+                kind: LocationKind::Collection,
+                automatic: true,
+            }],
+            ..Default::default()
+        };
+        let mut game = crate::desktop::manual_game("One".into(), library.join("One"));
+        game.build = Some("1".into());
+        let mut queue = Queue::default();
+        queue.observe(&[game.clone()], &preferences, true);
+        check(
+            queue.observe(&[], &preferences, false).is_empty(),
+            "an unhealthy scan queues nothing",
+        )?;
+        check(
+            !queue.baseline.is_empty(),
+            "and does not forget a game it failed to list",
+        )?;
+        queue.observe(&[], &preferences, true);
+        check(
+            queue.baseline.is_empty() && queue.baseline_homes.is_empty(),
+            "a healthy scan without the game forgets it",
+        )?;
+        check_eq(
+            queue.observe(&[game], &preferences, true).len(),
+            1,
+            "the reinstalled game at the same build is new",
+        )
+    }
+    #[test]
+    fn a_game_under_an_unreachable_location_is_not_forgotten() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        let library = temp.path().join("Gone");
+        let preferences = Preferences {
+            locations: vec![Location {
+                path: library.clone(),
+                kind: LocationKind::Collection,
+                automatic: true,
+            }],
+            ..Default::default()
+        };
+        let mut game = crate::desktop::manual_game("One".into(), library.join("One"));
+        game.build = Some("1".into());
+        let mut queue = Queue::default();
+        queue.observe(&[game.clone()], &preferences, true);
+        queue.observe(&[], &preferences, true);
+        check(
+            !queue.baseline.is_empty(),
+            "an offline library keeps its baseline",
+        )?;
+        std::fs::create_dir(&library).ctx("library comes back")?;
+        check(
+            queue.observe(&[game], &preferences, true).is_empty(),
+            "control: the game is not new when the drive returns",
+        )
     }
     #[test]
     fn a_game_that_changes_launcher_id_keeps_its_baseline() -> TestResult {
