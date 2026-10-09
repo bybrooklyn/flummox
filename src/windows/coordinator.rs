@@ -68,6 +68,10 @@ pub struct Snapshot {
     /// A discovery pass is running. No job starts until it ends.
     pub discovering: bool,
     pub maintenance_paused: bool,
+    /// Why maintenance set a new starting point for a location, such as a different
+    /// drive at the same path. The newest five are kept until the worker exits.
+    #[serde(default)]
+    pub notices: Vec<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct Request {
@@ -485,6 +489,22 @@ fn run() -> Result<()> {
                         if let Err(error) = queue.enqueue_automatic(game) {
                             snapshot.warnings.push(error.to_string());
                         }
+                    }
+                    for notice in std::mem::take(&mut queue.notices) {
+                        if !snapshot.notices.contains(&notice) {
+                            snapshot.notices.push(notice);
+                        }
+                    }
+                    let extra = snapshot.notices.len().saturating_sub(5);
+                    snapshot.notices.drain(..extra);
+                    // Remember which drive each location is on, now that `observe`
+                    // has compared against what was saved.
+                    if preferences_healthy
+                        && snapshot.warnings.is_empty()
+                        && preferences.record_volumes(&crate::desktop::volume_identity)
+                        && let Err(error) = preferences.save(&root)
+                    {
+                        snapshot.warnings.push(error.to_string());
                     }
                     save_queue(&queue, &root, &mut queue_dirty);
                 }

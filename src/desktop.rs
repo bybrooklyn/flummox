@@ -88,6 +88,22 @@ pub struct Preferences {
     /// Holds every job while true. On Windows the worker owns this value, and a
     /// Settings command from the window does not change it.
     pub maintenance_paused: bool,
+    /// The drive each location was last seen on, as the identity jobs use, keyed by
+    /// `location_key`. A location missing here has not been seen yet.
+    pub location_volumes: std::collections::BTreeMap<String, String>,
+}
+/// A fixed-length key for a location path.
+pub fn location_key(path: &Path) -> String {
+    blake3::hash(path.as_os_str().as_encoded_bytes())
+        .to_hex()
+        .to_string()
+}
+/// The identity of the drive holding `path`, or `None` when it cannot be read, for
+/// example while the drive is disconnected.
+pub fn volume_identity(path: &Path) -> Option<String> {
+    crate::storage::volume(path)
+        .ok()
+        .map(|volume| volume.identity)
 }
 /// Reads a whole file, failing if it holds more than `limit` bytes. It reads one byte
 /// past the limit, so the check does not depend on the size the filesystem reports.
@@ -256,6 +272,9 @@ impl Preferences {
         {
             old.kind = kind;
         } else {
+            if let Some(identity) = volume_identity(&path) {
+                self.location_volumes.insert(location_key(&path), identity);
+            }
             self.locations.push(Location {
                 path,
                 kind,
@@ -270,6 +289,29 @@ impl Preferences {
         let resolved = resolved_path(path);
         self.locations
             .retain(|location| resolved_path(&location.path) != resolved);
+        self.prune_volumes();
+    }
+    fn prune_volumes(&mut self) {
+        let keep: std::collections::HashSet<String> = self
+            .locations
+            .iter()
+            .map(|location| location_key(&location.path))
+            .collect();
+        self.location_volumes.retain(|key, _| keep.contains(key));
+    }
+    /// Stores the drive each location is on now, as read by `current`, and drops
+    /// entries for locations that are gone. A location whose drive cannot be read
+    /// keeps its old entry. Returns true when anything changed.
+    pub fn record_volumes(&mut self, current: &dyn Fn(&Path) -> Option<String>) -> bool {
+        let before = self.location_volumes.clone();
+        for location in &self.locations {
+            if let Some(identity) = current(&location.path) {
+                self.location_volumes
+                    .insert(location_key(&location.path), identity);
+            }
+        }
+        self.prune_volumes();
+        self.location_volumes != before
     }
     /// The games under the user's locations, plus one warning per path that could
     /// not be read. Each game's build is a metadata stamp of its files, so a change

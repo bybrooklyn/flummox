@@ -89,6 +89,13 @@ pub struct Queue {
     /// Hashed paths of the automatic locations as of the last healthy scan. A game
     /// first seen under one of them counts as a new install.
     pub initialized_locations: HashSet<String>,
+    /// The drive each automatic location was on at the last healthy scan, keyed
+    /// like `initialized_locations`. A location missing here has not been seen yet.
+    pub initialized_volumes: HashMap<String, String>,
+    /// Why the last scan set a new starting point for a location. The window shows
+    /// these once and the worker clears them.
+    #[serde(skip)]
+    pub notices: Vec<String>,
 }
 impl Queue {
     /// Loads the queue from `root`, or an empty one if the file does not exist. Jobs
@@ -309,11 +316,64 @@ impl Queue {
         preferences: &Preferences,
         healthy: bool,
     ) -> Vec<Game> {
+        self.observe_on(
+            games,
+            preferences,
+            healthy,
+            &crate::desktop::volume_identity,
+        )
+    }
+    /// `observe` with the drive lookup supplied, so a test can swap a drive.
+    ///
+    /// A location whose drive differs from the one saved is a different location:
+    /// its games get a new baseline and none is queued, and `notices` says why.
+    pub fn observe_on(
+        &mut self,
+        games: &[Game],
+        preferences: &Preferences,
+        healthy: bool,
+        volume_of: &dyn Fn(&Path) -> Option<String>,
+    ) -> Vec<Game> {
         let mut due = vec![];
         if !healthy {
             return due;
         }
+        let mut volumes = HashMap::new();
+        let mut moved: Vec<&Path> = vec![];
+        for location in preferences.locations.iter().filter(|l| l.automatic) {
+            let key = location_key(&location.path);
+            let saved = self
+                .initialized_volumes
+                .get(&key)
+                .or_else(|| preferences.location_volumes.get(&key));
+            match (volume_of(&location.path), saved) {
+                (Some(now), Some(before)) if now != *before => {
+                    moved.push(&location.path);
+                    self.notices.push(format!(
+                        "{} is on a different drive than when Flummox last checked it. Its games were not queued, and Flummox will compare future updates against what is there now.",
+                        location.path.display()
+                    ));
+                    volumes.insert(key, now);
+                }
+                (Some(now), _) => {
+                    volumes.insert(key, now);
+                }
+                (None, Some(before)) => {
+                    volumes.insert(key, before.clone());
+                }
+                (None, None) => {}
+            }
+        }
         for game in games {
+            if moved.iter().any(|path| game.install_dir.starts_with(path)) {
+                let enabled = !game
+                    .ids()
+                    .any(|id| preferences.excluded.contains(&id.to_string()));
+                for key in baseline_keys(game) {
+                    self.baseline.insert(key, (game.build.clone(), enabled));
+                }
+                continue;
+            }
             let enabled =
                 preferences.locations.iter().any(|location| {
                     location.automatic && game.install_dir.starts_with(&location.path)
@@ -359,6 +419,7 @@ impl Queue {
             .filter(|location| location.automatic)
             .map(|location| location_key(&location.path))
             .collect();
+        self.initialized_volumes = volumes;
         due
     }
 }
@@ -370,12 +431,7 @@ fn baseline_keys(game: &Game) -> Vec<String> {
     keys.push(format!("dir:{}", location_key(&game.install_dir)));
     keys
 }
-/// A fixed-length key for a location path, used in `initialized_locations`.
-fn location_key(path: &Path) -> String {
-    blake3::hash(path.as_os_str().as_encoded_bytes())
-        .to_hex()
-        .to_string()
-}
+use crate::desktop::location_key;
 /// Files that Windows reported would not shrink, keyed by path inside the game
 /// folder, with the size and modification time seen then. A file that still has
 /// both is skipped on the next pass. Losing the record only costs a recompression.
@@ -659,6 +715,111 @@ mod tests {
             queue.observe(&[game], &preferences, true).is_empty(),
             "a completed job settles the update",
         )
+    }
+    /// A library at `/games` that sits on the drive named by `drive`.
+    fn drive_fixture() -> (Preferences, Game, Queue) {
+        let (mut preferences, game, mut queue) = automatic_fixture();
+        let one = |_: &Path| Some("drive-a".to_owned());
+        preferences.record_volumes(&one);
+        let mut seen = game.clone();
+        seen.build = Some("1".into());
+        queue.observe_on(&[seen], &preferences, true, &one);
+        queue.notices.clear();
+        (preferences, game, queue)
+    }
+    #[test]
+    fn a_library_on_another_drive_gets_a_new_baseline_and_queues_nothing() -> TestResult {
+        let (preferences, game, mut queue) = drive_fixture();
+        let other = |_: &Path| Some("drive-b".to_owned());
+        let mut fresh = crate::desktop::manual_game("Two".into(), "/games/Two".into());
+        fresh.build = Some("9".into());
+        // The game now has build 2 and "Two" is unknown: both look due on drive-a.
+        let games = [game.clone(), fresh.clone()];
+        check(
+            queue
+                .observe_on(&games, &preferences, true, &other)
+                .is_empty(),
+            "a different drive at the same path queues nothing",
+        )?;
+        check_eq(queue.notices.len(), 1, "the reason is reported once")?;
+        check(
+            queue
+                .observe_on(&games, &preferences, true, &other)
+                .is_empty(),
+            "the new baseline holds on the next scan",
+        )?;
+        check_eq(queue.notices.len(), 1, "and the reason is not repeated")?;
+        let mut update = game;
+        update.build = Some("3".into());
+        check_eq(
+            queue
+                .observe_on(&[update], &preferences, true, &other)
+                .len(),
+            1,
+            "control: a later update on the new drive is queued",
+        )
+    }
+    #[test]
+    fn an_unreadable_drive_and_an_unchanged_one_do_not_reset_the_baseline() -> TestResult {
+        let (preferences, game, mut queue) = drive_fixture();
+        let gone = |_: &Path| None;
+        check_eq(
+            queue
+                .observe_on(std::slice::from_ref(&game), &preferences, true, &gone)
+                .len(),
+            1,
+            "an offline drive does not hide an update",
+        )?;
+        check(queue.notices.is_empty(), "and gives no reason")?;
+        let same = |_: &Path| Some("drive-a".to_owned());
+        check_eq(
+            queue.observe_on(&[game], &preferences, true, &same).len(),
+            1,
+            "control: the same drive still queues the update",
+        )
+    }
+    #[test]
+    fn a_saved_location_drive_decides_when_the_queue_has_none() -> TestResult {
+        let (mut preferences, game, _) = drive_fixture();
+        let other = |_: &Path| Some("drive-b".to_owned());
+        let mut queue = Queue::default();
+        queue.observe_on(std::slice::from_ref(&game), &preferences, true, &other);
+        check_eq(
+            queue.notices.len(),
+            1,
+            "the saved drive of the location is compared",
+        )?;
+        preferences.location_volumes.clear();
+        let mut queue = Queue::default();
+        queue.observe_on(std::slice::from_ref(&game), &preferences, true, &other);
+        check(
+            queue.notices.is_empty(),
+            "control: a location never seen before is recorded, not reported",
+        )?;
+        check_eq(
+            queue.initialized_volumes.len(),
+            1,
+            "and its drive is remembered",
+        )
+    }
+    #[test]
+    fn locations_and_queues_saved_before_drive_identity_still_load() -> TestResult {
+        let temp = tempfile::tempdir().ctx("fixture")?;
+        std::fs::write(
+            temp.path().join("desktop.json"),
+            br#"{"locations":[{"path":"/x","kind":"collection","automatic":true}]}"#,
+        )
+        .ctx("old preferences")?;
+        let preferences = Preferences::load(temp.path()).ctx("load preferences")?;
+        check(preferences.location_volumes.is_empty(), "no identity yet")?;
+        std::fs::write(
+            temp.path().join("native-queue.json"),
+            br#"{"jobs":[],"baseline":{},"next_id":0,"initialized_locations":["a"]}"#,
+        )
+        .ctx("old queue")?;
+        let queue = Queue::load(temp.path()).ctx("load queue")?;
+        check_eq(queue.initialized_locations.len(), 1, "locations kept")?;
+        check(queue.initialized_volumes.is_empty(), "no drives yet")
     }
     #[test]
     fn a_game_that_changes_launcher_id_keeps_its_baseline() -> TestResult {
