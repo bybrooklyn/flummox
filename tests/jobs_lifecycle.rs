@@ -202,8 +202,8 @@ fn managed_pack_remounts_after_coordinator_restart_and_keeps_updates() -> TestRe
         refused
             .as_ref()
             .err()
-            .is_some_and(|error| error.contains("Reclaim the retained original")),
-        format!("compaction waits for the original to be reclaimed: {refused:?}"),
+            .is_some_and(|error| error.contains("Delete the original before folding in updates")),
+        format!("folding in updates waits for the original to be deleted: {refused:?}"),
     )?;
     request(
         &home,
@@ -963,8 +963,9 @@ fn automatic_storage_rejects_a_mismatched_qualification_before_creation() -> Tes
         "mismatched corpus does not activate",
     )?;
     check(
-        job.message.contains("Compatibility no longer matches"),
-        format!("clear qualification error: {}", job.message),
+        job.message
+            .contains("The compatibility report no longer matches"),
+        format!("clear compatibility report error: {}", job.message),
     )?;
     check(
         !store.exists(),
