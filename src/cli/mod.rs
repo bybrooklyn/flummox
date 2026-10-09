@@ -2029,24 +2029,24 @@ fn cmd_watch(
     println!("Waiting for downloads to finish. Press Ctrl-C to stop.");
     crate::watch::run(&libraries, cancel.as_ref(), |app| {
         if app.is_tool() {
-            return;
+            return Ok(());
         }
         println!("\n{} finished downloading.", app.name);
         if dry_run {
             println!("  (dry run, nothing written)");
-            return;
+            return Ok(());
         }
         // The full id, so a missing Steam folder cannot fall through to
         // another launcher's game with this number in its title.
         let selector = format!("steam:{}", app.appid);
         // The coordinator pauses a queued job while the game runs, so a
         // download that finishes as the player presses Play is still queued.
+        // An error is returned for the watcher to retry and report.
         let text = Output { json: false };
-        if let Err(e) = cmd_compress(
+        cmd_compress(
             env, &selector, level, threads, false, false, false, true, text, cancel,
-        ) {
-            eprintln!("warning: could not compress {}: {e:#}", app.name);
-        }
+        )
+        .with_context(|| format!("could not compress {}", app.name))
     })
     .context("watching Steam libraries")
 }
