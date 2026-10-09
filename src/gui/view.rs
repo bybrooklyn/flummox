@@ -58,10 +58,10 @@ pub fn view(state: &State) -> Element<'_, Message> {
     )
 }
 
-/// The window frame: sidebar, then a column of scan banner, qualification
-/// wizard, space plan review, the page, and the active job bar, with the
-/// toast stacked over the bottom right corner. `compact` shrinks the sidebar
-/// to icons.
+/// The window frame: sidebar, then a column of the game-finding banner,
+/// qualification wizard, space plan review, the page with the toast stacked
+/// over its bottom right corner, and the active job bar. `compact` shrinks
+/// the sidebar to icons.
 fn layout(state: &State, compact: bool) -> Element<'_, Message> {
     // Sidebar. Entries in `PAGES` animate their highlight. Settings sits at
     // the bottom and switches without animation.
@@ -92,22 +92,22 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         PAGES.into_iter().map(nav_entry).collect(),
         nav_entry(Page::Settings),
     );
-    // The scan banner, the wizard and the plan each keep a slot while absent.
+    // The banner, the wizard and the plan each keep a slot while absent.
     // Widget state is matched by position, so a child that came and went would
     // shift the page and reset its scrolling and focus.
     let absent = || Element::from(Space::new());
-    // Banner shown while the worker is discovering games.
+    // Banner shown while the worker is finding games.
     let mut body = column![].spacing(0).width(Length::Fill);
     body = body.push(match &state.snapshot.scan_source {
         Some(source) => Element::from(
             container(
                 row![
                     theme::muted(format!(
-                        "Scanning {source} · {} games found",
-                        state.snapshot.discovered.len()
+                        "Finding games in {source} · {} found",
+                        games_count(state.snapshot.discovered.len())
                     )),
                     Space::new().width(Length::Fill),
-                    secondary("Cancel scan", Message::Send(Command::CancelDiscovery))
+                    secondary("Stop", Message::Send(Command::CancelDiscovery))
                 ]
                 .spacing(12)
                 .align_y(Alignment::Center),
@@ -166,13 +166,20 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         12.0
     };
     let offset = state.page_direction * distance * (1.0 - page_reveal);
-    body = body.push(shell::page_surface(
-        page.into(),
-        page_key.label(),
-        compact,
-        offset,
-        !state.reduced_motion && state.motion != MotionPreference::Reduced,
-        state.scroll_positions.clone(),
+    // The toast is stacked over the page alone, so it sits above the job bar
+    // below it instead of covering the bar's button.
+    body = body.push(shell::with_toast(
+        shell::page_surface(
+            page.into(),
+            page_key.label(),
+            compact,
+            offset,
+            !state.reduced_motion && state.motion != MotionPreference::Reduced,
+            state.scroll_positions.clone(),
+        ),
+        &state.toast,
+        state.reduced_motion,
+        Message::Dismiss,
     ));
     // The bar for the job in progress, on every page but Jobs, which already
     // shows it.
@@ -196,8 +203,7 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
             .padding(theme::page_gutter(compact).top(0)),
         );
     }
-    let base = shell::frame(sidebar, body.into());
-    shell::with_toast(base, &state.toast, state.reduced_motion, Message::Dismiss)
+    shell::frame(sidebar, body.into())
 }
 
 /// The body of the page `state.page` names.
@@ -227,7 +233,7 @@ fn command_words(command: &Command) -> Option<(&'static str, &str)> {
             },
             game.title.as_str(),
         )),
-        Command::EnqueuePack { game, task } => Some((pack_words(task), game.title.as_str())),
+        Command::EnqueuePack { game, task } => Some((task.label(), game.title.as_str())),
         _ => None,
     }
 }
@@ -254,25 +260,25 @@ fn empty_games(state: &State) -> (&'static str, &'static str, Option<(&'static s
     if state.games.is_empty() && state.scanning {
         (
             "Finding your games…",
-            "This can take a moment on a large library",
+            "This can take a moment on a large library.",
             None,
         )
     } else if state.games.is_empty() {
         (
             "No games found",
-            "Add a folder that holds your games",
-            Some(("Add a folder", Message::GoTo(Page::Drives))),
+            "Add a location that holds your games.",
+            Some(("Add location", Message::GoTo(Page::Drives))),
         )
     } else if !state.query.trim().is_empty() {
         (
             "No games match your search",
-            "Try fewer letters or clear the search",
+            "Try fewer letters or clear the search.",
             Some(("Clear search", Message::Query(String::new()))),
         )
     } else {
         (
             "No games match these filters",
-            "The filters hide every game",
+            "The filters hide every game.",
             Some(("Show all games", Message::ClearFilters)),
         )
     }
@@ -319,8 +325,8 @@ fn overview(state: &State) -> Element<'_, Message> {
         })
         .count();
     // The hero's main button compresses the library when a saving is
-    // predicted, is disabled while scanning or analysing, and otherwise
-    // offers another scan.
+    // predicted, is disabled while finding games or analysing, and otherwise
+    // offers another refresh.
     let mut content = column![
         theme::page_header(
             "Overview",
@@ -337,9 +343,9 @@ fn overview(state: &State) -> Element<'_, Message> {
         hero(
             column![
                 theme::muted(if current > 0 {
-                    "SPACE SAVED (ESTIMATE)"
+                    "Space saved (estimate)"
                 } else {
-                    "COMPRESS YOUR GAMES"
+                    "Compress your games"
                 }),
                 text(headline(
                     current,
@@ -349,22 +355,24 @@ fn overview(state: &State) -> Element<'_, Message> {
                 ))
                 .size(if current > 0 { 38 } else { 27 }),
                 theme::muted(if state.scanning {
-                    "Scanning…".into()
+                    "This can take a moment on a large library.".into()
                 } else if current > 0 && potential > 0 {
                     format!("About {} more to save", size(potential))
                 } else if current > 0 {
                     "Up to date".into()
                 } else {
-                    "Only files that shrink are compressed".into()
+                    "Only files that shrink are compressed.".into()
                 }),
                 row![
                     action_maybe(
                         if potential > 0 {
                             format!("Compress to save about {}", size(potential))
-                        } else if state.scanning || state.analysis_queuing() {
+                        } else if state.scanning {
+                            "Refreshing…".into()
+                        } else if state.analysis_queuing() {
                             "Analyzing…".into()
                         } else {
-                            "Scan again".into()
+                            "Refresh".into()
                         },
                         if potential > 0 {
                             Some(Message::OptimizeLibrary)
@@ -407,11 +415,7 @@ fn overview(state: &State) -> Element<'_, Message> {
             row![
                 column![
                     text(drive.path.display().to_string()),
-                    theme::muted(format!(
-                        "{} game{}",
-                        drive.games,
-                        if drive.games == 1 { "" } else { "s" }
-                    ))
+                    theme::muted(games_count(drive.games))
                 ]
                 .spacing(3)
                 .width(Length::Fill),
@@ -436,7 +440,7 @@ fn overview(state: &State) -> Element<'_, Message> {
         .take(3)
         .collect();
     if !recent.is_empty() {
-        content = content.push(theme::section_title("Recent work"));
+        content = content.push(theme::section_title("Recent jobs"));
     }
     for job in recent {
         content = content.push(panel(
@@ -588,7 +592,7 @@ fn games(state: &State, compact: bool) -> Element<'_, Message> {
     if state.order_stale {
         content = content.push(panel(
             row![
-                theme::muted("New estimates arrived while a game was open or ticked")
+                theme::muted("New estimates arrived while a game was open or ticked.")
                     .width(Length::Fill),
                 secondary("Sort again", Message::Sort(state.sort))
             ]
@@ -825,12 +829,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
         && (state.detail.value()
             || (!state.reduced_motion && state.detail.is_animating(std::time::Instant::now())))
     {
-        let mut details = column![theme::muted(format!(
-            "{} · {}",
-            item.filesystem,
-            game.install_dir.display()
-        ))]
-        .spacing(12);
+        let mut details = column![theme::muted(game.install_dir.display().to_string())].spacing(12);
         // The cover sits to the left of everything else in the pane. On a
         // narrow window there is no room for it.
         let cover_tile = item.cover.as_ref().filter(|_| !compact).map(|source| {
@@ -904,7 +903,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                 .push(modes.wrap())
                 .push(theme::muted(match chosen {
                     StorageChoice::Standard => {
-                        "Standard is quick, and the game's files stay exactly where they are."
+                        "Standard is quick, and the game's files stay where they are."
                     }
                     StorageChoice::Maximum => {
                         "Maximum saves more and takes minutes. The game runs from a compressed store, and the original is kept until you confirm it works."
@@ -948,7 +947,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                     "Balanced is recommended. Max takes longer for a little more.",
                 ));
         }
-        // Maximum Space. A game that runs from a store gets a card that says
+        // Maximum. A game that runs from a store gets a card that says
         // where it stands and offers the one next step. A game that does not
         // gets the store form, under Advanced.
         let install = state
@@ -1070,20 +1069,22 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
             let default_store = state.store_path(game).display().to_string();
             let typed = state.pack_paths.get(&id).cloned().unwrap_or_default();
             details = details
-                .push(theme::section_title("Maximum Space storage"))
-                .push(theme::muted("Verified chunks can be shared across games"))
+                .push(theme::section_title("Maximum store"))
+                .push(theme::muted(
+                    "The store holds the compressed game. Data that repeats is stored once and shared across games.",
+                ))
                 .push(
                     input(&default_store, &typed)
                         .on_input(move |path| Message::PackPath(path_id.clone(), path)),
                 )
                 .push(secondary_maybe(
-                    "Choose storage folder…",
+                    "Choose store folder…",
                     (!state.picker_busy)
                         .then(|| Message::Browse(super::dialog::Target::Storage(id.clone()))),
                 ))
                 .push(
                     column![
-                        text("1. Create and verify a store.").size(13),
+                        text("1. Create the store and switch the game to it.").size(13),
                         text("2. Play the game to test it.").size(13),
                         text("3. Delete the original to save the space.").size(13)
                     ]
@@ -1093,7 +1094,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                 .push(
                     row![
                         secondary_maybe(
-                            "Create & activate",
+                            "Create store and switch",
                             (!state.pending.contains(&id))
                                 .then(|| Message::PackActivate(id.clone(), true))
                         ),
@@ -1103,7 +1104,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                                 .then(|| Message::PackCreate(id.clone()))
                         ),
                         secondary_maybe(
-                            "Activate existing",
+                            "Switch to existing store",
                             (!state.pending.contains(&id))
                                 .then(|| Message::PackActivate(id.clone(), false))
                         )
@@ -1125,7 +1126,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                     if state.qualifying {
                         "Measuring…"
                     } else {
-                        "Qualify compatibility"
+                        "Test compatibility"
                     },
                     (item.game.state.is_idle() && !state.qualifying)
                         .then(|| Message::Qualify(id.clone())),
@@ -1153,8 +1154,8 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                 tools = tools.push(secondary("Cancel", Message::CloseQualification));
             }
             details = details.push(tools.wrap());
+            let mut facts = column![theme::fact("Filesystem", item.filesystem.clone())].spacing(4);
             if let Some(est) = state.estimate(game) {
-                let mut facts = column![].spacing(4);
                 if let Some(choice) = state.recommendation(game) {
                     facts = facts.push(theme::fact(
                         "Savings",
@@ -1163,17 +1164,17 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                             size(choice.native_saving),
                             choice
                                 .maximum_saving
-                                .map(|saving| format!(" · Maximum sample about {}", size(saving)))
+                                .map(|saving| format!(" · Maximum about {}", size(saving)))
                                 .unwrap_or_default()
                         ),
                     ));
                 }
                 facts = facts.push(theme::fact(
-                    "Sampled",
+                    "Sampling",
                     format!(
-                        "{} from {} files · {} skipped · {} not sampled{}",
+                        "{} sampled from {} · {} skipped · {} not sampled{}",
                         size(est.sampled),
-                        est.inspected_files,
+                        crate::text::count(est.inspected_files, "file", "files"),
                         est.skipped_files,
                         est.unsampled_files,
                         if est.already_compressed_mount {
@@ -1185,9 +1186,9 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                 ));
                 let evidence = est.format_evidence;
                 facts = facts.push(theme::fact(
-                    "Formats",
+                    "File types",
                     format!(
-                        "{} known · {} unknown · {} encoded · {} containers · {} raw{}",
+                        "{} known · {} unknown · {} already compressed · {} archives · {} uncompressed audio or video{}",
                         evidence.recognized_files,
                         evidence.unknown_files,
                         evidence.encoded_files,
@@ -1204,9 +1205,9 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                     facts = facts.push(theme::fact(
                         "Small files",
                         format!(
-                            "{} in {} files · grouping would save {} more",
+                            "{} in {} · grouping would save {} more",
                             size(est.small_files.bytes),
-                            est.small_files.files,
+                            crate::text::count(est.small_files.files, "file", "files"),
                             size(est.small_files.extra_payload_saving)
                         ),
                     ));
@@ -1219,13 +1220,16 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
                         "No compatibility report matches this build".into()
                     },
                 ));
-                details = details.push(facts);
             }
+            details = details.push(facts);
         }
         if let Some(job) = state.latest(game)
             && !job.errors.is_empty()
         {
-            details = details.push(theme::danger_text(job.errors.join("\n")));
+            details = details.push(theme::danger_text(format!(
+                "What went wrong:\n{}",
+                job.errors.join("\n")
+            )));
         }
         let reveal = if state.reduced_motion {
             1.0
@@ -1245,7 +1249,7 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
             "game-details",
         ));
     }
-    // The id lets "Review game and storage" scroll to the row.
+    // The id lets "Review game" scroll to the row.
     container(panel(contents))
         .id(iced::widget::Id::from(format!("game-{id}")))
         .into()
@@ -1254,10 +1258,10 @@ fn game_row<'a>(state: &'a State, item: &'a GameRow, compact: bool) -> Element<'
 // Settings sections: recovery, jobs, locations and preferences.
 
 /// The Recovery section: jobs that failed, were partial or were interrupted,
-/// and pack installs that are not simply mounted or that still retain an
-/// original or a previous store.
+/// and stores that are not simply mounted or that still keep an original or
+/// a previous version.
 fn recovery(state: &State, embedded: bool) -> Element<'_, Message> {
-    let subtitle = "Review interrupted jobs and retained storage before retrying or restoring.";
+    let subtitle = shell::RECOVERY_SUBTITLE;
     let mut content = column![
         if embedded {
             column![theme::section_title("Recovery"), theme::muted(subtitle)]
@@ -1292,15 +1296,17 @@ fn recovery(state: &State, embedded: bool) -> Element<'_, Message> {
             .iter()
             .find(|row| row.game.install_dir == install.game_path);
         let mut details = column![
-            theme::section_text(
-                game.map(|row| row.game.title.clone())
-                    .unwrap_or_else(|| install.game_path.display().to_string())
-            ),
+            theme::section_text(game.map(|row| row.game.title.clone()).unwrap_or_else(|| {
+                install
+                    .game_path
+                    .file_name()
+                    .map_or_else(|| "Unknown game".to_owned(), |name| name.to_string_lossy().into_owned())
+            })),
             theme::muted(install.game_path.display().to_string()),
             theme::muted(install.phase.label()),
             text(&install.message).size(13),
             theme::muted(format!(
-                "Store: {} · Updates: {}",
+                "Store: {} · updates: {}",
                 install.store_path.display(),
                 install.writes_path.display()
             ))
@@ -1308,18 +1314,18 @@ fn recovery(state: &State, embedded: bool) -> Element<'_, Message> {
         .spacing(8);
         if let Some(backup) = &install.backup_path {
             details = details.push(theme::muted(format!(
-                "Retained original: {}",
+                "Kept original: {}",
                 backup.display()
             )));
         }
         if let Some(previous) = &install.previous_store_path {
             details = details.push(theme::muted(format!(
-                "Previous store retained: {}",
+                "Kept previous version: {}",
                 previous.display()
             )));
         }
-        // True while any job for this game is active. Restore and verify are
-        // offered only without one.
+        // True while any job for this game is active. Decompress and check
+        // are offered only without one.
         let pending = state
             .snapshot
             .jobs
@@ -1332,7 +1338,7 @@ fn recovery(state: &State, embedded: bool) -> Element<'_, Message> {
                 && install.phase == crate::pack::InstallPhase::Mounted
             {
                 actions = actions.push(secondary(
-                    "Restore ordinary files",
+                    "Decompress to ordinary files",
                     Message::Send(Command::EnqueuePack {
                         game: row.game.clone(),
                         task: crate::jobs::PackTask::Restore,
@@ -1344,7 +1350,7 @@ fn recovery(state: &State, embedded: bool) -> Element<'_, Message> {
                 && install.phase == crate::pack::InstallPhase::Attention
             {
                 actions = actions.push(secondary(
-                    "Verify restored files",
+                    "Check decompressed files",
                     Message::Send(Command::EnqueuePack {
                         game: row.game.clone(),
                         task: crate::jobs::PackTask::VerifyRestored,
@@ -1352,7 +1358,7 @@ fn recovery(state: &State, embedded: bool) -> Element<'_, Message> {
                 ));
             }
             actions = actions.push(secondary(
-                "Review game and storage",
+                "Review game",
                 Message::ReviewGame(row.game.id.to_string()),
             ));
             details = details.push(actions.wrap());
@@ -1363,36 +1369,19 @@ fn recovery(state: &State, embedded: bool) -> Element<'_, Message> {
         ));
     }
     if issues == 0 {
-        content = content.push(panel(theme::muted(
-            "No interrupted jobs or retained storage need review.",
-        )));
+        content = content.push(panel(theme::muted(shell::RECOVERY_EMPTY)));
     }
     content.into()
 }
 
-/// What a job is doing, in the window's words. `PackTask::label` is shared
-/// with the command line, so the window names storage tasks itself.
+/// What a job is doing, in the window's words. Storage tasks use
+/// `PackTask::label`, which the command line shares.
 fn kind_words(job: &Job) -> &'static str {
     match job.operation {
         Operation::Analyze => "Analysis",
         Operation::Compress => "Compression",
         Operation::Decompress => "Decompression",
-        Operation::Pack => job.pack.as_ref().map_or("Maximum", pack_words),
-    }
-}
-
-/// What a storage task does, in the window's words.
-fn pack_words(task: &crate::jobs::PackTask) -> &'static str {
-    use crate::jobs::PackTask;
-    match task {
-        PackTask::Create { .. } => "Build Maximum store",
-        PackTask::Activate { create: true, .. } => "Maximum compression",
-        PackTask::Activate { .. } => "Switch to Maximum store",
-        PackTask::Compact => "Fold in updates",
-        PackTask::Restore => "Decompression to ordinary files",
-        PackTask::VerifyRestored => "Check decompressed files",
-        PackTask::Reclaim => "Delete the original",
-        PackTask::Prune => "Delete the previous version",
+        Operation::Pack => job.pack.as_ref().map_or("Maximum", crate::jobs::PackTask::label),
     }
 }
 
@@ -1455,7 +1444,7 @@ fn progress<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
 /// A card for a job that is running, waiting or needs attention, with its
 /// controls. A job that ended badly gets a card edged in the failure colour.
 fn job_row<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
-    // Pause and Cancel for an active job, except a pack job in a step that
+    // Pause and Stop for an active job, except a pack job in a step that
     // cannot be interrupted. Retry for a job that stopped short of completing.
     let mut controls = iced::widget::Row::new().spacing(8);
     if job.phase.active() && (job.operation != Operation::Pack || job.pack_interruptible) {
@@ -1467,7 +1456,7 @@ fn job_row<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
                     paused: !job.user_paused,
                 }),
             ))
-            .push(secondary("Cancel", Message::Send(Command::Cancel(job.id))));
+            .push(secondary("Stop", Message::Send(Command::Cancel(job.id))));
     } else if !job.phase.active() && job.phase != Phase::Completed {
         controls = controls.push(secondary("Retry", Message::Send(Command::Retry(job.id))));
     }
@@ -1485,16 +1474,20 @@ fn job_row<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
         row![
             theme::muted(if job.files_total > 0 {
                 format!(
-                    "{} / {} items · {} processed · {}s",
+                    "{} of {} · {} processed · {}",
                     job.files_done,
-                    job.files_total,
+                    shell::files_count(job.files_total),
                     size(job.bytes_done),
-                    job.elapsed
+                    crate::text::duration(job.elapsed)
                 )
             } else if job.bytes_done > 0 {
-                format!("{} processed · {}s", size(job.bytes_done), job.elapsed)
+                format!(
+                    "{} processed · {}",
+                    size(job.bytes_done),
+                    crate::text::duration(job.elapsed)
+                )
             } else {
-                format!("{}s elapsed", job.elapsed)
+                format!("{} elapsed", crate::text::duration(job.elapsed))
             })
             .width(Length::Fill),
             controls.wrap()
@@ -1513,7 +1506,10 @@ fn job_row<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
         )));
     }
     if !job.errors.is_empty() {
-        content = content.push(theme::danger_text(job.errors.join("\n")));
+        content = content.push(theme::danger_text(format!(
+            "What went wrong:\n{}",
+            job.errors.join("\n")
+        )));
     }
     match tone(job.phase) {
         theme::Tone::Failed => theme::attention_card(content, true),
@@ -1523,26 +1519,29 @@ fn job_row<'a>(state: &'a State, job: &'a Job) -> Element<'a, Message> {
         _ => panel(content),
     }
 }
+/// The `shell::JOB_GROUPS` index a phase is listed under. A paused job keeps
+/// its place in the line, so it is listed as waiting.
+fn job_group(phase: Phase) -> usize {
+    match phase {
+        Phase::Analyzing | Phase::Running | Phase::Pausing | Phase::Cancelling => 0,
+        Phase::Queued | Phase::Paused => 1,
+        Phase::Failed | Phase::Partial | Phase::Interrupted => 2,
+        Phase::Completed | Phase::Cancelled => 3,
+    }
+}
+
 /// The Jobs section: connection state, then jobs grouped as running, waiting,
 /// needing attention and history, then recent activity. Analyses are not
 /// listed. History shows the newest 20.
 fn queue(state: &State) -> Element<'_, Message> {
     let mut content = column![theme::page_header::<Message>(
         "Jobs",
-        Some("Track running work, waiting games, and recent results"),
+        Some(shell::JOBS_SUBTITLE),
         None
     )]
     .spacing(theme::PAGE_GAP);
     if let Some(error) = &state.connection_error {
-        content = content.push(theme::attention_card(
-            column![
-                theme::section_text("Worker connection interrupted"),
-                theme::danger_text(error),
-                theme::muted("Showing the last received jobs. Reconnecting…")
-            ]
-            .spacing(6),
-            true,
-        ));
+        content = content.push(shell::connection_lost(error));
     }
     if !state.snapshot_loaded && state.snapshot.jobs.is_empty() {
         content = content.push(theme::muted("Connecting to the background worker…"));
@@ -1555,18 +1554,7 @@ fn queue(state: &State) -> Element<'_, Message> {
             .snapshot
             .jobs
             .iter()
-            .filter(|job| {
-                job.operation != Operation::Analyze
-                    && match group {
-                        0 => job.phase.active() && job.phase != Phase::Queued,
-                        1 => job.phase == Phase::Queued,
-                        2 => matches!(
-                            job.phase,
-                            Phase::Failed | Phase::Partial | Phase::Interrupted
-                        ),
-                        _ => matches!(job.phase, Phase::Completed | Phase::Cancelled),
-                    }
-            })
+            .filter(|job| job.operation != Operation::Analyze && job_group(job.phase) == group)
             .collect();
         content = content.push(theme::section_text(format!("{title} · {}", jobs.len())));
         if jobs.is_empty() {
@@ -1590,11 +1578,11 @@ fn queue(state: &State) -> Element<'_, Message> {
     }
     content.into()
 }
-/// The Locations section: the form that adds a folder, one card per library
-/// with its maintenance toggle, and the excluded games.
+/// The Locations section: the form that adds a location, one card per
+/// location with its maintenance toggle, and the excluded games.
 fn drives(state: &State, embedded: bool) -> Element<'_, Message> {
-    let title = "Drives & libraries";
-    let subtitle = "Add games from any location and choose which libraries to maintain";
+    let title = "Locations";
+    let subtitle = shell::LOCATIONS_SUBTITLE;
     let mut content = column![
         if embedded {
             column![theme::section_title(title), theme::muted(subtitle)]
@@ -1608,8 +1596,8 @@ fn drives(state: &State, embedded: bool) -> Element<'_, Message> {
                 theme::section_title("Add a location"),
                 picker([FolderKind::Collection, FolderKind::Game], Some(state.folder_kind), Message::FolderKind),
                 theme::muted(match state.folder_kind {
-                    FolderKind::Collection => "Each immediate subfolder appears as a game. New subfolders appear when you refresh.",
-                    FolderKind::Game => "Show this entire folder as one game."
+                    FolderKind::Collection => "Each subfolder appears as a game. New subfolders appear when you refresh.",
+                    FolderKind::Game => "Show this whole folder as one game."
                 }),
                 row![
                     input("~/My Games or /mnt/games", &state.folder)
@@ -1621,7 +1609,7 @@ fn drives(state: &State, embedded: bool) -> Element<'_, Message> {
                         (!state.picker_busy)
                             .then_some(Message::Browse(super::dialog::Target::Game))
                     ),
-                    action("Add folder", Message::AddFolder)
+                    action("Add location", Message::AddFolder)
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
@@ -1635,7 +1623,7 @@ fn drives(state: &State, embedded: bool) -> Element<'_, Message> {
         )
     ]
     .spacing(theme::PAGE_GAP);
-    // Libraries the worker knows, followed by the parent folder of any game
+    // Locations the worker knows, followed by the parent folder of any game
     // that is in none of them. Those are listed as detected libraries.
     let mut paths: Vec<_> = state
         .snapshot
@@ -1703,7 +1691,7 @@ fn drives(state: &State, embedded: bool) -> Element<'_, Message> {
             row![
                 theme::muted(format!("Excluded: {}", state.title_of(id))).width(Length::Fill),
                 secondary(
-                    "Restore",
+                    "Include",
                     Message::Send(Command::Exclude {
                         id: id.clone(),
                         excluded: false
@@ -1724,12 +1712,12 @@ fn drives(state: &State, embedded: bool) -> Element<'_, Message> {
 fn settings_page(state: &State) -> Element<'_, Message> {
     let links = iced::widget::Row::with_children(
         [
-            ("Drives & libraries", "settings-locations"),
+            ("Locations", "settings-locations"),
             ("Recovery", "settings-recovery"),
             ("Background worker", "settings-worker"),
             ("Automatic maintenance", "settings-maintenance"),
             ("Appearance", "settings-appearance"),
-            ("Maximum Space compatibility", "settings-reports"),
+            ("Compatibility reports", "settings-reports"),
             ("About Flummox", "settings-about"),
         ]
         .into_iter()
@@ -1756,8 +1744,8 @@ fn settings_page(state: &State) -> Element<'_, Message> {
     .spacing(theme::PAGE_GAP * 2.0)
     .into()
 }
-/// The last Settings sections: worker restart, automatic maintenance,
-/// appearance, compatibility reports and About.
+/// The last Settings sections: background worker restart, automatic
+/// maintenance, appearance, compatibility reports and About.
 fn preferences(state: &State) -> Element<'_, Message> {
     let maintained = state
         .snapshot
@@ -1767,22 +1755,22 @@ fn preferences(state: &State) -> Element<'_, Message> {
         .count();
     // The worker refuses a restart while any job is active or a store exists.
     let restart_blocked = if state.snapshot.jobs.iter().any(|job| job.phase.active()) {
-        Some("Jobs are queued or running.")
+        Some("Jobs are waiting or running.")
     } else if !state.snapshot.packs.is_empty() {
-        Some("Games are running from Maximum Space stores.")
+        Some("Games are running from Maximum stores. Decompress them first.")
     } else {
         None
     };
     let mut worker = column![
         theme::section_title("Background worker"),
-        theme::muted("After an upgrade, restart when the queue is empty and Maximum Space games have been restored."),
+        theme::muted("After an upgrade, restart when no jobs are waiting or running and Maximum games have been decompressed."),
     ]
     .spacing(10);
     if let Some(reason) = restart_blocked {
         worker = worker.push(theme::muted(reason));
     }
     worker = worker.push(secondary_maybe(
-        "Restart worker",
+        "Restart background worker",
         restart_blocked
             .is_none()
             .then_some(Message::Send(Command::Restart)),
@@ -1797,15 +1785,18 @@ fn preferences(state: &State) -> Element<'_, Message> {
                         "Off".into()
                     } else {
                         format!(
-                            "{} librar{} maintained",
-                            maintained,
-                            if maintained == 1 { "y is" } else { "ies are" }
+                            "Maintaining {}",
+                            crate::text::count(
+                                u64::try_from(maintained).unwrap_or(u64::MAX),
+                                "location",
+                                "locations"
+                            )
                         )
                     })
                 ]
                 .spacing(4)
                 .width(Length::Fill),
-                secondary("Libraries", Message::GoTo(Page::Drives))
+                secondary("Locations", Message::GoTo(Page::Drives))
             ]
             .spacing(16)
             .align_y(Alignment::Center)
@@ -1848,8 +1839,15 @@ fn preferences(state: &State) -> Element<'_, Message> {
         )).id("settings-appearance"),
         container(panel(
             column![
-                theme::section_title("Maximum Space compatibility"),
-                theme::muted(format!("{} local reports. Analysis checks the exact build and installed files before enabling automatic activation.", state.reports.len())),
+                theme::section_title("Compatibility reports"),
+                theme::muted(format!(
+                    "{} saved on this computer. Analysis checks the exact build and installed files before Maximum is chosen automatically.",
+                    crate::text::count(
+                        u64::try_from(state.reports.len()).unwrap_or(u64::MAX),
+                        "compatibility report",
+                        "compatibility reports"
+                    )
+                )),
                 secondary_maybe("Import report…", (!state.picker_busy).then_some(Message::Browse(super::dialog::Target::Report)))
             ].spacing(8)
         )).id("settings-reports"),
@@ -1878,20 +1876,18 @@ fn completed_job_row(job: &Job) -> Element<'_, Message> {
                 text(&job.game.title).size(15),
                 theme::muted(match super::app::job_outcome(job) {
                     Some(outcome) => format!(
-                        "{} · {} · {} {} · {}s",
+                        "{} · {} · {} · {}",
                         kind,
                         outcome_words(outcome),
-                        job.files_done,
-                        if job.files_done == 1 { "file" } else { "files" },
-                        job.elapsed
+                        shell::files_count(job.files_done),
+                        crate::text::duration(job.elapsed)
                     ),
                     None => format!(
-                        "{} · {} {} · {} · {}s",
+                        "{} · {} · {} · {}",
                         kind,
-                        job.files_done,
-                        if job.files_done == 1 { "file" } else { "files" },
+                        shell::files_count(job.files_done),
                         size(job.bytes_done),
-                        job.elapsed
+                        crate::text::duration(job.elapsed)
                     ),
                 })
             ]
@@ -1938,6 +1934,32 @@ mod tests {
             headline(0, 900_000_000, true, false),
             "Finding your games…".to_owned(),
             "a scan in progress comes first",
+        )
+    }
+
+    #[test]
+    fn a_paused_job_is_listed_as_waiting_and_keeps_its_warning_colour() -> TestResult {
+        let titles: Vec<&str> = shell::JOB_GROUPS.iter().map(|(title, _)| *title).collect();
+        for (phase, group) in [
+            (Phase::Running, "Running"),
+            (Phase::Pausing, "Running"),
+            (Phase::Queued, "Waiting"),
+            (Phase::Paused, "Waiting"),
+            (Phase::Partial, "Needs attention"),
+            (Phase::Failed, "Needs attention"),
+            (Phase::Completed, "History"),
+            (Phase::Cancelled, "History"),
+        ] {
+            check_eq(
+                titles.get(job_group(phase)).copied(),
+                Some(group),
+                format!("{phase:?} is listed under {group}"),
+            )?;
+        }
+        check_eq(
+            tone(Phase::Paused),
+            theme::Tone::Warning,
+            "a paused job keeps the warning colour",
         )
     }
 

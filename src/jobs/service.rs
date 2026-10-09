@@ -1898,7 +1898,7 @@ pub(super) fn run() -> Result<()> {
             refresh_requested = false;
             if let Some(env) = crate::launchers::Env::current() {
                 snapshot.scan_generation = snapshot.scan_generation.saturating_add(1);
-                snapshot.scan_source = Some("Starting discovery".into());
+                snapshot.scan_source = Some("your launchers".into());
                 discovery = Some(crate::launchers::scan_job::Worker::start(env));
                 discovery_started = Instant::now();
             }

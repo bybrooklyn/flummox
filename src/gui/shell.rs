@@ -50,7 +50,7 @@ pub async fn background<T: Send + 'static>(
     });
     receive
         .await
-        .map_err(|_| "The background task stopped unexpectedly.".into())
+        .map_err(|_| "The action stopped unexpectedly. Try again.".into())
 }
 
 /// The window's theme: `forced_dark` when the user chose one, else the
@@ -482,7 +482,7 @@ pub fn shortfall(plan: &crate::storage::SpacePlan) -> u64 {
 }
 
 /// The review of a storage plan: what it is for, one line per volume with the
-/// reasons, the retained-original note and the failure when the plan does not
+/// reasons, the kept-original note and the failure when the plan does not
 /// fit. A failed plan is a card edged in the failure colour.
 pub fn plan_review<'a, M: Clone + 'a>(
     heading: Option<String>,
@@ -508,7 +508,7 @@ pub fn plan_review<'a, M: Clone + 'a>(
     }
     if plan.retained_original {
         review = review.push(theme::muted(
-            "The original is retained until you explicitly reclaim it.",
+            "The original is kept until you delete it.",
         ));
     }
     let failed = plan.check().is_err();
@@ -538,18 +538,28 @@ pub fn plan_review<'a, M: Clone + 'a>(
     }
 }
 
+/// A count of `usize` things through `crate::text::count`.
+fn counted(count: usize, one: &str, many: &str) -> String {
+    crate::text::count(u64::try_from(count).unwrap_or(u64::MAX), one, many)
+}
+
 /// "1 item needs attention" or "N items need attention".
 pub fn attention_title(count: usize) -> String {
-    if count == 1 {
-        "1 item needs attention".into()
-    } else {
-        format!("{count} items need attention")
-    }
+    format!(
+        "{} {} attention",
+        counted(count, "item", "items"),
+        if count == 1 { "needs" } else { "need" }
+    )
 }
 
 /// "1 game" or "N games".
 pub fn games_count(count: usize) -> String {
-    format!("{count} game{}", if count == 1 { "" } else { "s" })
+    counted(count, "game", "games")
+}
+
+/// "1 file" or "N files".
+pub fn files_count(count: u64) -> String {
+    crate::text::count(count, "file", "files")
 }
 
 /// The card on Overview for discovery warnings and games that need a look.
@@ -602,11 +612,41 @@ pub fn empty_panel<'a, M: Clone + 'a>(
 /// The Jobs page groups with the line shown when a group is empty.
 #[cfg(any(target_os = "linux", windows))]
 pub const JOB_GROUPS: [(&str, &str); 4] = [
-    ("Running", "No jobs running"),
-    ("Waiting", "No games waiting"),
-    ("Needs attention", "No jobs need attention"),
-    ("History", "Finished jobs will appear here"),
+    ("Running", "No jobs running."),
+    ("Waiting", "No jobs waiting."),
+    ("Needs attention", "No jobs need attention."),
+    ("History", "Finished jobs will appear here."),
 ];
+
+/// The Jobs page subtitle.
+#[cfg(any(target_os = "linux", windows))]
+pub const JOBS_SUBTITLE: &str = "Track running and waiting jobs, and see recent results.";
+
+/// The Locations section subtitle.
+pub const LOCATIONS_SUBTITLE: &str =
+    "Add a location that holds one game or many, and choose which ones to maintain.";
+
+/// The Recovery section subtitle.
+pub const RECOVERY_SUBTITLE: &str =
+    "Review interrupted jobs and kept originals before you retry or decompress.";
+
+/// The Recovery section when nothing needs review.
+pub const RECOVERY_EMPTY: &str = "No interrupted jobs or kept originals need review.";
+
+/// The card shown on the Jobs page while the background worker cannot be
+/// reached. `error` is the reason the connection reported.
+#[cfg(any(target_os = "linux", windows))]
+pub fn connection_lost<'a, M: 'a>(error: &'a str) -> Element<'a, M> {
+    theme::attention_card(
+        column![
+            theme::section_text("Lost connection to the background worker"),
+            theme::danger_text(error),
+            theme::muted("Showing the last received jobs. Reconnecting…")
+        ]
+        .spacing(6),
+        true,
+    )
+}
 
 /// How many finished jobs the history lists.
 #[cfg(any(target_os = "linux", windows))]

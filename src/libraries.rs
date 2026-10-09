@@ -171,7 +171,7 @@ pub fn remember(root: &Path, games: Vec<Game>, keep: impl Fn(&Game) -> bool) -> 
         if online && !previous.game.install_dir.exists() {
             continue;
         }
-        previous.game.state = InstallState::Broken { detail: if online { "Library unavailable: game was not rediscovered; refresh after checking its launcher" } else { "Library unavailable: reconnect its original drive" }.into() };
+        previous.game.state = InstallState::Broken { detail: if online { "Location unavailable: game was not rediscovered; refresh after checking its launcher" } else { "Location unavailable: reconnect its original drive" }.into() };
         result.push(previous);
     }
     // Skip the write when nothing but free space changed. Otherwise write a temp

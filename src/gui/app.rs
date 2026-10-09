@@ -75,7 +75,7 @@ impl Page {
             Self::Overview => "Overview",
             Self::Games => "Games",
             Self::Queue => "Jobs",
-            Self::Drives => "Drives",
+            Self::Drives => "Locations",
             Self::Recovery => "Recovery",
             Self::Settings => "Settings",
         }
@@ -93,7 +93,7 @@ pub struct GameRow {
     pub supported: bool,
     /// The filesystem compresses in place and a backend exists for it.
     pub native_supported: bool,
-    /// A Maximum Space store can be mounted over this game.
+    /// A Maximum store can be mounted over this game.
     pub pack_supported: bool,
     /// Why the game cannot be compressed. Replaces the row's status line.
     pub note: Option<String>,
@@ -114,7 +114,7 @@ impl GameRow {
     ) -> Self {
         // `libraries` marks a game it could not rediscover with this detail
         // prefix. Its directory may be gone, so it is not probed.
-        if matches!(&game.state, crate::model::InstallState::Broken { detail } if detail.starts_with("Library unavailable:"))
+        if matches!(&game.state, crate::model::InstallState::Broken { detail } if detail.starts_with("Location unavailable:"))
         {
             return Self {
                 game,
@@ -170,7 +170,7 @@ impl GameRow {
     }
 }
 /// The directory to probe for `game`, and whether the game runs from a
-/// mounted Maximum Space store.
+/// mounted Maximum store.
 ///
 /// A store is mounted at the game's own path, so probing that path reports the
 /// FUSE mount. The drive is the one holding the mount's parent folder, which
@@ -232,7 +232,7 @@ impl Sort {
 pub enum StorageChoice {
     /// Native compression in place. Quick, and the files stay where they are.
     Standard,
-    /// A Maximum Space store mounted at the game's path. Saves more, takes
+    /// A Maximum store mounted at the game's path. Saves more, takes
     /// minutes, and keeps the original until the user confirms the game runs.
     Maximum,
 }
@@ -243,9 +243,9 @@ pub enum Outcome {
     /// A native pass. Both sizes are sampled predictions, since the
     /// filesystem does not report what compression saved.
     Estimated { installed: u64, saved: u64 },
-    /// Maximum Space with the original deleted. Both sizes are the store's.
+    /// Maximum with the original deleted. Both sizes are the store's.
     Measured { before: u64, after: u64 },
-    /// Maximum Space with the original still kept, so nothing is saved yet.
+    /// Maximum with the original still kept, so nothing is saved yet.
     AwaitingConfirm { expected: u64 },
 }
 
@@ -261,13 +261,13 @@ pub fn job_outcome(job: &Job) -> Option<Outcome> {
 }
 
 /// Where a game sits in the Worth order: games that would save space, games
-/// not analyzed yet, compressed games, then games with little to gain or on
+/// not analyzed yet, compressed games, then games with little to save or on
 /// a drive that cannot compress.
 pub const WORTH_GROUPS: [&str; 4] = [
     "Worth compressing",
     "Not analyzed yet",
     "Compressed",
-    "Little to gain",
+    "Little to save",
 ];
 
 /// Which games the Games list shows. `State::filtered` holds the tests.
@@ -289,7 +289,7 @@ impl Filter {
             Self::Ready => "Ready",
             Self::Compressed => "Compressed",
             Self::Attention => "Needs attention",
-            Self::Updated => "Updated games",
+            Self::Updated => "Updated",
         }
     }
 }
@@ -383,7 +383,7 @@ pub struct State {
     /// Estimates arrived while a row was open or selected, so the list was
     /// left as it was and the page offers to sort again.
     pub order_stale: bool,
-    /// The "Little to gain" group is expanded.
+    /// The "Little to save" group is expanded.
     pub show_low: bool,
     /// Modes the user picked, by game. A game without an entry uses
     /// `State::choice_for`'s default.
@@ -756,7 +756,7 @@ impl State {
     }
     /// What compressing this game gained, or `None` when it is not compressed.
     ///
-    /// A Maximum Space install reports its store's own sizes. A native pass
+    /// A Maximum install reports its store's own sizes. A native pass
     /// reports the saving in its record, else the estimate its
     /// job carried.
     pub fn result(&self, game: &Game) -> Option<Outcome> {
@@ -914,7 +914,7 @@ impl State {
             .get(&(game.install_dir.clone(), game.build.clone()))
     }
     /// What to do with this game, from its estimate and what its drive
-    /// supports. `None` until an estimate exists. Maximum Space is offered
+    /// supports. `None` until an estimate exists. Maximum is offered
     /// only when the estimate says a qualification matched.
     pub fn recommendation(&self, game: &Game) -> Option<crate::recommendation::Recommendation> {
         let row = self.row_of(&game.id)?;
@@ -927,7 +927,7 @@ impl State {
             )
         })
     }
-    /// Where this game's Maximum Space store goes: the path the user entered,
+    /// Where this game's Maximum store goes: the path the user entered,
     /// else `.flummox/<hash>.store` beside the install directory. The hash is
     /// the first 16 hex digits of the BLAKE3 of the install path.
     pub fn store_path(&self, game: &Game) -> PathBuf {
@@ -962,12 +962,12 @@ impl State {
             .games
             .iter()
             .find(|r| r.game.id == game.id)
-            .ok_or_else(|| "Game no longer exists".to_owned())?;
+            .ok_or_else(|| "That game is no longer listed. Refresh and try again.".to_owned())?;
         match choice {
             StorageChoice::Standard => {
                 if !row.native_supported {
                     return Err(format!(
-                        "{}'s drive has no native compression. Open the game and choose Maximum.",
+                        "Standard is not available for {} on this drive. Open the game and choose Maximum.",
                         game.title
                     ));
                 }
@@ -1030,7 +1030,7 @@ impl State {
     /// Bytes saved so far. An estimate for natively compressed games.
     pub fn current_saving(&self) -> u64 {
         // One figure per installed game, from the same source its row shows.
-        // A Maximum Space game whose original is still kept has saved nothing.
+        // A Maximum game whose original is still kept has saved nothing.
         self.games
             .iter()
             .filter_map(|row| self.result(&row.game))
@@ -1283,7 +1283,7 @@ pub enum Message {
     /// Set how this game's Compress button compresses it.
     Choice(String, StorageChoice),
     Sort(Sort),
-    /// Expand or collapse the "Little to gain" group.
+    /// Expand or collapse the "Little to save" group.
     ToggleLow,
     Filter(Filter),
     /// Build 40 more rows of the Games list.
@@ -1318,7 +1318,7 @@ pub enum Message {
     PackActivate(String, bool),
     /// Create a store for a game without mounting it.
     PackCreate(String),
-    /// Show the confirm step for reclaiming the retained original.
+    /// Show the confirm step for deleting the kept original.
     PackReclaimPrompt(String),
     ToggleAdvanced(String),
 }
@@ -1392,13 +1392,19 @@ fn send_batch(commands: Vec<Command>) -> Result<Batch, String> {
 }
 
 /// One sentence for the commands of a batch that the worker refused: how many
-/// and the first reason.
-fn refusal_text(refused: &[(String, String)], noun: &str) -> Option<String> {
+/// and the first reason. `noun` and `outcome` are each the singular and plural
+/// form.
+fn refusal_text(
+    refused: &[(String, String)],
+    noun: (&str, &str),
+    outcome: (&str, &str),
+) -> Option<String> {
     let (_, reason) = refused.first()?;
-    let count = refused.len();
+    let count = u64::try_from(refused.len()).unwrap_or(u64::MAX);
     Some(format!(
-        "{count} {noun}{} could not be queued. {reason}",
-        if count == 1 { "" } else { "s" }
+        "{} {}. {reason}",
+        crate::text::count(count, noun.0, noun.1),
+        if count == 1 { outcome.0 } else { outcome.1 }
     ))
 }
 
@@ -1438,8 +1444,12 @@ fn queue_standard(state: &mut State, games: Vec<Game>, operation: Operation) -> 
     let skipped = wanted - commands.len();
     if skipped > 0 {
         state.show_status(Status::info(format!(
-            "{skipped} game{} left out: their drive needs Maximum, which is chosen per game.",
-            if skipped == 1 { " was" } else { "s were" }
+            "{} left out: their drive needs Maximum, which is chosen per game.",
+            crate::text::count(
+                u64::try_from(skipped).unwrap_or(u64::MAX),
+                "game was",
+                "games were"
+            )
         )));
     }
     if commands.is_empty() {
@@ -1651,7 +1661,9 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
             if std::mem::take(&mut state.qualifying) {
                 match result {
                     Ok(wizard) => state.qualification = Some(wizard),
-                    Err(error) => state.show_status(Status::error(error)),
+                    Err(error) => state.show_status(Status::error(format!(
+                        "Could not start the compatibility test: {error}"
+                    ))),
                 }
             }
         }
@@ -1679,7 +1691,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                 let roots = match (pack, wizard.mode) {
                     (Some(pack), _) => vec![pack.store_path.clone(), pack.writes_path.clone()],
                     (None, crate::compatibility::StorageMode::MaximumSpace) => {
-                        wizard.measured(Err("Activate Maximum Space for this game first".into()));
+                        wizard.measured(Err("Switch this game to Maximum first".into()));
                         return Task::none();
                     }
                     (None, crate::compatibility::StorageMode::Native) => vec![game.clone()],
@@ -1710,7 +1722,9 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                             |result| Message::QualificationSaved(result.and_then(|result| result)),
                         );
                     }
-                    Err(error) => state.show_status(Status::error(error.to_string())),
+                    Err(error) => state.show_status(Status::error(format!(
+                        "Could not save the compatibility report: {error}"
+                    ))),
                 }
             }
         }
@@ -1732,7 +1746,9 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                 )));
                 return update(state, Message::Refresh);
             }
-            Err(error) => state.show_status(Status::error(error)),
+            Err(error) => state.show_status(Status::error(format!(
+                "Could not save the compatibility report: {error}"
+            ))),
         },
         // Space plan review.
         Message::Planned(result) => match result {
@@ -1746,7 +1762,9 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                 });
             }
             Ok(plan) => state.planned = Some(plan),
-            Err(error) => state.show_status(Status::error(error)),
+            Err(error) => state.show_status(Status::error(format!(
+                "Could not check free space: {error}"
+            ))),
         },
         Message::StartPlanned => {
             // The stored numbers are the ones that failed, so checking them
@@ -1785,7 +1803,9 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                 "Diagnostics saved to {}. They include local folder paths.",
                 path.display()
             ))),
-            Err(error) => state.show_status(Status::error(error)),
+            Err(error) => state.show_status(Status::error(format!(
+                "Could not save diagnostics: {error}"
+            ))),
         },
         // Artwork. Decodes are started by `artwork_tasks` after the match.
         Message::ArtworkVisible(source) => state.artwork_cache.request(source),
@@ -1800,7 +1820,9 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::ArtworkSaved(result) => match result {
             Ok(()) => return update(state, Message::Refresh),
-            Err(error) => state.show_status(Status::error(error)),
+            Err(error) => state.show_status(Status::error(format!(
+                "Could not change the artwork: {error}"
+            ))),
         },
         // Navigation and scrolling.
         Message::Jump(section) => {
@@ -1881,7 +1903,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                 return super::surface::restore_offset(page.label(), offset, Message::Tick);
             }
         }
-        // Scanning and worker snapshots.
+        // Finding games and worker snapshots.
         Message::Rescan => return send(Command::RefreshDiscovery),
         Message::Refresh => {
             if state.scanning {
@@ -1950,7 +1972,9 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                         state.expanded = None;
                     }
                 }
-                Err(e) => state.show_status(Status::error(e)),
+                Err(e) => state.show_status(Status::error(format!(
+                    "Could not refresh the game list: {e}"
+                ))),
             }
             if std::mem::take(&mut state.rescan_wanted) {
                 return update(state, Message::Refresh);
@@ -1966,8 +1990,11 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                     state
                         .analysis_refused
                         .extend(batch.refused.iter().map(|(id, _)| id.clone()));
-                    let notice = refusal_text(&batch.refused, "analysis")
-                        .map(|text| text.replace("could not be queued", "were skipped"));
+                    let notice = refusal_text(
+                        &batch.refused,
+                        ("analysis", "analyses"),
+                        ("was skipped", "were skipped"),
+                    );
                     let task = update(state, Message::Snapshot(Ok(batch.snapshot)));
                     if let Some(text) = notice {
                         state.show_status(Status::info(text));
@@ -1980,7 +2007,11 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
         Message::Batched(result) => match result {
             Ok(batch) => {
                 let task = update(state, Message::Snapshot(Ok(batch.snapshot)));
-                if let Some(text) = refusal_text(&batch.refused, "job") {
+                if let Some(text) = refusal_text(
+                    &batch.refused,
+                    ("job", "jobs"),
+                    ("could not be queued", "could not be queued"),
+                ) {
                     state.show_refusal(text);
                 }
                 return task;
@@ -2085,7 +2116,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                 // first.
                 if libraries_changed {
                     if !first {
-                        state.show_status(Status::info("Library settings saved."));
+                        state.show_status(Status::info("Location settings saved."));
                     }
                     return update(state, Message::Refresh);
                 }
@@ -2101,7 +2132,9 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                 state.connection_error = Some(e.clone());
                 state.polling = true;
                 if first {
-                    state.show_status(Status::error(e));
+                    state.show_status(Status::error(format!(
+                        "Lost connection to the background worker: {e}"
+                    )));
                 }
             }
         },
@@ -2291,7 +2324,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                         if let Some(path) = destination.to_str() {
                             state.pack_paths.insert(id, path.to_owned());
                         } else {
-                            state.show_status(Status::error("This path cannot be shown in the storage field. Choose another folder."));
+                            state.show_status(Status::error("This path cannot be shown in the store field. Choose another folder."));
                         }
                     }
                     super::dialog::Target::Artwork(game) => {
@@ -2340,7 +2373,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                     .find(|row| report.game.matches(&row.game))
                     .map(|row| row.game.clone());
                 state.reports.push(report);
-                state.show_status(Status::info("Report imported. Analysis will verify the installed files before enabling Maximum Space."));
+                state.show_status(Status::info("Report imported. Analysis will check the installed files before Maximum is chosen automatically."));
                 if let Some(game) = game {
                     return send(Command::Enqueue {
                         game,
@@ -2349,7 +2382,9 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                     });
                 }
             }
-            Err(error) => state.show_status(Status::error(error)),
+            Err(error) => state.show_status(Status::error(format!(
+                "Could not import the report: {error}"
+            ))),
         },
         // Locations and preferences.
         Message::Folder(folder) => {
@@ -2414,7 +2449,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
             state.launcher_filter = launcher;
             state.capture_order();
         }
-        // Maximum Space storage.
+        // Maximum stores.
         Message::PackPath(id, path) => {
             state.pack_paths.insert(id, path);
         }
@@ -3523,7 +3558,7 @@ mod tests {
         check_eq(
             collapsed,
             ["a", "b"].map(String::from).to_vec(),
-            "the group of games with little to gain is collapsed",
+            "the group of games with little to save is collapsed",
         )?;
         state.show_low = true;
         let filtered = state.filtered();
@@ -3697,11 +3732,22 @@ mod tests {
 
     #[test]
     fn refusals_are_summarised_by_count_and_first_reason() -> TestResult {
-        check(refusal_text(&[], "job").is_none(), "nothing refused")?;
+        let jobs = ("job", "jobs");
+        let outcome = ("could not be queued", "could not be queued");
+        check(
+            refusal_text(&[], jobs, outcome).is_none(),
+            "nothing refused",
+        )?;
         check_eq(
-            refusal_text(&[("a".into(), "Why.".into())], "job"),
+            refusal_text(&[("a".into(), "Why.".into())], jobs, outcome),
             Some("1 job could not be queued. Why.".to_owned()),
             "one",
+        )?;
+        let two = [("a".into(), "Why.".into()), ("b".into(), "Else.".into())];
+        check_eq(
+            refusal_text(&two, ("analysis", "analyses"), ("was skipped", "were skipped")),
+            Some("2 analyses were skipped. Why.".to_owned()),
+            "two, with the plural noun and verb",
         )
     }
     #[test]

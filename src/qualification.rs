@@ -25,7 +25,7 @@ pub enum Check {
     Metadata,
     /// The launcher updated and verified the game under the tested mode.
     Update,
-    /// Restoring ordinary files and restarting worked.
+    /// Decompressing to ordinary files and restarting worked.
     Restore,
     Launch,
     /// Ticked when a problem was seen. A ticked issue box disqualifies.
@@ -110,8 +110,9 @@ impl Wizard {
             Ok(found) => {
                 wizard.allocated_before = found.allocated_bytes.to_string();
                 wizard.measurement = Some(format!(
-                    "Measured the game folder as the original: {} files, {} allocated bytes.",
-                    found.files, found.allocated_bytes
+                    "Measured the game folder as the original: {} using {} of disk space.",
+                    crate::text::count(found.files, "file", "files"),
+                    size(found.allocated_bytes)
                 ));
             }
             Err(error) => {
@@ -126,8 +127,9 @@ impl Wizard {
             Ok(found) => {
                 self.allocated_after = found.allocated_bytes.to_string();
                 format!(
-                    "Measured the compressed copy: {} files, {} allocated bytes.",
-                    found.files, found.allocated_bytes
+                    "Measured the compressed copy: {} using {} of disk space.",
+                    crate::text::count(found.files, "file", "files"),
+                    size(found.allocated_bytes)
                 )
             }
             Err(error) => format!("Compressed copy not measured: {error}."),
@@ -151,13 +153,17 @@ impl Wizard {
         let integer = |text: &str, label: &str| -> Result<u64> {
             text.trim()
                 .parse::<u64>()
-                .with_context(|| format!("Enter {label} as whole-number measurements"))
+                .with_context(|| format!("Enter {label} as a whole number."))
         };
         let mut checks = self.checks.clone();
-        checks.baseline_load_ms =
-            integer(&self.baseline_load, "baseline load time in milliseconds")?;
-        checks.candidate_load_ms =
-            integer(&self.candidate_load, "compressed load time in milliseconds")?;
+        checks.baseline_load_ms = integer(
+            &self.baseline_load,
+            "the load time before compression in milliseconds",
+        )?;
+        checks.candidate_load_ms = integer(
+            &self.candidate_load,
+            "the load time after compression in milliseconds",
+        )?;
         let report = Report {
             version: compatibility::VERSION,
             game: GameBuild::new(&self.game.id, &self.build),
@@ -167,19 +173,30 @@ impl Wizard {
             checks,
             storage: StorageResult {
                 logical_bytes: self.corpus.bytes,
-                allocated_before: integer(&self.allocated_before, "original allocated bytes")?,
-                allocated_after: integer(&self.allocated_after, "compressed allocated bytes")?,
+                allocated_before: integer(
+                    &self.allocated_before,
+                    "the space used by the original, in bytes,",
+                )?,
+                allocated_after: integer(
+                    &self.allocated_after,
+                    "the space used by the compressed copy, in bytes,",
+                )?,
                 random_read_p95_ns: None,
             },
             flummox_version: env!("CARGO_PKG_VERSION").into(),
         };
         ensure!(
             report.storage.allocated_before > 0 && report.storage.allocated_after > 0,
-            "Allocated-byte measurements must be positive"
+            "The space used by the original and by the compressed copy must each be more than zero."
         );
         report.validate()?;
         Ok(report)
     }
+}
+
+/// Bytes in decimal units, for the lines the form prints.
+fn size(bytes: u64) -> String {
+    humansize::format_size(bytes, humansize::DECIMAL)
 }
 
 /// Hashes every file of the game into a [`Corpus`]. Linux uses
@@ -287,15 +304,15 @@ pub fn view<'a, Message: Clone + 'a>(
     use crate::gui::theme;
     use iced::widget::{checkbox, column, pick_list, row, text_input};
     let mut form = column![
-        theme::section_text(format!("Qualify {}", wizard.game.title)),
-        theme::muted("Use a disposable game copy. Measure the ordinary install, then compression, launch, gameplay, update, verification, restart, and restoration."),
+        theme::section_text(format!("Compatibility test for {}", wizard.game.title)),
+        theme::muted("Use a disposable copy of the game. Measure the ordinary install, then test compression, launch, gameplay, updates, verification, restart and decompression."),
         theme::muted(format!(
-            "Baseline: {} files · {}",
-            wizard.corpus.files,
-            humansize::format_size(wizard.corpus.bytes, humansize::DECIMAL)
+            "Original install: {} · {}",
+            crate::text::count(wizard.corpus.files, "file", "files"),
+            size(wizard.corpus.bytes)
         )),
         theme::field(
-            "Storage mode",
+            "Mode",
             pick_list([StorageMode::Native, StorageMode::MaximumSpace], Some(wizard.mode), mode)
                 .padding(theme::INPUT_PADDING)
                 .style(theme::pick_list)
@@ -307,22 +324,22 @@ pub fn view<'a, Message: Clone + 'a>(
     for (label, value, kind) in [
         ("Game build", &wizard.build, Field::Build),
         (
-            "Baseline load time (ms)",
+            "Load time before compression (ms)",
             &wizard.baseline_load,
             Field::BaselineLoad,
         ),
         (
-            "Compressed load time (ms)",
+            "Load time after compression (ms)",
             &wizard.candidate_load,
             Field::CandidateLoad,
         ),
         (
-            "Original allocated bytes",
+            "Space used by the original (bytes)",
             &wizard.allocated_before,
             Field::AllocationBefore,
         ),
         (
-            "Compressed allocated bytes",
+            "Space used by the compressed copy (bytes)",
             &wizard.allocated_after,
             Field::AllocationAfter,
         ),
@@ -353,7 +370,7 @@ pub fn view<'a, Message: Clone + 'a>(
             Check::Update,
         ),
         (
-            "Restoration and restart succeed",
+            "Decompression and restart succeed",
             wizard.checks.rollback_verified,
             Check::Restore,
         ),
@@ -380,13 +397,16 @@ pub fn view<'a, Message: Clone + 'a>(
     if let Some(measurement) = &wizard.measurement {
         form = form.push(theme::muted(measurement));
     }
-    form = form.push(theme::muted("Record actual allocated bytes; whole-drive free-space changes include other processes. Reports retain failed checks and do not claim untested games are compatible."));
+    form = form.push(theme::muted("Record the space actually used on disk. Free-space changes on the whole drive include other programs' writes. Reports keep failed checks and do not claim that untested games are compatible."));
     if let Err(error) = wizard.report() {
         form = form.push(theme::danger_text(error.to_string()));
     }
     form.push(
         row![
-            theme::action_maybe("Save local report", wizard.report().is_ok().then_some(save)),
+            theme::action_maybe(
+                "Save compatibility report",
+                wizard.report().is_ok().then_some(save)
+            ),
             theme::secondary("Close", cancel)
         ]
         .spacing(8)

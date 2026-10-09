@@ -170,7 +170,7 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
             }))
             .ctx("store summary")?,
             phase: crate::pack::InstallPhase::Mounted,
-            message: "Writable compressed install is mounted".into(),
+            message: "Using Maximum.".into(),
         });
     }
     for row in [native, flat, unknown, kept, confirmed] {
@@ -241,7 +241,7 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
                 },
                 additional: 4_000_000_000,
                 headroom: 200_000_000,
-                reasons: vec!["Verified store; original retained".into()],
+                reasons: vec!["Store checked; original kept".into()],
             }],
         },
     ));
@@ -250,7 +250,7 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
     state.page = Page::Recovery;
     if let Some(job) = state.snapshot.jobs.first_mut() {
         job.phase = Phase::Interrupted;
-        job.message = "Worker stopped; original retained".into();
+        job.message = "The background worker stopped; original kept.".into();
     }
     render(&state, 1100, 720, &output.join("recovery.png"))?;
     state.page = Page::Games;
@@ -272,7 +272,7 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
         operation: Operation::Pack,
         pack: Some(PackTask::Compact),
         phase: Phase::Running,
-        message: "Building Maximum Space store".into(),
+        message: "Folding in updates".into(),
         files_done: 30,
         bytes_done: 800_000_000,
         files_total: 140,
@@ -351,7 +351,7 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
     }
     render(&state, 1100, 1800, &output.join("jobs-phases.png"))?;
     render(&state, 720, 1800, &output.join("jobs-phases-narrow.png"))?;
-    state.connection_error = Some("Worker disconnected; reconnecting".into());
+    state.connection_error = Some("Background worker disconnected".into());
     render(&state, 1100, 1800, &output.join("jobs-disconnected.png"))?;
     state.connection_error = None;
 
@@ -364,7 +364,7 @@ fn desktop_workflows_render_without_a_display() -> TestResult {
     ));
     render(&state, 1100, 720, &output.join("toast.png"))?;
     state.show_status(Status::error(
-        "This game is excluded. Restore it in Drives first.",
+        "This game is excluded. Include it in Settings, under Locations, first.",
     ));
     render(&state, 720, 720, &output.join("toast-error-narrow.png"))?;
     state.toast.status = None;

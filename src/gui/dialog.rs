@@ -80,7 +80,7 @@ fn run(mut command: Command) -> std::io::Result<(Option<i32>, Vec<u8>, Vec<u8>)>
 pub enum Target {
     /// A folder of games to add as a location.
     Game,
-    /// The folder for a Maximum Space store. Holds the game's id string.
+    /// The folder for a Maximum store. Holds the game's id string.
     Storage(String),
     /// A compatibility report, as a JSON file.
     Report,
@@ -125,8 +125,8 @@ pub fn choose(target: &Target) -> Result<Option<PathBuf>, String> {
     let report = matches!(target, Target::Report);
     let artwork = matches!(target, Target::Artwork(_));
     let title = match target {
-        Target::Game => "Choose a games location",
-        Target::Storage(_) => "Choose where Maximum Space stores should live",
+        Target::Game => "Choose a location",
+        Target::Storage(_) => "Choose a folder for the Maximum store",
         Target::Report => "Import a compatibility report",
         Target::Artwork(_) => "Choose local game artwork",
     };

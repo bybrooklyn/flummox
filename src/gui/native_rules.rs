@@ -83,7 +83,7 @@ pub fn job_for_folder<'a>(jobs: &'a [Job], folder: &Path) -> Option<&'a Job> {
         .or_else(|| on_folder().next())
 }
 
-/// Whether a retained record for `root` belongs to a job that is still active.
+/// Whether a record for `root` belongs to a job that is still active.
 /// Either path may be the parent of the other.
 #[cfg(any(windows, test))]
 pub fn recovery_in_use(jobs: &[Job], root: &Path) -> bool {
