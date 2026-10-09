@@ -1,6 +1,6 @@
 //! Durable discovery cache. Missing drives retain their games and volume identity.
 use crate::{
-    model::{Game, InstallState},
+    model::{Game, InstallState, Launcher},
     storage,
 };
 use anyhow::{Context, Result};
@@ -105,6 +105,41 @@ fn stable_bytes(games: &[RememberedGame]) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&Cache { games })?)
 }
 
+/// Whether `key` is a list position, as an earlier build gave Heroic games
+/// that have no app name.
+fn is_index_key(key: &str) -> bool {
+    !key.is_empty() && key.len() <= 4 && key.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Adds to `game.also` each index-style Heroic id the cache holds for the
+/// same folder, so exclusions, history and artwork stored under it still match.
+/// Stored data is not rewritten.
+fn inherit_index_aliases(game: &mut Game, cached: &[RememberedGame]) {
+    let heroic = matches!(
+        game.id.launcher,
+        Launcher::HeroicLegendary
+            | Launcher::HeroicGog
+            | Launcher::HeroicNile
+            | Launcher::HeroicSideload
+    );
+    if !heroic {
+        return;
+    }
+    for previous in cached
+        .iter()
+        .filter(|previous| previous.game.install_dir == game.install_dir)
+    {
+        for id in previous.game.ids() {
+            if id.launcher == game.id.launcher
+                && is_index_key(&id.key)
+                && game.ids().all(|have| have != id)
+            {
+                game.also.push(id.clone());
+            }
+        }
+    }
+}
+
 /// Merges a fresh discovery with `libraries.json` under `root` and writes the result
 /// back when it changed. A cached game that was not rediscovered is returned as
 /// `Broken` while its drive is absent, or present but the game was not listed, for
@@ -127,6 +162,7 @@ pub fn remember(root: &Path, games: Vec<Game>, keep: impl Fn(&Game) -> bool) -> 
     // Games that cannot be placed on a volume are listed but not cached.
     let mut uncached: Vec<Game> = Vec::new();
     for mut game in games {
+        inherit_index_aliases(&mut game, &old.games);
         // A fresh sighting is accepted whatever the cache says about the volume.
         // The launcher found the folder, so it is there now.
         if !game.install_dir.is_dir() {
@@ -251,6 +287,54 @@ mod tests {
             after.first().map(|g| g.install_dir.clone()),
             Some(b),
             "the moved game is listed once, at its new path",
+        )
+    }
+    #[test]
+    fn a_heroic_game_keeps_its_old_index_id_as_an_alias() -> TestResult {
+        let fixture = tempfile::tempdir().ctx("fixture")?;
+        let state = fixture.path().join("state");
+        let dir = fixture.path().join("game");
+        std::fs::create_dir(&dir).ctx("game folder")?;
+        // An earlier build keyed the game by its array position.
+        remember(&state, vec![fixture_game("0", &dir)], |_| true).ctx("first scan")?;
+        // Exclusions are stored as id strings and matched against every id.
+        let excluded = [GameId::new(Launcher::HeroicGog, "0").to_string()];
+        let named = fixture_game("1423049311", &dir);
+        let after = remember(&state, vec![named.clone()], |_| true).ctx("second scan")?;
+        let game = after.first().ctx("the game")?;
+        check_eq(
+            game.id.clone(),
+            named.id.clone(),
+            "the new id stays the primary id",
+        )?;
+        check(
+            game.ids().any(|id| excluded.contains(&id.to_string())),
+            "the exclusion stored under the old id applies",
+        )?;
+        check(
+            !named.ids().any(|id| excluded.contains(&id.to_string())),
+            "control: without the alias the exclusion is lost",
+        )?;
+        let third = remember(&state, vec![named], |_| true).ctx("third scan")?;
+        check(
+            third
+                .first()
+                .ctx("game again")?
+                .ids()
+                .any(|id| id.key == "0"),
+            "the alias survives later scans",
+        )?;
+        let other = tempfile::tempdir().ctx("other")?;
+        let elsewhere = other.path().join("game");
+        std::fs::create_dir(&elsewhere).ctx("other folder")?;
+        let unrelated = remember(&state, vec![fixture_game("7", &elsewhere)], |_| true)
+            .ctx("unrelated scan")?;
+        check(
+            unrelated
+                .iter()
+                .filter(|g| g.install_dir == elsewhere)
+                .all(|g| g.also.is_empty()),
+            "a game in another folder inherits nothing",
         )
     }
     #[test]

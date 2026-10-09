@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::inotify;
@@ -50,6 +51,22 @@ pub fn appid_from_manifest(name: &str) -> Option<u32> {
         .ok()
 }
 
+/// Waits before each retry of an `on_ready` that failed: three retries after
+/// the first attempt.
+pub const RETRY_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(10),
+    Duration::from_secs(60),
+    Duration::from_secs(300),
+];
+
+/// An app whose `on_ready` failed and is waiting for its next attempt.
+struct Retry {
+    app: App,
+    /// Attempts made so far.
+    attempts: usize,
+    due: Instant,
+}
+
 /// What the watcher last saw of an app.
 struct Seen {
     settled: bool,
@@ -69,11 +86,23 @@ fn newly_ready(before: Option<&Seen>, app: &App) -> bool {
 ///
 /// Runs until `cancel` is set, or fails once every watched folder is gone.
 /// `on_ready` is called once per app each time it becomes settled or settles
-/// on a new build, not once per manifest write.
+/// on a new build, not once per manifest write. An app counts as handled only
+/// when `on_ready` returns `Ok`. After an error it is retried on the
+/// [`RETRY_BACKOFF`] schedule, and once that is spent, at the next manifest change.
 pub fn run(
     libraries: &[PathBuf],
     cancel: &AtomicBool,
-    mut on_ready: impl FnMut(&App),
+    on_ready: impl FnMut(&App) -> anyhow::Result<()>,
+) -> io::Result<()> {
+    run_with_backoff(libraries, cancel, &RETRY_BACKOFF, on_ready)
+}
+
+/// [`run`] with the waits between retries of a failing `on_ready`.
+pub fn run_with_backoff(
+    libraries: &[PathBuf],
+    cancel: &AtomicBool,
+    backoff: &[Duration],
+    mut on_ready: impl FnMut(&App) -> anyhow::Result<()>,
 ) -> io::Result<()> {
     let fd = inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK)?;
 
@@ -112,11 +141,16 @@ pub fn run(
     }
 
     let mut alive = watched.len();
+    let mut retries: HashMap<u32, Retry> = HashMap::new();
     let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); BUF_BYTES];
     while !cancel.load(Ordering::Relaxed) {
         let mut fds = [PollFd::new(&fd, PollFlags::IN)];
-        match poll(&mut fds, Some(&WAIT)) {
-            Ok(0) => continue,
+        let timeout = wait_for(&retries);
+        match poll(&mut fds, Some(&timeout)) {
+            Ok(0) => {
+                retry_due(&mut retries, &mut seen, backoff, &mut on_ready);
+                continue;
+            }
             Ok(_) => {}
             Err(rustix::io::Errno::INTR) => continue,
             Err(e) => return Err(e.into()),
@@ -129,6 +163,7 @@ pub fn run(
                 "every watched Steam folder has gone away",
             ));
         }
+        retry_due(&mut retries, &mut seen, backoff, &mut on_ready);
         if !drained.rescan {
             continue;
         }
@@ -137,20 +172,126 @@ pub fn run(
         // watch descriptor belongs to which directory.
         for library in &watched {
             for app in steam::apps_in_library(library).unwrap_or_default() {
-                let before = seen.insert(
+                let settled = is_settled(&app);
+                let ready = newly_ready(seen.get(&app.appid), &app);
+                // An app waiting on a backoff keeps waiting while its build is
+                // unchanged, so another game's manifest cannot cut the wait short.
+                let waiting = retries.get(&app.appid).is_some_and(|retry| {
+                    retry.app.build == app.build && retry.due > Instant::now()
+                });
+                if ready && waiting {
+                    continue;
+                }
+                // An app that is ready is recorded as handled only once
+                // `on_ready` succeeds.
+                seen.insert(
                     app.appid,
                     Seen {
-                        settled: is_settled(&app),
+                        settled: settled && !ready,
                         build: app.build.clone(),
                     },
                 );
-                if newly_ready(before.as_ref(), &app) {
-                    on_ready(&app);
+                if !settled {
+                    retries.remove(&app.appid);
+                }
+                if ready {
+                    attempt(&app, 1, &mut retries, &mut seen, backoff, &mut on_ready);
                 }
             }
         }
     }
     Ok(())
+}
+
+/// Runs `on_ready` for `app`, which has made `attempts - 1` earlier tries.
+/// Success marks it settled. A failure schedules the next try, or once the
+/// backoff is spent logs the error and leaves the app for the next manifest change.
+fn attempt(
+    app: &App,
+    attempts: usize,
+    retries: &mut HashMap<u32, Retry>,
+    seen: &mut HashMap<u32, Seen>,
+    backoff: &[Duration],
+    on_ready: &mut impl FnMut(&App) -> anyhow::Result<()>,
+) {
+    match on_ready(app) {
+        Ok(()) => {
+            retries.remove(&app.appid);
+            seen.insert(
+                app.appid,
+                Seen {
+                    settled: true,
+                    build: app.build.clone(),
+                },
+            );
+        }
+        Err(error) => match backoff.get(attempts.saturating_sub(1)) {
+            Some(wait) => {
+                tracing::debug!(appid = app.appid, attempts, %error, "retrying a finished download");
+                retries.insert(
+                    app.appid,
+                    Retry {
+                        app: app.clone(),
+                        attempts,
+                        due: Instant::now() + *wait,
+                    },
+                );
+            }
+            None => {
+                retries.remove(&app.appid);
+                tracing::warn!(
+                    appid = app.appid,
+                    name = %app.name,
+                    attempts,
+                    "gave up on a finished download until its manifest changes: {error:#}"
+                );
+            }
+        },
+    }
+}
+
+/// Retries every app whose wait is over.
+fn retry_due(
+    retries: &mut HashMap<u32, Retry>,
+    seen: &mut HashMap<u32, Seen>,
+    backoff: &[Duration],
+    on_ready: &mut impl FnMut(&App) -> anyhow::Result<()>,
+) {
+    let now = Instant::now();
+    let due: Vec<u32> = retries
+        .iter()
+        .filter(|(_, retry)| retry.due <= now)
+        .map(|(appid, _)| *appid)
+        .collect();
+    for appid in due {
+        if let Some(retry) = retries.remove(&appid) {
+            attempt(
+                &retry.app,
+                retry.attempts + 1,
+                retries,
+                seen,
+                backoff,
+                on_ready,
+            );
+        }
+    }
+}
+
+/// How long to wait for events: the regular interval, or less when a retry is
+/// due sooner.
+fn wait_for(retries: &HashMap<u32, Retry>) -> Timespec {
+    let now = Instant::now();
+    let soonest = retries
+        .values()
+        .map(|retry| retry.due.saturating_duration_since(now))
+        .min();
+    match soonest {
+        Some(left) if left < Duration::from_secs(1) => Timespec {
+            tv_sec: 0,
+            tv_nsec: i64::from(left.subsec_nanos()).max(1_000_000),
+        },
+        _ => WAIT,
+    }
 }
 
 /// What the pending events asked for.

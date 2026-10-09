@@ -175,7 +175,7 @@ proptest! {
             u64::from(block),
             "a 128 KiB block that does not shrink costs 128 KiB"
         );
-        prop_assert_eq!(model.level(), level, "the model reports the level it was built with");
+        prop_assert_eq!(model.level, level, "the model keeps the level it was built with");
     }
 }
 

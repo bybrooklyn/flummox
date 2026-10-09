@@ -266,6 +266,28 @@ pub fn refuse_install_path(path: &Path) -> Result<(), String> {
     refuse_install_path_with(path, home.as_deref())
 }
 
+/// Whether two install directories that cannot be resolved on disk name the
+/// same folder. On Windows case, slash direction and a trailing slash do not
+/// matter, so `c:/games/Foo` equals `C:\Games\Foo\`. Elsewhere the spelling
+/// must match.
+pub fn same_install_dir(a: &Path, b: &Path) -> bool {
+    same_install_dir_with(a, b, cfg!(windows))
+}
+
+/// [`same_install_dir`] with the case folding chosen by the caller.
+pub fn same_install_dir_with(a: &Path, b: &Path, fold: bool) -> bool {
+    if !fold {
+        return a == b;
+    }
+    let key = |path: &Path| {
+        path.to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_lowercase()
+    };
+    key(a) == key(b)
+}
+
 /// Marks every `Manual` game that would swallow other games as `Broken`.
 ///
 /// A folder is refused when another discovered game lives inside it or when
@@ -535,6 +557,28 @@ mod tests {
             serde_json::from_str(&json).map_err(|error| error.to_string())?,
             state,
             "broken state round trip",
+        )
+    }
+
+    #[test]
+    fn install_dirs_fold_case_and_slashes_only_when_asked() -> TestResult {
+        let registry = Path::new("c:/program files/Game/");
+        let picked = Path::new("C:\\Program Files\\game");
+        check(
+            same_install_dir_with(registry, picked, true),
+            "spellings of one Windows folder are equal",
+        )?;
+        check(
+            !same_install_dir_with(registry, picked, false),
+            "without folding the spellings differ",
+        )?;
+        check(
+            !same_install_dir_with(Path::new("C:/a"), Path::new("C:/b"), true),
+            "different folders stay different",
+        )?;
+        check(
+            same_install_dir(Path::new("/games/a"), Path::new("/games/a")),
+            "identical paths are equal",
         )
     }
 }

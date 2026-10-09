@@ -49,6 +49,7 @@ fn an_update_that_finishes_while_another_game_is_handled_is_not_lost() -> TestRe
                     // Stands for a compress job that takes a while.
                     release_rx.recv_timeout(WAIT).ok();
                 }
+                Ok(())
             })
         });
         let mut seen = Vec::new();
@@ -87,7 +88,7 @@ fn the_watcher_fails_when_every_watched_folder_goes_away() -> TestResult {
     let (done_tx, done_rx) = mpsc::channel::<std::io::Result<()>>();
     std::thread::scope(|scope| -> TestResult {
         scope.spawn(|| {
-            let result = watch::run(&[tmp.path().to_path_buf()], &cancel, |_| {});
+            let result = watch::run(&[tmp.path().to_path_buf()], &cancel, |_| Ok(()));
             done_tx.send(result).ok();
         });
         std::thread::sleep(Duration::from_millis(300));
@@ -96,5 +97,86 @@ fn the_watcher_fails_when_every_watched_folder_goes_away() -> TestResult {
         cancel.store(true, Ordering::Relaxed);
         let result = got.ctx("the watcher returns once its folder is gone")?;
         check(result.is_err(), "and it returns an error, not success")
+    })
+}
+
+#[test]
+fn a_failed_callback_is_retried_and_a_success_settles_the_game() -> TestResult {
+    let tmp = library()?;
+    let cancel = AtomicBool::new(false);
+    let (tx, rx) = mpsc::channel::<u32>();
+    let backoff = [Duration::from_millis(50), Duration::from_millis(50)];
+    let calls = std::thread::scope(|scope| -> Result<usize, String> {
+        let (library, cancel) = (tmp.path().to_path_buf(), &cancel);
+        let watcher = scope.spawn(move || {
+            let mut calls = 0u32;
+            watch::run_with_backoff(&[library], cancel, &backoff, |app| {
+                calls += 1;
+                tx.send(app.appid).ok();
+                if calls == 1 {
+                    anyhow::bail!("the coordinator was not reachable");
+                }
+                Ok(())
+            })
+        });
+        let result = (|| {
+            std::thread::sleep(Duration::from_millis(500));
+            write_manifest(tmp.path(), 100, 1)?;
+            let mut got = vec![rx.recv_timeout(WAIT).ctx("the first attempt")?];
+            got.push(rx.recv_timeout(WAIT).ctx("the retry after the failure")?);
+            // A third call would mean a settled game was reported again.
+            check(
+                rx.recv_timeout(Duration::from_millis(500)).is_err(),
+                "a game whose callback succeeded is not reported again",
+            )?;
+            Ok::<usize, String>(got.len())
+        })();
+        cancel.store(true, Ordering::Relaxed);
+        let ran = watcher.join().map_err(|_| "the watcher panicked")?;
+        ran.ctx("the watcher stops cleanly")?;
+        result
+    })?;
+    check_eq(calls, 2, "one failure and one success")
+}
+
+#[test]
+fn retries_are_bounded_and_a_manifest_change_starts_again() -> TestResult {
+    let tmp = library()?;
+    let cancel = AtomicBool::new(false);
+    let (tx, rx) = mpsc::channel::<u32>();
+    let backoff = [Duration::from_millis(30), Duration::from_millis(30)];
+    std::thread::scope(|scope| -> TestResult {
+        let (library, cancel) = (tmp.path().to_path_buf(), &cancel);
+        let watcher = scope.spawn(move || {
+            watch::run_with_backoff(&[library], cancel, &backoff, |app| {
+                tx.send(app.appid).ok();
+                anyhow::bail!("always failing")
+            })
+        });
+        let result = (|| {
+            std::thread::sleep(Duration::from_millis(500));
+            write_manifest(tmp.path(), 100, 1)?;
+            for attempt in 1..=3 {
+                rx.recv_timeout(WAIT)
+                    .ctx(format!("attempt {attempt} of the first round"))?;
+            }
+            check(
+                rx.recv_timeout(Duration::from_millis(600)).is_err(),
+                "after the bounded attempts it waits for a manifest change",
+            )?;
+            write_manifest(tmp.path(), 200, 1)?;
+            // The new game fires, and so does the one that gave up.
+            let first = rx.recv_timeout(WAIT).ctx("the first call after the change")?;
+            let second = rx.recv_timeout(WAIT).ctx("the second call after the change")?;
+            check(
+                first == 100 || second == 100,
+                format!("game 100 is tried again, got {first} and {second}"),
+            )?;
+            Ok(())
+        })();
+        cancel.store(true, Ordering::Relaxed);
+        let ran = watcher.join().map_err(|_| "the watcher panicked")?;
+        ran.ctx("the watcher stops cleanly")?;
+        result
     })
 }

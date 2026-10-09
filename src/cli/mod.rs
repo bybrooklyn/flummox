@@ -347,10 +347,7 @@ pub fn run() -> Result<()> {
             plan.check()
         }
         Command::Drives => cmd_drives(&env, out),
-        Command::Doctor => {
-            ensure!(!out.json, "doctor has no JSON output yet");
-            cmd_doctor(&env)
-        }
+        Command::Doctor => cmd_doctor(&env, out),
         Command::Pack { action } => crate::pack::cli::run(action, cli.json, &cancel),
         Command::Benchmark { folder, budget_mib } => {
             let report = crate::benchmark::run(&folder, budget_mib, &cancel)?;
@@ -2032,24 +2029,24 @@ fn cmd_watch(
     println!("Waiting for downloads to finish. Press Ctrl-C to stop.");
     crate::watch::run(&libraries, cancel.as_ref(), |app| {
         if app.is_tool() {
-            return;
+            return Ok(());
         }
         println!("\n{} finished downloading.", app.name);
         if dry_run {
             println!("  (dry run, nothing written)");
-            return;
+            return Ok(());
         }
         // The full id, so a missing Steam folder cannot fall through to
         // another launcher's game with this number in its title.
         let selector = format!("steam:{}", app.appid);
         // The coordinator pauses a queued job while the game runs, so a
         // download that finishes as the player presses Play is still queued.
+        // An error is returned for the watcher to retry and report.
         let text = Output { json: false };
-        if let Err(e) = cmd_compress(
+        cmd_compress(
             env, &selector, level, threads, false, false, false, true, text, cancel,
-        ) {
-            eprintln!("warning: could not compress {}: {e:#}", app.name);
-        }
+        )
+        .with_context(|| format!("could not compress {}", app.name))
     })
     .context("watching Steam libraries")
 }
@@ -2327,65 +2324,111 @@ fn cmd_drives(env: &Env, out: Output) -> Result<()> {
     })
 }
 
-fn cmd_doctor(env: &Env) -> Result<()> {
-    println!("flummox doctor\n");
+/// One line of `doctor`: what was checked and how it came out.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct DoctorCheck {
+    /// A stable identifier for scripts.
+    name: &'static str,
+    /// `ok`, `warn` for something that will get in the way, or `off` for a
+    /// feature that is not turned on.
+    status: &'static str,
+    detail: String,
+}
 
+/// The whole of `doctor --json`.
+#[derive(Debug, serde::Serialize)]
+struct DoctorReport {
+    checks: Vec<DoctorCheck>,
+}
+
+fn doctor_line(name: &'static str, status: &'static str, detail: impl Into<String>) -> DoctorCheck {
+    DoctorCheck {
+        name,
+        status,
+        detail: detail.into(),
+    }
+}
+
+/// Runs the checks for `doctor`. `kernel` is the release string or why it could
+/// not be read, and `fuse` says whether `/dev/fuse` exists, so a test can supply
+/// both instead of reading this machine.
+fn doctor_checks(env: &Env, kernel: Result<String, String>, fuse: bool) -> Vec<DoctorCheck> {
+    let mut checks = Vec::new();
     let roots = crate::launchers::steam::roots(env);
     if roots.is_empty() {
-        println!(
-            "[!] No Steam installation found under {}",
-            env.home.display()
-        );
-    } else {
-        for root in &roots {
-            println!("[ok] Steam root: {}", root.display());
-            match crate::launchers::steam::libraries(root) {
-                Ok(libs) => {
-                    for lib in libs {
-                        println!("     library: {}", lib.display());
-                    }
+        checks.push(doctor_line(
+            "steam-root",
+            "warn",
+            format!("No Steam installation found under {}", env.home.display()),
+        ));
+    }
+    for root in &roots {
+        checks.push(doctor_line(
+            "steam-root",
+            "ok",
+            format!("Steam root: {}", root.display()),
+        ));
+        match crate::launchers::steam::libraries(root) {
+            Ok(libs) => {
+                for lib in libs {
+                    checks.push(doctor_line(
+                        "steam-library",
+                        "ok",
+                        format!("Steam library: {}", lib.display()),
+                    ));
                 }
-                Err(e) => println!("[!]  cannot read its libraries: {e}"),
             }
+            Err(e) => checks.push(doctor_line(
+                "steam-library",
+                "warn",
+                format!("cannot read the libraries of {}: {e}", root.display()),
+            )),
         }
     }
 
-    match std::fs::read_to_string("/proc/sys/kernel/osrelease") {
+    match kernel {
         Ok(release) => {
             let release = release.trim();
-            println!("[ok] kernel {release}");
+            checks.push(doctor_line("kernel", "ok", format!("kernel {release}")));
             for note in kernel_notes(release) {
-                println!("[!]  {note}");
+                checks.push(doctor_line("kernel-note", "warn", note));
             }
         }
-        Err(e) => println!("[!] cannot read the kernel version: {e}"),
+        Err(e) => checks.push(doctor_line(
+            "kernel",
+            "warn",
+            format!("cannot read the kernel version: {e}"),
+        )),
     }
 
-    let fuse = Path::new("/dev/fuse").exists();
-    println!(
-        "{} /dev/fuse {}",
-        if fuse { "[ok]" } else { "[!] " },
-        if fuse {
-            "present (ready for Maximum)"
-        } else {
-            "missing"
-        }
-    );
+    checks.push(if fuse {
+        doctor_line("fuse", "ok", "/dev/fuse present (ready for Maximum)")
+    } else {
+        doctor_line("fuse", "warn", "/dev/fuse missing")
+    });
 
     for library in steam_libraries(env) {
         let on = backend::btrfs::dir_property(&library.join("steamapps"))
             .ok()
             .flatten();
-        match on {
-            Some(algo) => println!(
-                "[ok] new downloads compress on arrival ({algo}): {}",
-                library.display()
+        checks.push(match on {
+            Some(algo) => doctor_line(
+                "download-compression",
+                "ok",
+                format!(
+                    "new downloads compress on arrival ({algo}): {}",
+                    library.display()
+                ),
             ),
-            None => println!(
-                "[ ]  new downloads land uncompressed: {}. Turn it on with `flummox hook on`",
-                library.display()
+            None => doctor_line(
+                "download-compression",
+                "off",
+                format!(
+                    "new downloads land uncompressed: {}. Turn it on with `flummox hook on`",
+                    library.display()
+                ),
             ),
-        }
+        });
     }
 
     let games = scan(env).games;
@@ -2393,7 +2436,11 @@ fn cmd_doctor(env: &Env) -> Result<()> {
         .iter()
         .filter(|g| g.state.is_idle() && !g.is_tool)
         .count();
-    println!("[ok] {} games found, {idle} ready to compress", games.len());
+    checks.push(doctor_line(
+        "games",
+        "ok",
+        format!("{} games found, {idle} ready to compress", games.len()),
+    ));
 
     let mut checked: Vec<PathBuf> = Vec::new();
     for game in &games {
@@ -2404,16 +2451,42 @@ fn cmd_doctor(env: &Env) -> Result<()> {
             continue;
         }
         checked.push(fs.mountpoint.clone());
-        match fsprobe::snapshot_risk(&fs) {
-            Some(why) => println!(
-                "[!]  {}: {why}; compressing unshares extents from snapshots, \
-                 so space may not drop until they expire",
-                fs.mountpoint.display()
+        checks.push(match fsprobe::snapshot_risk(&fs) {
+            Some(why) => doctor_line(
+                "snapshots",
+                "warn",
+                format!(
+                    "{}: {why}; compressing unshares extents from snapshots, \
+                     so space may not drop until they expire",
+                    fs.mountpoint.display()
+                ),
             ),
-            None => println!("[ok] {}: no snapshots in the way", fs.mountpoint.display()),
-        }
+            None => doctor_line(
+                "snapshots",
+                "ok",
+                format!("{}: no snapshots in the way", fs.mountpoint.display()),
+            ),
+        });
     }
-    Ok(())
+    checks
+}
+
+fn cmd_doctor(env: &Env, out: Output) -> Result<()> {
+    let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease").map_err(|e| e.to_string());
+    let report = DoctorReport {
+        checks: doctor_checks(env, kernel, Path::new("/dev/fuse").exists()),
+    };
+    out.emit(&report, || {
+        println!("flummox doctor\n");
+        for line in &report.checks {
+            let mark = match line.status {
+                "ok" => "[ok]",
+                "off" => "[ ] ",
+                _ => "[!] ",
+            };
+            println!("{mark} {}", line.detail);
+        }
+    })
 }
 
 /// What this kernel cannot do for btrfs, as lines for `doctor`.
@@ -2445,6 +2518,64 @@ mod tests {
     use crate::testutil::{Ctx, TestResult, check, check_eq};
 
     use super::*;
+
+    #[test]
+    fn doctor_json_lists_each_check_with_name_status_and_detail() -> TestResult {
+        let home = tempfile::tempdir().ctx("fixture home")?;
+        let env = Env::from_home(home.path());
+        let checks = doctor_checks(&env, Ok("6.8.0-test\n".into()), false);
+        let report = DoctorReport { checks };
+        let value = serde_json::to_value(&report).ctx("serialise")?;
+        let list = value
+            .get("checks")
+            .and_then(serde_json::Value::as_array)
+            .ctx("a checks array")?;
+        check(!list.is_empty(), "the fixture produces checks")?;
+        for entry in list {
+            for field in ["name", "status", "detail"] {
+                check(
+                    entry.get(field).is_some_and(serde_json::Value::is_string),
+                    format!("every check has a string {field}: {entry}"),
+                )?;
+            }
+        }
+        let find = |name: &str| {
+            report
+                .checks
+                .iter()
+                .find(|entry| entry.name == name)
+                .cloned()
+        };
+        check_eq(
+            find("steam-root").map(|entry| entry.status),
+            Some("warn"),
+            "an empty home has no Steam",
+        )?;
+        check_eq(
+            find("fuse").map(|entry| entry.status),
+            Some("warn"),
+            "a missing /dev/fuse warns",
+        )?;
+        let kernel = find("kernel").ctx("the kernel check")?;
+        check_eq(kernel.detail, "kernel 6.8.0-test".to_owned(), "release is trimmed")?;
+        check(
+            report.checks.iter().any(|entry| entry.name == "kernel-note"),
+            "an old kernel adds its notes",
+        )?;
+        let unreadable = doctor_checks(&env, Err("denied".into()), true);
+        check(
+            unreadable
+                .iter()
+                .any(|entry| entry.name == "kernel" && entry.status == "warn"),
+            "an unreadable kernel version warns",
+        )?;
+        check(
+            unreadable
+                .iter()
+                .any(|entry| entry.name == "fuse" && entry.status == "ok"),
+            "control: a present /dev/fuse is ok",
+        )
+    }
 
     #[test]
     fn doctor_names_both_kernel_requirements_on_an_old_kernel() -> TestResult {

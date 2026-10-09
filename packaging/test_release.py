@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import tomllib
 import unittest
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 
@@ -32,10 +33,40 @@ class ReleaseTests(unittest.TestCase):
         if missing:
             self.skipTest(f'{", ".join(missing)} needed')
 
+    def vcs(self, root, *args):
+        result = subprocess.run(
+            ['git', '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+             '-c', 'commit.gpgsign=false', *args],
+            cwd=root, check=True, capture_output=True, text=True)
+        return result.stdout.strip()
+
+    def repo(self, root):
+        """A small history under `root`: `self.base` is an ancestor of
+        `self.head`, and `self.other` sits on a branch that `head` does not
+        contain. GITHUB_SHA names `head` for the test."""
+        if (root / '.git').exists():
+            return
+        self.vcs(root, 'init', '-q', '-b', 'main')
+        for name in ['base', 'head']:
+            (root / f'{name}.txt').write_text(name)
+            self.vcs(root, 'add', f'{name}.txt')
+            self.vcs(root, 'commit', '-q', '-m', name)
+            setattr(self, name, self.vcs(root, 'rev-parse', 'HEAD'))
+        self.vcs(root, 'checkout', '-q', '-b', 'side', self.base)
+        (root / 'other.txt').write_text('other')
+        self.vcs(root, 'add', 'other.txt')
+        self.vcs(root, 'commit', '-q', '-m', 'other')
+        self.other = self.vcs(root, 'rev-parse', 'HEAD')
+        self.vcs(root, 'checkout', '-q', 'main')
+        patch = mock.patch.dict(os.environ, {'GITHUB_SHA': self.head})
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def test_acceptance_requires_complete_evidence_for_each_backend(self):
         acceptance = module('check-acceptance.py')
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            self.repo(root)
             directory = root / 'docs/validation'
             directory.mkdir(parents=True)
             runs = []
@@ -49,6 +80,7 @@ class ReleaseTests(unittest.TestCase):
                     'platform': 'linux' if linux else kind,
                     'mode': 'maximum-space' if linux else 'native',
                     'flummox_version': '0.0.2',
+                    'flummox_commit': self.base,
                     'storage': {'logical_bytes': 1024, 'allocated_before': 4096, 'allocated_after': 2048, 'random_read_p95_ns': None},
                     'checks': {
                         'bytes_verified': True, 'metadata_verified': True,
@@ -123,6 +155,7 @@ class ReleaseTests(unittest.TestCase):
 
     def acceptance_fixture(self, root, version, report_version):
         acceptance = module('check-acceptance.py')
+        self.repo(root)
         directory = root / 'docs/validation'
         directory.mkdir(parents=True, exist_ok=True)
         runs = []
@@ -136,6 +169,7 @@ class ReleaseTests(unittest.TestCase):
                 'platform': 'linux' if linux else kind,
                 'mode': 'maximum-space' if linux else 'native',
                 'flummox_version': report_version,
+                'flummox_commit': self.base,
                 'storage': {'logical_bytes': 1024, 'allocated_before': 4096, 'allocated_after': 2048, 'random_read_p95_ns': None},
                 'checks': {
                     'bytes_verified': True, 'metadata_verified': True,
@@ -187,6 +221,56 @@ class ReleaseTests(unittest.TestCase):
                 write(changed, reports)
                 with self.subTest(field=field), self.assertRaises(ValueError):
                     acceptance.check(root, '0.0.2')
+
+    def test_acceptance_ties_reports_to_the_released_commit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            acceptance, manifest, reports, write = self.acceptance_fixture(root, '0.0.2', '0.0.2')
+            acceptance.check(root, '0.0.2')
+            # The commit comes from the argument as well as GITHUB_SHA.
+            with mock.patch.dict(os.environ):
+                del os.environ['GITHUB_SHA']
+                acceptance.check(root, '0.0.2', self.head)
+                with self.assertRaisesRegex(ValueError, 'release commit'):
+                    acceptance.check(root, '0.0.2')
+            # A build from a commit the release does not contain.
+            changed = copy.deepcopy(reports)
+            changed['windows']['flummox_commit'] = self.other
+            write(manifest, changed)
+            with self.assertRaisesRegex(ValueError, 'not an ancestor'):
+                acceptance.check(root, '0.0.2')
+            # A commit the repository has never seen is an error, not a pass.
+            changed['windows']['flummox_commit'] = 'f' * 40
+            write(manifest, changed)
+            with self.assertRaises(ValueError):
+                acceptance.check(root, '0.0.2')
+            # The release commit itself counts as its own ancestor.
+            changed['windows']['flummox_commit'] = self.head
+            write(manifest, changed)
+            acceptance.check(root, '0.0.2')
+            # A stable release needs every run to carry a commit.
+            for kind in sorted(reports):
+                changed = copy.deepcopy(reports)
+                del changed[kind]['flummox_commit']
+                write(manifest, changed)
+                with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, 'no build commit'):
+                    acceptance.check(root, '0.0.2')
+            # Only a full lower-case commit id is accepted.
+            for bad in ['', 'abc', self.base.upper(), self.base[:39], self.base + '0', None, 5]:
+                changed = copy.deepcopy(reports)
+                changed['proton']['flummox_commit'] = bad
+                write(manifest, changed)
+                with self.subTest(bad=bad), self.assertRaises(ValueError):
+                    acceptance.check(root, '0.0.2')
+
+    def test_a_prerelease_record_may_lack_build_commits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            acceptance, manifest, reports, write = self.acceptance_fixture(root, '0.0.3-rc.1', '0.0.3-rc.1')
+            for report in reports.values():
+                del report['flummox_commit']
+            write(manifest, reports)
+            acceptance.check(root, '0.0.3-rc.1')
 
     def test_acceptance_takes_the_version_it_is_given(self):
         with tempfile.TemporaryDirectory() as temporary:

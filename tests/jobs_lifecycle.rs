@@ -943,6 +943,7 @@ fn automatic_storage_rejects_a_mismatched_qualification_before_creation() -> Tes
             random_read_p95_ns: None,
         },
         flummox_version: env!("CARGO_PKG_VERSION").into(),
+        flummox_commit: None,
     };
     let store = temp.path().join("storage/game.store");
     let snapshot = request(

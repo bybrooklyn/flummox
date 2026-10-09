@@ -184,6 +184,7 @@ impl Wizard {
                 random_read_p95_ns: None,
             },
             flummox_version: env!("CARGO_PKG_VERSION").into(),
+            flummox_commit: compatibility::build_commit(),
         };
         ensure!(
             report.storage.allocated_before > 0 && report.storage.allocated_after > 0,
