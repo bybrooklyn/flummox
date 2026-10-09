@@ -56,12 +56,12 @@ impl InstallPhase {
     /// Short status text for the CLI and GUI.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Switching => "Activating",
+            Self::Switching => "Switching to Maximum",
             Self::Mounted => "Ready",
-            Self::Reclaiming => "Reclaiming space",
-            Self::Compacting => "Compacting updates",
-            Self::Pruning => "Reclaiming previous version",
-            Self::Restoring => "Restoring files",
+            Self::Reclaiming => "Deleting the original",
+            Self::Compacting => "Folding in updates",
+            Self::Pruning => "Deleting the previous version",
+            Self::Restoring => "Decompressing",
             Self::Attention => "Needs attention",
         }
     }
@@ -276,7 +276,7 @@ mod enabled {
         ]
         .into_iter()
         .find(|helper| Path::new(helper).is_file())
-        .context("A disconnected FUSE mount needs fusermount3 to recover")?;
+        .context("The game folder is stuck from an earlier run and needs fusermount3 to be freed. Install fusermount3 and try again.")?;
         let status = std::process::Command::new(helper)
             .arg("-u")
             .arg(path)
@@ -284,7 +284,7 @@ mod enabled {
             .context("Starting the FUSE unmount helper")?;
         ensure!(
             status.success(),
-            "The disconnected FUSE mount could not be cleared"
+            "The game folder is stuck from an earlier run and could not be freed. Restart the computer and try again."
         );
         Ok(())
     }
@@ -310,28 +310,28 @@ mod enabled {
         observer: &dyn crate::pack::Observer,
     ) -> Result<Install> {
         let game = game.canonicalize().context("Finding the installed game")?;
-        ensure!(game.is_dir(), "The game path must be a directory");
+        ensure!(game.is_dir(), "The game must be a folder.");
         let parent = game.parent().context("The game folder has no parent")?;
         // A folder on a different device from its parent is a mount point.
         ensure!(
             std::fs::symlink_metadata(&game)?.dev() == std::fs::symlink_metadata(parent)?.dev(),
-            "The game path is already a mount point"
+            "This game folder is already in use by Maximum."
         );
-        let store = store.canonicalize().context("Finding the pack store")?;
+        let store = store.canonicalize().context("Finding the store")?;
         ensure!(
             store.is_file() || store.is_dir(),
-            "The pack store must be a file or directory"
+            "The store must be a file or folder."
         );
         let writes = canonical_new_dir(writes)?;
         validate_paths(&game, &store, &writes)?;
-        let reader = Reader::open(&store).context("Validating the pack store")?;
+        let reader = Reader::open(&store).context("Checking the store")?;
         reader
             .verify_directory_observed(&game, cancel, observer)
             .context("The store no longer matches the installed game")?;
         let backup = backup_for(&game)?;
         ensure!(
             !backup.exists(),
-            "The rollback folder already exists: {}",
+            "A kept copy of the original already exists at {}. Move it away and try again.",
             backup.display()
         );
         Ok(Install {
@@ -343,7 +343,7 @@ mod enabled {
             previous_writes_path: None,
             summary: Some(reader.summary().clone()),
             phase: InstallPhase::Switching,
-            message: "Activation recorded; preparing the launcher path".into(),
+            message: "Switching to Maximum…".into(),
         })
     }
 
@@ -353,12 +353,12 @@ mod enabled {
     pub(crate) fn activate(install: &mut Install) -> Result<MountedInstall> {
         ensure!(
             install.phase == InstallPhase::Switching,
-            "Install is not awaiting activation"
+            "This game is not waiting to switch to Maximum."
         );
         let backup = install
             .backup_path
             .as_ref()
-            .context("The rollback path is missing")?;
+            .context("The kept copy of the original is missing")?;
         // Steps: move the original aside, create an empty mount point, mount.
         // An existing backup means the move already happened in an earlier run.
         if !backup.exists() {
@@ -377,7 +377,7 @@ mod enabled {
         }
         let mounted = mount_record(install)?;
         install.phase = InstallPhase::Mounted;
-        install.message = "Writable compressed install is mounted; rollback copy retained".into();
+        install.message = "Using Maximum. The original is kept.".into();
         Ok(mounted)
     }
 
@@ -389,7 +389,7 @@ mod enabled {
             // The retained original is the only other copy of the game, so an
             // interrupted reclaim finishes only while the store still opens.
             Reader::open(&install.store_path)
-                .context("The store is unreadable, so the retained original was kept")?;
+                .context("The store cannot be read, so the original was kept")?;
             finish_reclaim(install)?;
         }
         if install.phase == InstallPhase::Pruning {
@@ -397,7 +397,8 @@ mod enabled {
         }
         if install.phase == InstallPhase::Compacting {
             install.phase = InstallPhase::Mounted;
-            install.message = "Compaction was interrupted; using the previous store".into();
+            install.message =
+                "Folding in updates was interrupted. The previous version is still in use.".into();
         }
         remove_orphaned_compactions(install);
         if install.phase == InstallPhase::Switching {
@@ -411,7 +412,7 @@ mod enabled {
                 install.phase,
                 InstallPhase::Mounted | InstallPhase::Attention
             ),
-            "Install needs manual attention"
+            "This game needs attention before it can continue. Review it in Jobs."
         );
         clear_disconnected_mount(&install.game_path)?;
         if !install.game_path.exists() {
@@ -428,18 +429,18 @@ mod enabled {
         ensure!(
             std::fs::symlink_metadata(&install.game_path)?.dev()
                 == std::fs::symlink_metadata(parent)?.dev(),
-            "The launcher path is already mounted by another process"
+            "The game folder is already in use by another Flummox process."
         );
         ensure!(
             std::fs::read_dir(&install.game_path)?.next().is_none(),
-            "The launcher mount point contains unexpected files"
+            "The game folder contains files Flummox did not put there. Move them away and try again."
         );
         let mounted = mount_record(install)?;
         install.phase = InstallPhase::Mounted;
         install.message = if install.backup_path.is_some() {
-            "Writable compressed install is mounted; rollback copy retained".into()
+            "Using Maximum. The original is kept.".into()
         } else {
-            "Writable compressed install is mounted".into()
+            "Using Maximum.".into()
         };
         Ok(Some(mounted))
     }
@@ -449,14 +450,14 @@ mod enabled {
     pub(crate) fn reclaim(install: &mut Install) -> Result<()> {
         ensure!(
             install.phase == InstallPhase::Mounted,
-            "Install is not ready"
+            "This game is not ready for that yet. Wait for the current step to finish."
         );
         ensure!(
             install.backup_path.is_some(),
-            "The rollback copy was already reclaimed"
+            "The original was already deleted."
         );
         install.phase = InstallPhase::Reclaiming;
-        install.message = "Removing the retained original files".into();
+        install.message = "Deleting the original…".into();
         Ok(())
     }
 
@@ -467,7 +468,7 @@ mod enabled {
     pub(crate) fn finish_reclaim(install: &mut Install) -> Result<()> {
         ensure!(
             install.phase == InstallPhase::Reclaiming,
-            "Install is not reclaiming space"
+            "This game is not deleting its original."
         );
         if let Some(backup) = &install.backup_path
             && backup.exists()
@@ -484,7 +485,7 @@ mod enabled {
         }
         install.backup_path = None;
         install.phase = InstallPhase::Mounted;
-        install.message = "Writable compressed install is mounted".into();
+        install.message = "Using Maximum.".into();
         Ok(())
     }
 
@@ -493,14 +494,14 @@ mod enabled {
     pub(crate) fn begin_prune(install: &mut Install) -> Result<()> {
         ensure!(
             install.phase == InstallPhase::Mounted,
-            "Install is not ready"
+            "This game is not ready for that yet. Wait for the current step to finish."
         );
         ensure!(
             install.previous_store_path.is_some(),
-            "There is no previous store to reclaim"
+            "There is no previous version to delete."
         );
         install.phase = InstallPhase::Pruning;
-        install.message = "Removing the retained previous store".into();
+        install.message = "Deleting the previous version…".into();
         Ok(())
     }
 
@@ -511,7 +512,7 @@ mod enabled {
     pub(crate) fn finish_prune(install: &mut Install) -> Result<()> {
         ensure!(
             install.phase == InstallPhase::Pruning,
-            "Install is not reclaiming a previous store"
+            "This game is not deleting its previous version."
         );
         if let Some(previous) = &install.previous_store_path {
             ensure!(
@@ -562,9 +563,9 @@ mod enabled {
         install.previous_writes_path = None;
         install.phase = InstallPhase::Mounted;
         install.message = if install.backup_path.is_some() {
-            "Writable compressed install is mounted; rollback copy retained".into()
+            "Using Maximum. The original is kept.".into()
         } else {
-            "Writable compressed install is mounted".into()
+            "Using Maximum.".into()
         };
         Ok(())
     }
@@ -584,7 +585,7 @@ mod enabled {
                 install.phase,
                 InstallPhase::Mounted | InstallPhase::Restoring
             ),
-            "Install is not ready to restore"
+            "This game is not ready to decompress yet. Wait for the current step to finish."
         );
         if let Some(mounted) = mounted {
             mounted
@@ -596,13 +597,10 @@ mod enabled {
                 .mode(0o700)
                 .create(&install.game_path)?;
         }
-        ensure!(
-            install.game_path.is_dir(),
-            "The launcher mount point is missing"
-        );
+        ensure!(install.game_path.is_dir(), "The game folder is missing.");
         ensure!(
             std::fs::read_dir(&install.game_path)?.next().is_none(),
-            "The launcher path did not unmount cleanly"
+            "The game folder could not be released. Close the game and its launcher, then try again."
         );
         // The restored folder is renamed over the game path, so the empty
         // mount point goes immediately before each rename and is put back if

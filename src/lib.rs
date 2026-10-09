@@ -47,12 +47,12 @@ pub mod libraries;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod model;
-pub mod observer;
 #[cfg(any(windows, target_os = "macos"))]
 pub mod native;
 #[cfg(target_os = "macos")]
 #[path = "launchers/vdf.rs"]
 mod native_vdf;
+pub mod observer;
 #[cfg(target_os = "linux")]
 pub mod pack;
 mod path_serde;
@@ -65,6 +65,7 @@ pub mod safeio;
 pub mod sandbox;
 pub mod storage;
 pub mod testutil;
+pub mod text;
 #[cfg(target_os = "linux")]
 pub mod watch;
 #[cfg(windows)]

@@ -4,7 +4,7 @@
 
 Install a downloaded Arch package with `sudo pacman -U flummox-*.pkg.tar.zst`.
 From a source checkout, run `cd packaging && makepkg -si`. This builds both
-binaries with Maximum Space support. Install `fuse3` for Maximum Space and
+binaries with Maximum support. Install `fuse3` for Maximum and
 `kdialog` or `zenity` for the desktop folder picker.
 
 ## Linux x86_64 and ARM64 archives
@@ -30,7 +30,7 @@ sudo install -Dm644 share/licenses/flummox/LICENSE /usr/share/licenses/flummox/L
 
 Adjust the archive version to the downloaded release. Source builds are available
 for distributions with an older glibc. Launch `flummox-gui` from the desktop menu
-or terminal. The coordinator starts as the current user; no root daemon is needed.
+or terminal. The background worker starts as the current user; no root daemon is needed.
 The archive carries the packaged watch unit under `lib/systemd/user` for
 reference, and it is not enabled by installation. `flummox watch enable` writes
 its own copy of the unit into `~/.config/systemd/user` with the hardening of
@@ -42,21 +42,22 @@ mounted installs require it.
 
 From 0.0.2, a newer Flummox replaces an older background worker by itself the
 first time you open the window or run a command, as long as that worker is idle
-and no Maximum Space game is mounted. It never replaces a newer worker with an
+and no game is using Maximum. It never replaces a newer worker with an
 older one. If the worker is busy, the message says what to finish first.
 
-To restart it yourself, finish or cancel queued jobs and restore mounted
-Maximum Space games, then use Settings > Restart worker or:
+To restart it yourself, finish or stop the waiting and running jobs and
+decompress the games that use Maximum, then use **Restart worker** under
+Settings > Background worker or:
 
 ```sh
 flummox jobs restart
 ```
 
 Restart preserves queue history, library settings, exclusions, and reports. It
-refuses while work is queued/running or compressed games remain mounted. Workers
+refuses while jobs are waiting or running or games still use Maximum. Workers
 from versions without the restart command require logging out and back in after
-the upgrade. Close Flummox windows before logging out. Do not kill a coordinator
-while storage work is running.
+the upgrade. Close Flummox windows before logging out. Do not kill the background worker
+while a job is running.
 
 ## macOS (Apple Silicon)
 
@@ -73,7 +74,7 @@ and drag `Flummox.app` into Applications. macOS 14 or newer is required. The app
 is ad hoc signed; Apple Developer ID signing and notarization are not configured.
 macOS can require approval in System Settings > Privacy & Security when opening
 the downloaded app. The published v0.0.1 Mac download is an informational shell. The development
-version adds APFS compression, restoration, and recovery. Native Mac jobs finish
+version adds APFS compression, decompressing, and recovery. Native Mac jobs finish
 the current file when stopped; interrupted replacements keep their originals
 for explicit recovery. Mac FUSE support is not required.
 
@@ -154,10 +155,11 @@ itself contains one game's files. Spaces, quoted paths, and `~/My\ Games` are
 accepted; Flummox expands your home folder without executing shell commands.
 Hidden folders, files directly in the library root, and symlinked subfolders
 are excluded from collection discovery. Add a symlinked game directly if needed.
-Refresh to discover newly installed subfolders. Overlapping locations are merged
-with detected launcher games. Locations persist across app and coordinator
+Refresh to find newly installed subfolders. Overlapping locations are merged
+with detected launcher games. Locations persist across app and background worker
 restarts. **Remove location** forgets the registration and preserves every file;
-finish jobs and restore Maximum Space games in that location before removal.
+finish or stop the jobs and decompress the games that use Maximum in that
+location before removal.
 Automatic maintenance remains off until you enable it for the location.
 
 The CLI uses the same configuration:
@@ -168,7 +170,7 @@ flummox jobs add-folder '/mnt/games/One Game' --single-game
 flummox jobs remove-folder '~/My Games'
 ```
 
-The development coordinator protocol is version 8. An older idle coordinator
+The development background worker protocol is version 8. An older idle worker
 is [replaced automatically](#upgrade-a-running-installation).
 
 ## Verify release signatures

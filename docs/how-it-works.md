@@ -1,6 +1,6 @@
 # How it works
 
-The mechanism behind native compression, and the benchmark commands that
+The mechanism behind Standard compression, and the benchmark commands that
 compare it with larger-window stores. State transitions and recovery are in
 [the job and compression design](jobs-and-compression.md).
 
@@ -59,10 +59,10 @@ uses the same source samples, and every frame is decoded and checked against
 its input. The report includes input coverage, encoded size, and encode/decode
 time. It does not change the game's storage or measure recovered disk space.
 
-Larger frames can reuse repetition outside btrfs's native compression window.
+Larger frames can reuse repetition outside btrfs's compression window.
 They also require more decompression work per random read. The frame-sampling
 rows exclude store metadata and allocation costs. The complete store benchmark provides full-corpus measurements that include
-metadata, content-defined chunk deduplication, verified restoration, and an
+metadata, content-defined chunk deduplication, verified decompressing, and an
 optional read-only or writable FUSE mount. Content-derived boundaries recover
 sharing after insertions and removals instead of losing every later match.
 Directory stores also hard-link matching chunk objects through a same-drive
@@ -88,10 +88,10 @@ flummox pack restore /path/to/game.flumpack /path/to/new-folder
 flummox pack activate /path/to/game.flumpack /launcher/game/path
 ```
 
-Source folders are retained. Builds with `pack-mount` can use a persistent
+Source folders stay. Builds with `pack-mount` can use a persistent
 copy-on-write directory, so game writes and launcher file replacements survive
 without changing the base store. A stopped layer can be committed into a new
-verified store. Automatic installation replacement and GUI activation are
-available when the app is built with `gui,pack-mount`. Activation keeps
-the launcher's existing path, remounts at login, and retains the original until
-an explicit reclaim action. See [store commands and format](pack-store.md).
+checked store. Switching a game to Maximum from the window is
+available when the app is built with `gui,pack-mount`. Switching keeps
+the launcher's existing path, mounts the game again at login, and keeps the original until
+you delete it. See [store commands and format](pack-store.md).

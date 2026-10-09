@@ -77,7 +77,7 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Return a game to uncompressed storage.
+    /// Decompress a game.
     Decompress {
         /// Game to decompress.
         selector: String,
@@ -121,12 +121,12 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Hide something that is not a game, or that you never want touched.
+    /// Exclude something that is not a game, or that you never want touched.
     Exclude {
         #[command(subcommand)]
         action: ExcludeAction,
     },
-    /// Plan additional storage without changing installed files.
+    /// Show the free space a job needs, without changing any files.
     Plan {
         folder: PathBuf,
         #[arg(long)]
@@ -138,18 +138,18 @@ enum Command {
     Drives,
     /// Check this machine for anything that would stop the tool working.
     Doctor,
-    /// Compare native block compression with experimental larger frames, read-only.
+    /// Compare Standard compression with larger-frame Maximum compression, read-only.
     Benchmark {
         folder: PathBuf,
         #[arg(long, default_value_t = 32)]
         budget_mib: u64,
     },
-    /// Validate and manage path-free compatibility qualification reports.
+    /// Check and manage compatibility reports.
     Compatibility {
         #[command(subcommand)]
         action: CompatibilityAction,
     },
-    /// Experimental larger-window stores, verification, restoration and mounts.
+    /// Maximum: stores, checks, decompressing and mounts.
     Pack {
         #[command(subcommand)]
         action: crate::pack::cli::Command,
@@ -196,7 +196,7 @@ enum CompatibilityAction {
     Import { report: PathBuf },
     /// List stored reports. Use --json for sanitized export data.
     List,
-    /// Report the allocated bytes of files and folders for a qualification.
+    /// Report the allocated bytes of files and folders for a compatibility report.
     Measure {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
@@ -205,17 +205,17 @@ enum CompatibilityAction {
 
 #[derive(Debug, Subcommand)]
 enum ExcludeAction {
-    /// Hide a game, by app ID or part of its title.
+    /// Exclude a game, by app ID or part of its title.
     Add {
-        /// What to hide.
+        /// What to exclude.
         selector: String,
     },
-    /// Show a hidden game again.
+    /// Include an excluded game again.
     Remove {
-        /// What to stop hiding.
+        /// What to include again.
         selector: String,
     },
-    /// What is currently hidden.
+    /// List the excluded games.
     List,
 }
 
@@ -337,7 +337,7 @@ pub fn run() -> Result<()> {
                 plan.add(
                     crate::storage::volume(&store)?,
                     crate::storage::pack_bound(&crate::storage::inventory(&folder)?)?,
-                    "Verified store; original retained",
+                    "New store; the original stays on its drive",
                 )?;
                 plan
             } else {
@@ -466,7 +466,7 @@ fn cmd_compatibility(out: Output, action: CompatibilityAction) -> Result<()> {
             let reports = store.load()?;
             out.emit(&reports, || {
                 if reports.is_empty() {
-                    println!("No compatibility qualifications recorded.");
+                    println!("No compatibility reports recorded.");
                 }
                 for report in &reports {
                     println!(
@@ -808,7 +808,7 @@ fn check_idle(game: &Game, force: bool) -> Result<()> {
 fn check_job_opts(opts: &CompressOpts) -> Result<()> {
     ensure!(
         (1..=32).contains(&opts.threads),
-        "Choose between 1 and 32 worker threads."
+        "Choose between 1 and 32 threads."
     );
     if let Some(level) = opts.level {
         zstd_level(&level.to_string()).map_err(anyhow::Error::msg)?;
@@ -892,13 +892,13 @@ fn cmd_scan(env: &Env, out: Output, tools: bool) -> Result<()> {
                         .then(|| format!("{} has no backend yet", kind.label())),
                 ),
                 Some(Tier::Pack) => (
-                    Some("Maximum Space"),
+                    Some("Maximum"),
                     cfg!(feature = "pack-mount") && Path::new("/dev/fuse").exists(),
                     (!cfg!(feature = "pack-mount"))
-                        .then(|| "rebuild with --features pack-mount for Maximum Space".to_owned())
+                        .then(|| "rebuild with --features pack-mount for Maximum".to_owned())
                         .or_else(|| {
                             (!Path::new("/dev/fuse").exists()).then(|| {
-                                "FUSE is unavailable; Maximum Space cannot mount games".to_owned()
+                                "Maximum needs FUSE, a Linux feature for custom filesystems, and it is not available here".to_owned()
                             })
                         }),
                 ),
@@ -1205,7 +1205,7 @@ fn cmd_compress(
         && game.ids().any(|id| open.is_excluded(id).unwrap_or(false))
     {
         bail!(
-            "{} is on the exclusion list. Run `flummox exclude remove {}` first.",
+            "{} is excluded. Run `flummox exclude remove {}` to include it.",
             game.title,
             game.id
         );
@@ -1616,7 +1616,7 @@ fn queued_job(
         .context("The queued job was not returned")?
         .id;
     println!(
-        "Queued {} as job {id}. Closing this client leaves it running.",
+        "Added {} as job {id}. It keeps running if you close this client.",
         game.title
     );
     let mut previous = String::new();
@@ -1632,7 +1632,7 @@ fn queued_job(
             .find(|j| j.id == id)
             .context("Job history is unavailable")?;
         let status = format!(
-            "{}: {} / {} files",
+            "{}: {} of {} files",
             job.phase.label(),
             job.files_done,
             job.files_total
@@ -2162,7 +2162,7 @@ fn pick_hidden<'a>(
     let wanted = selector.trim();
     ensure!(
         !wanted.is_empty(),
-        "name a hidden game; try `flummox exclude list`"
+        "name an excluded game; try `flummox exclude list`"
     );
     let by_id = |entry: &&(crate::model::GameId, String)| {
         entry.0.to_string().eq_ignore_ascii_case(wanted) || entry.0.key == wanted
@@ -2179,7 +2179,7 @@ fn pick_hidden<'a>(
         found = hidden.iter().filter(by_part).collect();
     }
     match found.as_slice() {
-        [] => bail!("{selector:?} is not on the exclusion list; try `flummox exclude list`"),
+        [] => bail!("{selector:?} is not excluded; try `flummox exclude list`"),
         [one] => Ok(one),
         many => {
             let titles: Vec<String> = many
@@ -2187,7 +2187,7 @@ fn pick_hidden<'a>(
                 .map(|(id, title)| format!("{title} ({id})"))
                 .collect();
             bail!(
-                "{selector:?} matches several hidden games:\n  {}",
+                "{selector:?} matches several excluded games:\n  {}",
                 titles.join("\n  ")
             )
         }
@@ -2209,8 +2209,8 @@ fn cmd_exclude(env: &Env, out: Output, action: ExcludeAction) -> Result<()> {
                 id: game.id.to_string(),
                 excluded: true,
             })?;
-            println!("Hidden: {} ({})", game.title, game.id);
-            println!("It will not appear in scans and will not be compressed.");
+            println!("Excluded: {} ({})", game.title, game.id);
+            println!("Jobs will skip it until you include it again.");
             Ok(())
         }
         ExcludeAction::Remove { selector } => {
@@ -2223,7 +2223,7 @@ fn cmd_exclude(env: &Env, out: Output, action: ExcludeAction) -> Result<()> {
                 id: id.to_string(),
                 excluded: false,
             })?;
-            println!("Visible again: {title} ({id})");
+            println!("Included again: {title} ({id})");
             Ok(())
         }
         ExcludeAction::List => {
@@ -2242,7 +2242,7 @@ fn cmd_exclude(env: &Env, out: Output, action: ExcludeAction) -> Result<()> {
                 .collect();
             out.emit(&rows, || {
                 if rows.is_empty() {
-                    println!("Nothing is hidden.");
+                    println!("No games are excluded.");
                     return;
                 }
                 for row in &rows {
@@ -2293,10 +2293,11 @@ fn cmd_drives(env: &Env, out: Output) -> Result<()> {
                 }
                 Tier::Native(kind) => format!("none ({} has no backend yet)", kind.label()),
                 Tier::Pack if cfg!(feature = "pack-mount") && Path::new("/dev/fuse").exists() => {
-                    "Maximum Space through a writable FUSE store".to_owned()
+                    "Maximum, with a store that updates can write to".to_owned()
                 }
                 Tier::Pack => {
-                    "Maximum Space needs the pack-mount feature and working FUSE".to_owned()
+                    "Maximum needs a build with the pack-mount feature and a working FUSE"
+                        .to_owned()
                 }
                 Tier::Unsupported(why) => format!("none ({why})"),
             };
@@ -2365,7 +2366,7 @@ fn cmd_doctor(env: &Env) -> Result<()> {
         "{} /dev/fuse {}",
         if fuse { "[ok]" } else { "[!] " },
         if fuse {
-            "present (ready for Maximum Space stores)"
+            "present (ready for Maximum)"
         } else {
             "missing"
         }

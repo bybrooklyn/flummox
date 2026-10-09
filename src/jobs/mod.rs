@@ -63,7 +63,7 @@ impl MotionPreference {
     /// Name shown to the user; `Display` prints the same text.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Expressive => "Expressive",
+            Self::Expressive => "Smooth",
             Self::Subtle => "Subtle",
             Self::Reduced => "Reduced",
         }
@@ -132,17 +132,17 @@ impl Phase {
     /// Short text used in rows and queue entries.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Queued => "Queued",
+            Self::Queued => "Waiting",
             Self::Analyzing => "Analyzing",
-            Self::Running => "Working",
+            Self::Running => "Running",
             Self::Pausing => "Pausing",
             Self::Paused => "Paused",
             Self::Cancelling => "Stopping",
             Self::Cancelled => "Stopped",
             Self::Completed => "Completed",
-            Self::Partial => "Needs attention",
+            Self::Partial => "Partly done",
             Self::Interrupted => "Interrupted",
-            Self::Failed => "Needs attention",
+            Self::Failed => "Failed",
         }
     }
 }
@@ -224,14 +224,14 @@ impl PackTask {
     /// Title of the queue entry for this task.
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Create { .. } => "Create verified store",
-            Self::Activate { create: true, .. } => "Create Maximum Space",
-            Self::Activate { .. } => "Activate Maximum Space",
-            Self::Compact => "Compact updates",
-            Self::Restore => "Restore ordinary files",
-            Self::VerifyRestored => "Verify restored files",
-            Self::Reclaim => "Reclaim original",
-            Self::Prune => "Reclaim previous version",
+            Self::Create { .. } => "Create the store",
+            Self::Activate { create: true, .. } => "Create the store and switch to Maximum",
+            Self::Activate { .. } => "Switch to Maximum",
+            Self::Compact => "Fold in updates",
+            Self::Restore => "Decompress to ordinary files",
+            Self::VerifyRestored => "Check decompressed files",
+            Self::Reclaim => "Delete the original",
+            Self::Prune => "Delete the previous version",
         }
     }
 }
@@ -636,28 +636,28 @@ pub fn space_plan(
                     plan.add(
                         storage::volume(store)?,
                         storage::pack_bound(&footprint)?,
-                        "Verified store; original remains on the source drive",
+                        "New store; the original stays on its drive",
                     )?;
                     if matches!(task, PackTask::Activate { .. }) {
                         plan.add(
                             storage::volume(&game.install_dir)?,
                             0,
-                            "Original retained; activation metadata",
+                            "The original is kept; a little space for the switch",
                         )?;
                     }
                 }
                 PackTask::Activate { store, .. } => {
-                    anyhow::ensure!(store.exists(), "Verified store is unavailable");
+                    anyhow::ensure!(store.exists(), "The store is missing. Create it first.");
                     plan.retained_original = true;
                     plan.add(
                         storage::volume(store)?,
                         0,
-                        "Existing verified store and writable updates",
+                        "The existing store and room for updates",
                     )?;
                     plan.add(
                         storage::volume(&game.install_dir)?,
                         0,
-                        "Original retained; activation metadata",
+                        "The original is kept; a little space for the switch",
                     )?;
                 }
                 PackTask::Compact | PackTask::Restore | PackTask::VerifyRestored => {
@@ -665,7 +665,7 @@ pub fn space_plan(
                         .packs
                         .iter()
                         .find(|install| install.game_path == game.install_dir)
-                        .context("This game has no activated store")?;
+                        .context("This game is not using Maximum.")?;
                     let updates = storage::inventory(&install.writes_path)?;
                     let summary = install.summary.clone().map(Ok).unwrap_or_else(|| {
                         Ok::<_, anyhow::Error>(
@@ -687,7 +687,7 @@ pub fn space_plan(
                         plan.add(
                             storage::volume(&install.store_path)?,
                             storage::pack_bound(&footprint)?,
-                            "New compacted store; previous version retained",
+                            "A new store; the previous version is kept until you delete it",
                         )?;
                     } else {
                         // With the original still on disk, restoring only adds
@@ -707,7 +707,7 @@ pub fn space_plan(
                         plan.add(
                             storage::volume(destination)?,
                             bytes,
-                            "Ordinary files and writable updates",
+                            "Ordinary files and room for updates",
                         )?;
                     }
                     plan.retained_original = install.backup_path.is_some();

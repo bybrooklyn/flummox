@@ -159,47 +159,51 @@ pub fn choose(
     let mut reasons = Vec::new();
     match mode {
         StorageMode::Skip if maximum_is_only_mode && !maximum_compatible => reasons.push(
-            "This drive has no native compression. Maximum Space could save space here, but automatic activation waits for a game-specific compatibility result."
+            "This drive has no Standard compression. Maximum could save space here, but it is not applied automatically until a compatibility report for this game exists."
                 .into(),
         ),
         StorageMode::Skip if maximum_worthwhile && !maximum_compatible => reasons.push(
-            "Maximum Space could save more, but automatic activation waits for a game-specific compatibility result. Its advanced controls remain available for local testing."
+            "Maximum could save more, but it is not applied automatically until a compatibility report for this game exists. You can still try it yourself under Advanced."
                 .into(),
         ),
         StorageMode::Skip => reasons.push(
-            "The measured saving is below the automatic optimization threshold.".into(),
+            "The measured saving is too small to compress automatically.".into(),
         ),
         StorageMode::Native => {
             reasons.push(
-                "Native compression provides a worthwhile saving with ordinary game files."
+                "Standard compression saves a useful amount and keeps ordinary game files."
                     .into(),
             );
             if maximum_worthwhile && !maximum_compatible {
                 reasons.push(
-                    "Maximum Space needs a completed compatibility check for this game.".into(),
+                    "Maximum needs a compatibility report for this game.".into(),
                 );
             }
         }
         StorageMode::MaximumSpace if maximum_worthwhile => reasons.push(
-            "The verified pack projection saves at least five percentage points beyond native compression."
+            "Maximum is estimated to save at least five percentage points more than Standard."
                 .into(),
         ),
         // Chosen because this drive has no native compression to compare with.
         StorageMode::MaximumSpace => reasons.push(
-            "This drive has no native compression, and the verified pack projection provides a worthwhile saving."
+            "This drive has no Standard compression, and Maximum is estimated to save a useful amount."
                 .into(),
         ),
     }
     if estimate.unsampled_files > 0 {
         reasons.push(format!(
-            "{} eligible files remain outside the sample.",
-            estimate.unsampled_files
+            "{} outside the sample.",
+            crate::text::count(
+                estimate.unsampled_files,
+                "eligible file is",
+                "eligible files are"
+            )
         ));
     }
     let requirements = if mode == StorageMode::MaximumSpace {
         vec![
-            "Verified writable mount support".into(),
-            "Rollback space during activation".into(),
+            "Support for Maximum on this system".into(),
+            "Room to keep the original while switching".into(),
         ]
     } else {
         Vec::new()

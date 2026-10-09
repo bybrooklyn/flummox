@@ -198,9 +198,9 @@ fn popup(window: HWND) -> Result<()> {
     for (id, label) in [
         (1, "Open Flummox"),
         if PAUSED.with(|slot| slot.get()) {
-            (3, "Resume background work")
+            (3, "Resume background jobs")
         } else {
-            (2, "Pause background work")
+            (2, "Pause background jobs")
         },
         (4, "Exit"),
     ] {

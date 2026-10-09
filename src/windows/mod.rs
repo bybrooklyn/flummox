@@ -396,7 +396,7 @@ fn visit_in(
     let mut failures = Failures::default();
     let outcome = (|| -> Result<()> {
         for item in walkdir::WalkDir::new(&root).follow_links(false) {
-            ensure!(!cancel.load(Ordering::Relaxed), "Operation stopped");
+            ensure!(!cancel.load(Ordering::Relaxed), "The job was stopped.");
             let item = match item {
                 Ok(item) => item,
                 Err(error) => {
@@ -460,7 +460,7 @@ fn visit_in(
                 }
                 Err(error) => {
                     // A stop request surfaces as an error from the operation.
-                    ensure!(!cancel.load(Ordering::Relaxed), "Operation stopped");
+                    ensure!(!cancel.load(Ordering::Relaxed), "The job was stopped.");
                     note_failure(&mut failures, &error);
                     before
                 }
@@ -580,9 +580,7 @@ pub fn run() -> Result<()> {
         Command::Analyze { folder, restore } => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&crate::storage::per_file_plan(
-                    &folder, restore
-                )?)?
+                serde_json::to_string_pretty(&crate::storage::per_file_plan(&folder, restore)?)?
             );
             return Ok(());
         }
@@ -611,10 +609,10 @@ pub(crate) fn folder_controlled(
         restore,
         |path| {
             while pause.load(Ordering::Relaxed) {
-                ensure!(!cancel.load(Ordering::Relaxed), "Operation stopped");
+                ensure!(!cancel.load(Ordering::Relaxed), "The job was stopped.");
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            ensure!(!cancel.load(Ordering::Relaxed), "Operation stopped");
+            ensure!(!cancel.load(Ordering::Relaxed), "The job was stopped.");
             if restore {
                 decompress_file(path)
             } else {

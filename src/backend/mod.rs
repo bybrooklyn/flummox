@@ -400,7 +400,7 @@ impl Backend for PackBackend {
     ) -> io::Result<Outcome> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "Maximum Space activation must use the verified pack transaction",
+            "Switching to Maximum must go through the Maximum controls.",
         ))
     }
 
@@ -412,7 +412,7 @@ impl Backend for PackBackend {
     ) -> io::Result<Outcome> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "Restore this game through its Maximum Space controls",
+            "Decompress this game through its Maximum controls.",
         ))
     }
 
@@ -676,7 +676,7 @@ impl std::fmt::Display for Preset {
         f.write_str(match self {
             Self::Fast => "Fast",
             Self::Balanced => "Balanced",
-            Self::Max => "Maximum",
+            Self::Max => "Max",
         })
     }
 }
