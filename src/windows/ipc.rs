@@ -67,8 +67,12 @@ pub fn user_sid() -> Result<String> {
     ensure!(result != 0, "Cannot read the current user's identity");
     // SAFETY: the successful call filled a TOKEN_USER in the aligned buffer.
     let sid = unsafe { (*data.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    sid_text(sid)
+}
+/// Formats a SID as text. The caller keeps `sid` live for the call.
+fn sid_text(sid: PSID) -> Result<String> {
     let mut string = std::ptr::null_mut();
-    // SAFETY: sid remains inside the live token buffer and string is a writable output slot.
+    // SAFETY: the caller keeps sid live and string is a writable output slot.
     let result = unsafe { ConvertSidToStringSidW(sid, &mut string) };
     ensure!(result != 0, "Cannot format the user's identity");
     let _owned = Local(string.cast());
@@ -81,7 +85,7 @@ pub fn user_sid() -> Result<String> {
         }
         units.push(unit);
     }
-    anyhow::bail!("Current-user SID exceeds its limit")
+    anyhow::bail!("SID text exceeds its limit")
 }
 /// UTF-16 with a terminating zero, as the wide Win32 calls expect.
 fn wide(text: &str) -> Vec<u16> {
@@ -179,6 +183,7 @@ fn connect_named(name: &str) -> Result<std::fs::File> {
             Err(error) => return Err(error.into()),
         }
     };
+    verify_owner(&file)?;
     let mode = PIPE_NOWAIT;
     // SAFETY: file owns a live pipe and mode points to a valid DWORD.
     let result = unsafe {
@@ -191,6 +196,44 @@ fn connect_named(name: &str) -> Result<std::fs::File> {
     };
     ensure!(result != 0, "Cannot set pipe timeout mode");
     Ok(file)
+}
+/// The built-in Administrators group, which owns objects an elevated process creates.
+const ADMINISTRATORS: &str = "S-1-5-32-544";
+/// True when a pipe owned by `owner` may be trusted by the user `user`. Both are
+/// SIDs as text. The user's own SID and the Administrators group qualify.
+fn owner_is_trusted(owner: &str, user: &str) -> bool {
+    owner.eq_ignore_ascii_case(user) || owner.eq_ignore_ascii_case(ADMINISTRATORS)
+}
+/// Rejects a pipe that another account created under this user's pipe name.
+fn verify_owner(file: &std::fs::File) -> Result<()> {
+    let mut owner = std::ptr::null_mut();
+    let mut descriptor = std::ptr::null_mut();
+    // SAFETY: file owns a live pipe handle; owner and descriptor are writable output
+    // slots and the unrequested outputs are null.
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle().cast(),
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    // owner points inside descriptor, so one free covers both.
+    let _owned = Local(descriptor);
+    ensure!(
+        status == 0 && !owner.is_null(),
+        "Cannot read who owns Flummox's background worker pipe (error {status})"
+    );
+    let owner = sid_text(owner)?;
+    ensure!(
+        owner_is_trusted(&owner, &user_sid()?),
+        "Another account is using Flummox's background worker name. Sign out of the other account or restart the computer, then open Flummox again."
+    );
+    Ok(())
 }
 /// True when `error` says the pipe does not exist, meaning no worker is running.
 pub fn is_missing(error: &anyhow::Error) -> bool {
@@ -376,6 +419,30 @@ mod tests {
             .map_err(|_| "pipe client thread stopped".to_owned())?
             .ctx("client reads delayed reply")?;
         check(reply, "empty pipe waits instead of reporting EOF")
+    }
+    #[test]
+    fn only_the_user_and_the_administrators_group_may_own_the_pipe() -> TestResult {
+        let user = "S-1-5-21-1-2-3-1001";
+        check(
+            owner_is_trusted(user, user),
+            "the user's own pipe is accepted",
+        )?;
+        check(
+            owner_is_trusted("S-1-5-32-544", user),
+            "an elevated process's pipe is accepted",
+        )?;
+        check(
+            !owner_is_trusted("S-1-5-21-1-2-3-1002", user),
+            "control: another account's pipe is refused",
+        )?;
+        check(
+            !owner_is_trusted("S-1-5-21-1-2-3-100", user),
+            "control: a SID that is a prefix of the user's is refused",
+        )?;
+        check(
+            !owner_is_trusted("S-1-5-32-545", user),
+            "control: the Users group is refused",
+        )
     }
     #[test]
     fn frames_reject_truncation_and_excessive_lengths() -> TestResult {
