@@ -38,7 +38,9 @@ RestartApplications=no
 Source: "{#SourceDir}\flummox.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\flummox-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\..\THIRD-PARTY-LICENSES.txt"; DestDir: "{app}"; Flags: ignoreversion
+; Release builds generate this file and check it before compiling the
+; installer. The CI install test has no notices to ship.
+Source: "..\..\THIRD-PARTY-LICENSES.txt"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\..\RELEASE-NOTES.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Tasks]

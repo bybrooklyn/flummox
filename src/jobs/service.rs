@@ -2808,14 +2808,14 @@ mod tests {
     fn the_coordinator_refuses_relative_paths() -> TestResult {
         let temp = tempfile::tempdir().ctx("state")?;
         let (db, mut snapshot) = open_store(&temp.path().join("jobs.sqlite")).ctx("store")?;
-        // `src` exists relative to the test's working directory.
+        // `.` exists whatever directory the test runs from.
         check(
-            Path::new("src").is_dir(),
+            Path::new(".").is_dir(),
             "control: the relative folder exists",
         )?;
         let relative = apply(
             Command::Enqueue {
-                game: game(Path::new("src"), "relative"),
+                game: game(Path::new("."), "relative"),
                 operation: Operation::Analyze,
                 options: CompressOpts::default(),
             },
@@ -2832,7 +2832,7 @@ mod tests {
         check_eq(snapshot.jobs.len(), 0, "nothing was queued")?;
         let reclaim = apply(
             Command::PackReclaim {
-                game_path: "src".into(),
+                game_path: ".".into(),
             },
             &mut snapshot,
             &db,
