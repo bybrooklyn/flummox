@@ -74,7 +74,7 @@ impl Page {
             Self::Settings => "Settings",
         }
     }
-    fn icon(self) -> &'static str {
+    fn icon(self) -> super::icon::Icon {
         match self {
             Self::Overview => shell::icons::OVERVIEW,
             Self::Games => shell::icons::GAMES,
@@ -231,6 +231,8 @@ struct State {
     page: Page,
     /// Progress of the page transition.
     reveal: Animation<bool>,
+    /// The highlight of each sidebar entry.
+    nav: shell::NavHighlight<Page>,
     /// Frames are requested until this instant so a programmatic scroll gets drawn.
     scroll_redraw_until: Option<Instant>,
     /// Sign of the transition offset: -1.0 towards an earlier page, 1.0 otherwise.
@@ -308,6 +310,11 @@ impl Default for State {
             reveal: Animation::new(true)
                 .duration(Duration::from_millis(180))
                 .easing(Easing::EaseOutCubic),
+            nav: shell::NavHighlight::new(
+                [Page::Overview, Page::Games, Page::Jobs, Page::Settings],
+                Page::Overview,
+                Duration::from_millis(shell::NAV_TIMING.0),
+            ),
             direction: 1.0,
             scroll_positions: Default::default(),
             games: Vec::new(),
@@ -339,6 +346,14 @@ impl Default for State {
 impl State {
     fn reduced_motion(&self) -> bool {
         self.preferences.motion == MotionChoice::Reduced
+    }
+    /// How long the sidebar highlight takes to move, by the motion setting.
+    fn nav_duration(&self) -> Duration {
+        Duration::from_millis(match self.preferences.motion {
+            MotionChoice::Normal => shell::NAV_TIMING.0,
+            MotionChoice::Subtle => shell::NAV_TIMING.1,
+            MotionChoice::Reduced => 0,
+        })
     }
     /// How long the toast takes to appear, by the motion setting.
     fn fade(&self) -> Duration {
@@ -962,6 +977,9 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                     1.0
                 };
                 state.page = page;
+                let duration = state.nav_duration();
+                state.nav.retime(duration);
+                state.nav.select(page, Instant::now());
                 state.reveal = Animation::new(false)
                     .duration(state.preferences.motion.duration())
                     .easing(Easing::EaseOutCubic)
@@ -1412,7 +1430,9 @@ fn filtered_games(state: &State) -> Vec<&crate::model::Game> {
 /// Whether a page transition, the toast or a programmatic scroll still needs frames.
 fn animating(state: &State) -> bool {
     (!state.reduced_motion()
-        && (state.reveal.is_animating(Instant::now()) || state.toast.animating()))
+        && (state.reveal.is_animating(Instant::now())
+            || state.nav.animating(Instant::now())
+            || state.toast.animating()))
         || state
             .scroll_redraw_until
             .is_some_and(|until| Instant::now() < until)
@@ -1904,7 +1924,12 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
         shell::nav_entry(
             destination.label(),
             destination.icon(),
-            if destination == page { 1.0 } else { 0.0 },
+            state.nav.value(
+                destination,
+                page,
+                state.reduced_motion(),
+                Instant::now(),
+            ),
             compact,
             Message::GoTo(destination),
         )
@@ -2534,9 +2559,9 @@ fn completed_row(job: &crate::desktop_jobs::Job) -> Element<'_, Message> {
     theme::panel_card(
         row![
             if job.phase == Phase::Completed {
-                Element::from(theme::accent_text("✓").size(18))
+                super::icon::icon(super::icon::Icon::Check, 18.0, super::icon::Tint::Accent)
             } else {
-                Element::from(text("○").size(18))
+                super::icon::icon(super::icon::Icon::Dot, 18.0, super::icon::Tint::Muted)
             },
             column![
                 text(&job.game.title).size(15),

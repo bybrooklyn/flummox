@@ -19,7 +19,6 @@ use std::time::{Duration, Instant};
 /// Animation lengths in milliseconds as (expressive, subtle). Reduced motion
 /// gives zero. Every transition in the window takes its length from here.
 mod timing {
-    pub const NAV: (u64, u64) = (220, 140);
     pub const PAGE: (u64, u64) = (180, 120);
     pub const DETAIL: (u64, u64) = (260, 150);
     pub const TOAST: (u64, u64) = (240, 150);
@@ -325,7 +324,7 @@ pub struct State {
     pub qualify_dirty: bool,
     // Navigation and scrolling.
     /// The highlight animation of each sidebar entry.
-    pub nav: Vec<(Page, Animation<bool>)>,
+    pub nav: super::shell::NavHighlight<Page>,
     pub page_reveal: Animation<bool>,
     /// Frames keep coming until this instant, after a scroll set from code.
     pub scroll_redraw_until: Option<Instant>,
@@ -447,18 +446,11 @@ impl State {
             qualify_cancel: Default::default(),
             qualify_run: 0,
             qualify_dirty: false,
-            nav: PAGES
-                .into_iter()
-                .chain(std::iter::once(Page::Settings))
-                .map(|page| {
-                    (
-                        page,
-                        Animation::new(page == Page::Overview)
-                            .duration(Duration::from_millis(timing::NAV.0))
-                            .easing(EASING),
-                    )
-                })
-                .collect(),
+            nav: super::shell::NavHighlight::new(
+                PAGES.into_iter().chain(std::iter::once(Page::Settings)),
+                Page::Overview,
+                Duration::from_millis(super::shell::NAV_TIMING.0),
+            ),
             scroll_redraw_until: None,
             page_reveal: Animation::new(true)
                 .duration(Duration::from_millis(timing::PAGE.0))
@@ -1952,9 +1944,7 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
                     .go(true, Instant::now());
             }
             state.confirm_reclaim.clear();
-            for (target, animation) in &mut state.nav {
-                animation.go_mut(*target == page, Instant::now());
-            }
+            state.nav.select(page, Instant::now());
             // A section destination scrolls to its section. Any other page
             // change returns to where that page was last scrolled.
             if let Some(section) = destination.section() {
@@ -2490,12 +2480,8 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
             state.reduced_motion = motion == MotionPreference::Reduced;
             // The sidebar animations are rebuilt at their current value with
             // the new timing. The setting is also sent to the worker.
-            let duration = state.motion_duration(timing::NAV);
-            for (_, animation) in &mut state.nav {
-                *animation = Animation::new(animation.value())
-                    .duration(duration)
-                    .easing(EASING);
-            }
+            let duration = state.motion_duration(super::shell::NAV_TIMING);
+            state.nav.retime(duration);
             return send(Command::Motion(motion));
         }
         Message::Theme(theme) => {
@@ -3828,8 +3814,8 @@ mod tests {
     fn every_transition_takes_its_length_from_one_table() -> TestResult {
         let mut state = State::new(Env::from_home("/fixture"));
         check_eq(
-            state.motion_duration(timing::NAV),
-            Duration::from_millis(timing::NAV.0),
+            state.motion_duration(crate::gui::shell::NAV_TIMING),
+            Duration::from_millis(crate::gui::shell::NAV_TIMING.0),
             "expressive",
         )?;
         state.motion = MotionPreference::Subtle;

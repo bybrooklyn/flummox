@@ -4,6 +4,7 @@
 
 use super::{
     artwork::{Cache, Source},
+    icon::{Icon, Tint, icon},
     surface, theme,
 };
 use humansize::{DECIMAL, format_size};
@@ -29,12 +30,74 @@ pub const INFO_SECONDS: u64 = 4;
 #[cfg(any(target_os = "linux", windows))]
 pub const REFUSAL_SECONDS: u64 = 8;
 
-/// The symbols the sidebar draws for each destination.
+/// How long the sidebar highlight takes to move, in milliseconds as
+/// (expressive, subtle). Reduced motion gives zero.
+pub const NAV_TIMING: (u64, u64) = (220, 140);
+
+/// The highlight of each sidebar entry, eased towards the selected one.
+///
+/// Both windows keep one of these and read [`NavHighlight::value`] each frame.
+pub struct NavHighlight<K> {
+    entries: Vec<(K, Animation<bool>)>,
+}
+
+impl<K: Copy + PartialEq> NavHighlight<K> {
+    /// One animation per key, with `selected` lit and the rest dark.
+    pub fn new(keys: impl IntoIterator<Item = K>, selected: K, duration: Duration) -> Self {
+        Self {
+            entries: keys
+                .into_iter()
+                .map(|key| (key, Self::animation(key == selected, duration)))
+                .collect(),
+        }
+    }
+
+    fn animation(lit: bool, duration: Duration) -> Animation<bool> {
+        Animation::new(lit).duration(duration).easing(EASING)
+    }
+
+    /// Starts moving the highlight to `selected`.
+    pub fn select(&mut self, selected: K, now: Instant) {
+        for (key, animation) in &mut self.entries {
+            animation.go_mut(*key == selected, now);
+        }
+    }
+
+    /// Changes the duration, keeping each entry where it is.
+    pub fn retime(&mut self, duration: Duration) {
+        for (_, animation) in &mut self.entries {
+            *animation = Self::animation(animation.value(), duration);
+        }
+    }
+
+    /// How lit `key` is, from 0 to 1. With `reduced` the selected entry is
+    /// fully lit and the rest dark at once.
+    pub fn value(&self, key: K, selected: K, reduced: bool, now: Instant) -> f32 {
+        if reduced {
+            return if key == selected { 1.0 } else { 0.0 };
+        }
+        self.entries
+            .iter()
+            .find(|(entry, _)| *entry == key)
+            .map(|(_, animation)| animation.interpolate(0.0, 1.0, now))
+            .unwrap_or(0.0)
+    }
+
+    /// Whether any entry is still moving.
+    pub fn animating(&self, now: Instant) -> bool {
+        self.entries
+            .iter()
+            .any(|(_, animation)| animation.is_animating(now))
+    }
+}
+
+/// The icons the sidebar draws for each destination.
 pub mod icons {
-    pub const OVERVIEW: &str = "⌂";
-    pub const GAMES: &str = "◈";
-    pub const JOBS: &str = "☷";
-    pub const SETTINGS: &str = "⚙";
+    use crate::gui::icon::Icon;
+    pub const OVERVIEW: Icon = Icon::Overview;
+    pub const GAMES: Icon = Icon::Games;
+    pub const JOBS: Icon = Icon::Jobs;
+    pub const SETTINGS: Icon = Icon::Settings;
 }
 
 /// Runs blocking work without occupying iced's executor or window thread.
@@ -201,11 +264,19 @@ pub fn with_toast<'a, M: Clone + 'a>(
     let reveal = toast.progress(reduced);
     let card = container(
         row![
-            text("●").size(12).style(theme::toast_mark(status.is_error)),
+            icon(
+                Icon::Dot,
+                14.0,
+                if status.is_error {
+                    Tint::Danger
+                } else {
+                    Tint::Accent
+                }
+            ),
             text(&status.text).size(14).width(Length::Fill),
-            button(text("×").size(18))
-                .style(button::text)
-                .padding([3, 6])
+            button(icon(Icon::Close, 16.0, Tint::Inherit))
+                .style(theme::toast_close_button)
+                .padding([6, 7])
                 .on_press(dismiss)
         ]
         .spacing(12)
@@ -379,14 +450,12 @@ pub fn artwork_tile<'a, M: Clone + 'a>(
 /// the same x, and the label unless `compact`, which shows it as a tooltip.
 pub fn nav_entry<'a, M: Clone + 'a>(
     label: &'a str,
-    icon: &'a str,
+    mark: Icon,
     highlight: f32,
     compact: bool,
     message: M,
 ) -> Element<'a, M> {
-    let icon = text(icon)
-        .size(if compact { 20 } else { 18 })
-        .style(theme::nav_icon(highlight));
+    let icon = icon(mark, if compact { 22.0 } else { 20.0 }, Tint::Inherit);
     let content: Element<'a, M> = if compact {
         container(icon)
             .width(Length::Fill)
@@ -867,6 +936,37 @@ mod tests {
         check(run_is_current(true, 2, 2), "the run being waited for")?;
         check(!run_is_current(true, 2, 1), "an older run")?;
         check(!run_is_current(false, 2, 2), "nothing is waited for")
+    }
+
+    #[test]
+    fn the_highlight_moves_to_the_selected_entry_and_not_before() -> TestResult {
+        let began = Instant::now();
+        let span = Duration::from_millis(200);
+        let mut nav = NavHighlight::new([1, 2, 3], 1, span);
+        check_eq(nav.value(1, 1, false, began), 1.0, "the first starts lit")?;
+        check_eq(nav.value(2, 1, false, began), 0.0, "the others start dark")?;
+        nav.select(2, began);
+        check(nav.animating(began), "a change is moving")?;
+        let middle = nav.value(2, 2, false, began + span / 2);
+        check(
+            middle > 0.0 && middle < 1.0,
+            format!("halfway the entry is between dark and lit: {middle}"),
+        )?;
+        let end = began + span * 2;
+        check_eq(nav.value(2, 2, false, end), 1.0, "it ends lit")?;
+        check_eq(nav.value(1, 2, false, end), 0.0, "the old one ends dark")?;
+        check(!nav.animating(end), "and stops asking for frames")?;
+        check_eq(
+            nav.value(1, 2, true, began),
+            0.0,
+            "reduced motion skips the movement",
+        )?;
+        nav.retime(Duration::ZERO);
+        check_eq(
+            nav.value(2, 2, false, end),
+            1.0,
+            "retiming keeps each entry's value",
+        )
     }
 
     #[test]

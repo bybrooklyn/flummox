@@ -21,6 +21,8 @@ mod preview;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 mod preview_renderer;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+mod icon;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod shell;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod surface;
@@ -86,10 +88,7 @@ fn theme_of(state: &app::State) -> iced::Theme {
 fn animation_pending(state: &app::State) -> bool {
     let now = std::time::Instant::now();
     !state.reduced_motion
-        && (state
-            .nav
-            .iter()
-            .any(|(_, animation)| animation.is_animating(now))
+        && (state.nav.animating(now)
             || state.page_reveal.is_animating(now)
             || state.toast.animating()
             || state.detail.is_animating(now)

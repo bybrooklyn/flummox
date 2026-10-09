@@ -67,8 +67,8 @@ fn run_limited(program: &str, args: &[&str], limit: Duration) -> Option<String> 
             Ok(Some(status)) => break status,
             Ok(None) if began.elapsed() < limit => std::thread::sleep(Duration::from_millis(5)),
             Ok(None) | Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                let _killed = child.kill();
+                let _reaped = child.wait();
                 return None;
             }
         }

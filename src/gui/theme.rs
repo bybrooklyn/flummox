@@ -3,16 +3,16 @@
 //! Kept separate from [`crate::view`] so that page code reads as layout rather
 //! than as a list of colour values.
 
+use iced::widget::{Space, column, container, row, text};
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-use iced::widget::{Space, button, column, pick_list as pick_list_widget, row};
-use iced::widget::{container, text};
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+use iced::widget::{button, pick_list as pick_list_widget};
 #[cfg(any(target_os = "linux", test))]
 use iced::widget::progress_bar as progress_widget;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use iced::widget::{scrollable as scrollable_widget, text_input as text_input_widget};
+use iced::{Alignment, Border, Element, Length};
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-use iced::{Alignment, Border, Element, Length, Padding};
+use iced::Padding;
 use iced::{Background, Color, Font, Theme, color};
 
 /// The palette every style in this file draws from. Fields are gated to the
@@ -27,12 +27,10 @@ struct Colors {
     background: Color,
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     sidebar: Color,
-    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     panel: Color,
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     hero: Color,
     /// The edge of a card.
-    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     border: Color,
     /// The edge of a control, at 3:1 against the surfaces it sits on.
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -53,11 +51,9 @@ fn colors(theme: &Theme) -> Colors {
             background: color!(0x141618),
             #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             sidebar: color!(0x191C1F),
-            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             panel: color!(0x1E2225),
             #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             hero: color!(0x1E2225),
-            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             border: color!(0x444C53),
             #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             control_border: color!(0x6B7771),
@@ -74,11 +70,9 @@ fn colors(theme: &Theme) -> Colors {
             background: color!(0xF5F6F7),
             #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             sidebar: color!(0xECF1EE),
-            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             panel: color!(0xFFFFFF),
             #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             hero: color!(0xFFFFFF),
-            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             border: color!(0xB9C4BE),
             #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             control_border: color!(0x7C8882),
@@ -93,7 +87,6 @@ pub const BODY_FONT: Font = Font::DEFAULT;
 
 /// The weight headings use, so a heading reads as one beside body text of a
 /// similar size.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub const HEADING_FONT: Font = Font {
     weight: iced::font::Weight::Semibold,
     ..BODY_FONT
@@ -104,10 +97,8 @@ pub const PAGE_TITLE_SIZE: f32 = 26.0;
 /// Size of every heading inside a page: groups, cards and settings sections.
 pub const SECTION_TITLE_SIZE: f32 = 16.0;
 /// Vertical space between the blocks of a page column.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub const PAGE_GAP: f32 = 16.0;
 /// Padding inside a card and a hero.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub const CARD_PADDING: f32 = 16.0;
 /// Padding of every button, so a row of them has one height.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -122,7 +113,6 @@ pub const TRAILING_WIDTH: f32 = 220.0;
 #[cfg(target_os = "linux")]
 pub const ACTION_SLOT_WIDTH: f32 = 140.0;
 /// Height of the page header row, so titles sit at one baseline.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 const PAGE_HEADER_HEIGHT: f32 = 40.0;
 
 /// The application's theme.
@@ -179,7 +169,6 @@ pub fn sidebar(theme: &Theme) -> container::Style {
 }
 
 /// A raised card holding one group of information.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub fn panel(theme: &Theme) -> container::Style {
     let colors = colors(theme);
     container::Style {
@@ -312,17 +301,6 @@ pub fn nav_button(highlight: f32) -> impl Fn(&Theme, button::Status) -> button::
     }
 }
 
-/// A navigation symbol that follows the animated selection color.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
-pub fn nav_icon(highlight: f32) -> impl Fn(&Theme) -> text::Style {
-    move |theme| {
-        let colors = colors(theme);
-        text::Style {
-            color: Some(mix(colors.muted, colors.text, highlight.clamp(0.0, 1.0))),
-        }
-    }
-}
-
 /// The button for the main action on a page.
 ///
 /// Light themes fill with `accent` and white text, since the pale
@@ -418,6 +396,51 @@ pub fn selected_button(theme: &Theme, status: button::Status) -> button::Style {
             radius: 8.0.into(),
             width: 1.0,
             color: colors.accent,
+        },
+        ..button::Style::default()
+    }
+}
+
+/// The accent colour of `theme`.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+pub fn accent_color(theme: &Theme) -> Color {
+    colors(theme).accent
+}
+
+/// The colour for errors in `theme`.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+pub fn danger_color(theme: &Theme) -> Color {
+    colors(theme).danger
+}
+
+/// The colour for secondary text in `theme`.
+#[cfg(any(target_os = "linux", windows))]
+pub fn muted_color(theme: &Theme) -> Color {
+    colors(theme).muted
+}
+
+/// The button that dismisses a toast: a cross that gains a fill on hover.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+pub fn toast_close_button(theme: &Theme, status: button::Status) -> button::Style {
+    let colors = colors(theme);
+    let hot = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    button::Style {
+        background: hot.then(|| {
+            Background::Color(mix(
+                colors.panel,
+                colors.text,
+                if status == button::Status::Pressed {
+                    0.22
+                } else {
+                    0.12
+                },
+            ))
+        }),
+        text_color: if hot { colors.text } else { colors.muted },
+        border: Border {
+            radius: 6.0.into(),
+            width: 0.0,
+            color: Color::TRANSPARENT,
         },
         ..button::Style::default()
     }
@@ -608,13 +631,11 @@ pub fn tone_text(tone: Tone) -> impl Fn(&Theme) -> text::Style {
 }
 
 /// A page heading.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub fn page_title(label: &str) -> text::Text<'_> {
     text(label).size(PAGE_TITLE_SIZE).font(HEADING_FONT)
 }
 
 /// A heading inside a page, used for groups, cards and settings sections.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub fn section_title(label: &str) -> text::Text<'_> {
     text(label).size(SECTION_TITLE_SIZE).font(HEADING_FONT)
 }
@@ -646,29 +667,6 @@ pub fn warning_text<'a>(label: impl text::IntoFragment<'a>) -> text::Text<'a> {
     text(label).size(13).style(|theme: &Theme| text::Style {
         color: Some(colors(theme).warning),
     })
-}
-
-/// A success marker, such as the tick on a finished job.
-#[cfg(any(target_os = "linux", windows))]
-pub fn accent_text<'a>(label: impl text::IntoFragment<'a>) -> text::Text<'a> {
-    text(label).style(|theme: &Theme| text::Style {
-        color: Some(colors(theme).accent),
-    })
-}
-
-/// The state marker in a toast.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
-pub fn toast_mark(is_error: bool) -> impl Fn(&Theme) -> text::Style {
-    move |theme| {
-        let colors = colors(theme);
-        text::Style {
-            color: Some(if is_error {
-                colors.danger
-            } else {
-                colors.accent
-            }),
-        }
-    }
 }
 
 /// A number worth reading from across the room, with its label beneath.
@@ -754,7 +752,18 @@ pub fn disclosure<'a, Message: Clone + 'a>(
     message: Message,
 ) -> Element<'a, Message> {
     button(
-        row![text(if open { "▾" } else { "▸" }).size(13), text(label)]
+        row![
+            super::icon::icon(
+                if open {
+                    super::icon::Icon::ChevronOpen
+                } else {
+                    super::icon::Icon::ChevronClosed
+                },
+                16.0,
+                super::icon::Tint::Inherit
+            ),
+            text(label)
+        ]
             .spacing(6)
             .align_y(Alignment::Center),
     )
@@ -765,7 +774,6 @@ pub fn disclosure<'a, Message: Clone + 'a>(
 }
 
 /// A card.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub fn panel_card<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
@@ -803,7 +811,6 @@ pub fn attention_card<'a, Message: 'a>(
 
 /// The top of a page: the title with `trailing` at the right of a row of
 /// fixed height, and the optional `subtitle` under it.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub fn page_header<'a, Message: 'a>(
     title: &'a str,
     subtitle: Option<&'a str>,

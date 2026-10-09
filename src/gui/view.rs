@@ -67,16 +67,12 @@ fn layout(state: &State, compact: bool) -> Element<'_, Message> {
     // the bottom and switches without animation.
     // Every entry, Settings included, eases its highlight the same way.
     let highlight_of = |page: Page| {
-        if state.reduced_motion {
-            if state.page == page { 1. } else { 0. }
-        } else {
-            state
-                .nav
-                .iter()
-                .find(|(target, _)| *target == page)
-                .map(|(_, a)| a.interpolate(0., 1., std::time::Instant::now()))
-                .unwrap_or(0.)
-        }
+        state.nav.value(
+            page,
+            state.page,
+            state.reduced_motion,
+            std::time::Instant::now(),
+        )
     };
     let nav_entry = |page: Page| -> Element<'_, Message> {
         shell::nav_entry(
@@ -285,13 +281,13 @@ fn empty_games(state: &State) -> (&'static str, &'static str, Option<(&'static s
 }
 
 /// The symbol drawn for a page in the sidebar.
-fn page_icon(page: Page) -> &'static str {
+fn page_icon(page: Page) -> super::icon::Icon {
     match page {
         Page::Overview => shell::icons::OVERVIEW,
         Page::Games => shell::icons::GAMES,
         Page::Queue => shell::icons::JOBS,
-        Page::Drives => "▰",
-        Page::Recovery => "⟲",
+        Page::Drives => super::icon::Icon::Drives,
+        Page::Recovery => super::icon::Icon::Recovery,
         Page::Settings => shell::icons::SETTINGS,
     }
 }
@@ -1871,9 +1867,9 @@ fn completed_job_row(job: &Job) -> Element<'_, Message> {
     panel(
         row![
             if job.phase == Phase::Completed {
-                Element::from(theme::accent_text("✓").size(18))
+                super::icon::icon(super::icon::Icon::Check, 18.0, super::icon::Tint::Accent)
             } else {
-                Element::from(text("○").size(18))
+                super::icon::icon(super::icon::Icon::Dot, 18.0, super::icon::Tint::Muted)
             },
             column![
                 text(&job.game.title).size(15),
