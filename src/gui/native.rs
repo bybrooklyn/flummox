@@ -49,7 +49,12 @@ const FOLDER_HINT: &str = "~/My Games/Your game";
 const LIBRARY_HINT: &str = "C:\\Games or D:\\Games";
 #[cfg(target_os = "macos")]
 const LIBRARY_HINT: &str = "~/My Games";
+/// The recovery button. Windows decompresses the files, and macOS puts a kept
+/// original back, so the label names what each does.
+#[cfg(windows)]
 const RECOVERY_ACTION: &str = "Decompress to ordinary files";
+#[cfg(target_os = "macos")]
+const RECOVERY_ACTION: &str = "Put the original back";
 
 /// What a finished background settings save hands back: the worker's new
 /// snapshot on Windows, nothing on macOS.
@@ -1277,11 +1282,11 @@ fn apply(state: &mut State, message: Message) -> Task<Message> {
         Message::Recover(folder) => {
             state.working = true;
             state.job_folder = None;
-            state.info("Recovering the kept original…");
+            state.info("Putting the original back…");
             return Task::perform(
                 background(move || {
                     backend::recover_folder(&folder)
-                        .map(|()| "Recovery finished.".into())
+                        .map(|()| "The original is back.".into())
                         .map_err(|error| error.to_string())
                 }),
                 Message::Finished,
@@ -1511,6 +1516,11 @@ fn overview(state: &State) -> Element<'_, Message> {
             Some(Message::ReviewAttention),
         ));
     }
+    // The worker's notes, such as a location that moved to another drive.
+    #[cfg(windows)]
+    if !state.worker.notices.is_empty() {
+        content = content.push(shell::attention_notes(0, &state.worker.notices, None));
+    }
     content = content.push(theme::section_title("Running jobs"));
     content = content.push(theme::panel_card(text(current_work(state))));
     content.into()
@@ -1653,6 +1663,9 @@ fn progress_box<'a>(title: String, totals: Totals, note: &'a str) -> Element<'a,
         )),
     ]
     .spacing(4);
+    if let Some(failed) = rules::failed_text(totals.failed) {
+        content = content.push(theme::danger_text(failed));
+    }
     if !note.is_empty() {
         content = content.push(theme::muted(note));
     }
@@ -1671,6 +1684,7 @@ fn selected_progress(state: &State) -> Option<Element<'_, Message>> {
             bytes: job.progress.bytes,
             allocation_before: job.progress.allocation_before,
             allocation_after: job.progress.allocation_after,
+            failed: job.progress.failed,
         };
         Some(progress_box(
             format!(
@@ -1696,6 +1710,8 @@ fn selected_progress(state: &State) -> Option<Element<'_, Message>> {
             bytes: progress.bytes,
             allocation_before: progress.allocation_before,
             allocation_after: progress.allocation_after,
+            // The macOS pass reports no per-file failures.
+            failed: 0,
         };
         Some(progress_box(
             format!("Working on {}", folder_title(state, &state.selected_path())),
@@ -2545,6 +2561,10 @@ fn job_card<'a>(state: &State, job: &'a crate::desktop_jobs::Job) -> Element<'a,
         .align_y(Alignment::Center),
     ]
     .spacing(10);
+    let content = match rules::failed_text(job.progress.failed) {
+        Some(text) => content.push(theme::danger_text(text)),
+        None => content,
+    };
     if failed {
         theme::attention_card(content, true)
     } else {
@@ -2571,7 +2591,11 @@ fn completed_row(job: &crate::desktop_jobs::Job) -> Element<'_, Message> {
                     shell::files_count(job.progress.files),
                     job.progress.changed,
                     job.progress.skipped
-                ))
+                )),
+                match rules::failed_text(job.progress.failed) {
+                    Some(text) => Element::from(theme::danger_text(text)),
+                    None => Element::from(iced::widget::Space::new()),
+                }
             ]
             .spacing(3)
             .width(Length::Fill),

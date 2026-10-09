@@ -224,6 +224,19 @@ pub struct Totals {
     pub bytes: u64,
     pub allocation_before: u64,
     pub allocation_after: u64,
+    /// Files the pass could not process and went on without.
+    pub failed: u64,
+}
+
+/// The line naming how many files a pass could not process, or `None` when
+/// every file went through.
+pub fn failed_text(failed: u64) -> Option<String> {
+    (failed > 0).then(|| {
+        format!(
+            "{} could not be processed",
+            crate::text::count(failed, "file", "files")
+        )
+    })
 }
 
 impl Totals {
@@ -256,6 +269,21 @@ mod tests {
             progress: Default::default(),
             message: String::new(),
         }
+    }
+
+    #[test]
+    fn failed_files_are_counted_in_words_and_absent_when_none() -> TestResult {
+        check_eq(failed_text(0), None, "nothing failed")?;
+        check_eq(
+            failed_text(1),
+            Some("1 file could not be processed".to_owned()),
+            "one",
+        )?;
+        check_eq(
+            failed_text(3),
+            Some("3 files could not be processed".to_owned()),
+            "several",
+        )
     }
 
     #[test]
