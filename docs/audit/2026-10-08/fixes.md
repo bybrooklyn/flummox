@@ -72,6 +72,12 @@ and tested it. The second run passed every job at commit `4505852`.
 | Minimum supported Rust version | The crate checks on the declared version. |
 | Build, test, lint and dependency policy | `just ci` passes with the Landlock tests required. |
 
+The Windows tests that Wine could not run passed there. They are the ones
+that compress a real file with WOF and check its allocation falls while a
+random file's does not, the pass that counts an unopenable file and carries
+on, the skip of files Windows would not shrink, the coordinator from enqueue
+through restart, and a client connecting to a pipe whose owner is checked.
+
 The first run failed two jobs, and both causes were in this branch: a test
 that assumed the repository as its working directory, and an installer that
 listed a notices file the CI build does not generate.
