@@ -157,7 +157,7 @@ jobs:
       # whose licences require their notices to travel with the binary.
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
-          tool: cargo-about
+          tool: cargo-about@0.9.2
       - name: Generate third-party licence notices
         run: |
           cargo about generate --locked --all-features --config packaging/about.toml --output-file THIRD-PARTY-LICENSES.txt packaging/about.hbs
@@ -170,7 +170,7 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           TARGET: ${{ matrix.target }}
         run: |
-          choco install innosetup --yes --no-progress
+          choco install innosetup --version 6.7.1 --yes --no-progress
           if ($LASTEXITCODE -ne 0) { throw 'Inno Setup installation failed' }
           $compiler = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*\ISCC.exe" | Select-Object -First 1
           if (!$compiler) { throw 'ISCC.exe is missing' }
@@ -237,7 +237,8 @@ jobs:
     if: needs.prepare.outputs.prerelease == 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    container: archlinux:base
+    # Pinned by digest. `pacman -Syu` in the job brings the packages up to date.
+    container: archlinux:base@sha256:4e77cf2ea5f410e6f8be5abf93ccf17ce2436e87a138c167208356711a405dbd
     steps:
       - name: Install packaging dependencies
         run: pacman -Syu --noconfirm --needed base-devel git python

@@ -28,7 +28,7 @@ arch=('x86_64' 'aarch64')
 url="https://github.com/bybrooklyn/flummox"
 license=('AGPL-3.0-or-later')
 depends=('glibc>=2.39' 'gcc-libs' 'libxkbcommon' 'libxkbcommon-x11' 'wayland' 'libx11' 'libxcursor' 'libxi' 'libxrandr' 'fontconfig')
-optdepends=('btrfs-progs: for inspecting compression' 'fuse3: Maximum Space mounts' 'zenity: native folder picker' 'kdialog: KDE folder picker')
+optdepends=('btrfs-progs: for inspecting compression' 'fuse3: Maximum stores' 'vulkan-icd-loader: GPU rendering in the window' 'zenity: native folder picker' 'kdialog: KDE folder picker')
 provides=('flummox')
 conflicts=('flummox')
 options=('!strip' '!debug')
@@ -56,7 +56,7 @@ package() {{
     srcinfo += '\tlicense = AGPL-3.0-or-later\n'
     for value in ['glibc>=2.39', 'gcc-libs', 'libxkbcommon', 'libxkbcommon-x11', 'wayland', 'libx11', 'libxcursor', 'libxi', 'libxrandr', 'fontconfig']:
         srcinfo += f'\tdepends = {value}\n'
-    for value in ['btrfs-progs: for inspecting compression', 'fuse3: Maximum Space mounts', 'zenity: native folder picker', 'kdialog: KDE folder picker']:
+    for value in ['btrfs-progs: for inspecting compression', 'fuse3: Maximum stores', 'vulkan-icd-loader: GPU rendering in the window', 'zenity: native folder picker', 'kdialog: KDE folder picker']:
         srcinfo += f'\toptdepends = {value}\n'
     srcinfo += '\tprovides = flummox\n\tconflicts = flummox\n\toptions = !strip\n\toptions = !debug\n'
     for arch, filename in archives.items():

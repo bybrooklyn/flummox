@@ -47,7 +47,7 @@ jobs:
       - name: Compile and smoke-test the Windows installer
         shell: pwsh
         run: |
-          choco install innosetup --yes --no-progress
+          choco install innosetup --version 6.7.1 --yes --no-progress
           if ($LASTEXITCODE -ne 0) { throw 'Inno Setup installation failed' }
           $version = (cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
           if ($LASTEXITCODE -ne 0) { throw 'Package metadata failed' }

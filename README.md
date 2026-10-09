@@ -74,7 +74,7 @@ expire. Flummox checks and warns before it starts.
 - [Security audit](https://github.com/bybrooklyn/flummox/blob/main/docs/security/2026-10-08-audit.md): what was reviewed, what was fixed, and what is still open
 - [Changelog](https://github.com/bybrooklyn/flummox/blob/main/CHANGELOG.md): what each version changed
 
-## Licence
+## License
 
 AGPL-3.0-or-later. See [LICENSE](https://github.com/bybrooklyn/flummox/blob/main/LICENSE).
 

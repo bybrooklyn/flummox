@@ -145,11 +145,11 @@ push access can read them by editing a workflow on a branch.
 5. Require the `Build, test, lint and dependency policy` check and the btrfs and
    FUSE jobs of `Filesystem tests` on `main`, so a commit is checked before it
    can be tagged.
-6. TODO, needs network access to verify: pin the Arch container in the `arch`
-   job to an image digest. The workflow uses `archlinux:base`, which moves.
-7. TODO, needs network access to verify: pin Inno Setup in the Windows
-   installer steps by version and checksum. The workflow runs an unpinned
-   `choco install innosetup`.
-8. TODO, needs network access to verify: pin the `cargo-about` version in the
-   release build job. Only `just`, `cargo-deny` and the Rust toolchain are
-   pinned there today.
+The release inputs that used to move are pinned in the workflows, and each
+needs a manual bump when a newer one is wanted:
+
+- The Arch container is `archlinux:base` at the digest in `release.yml`,
+  read from Docker Hub on 2026-10-08.
+- Inno Setup is the Chocolatey package `innosetup` 6.7.1 in `release.yml` and
+  `ci.yml`. The package carries the installer's checksum.
+- `cargo-about` is 0.9.2.

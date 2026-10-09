@@ -19,9 +19,11 @@ license=('AGPL-3.0-or-later')
 depends=('glibc' 'gcc-libs' 'libxkbcommon' 'libxkbcommon-x11' 'wayland' 'libx11' 'libxcursor'
          'libxi' 'libxrandr' 'fontconfig')
 makedepends=('cargo' 'git')
-# FUSE runs Maximum Space mounts; either dialog helper enables folder browsing.
+# FUSE runs Maximum stores. The Vulkan loader gives the window GPU rendering.
+# Either dialog helper enables folder browsing.
 optdepends=('btrfs-progs: for inspecting compression'
-            'fuse3: for Maximum Space mounts'
+            'fuse3: for Maximum stores'
+            'vulkan-icd-loader: for GPU rendering in the window'
             'zenity: for native folder and report selection'
             'kdialog: for native folder and report selection on KDE')
 options=('!lto')  # LTO is already configured in the release profile.
