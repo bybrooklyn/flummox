@@ -31,11 +31,13 @@ The presentation follows these rules:
   Sentences end with a full stop and fragments do not, in-progress text ends
   with an ellipsis, counts agree with their noun, and sizes and durations are
   humanised.
-- A game has one mode choice, Standard or Maximum. Several games at once
-  always use Standard.
+- On Linux a game has one mode choice, Standard or Maximum. Several games at
+  once always use Standard. Windows and Mac have one compression method each
+  and no mode choice.
 - Decompress, Analyze and the mode choice belong in expanded details. The
   Standard strength, store paths and the compatibility report form live under
-  Advanced.
+  Advanced. Windows and Mac put Decompress and Test compatibility under
+  Advanced and have no strength or store form.
 - A job starts without a confirmation when its storage plan passes. The plan is
   shown only when it fails.
 - On Linux, Jobs have their own page. On Windows and Mac, Jobs is a section of

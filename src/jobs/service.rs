@@ -1785,7 +1785,7 @@ pub(super) fn run() -> Result<()> {
     // bring the login entry in line with the saved settings.
     let mut mounts: Vec<PackMount> = Vec::new();
     survive(
-        "recovering Maximum Space installs",
+        "recovering games that use Maximum",
         recover_packs(&mut snapshot, &db, &mut mounts),
     );
     for library in &snapshot.libraries {
@@ -2398,7 +2398,7 @@ pub(super) fn run() -> Result<()> {
             && last_pack_recovery.elapsed() >= recovery_delay
         {
             survive(
-                "recovering Maximum Space installs",
+                "recovering games that use Maximum",
                 recover_packs(&mut snapshot, &db, &mut mounts),
             );
             last_pack_recovery = Instant::now();

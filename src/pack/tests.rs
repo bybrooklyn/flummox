@@ -20,7 +20,7 @@ fn maximum_policy_survives_update_compaction() -> TestResult {
             level: 9,
             compare_level: Some(22),
         },
-        "Maximum Space always compares the full high-level set",
+        "Maximum always compares the full high-level set",
     )
 }
 

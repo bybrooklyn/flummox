@@ -554,7 +554,7 @@ fn build_index(
             .filter(|s| s.stamp.mode & libc::S_IFMT == libc::S_IFREG)
             .map(|s| s.stamp.size)
             .sum(),
-        "Building Maximum Space store",
+        "Creating the store…",
     );
     observer.checkpoint()?;
     let grouped = group_small_files(
@@ -660,7 +660,7 @@ fn build_index(
         if source.stamp.mode & libc::S_IFMT == libc::S_IFREG {
             files_done += 1;
             bytes_done = bytes_done.saturating_add(source.stamp.size);
-            observer.progress(files_done, bytes_done, "Building Maximum Space store");
+            observer.progress(files_done, bytes_done, "Creating the store…");
         }
         ensure!(
             source.stamp.mode & libc::S_IFMT != libc::S_IFREG || source.stamp.mode & 0o6000 == 0,

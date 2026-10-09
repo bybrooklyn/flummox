@@ -760,7 +760,7 @@ fn backend_for(install_dir: &Path) -> Result<(FsInfo, Box<dyn Backend>)> {
             )
         }
         Tier::Pack => bail!(
-            "{} is on {}, which needs Maximum Space. Use `flummox pack create` followed by \
+            "{} is on {}, which needs Maximum. Use `flummox pack create` followed by \
              `flummox pack activate`, or use the desktop app's advanced controls.",
             install_dir.display(),
             fs.fstype

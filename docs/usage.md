@@ -41,8 +41,8 @@ field usable.
 On Windows, choose a locally detected Steam, Epic, GOG or Heroic game, or add
 another installed-game folder, then press **Compress**. Flummox reports files
 processed and space freed while Windows works. **Stop** finishes the
-current file and keeps completed work valid. **Decompress** removes WOF backing
-and leaves the same files at the same paths.
+current file and keeps completed work valid. **Decompress**, under Advanced,
+removes WOF backing and leaves the same files at the same paths.
 
 The window theme and responsive layout are shared across targets. Linux-only
 storage controls appear only when their backend and FUSE support are available.
@@ -108,8 +108,9 @@ flummox compatibility list --json  # export path-free compatibility reports
 flummox compatibility measure DIR  # allocated bytes for a compatibility report
 ```
 
-Import a locally produced compatibility report from Settings or an
-expanded game, or with `flummox compatibility import report.json`. Analysis
+On Linux, import a locally produced compatibility report from Settings or an
+expanded game, or with `flummox compatibility import report.json`. The Windows
+and Mac window has no import control. Analysis
 hashes installed files when a candidate report matches the game build. Automatic
 switching checks the game files again before the store is created and before the
 game switches to it. Reports identify a launcher key, build and
