@@ -180,6 +180,28 @@ pub struct Report {
     pub storage: StorageResult,
     /// Version of the Flummox build that wrote the report.
     pub flummox_version: String,
+    /// The commit that build was made from, when CI recorded one: 40
+    /// lowercase hex digits. It names source, not a host. Local builds and
+    /// reports written before this field have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flummox_commit: Option<String>,
+}
+
+/// Whether `text` is a full commit id: 40 lowercase hex digits.
+fn is_commit_id(text: &str) -> bool {
+    text.len() == 40 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The commit this binary was built from, from `GITHUB_SHA` at compile time.
+/// `None` for a local build, or when the variable is not a full commit id.
+pub fn build_commit() -> Option<String> {
+    commit_from(option_env!("GITHUB_SHA"))
+}
+
+fn commit_from(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::to_ascii_lowercase)
+        .filter(|text| is_commit_id(text))
 }
 
 /// Thresholds a valid report must meet before it qualifies a game.
@@ -243,6 +265,10 @@ impl Report {
         ensure!(
             self.checks.baseline_load_ms > 0 && self.checks.candidate_load_ms > 0,
             "Compatibility report load measurements are missing"
+        );
+        ensure!(
+            self.flummox_commit.as_deref().is_none_or(is_commit_id),
+            "Compatibility report build commit is not a 40-digit lowercase hex id"
         );
         ensure!(
             !self.flummox_version.trim().is_empty(),
@@ -578,6 +604,7 @@ mod tests {
                 random_read_p95_ns: Some(50_000),
             },
             flummox_version: "0.1.0".into(),
+            flummox_commit: None,
         }
     }
 
@@ -755,6 +782,40 @@ mod tests {
             slow.qualifies(&game(), &"a".repeat(64), Policy::default()),
             "control: exactly ten percent slower still qualifies",
         )
+    }
+
+    #[test]
+    fn the_build_commit_is_optional_and_must_be_a_full_lower_case_id() -> TestResult {
+        let mut with = report();
+        with.flummox_commit = Some("0123456789abcdef0123456789abcdef01234567".into());
+        check(with.validate().is_ok(), "a full commit id is accepted")?;
+        for bad in [
+            "",
+            "0123456789ABCDEF0123456789abcdef01234567",
+            "0123456789abcdef",
+            "g123456789abcdef0123456789abcdef01234567",
+            "0123456789abcdef0123456789abcdef012345678",
+        ] {
+            let mut changed = report();
+            changed.flummox_commit = Some(bad.into());
+            check(changed.validate().is_err(), format!("{bad:?} is refused"))?;
+        }
+        check(report().validate().is_ok(), "control: absent is accepted")?;
+        let json = serde_json::to_string(&report()).ctx("serialise")?;
+        check(
+            !json.contains("flummox_commit"),
+            "an absent commit is not written",
+        )?;
+        let read: Report = serde_json::from_str(&json).ctx("a report from before the field")?;
+        check_eq(read.flummox_commit, None, "old reports still load")?;
+        let id = "0123456789ABCDEF0123456789abcdef01234567";
+        check_eq(
+            commit_from(Some(id)),
+            Some(id.to_ascii_lowercase()),
+            "the build variable is folded to lower case",
+        )?;
+        check_eq(commit_from(Some("abc")), None, "a short value is dropped")?;
+        check_eq(commit_from(None), None, "a local build has none")
     }
 
     #[test]

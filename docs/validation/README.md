@@ -62,8 +62,17 @@ The compressed allocation may not exceed the original. Each run names its own
 report file and its own corpus hash, so one report cannot stand for two kinds,
 and a run's `game_key` and `game_build` must equal its report's. A report's
 `flummox_version` is the release version or one of its release candidates,
-such as `0.0.2-rc.3` for `0.0.2`. The check does not tie a report to the
-commit that is tagged.
+such as `0.0.2-rc.3` for `0.0.2`.
+
+A report made by a CI build also carries `flummox_commit`, the 40-digit
+lowercase id of the commit the build came from. It names source, not a host.
+Builds made locally have none. The check takes the commit being released from
+`--commit` or `GITHUB_SHA` and requires each report's commit to be that commit
+or an ancestor of it, using `git merge-base --is-ancestor`, so it runs in a
+checkout with full history. A stable version needs the field in every run's
+report, which means each real-game run must use a build from the release
+workflow. A prerelease may leave it out. The field is a claim made by the
+tester's build and is not signed.
 
 ## Desktop checks before game qualification
 
