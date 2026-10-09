@@ -11,7 +11,7 @@ Three limits apply to everything below:
   btrfs and Landlock tests forced on (`FLUMMOX_REQUIRE_FUSE`,
   `FLUMMOX_REQUIRE_BTRFS`, `FLUMMOX_REQUIRE_LANDLOCK`).
 - Windows fixes were cross-compiled and linted with `just win-lint`. None has
-  run on Windows.
+  run on Windows. The second round ran the Windows library tests under Wine.
 - Mac fixes were type-checked and linted with `just mac-lint`, which uses zig
   for the C dependencies. Nothing was linked or run on a Mac.
 
@@ -26,30 +26,53 @@ These cannot be done from a commit.
    `HOMEBREW_DEPLOY_KEY` into the `release` environment and delete the
    repository-level copies (13, 1.1).
 2. Add a required reviewer and a `v*` tag ruleset (13, 1.1).
-3. Pin the Arch container image by digest, Inno Setup by version and
-   checksum, and the `cargo-about` version (13, 1.7). The values need network
-   access to verify.
-4. Run CI on Windows and on a Mac before trusting those fixes. Reports 11 and
+3. Run CI on Windows and on a Mac before trusting those fixes. Reports 11 and
    12 each end with a list of what to check on the real system.
 
-## Needs a decision
+## Decided and fixed in a second round
 
-| Report | Finding | Why it was left |
+The first round left these as needing a decision. Each now has a default,
+chosen by the session that ran the fixes, and is implemented. Change the
+default if it is the wrong one.
+
+| Report | Finding | What was done |
 |---|---|---|
-| 06 | 3 | A user with a mounted Maximum game cannot restart the worker after a protocol change. A fix lets Restart unmount a game that may be running. |
-| 06 | batch enqueue | Needs a protocol version bump. |
-| 10 | 2 | Heroic GOG games that were keyed by list position get a new id. Exclusions and artwork set under the old id stay there. No migration was written. |
-| 11 | 9 | A pipe-owner check would lock the user out if the worker ever ran elevated. Confirm on Windows first. |
-| 11 | 5c | Removable drives swapped at one letter. Needs a change to the saved settings format. |
-| 11 | 15c | The tray icon is the generic one. Needs an `.ico` and a resource embed. |
-| 09 | 10 | The confidence cut-offs (under 0.05 percent of bytes sampled is Low, under 0.5 percent is Medium) were chosen by the fixing agent. |
-| 09 | 6 | Reports for custom-folder games now store a hash of the key. Reports saved before this no longer match and must be made again. |
-| 01 | 20 | The first frame assumes a dark desktop. iced gives the desktop theme only after the window opens. |
-| 01 | 18 | Escape closes the storage plan and leaves the compatibility form open, since closing it discards typed input. |
-| 03 | 11 | The sidebar glyphs depend on the system font. Bundling an icon font is an asset decision. |
-| 13 | 1.3 | Acceptance reports carry no commit hash, so the gate cannot tie one to the tagged commit. |
+| 06 | 3 | Restart unmounts idle stores and the next worker remounts them. It refuses, naming the game, when a process runs from a store. A worker of another protocol version accepts Stop, Pause and status. |
+| 06 | batch enqueue | `Command::EnqueueMany` and `jobs::request_many`. The protocol went from 8 to 9. The Linux window uses it. |
+| 06 | 11, 13, 15 | The exclusion is written to history first and undone on failure. Mounts survive a failed start, with a FUSE test. A client that connects during start-up is told the worker is starting and retries. |
+| 07 | 8 | The crash case: opening a layer with the store hides the store children of a folder whose whiteout it drops. |
+| 08 | 1, 14, 15 | A decompress job probes the kernel with a scratch file before changing anything. The x32 numbers of the socket calls are denied. A no-copy-on-write file gets no predicted saving. |
+| 09 | 6 | Old reports for custom folders are rewritten on load with the hashed key, so they still match and no path stays on disk. |
+| 09 | 13 | A sparse file is priced by its allocated blocks, on Linux. |
+| 10 | 2 | A Heroic game keeps its old position id as an alias, so exclusions and history still apply. |
+| 10 | 15 | Offline folders are merged without regard to case on Windows. |
+| 11 | 9 | The client accepts a pipe owned by the user or by the Administrators group and refuses any other. |
+| 11 | 5c | A location's drive identity is saved. A location that moves to another drive gets a new baseline and queues nothing. |
+| 11 | 15c | The tray draws a Flummox mark at run time. |
+| 11 | 12, 17 | A custom game past the stamp limits gets a partial stamp and stays usable. The freed figure is cross-checked against the compressed file size. |
+| 12 | B9, B11 | `watch` retries a failed job at 10, 60 and 300 seconds. `doctor --json` prints its checks. |
+| 13 | 1.3 | A report carries the commit it was built from, and a stable release requires each report's commit to be an ancestor of the release. |
+| 13 | 1.7 | The Arch image digest, Inno Setup 6.7.1 and cargo-about 0.9.2 are pinned. The values were looked up on 2026-10-08. |
+| 01 | 20 | The desktop theme is read before the window opens, from `GTK_THEME` and then `gsettings` under a 300 ms limit. |
+| 01 | 18 | Escape closes an untouched compatibility form and keeps a filled one, with a notice. |
+| 03 | 11 | Sidebar icons and the small marks are drawn from rectangles in `src/gui/icon.rs`. No glyph depends on a system font. |
+| 05 | unsupported page | Systems with no backend get a titled page with a card. `just other-lint` type-checks it for FreeBSD. |
 
-## Fixed
+## Cannot be done from this machine
+
+| What | Why |
+|---|---|
+| Move the release secrets, add a reviewer and a tag rule | GitHub settings, owner only. |
+| Run the Windows compress and decompress pass | Wine has no WOF and, without a display, no drive lookup. 108 of 122 Windows tests pass under Wine. The 14 that fail are listed in the Windows round's report, and one of them was a test defect that is fixed. |
+| Run the Inno Setup script | Needs Windows. |
+| Link or run anything on a Mac | No Mac toolchain. The Mac code is type-checked and linted only. |
+| Run the new CI and release workflow steps | They run on GitHub. They were checked as text and through unit tests of the scripts. |
+| Confirm any fix in the real window | The previews are software renders of fixture state. |
+
+## Fixed in the first round
+
+This section is the first round as it stood. Where it calls an item open, the
+table above says how the second round closed it.
 
 ### 01 and 02, Linux window behaviour
 
@@ -159,9 +182,10 @@ replays a journal and puts a kept original back.
 
 On the final commit of `audit-fixes`:
 
-- `just lint`, `just win-lint` and `just mac-lint` pass.
-- `cargo test --all-features` passes 401 tests with the three
+- `just lint`, `just win-lint`, `just mac-lint` and `just other-lint` pass.
+- `cargo test --all-features` passes 444 tests with the three
   `FLUMMOX_REQUIRE_` variables set. Before the audit it passed 200.
-- `python3 packaging/test_release.py` passes 17 tests and skips the one that
+- Under Wine, 108 of 122 Windows library tests pass.
+- `python3 packaging/test_release.py` passes 19 tests and skips the one that
   needs minisign.
 - `just prose` is clean.
