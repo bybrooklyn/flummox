@@ -297,9 +297,8 @@ mod tests {
         std::fs::create_dir(&dir).ctx("game folder")?;
         // An earlier build keyed the game by its array position.
         remember(&state, vec![fixture_game("0", &dir)], |_| true).ctx("first scan")?;
-        let db = crate::db::Db::open_in_memory().ctx("db")?;
-        db.exclude(&GameId::new(Launcher::HeroicGog, "0"), "Old")
-            .ctx("exclusion under the old id")?;
+        // Exclusions are stored as id strings and matched against every id.
+        let excluded = [GameId::new(Launcher::HeroicGog, "0").to_string()];
         let named = fixture_game("1423049311", &dir);
         let after = remember(&state, vec![named.clone()], |_| true).ctx("second scan")?;
         let game = after.first().ctx("the game")?;
@@ -308,11 +307,14 @@ mod tests {
             named.id.clone(),
             "the new id stays the primary id",
         )?;
-        let mut excluded = false;
-        for id in game.ids() {
-            excluded |= db.is_excluded(id).ctx("lookup")?;
-        }
-        check(excluded, "the exclusion stored under the old id applies")?;
+        check(
+            game.ids().any(|id| excluded.contains(&id.to_string())),
+            "the exclusion stored under the old id applies",
+        )?;
+        check(
+            !named.ids().any(|id| excluded.contains(&id.to_string())),
+            "control: without the alias the exclusion is lost",
+        )?;
         let third = remember(&state, vec![named], |_| true).ctx("third scan")?;
         check(
             third
