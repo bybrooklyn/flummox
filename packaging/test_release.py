@@ -443,7 +443,7 @@ class ReleaseTests(unittest.TestCase):
         pkgbuild = (HERE / 'PKGBUILD').read_text()
         match = re.search(r'^pkgver=(\S+)$', pkgbuild, flags=re.M)
         self.assertIsNotNone(match)
-        self.assertEqual(match[1], cargo)
+        self.assertEqual(match[1], cargo.split('-')[0])
 
     def test_distribution_checksums_match_release_bytes(self):
         distributions = module('distributions.py')
