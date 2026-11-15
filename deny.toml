@@ -61,6 +61,13 @@ ignore = [
     # it sees are the system fonts iced loads to draw the window, not
     # anything a game or a downloaded file supplies.
     "RUSTSEC-2026-0192",
+    # `zbus_names`, `zvariant` and `zvariant_derive`, via mundy in iced's
+    # winit integration. The maintainers moved the code into zbus 6 and
+    # published no patched release of these versions. They carry D-Bus
+    # messages from the desktop session, not data from a game.
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0372",
 ]
 
 # ---------------------------------------------------------------------------
